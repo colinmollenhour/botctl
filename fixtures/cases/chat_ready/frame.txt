@@ -1,0 +1,5 @@
+Claude Code
+
+Main chat input area
+
+Enter submit message

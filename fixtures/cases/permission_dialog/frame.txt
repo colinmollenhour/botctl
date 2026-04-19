@@ -1,0 +1,8 @@
+Claude Code needs permission to continue
+
+Allow once
+Allow for session
+No
+
+Enter confirms the selected option
+Escape cancels
