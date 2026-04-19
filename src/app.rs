@@ -1,13 +1,20 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
-use crate::automation::{AutomationAction, render_keybindings_json};
-use crate::classifier::Classifier;
+use crate::automation::{AutomationAction, prompt_submission_sequence, render_keybindings_json};
+use crate::classifier::{Classifier, SessionState};
 use crate::cli::{
-    CaptureArgs, ClassifyArgs, Command, ObserveArgs, ReplayArgs, SendActionArgs, StartArgs,
+    CaptureArgs, ClassifyArgs, Command, EditorHelperArgs, ObserveArgs, PreparePromptArgs,
+    RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs, SubmitPromptArgs,
 };
-use crate::fixtures::FixtureCase;
-use crate::observe::{ObserveRequest, observe_session};
+use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
+use crate::observe::{ObserveRequest, collect_observation, observe_session};
+use crate::prompt::{
+    PromptSource, default_state_dir, prepare_prompt, resolve_prompt_text, write_editor_target,
+    write_editor_target_from_pending,
+};
 use crate::tmux::{StartSessionRequest, TmuxClient};
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -45,10 +52,14 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::ListPanes => run_list_panes(),
         Command::Capture(args) => run_capture(args),
         Command::Observe(args) => run_observe(args),
+        Command::RecordFixture(args) => run_record_fixture(args),
         Command::Classify(args) => run_classify(args),
         Command::Replay(args) => run_replay(args),
         Command::Bindings => Ok(render_keybindings_json()),
         Command::SendAction(args) => run_send_action(args),
+        Command::PreparePrompt(args) => run_prepare_prompt(args),
+        Command::EditorHelper(args) => run_editor_helper(args),
+        Command::SubmitPrompt(args) => run_submit_prompt(args),
         Command::Help => Ok(crate::cli::usage()),
     }
 }
@@ -124,6 +135,45 @@ fn run_observe(args: ObserveArgs) -> AppResult<String> {
     Ok(report.render())
 }
 
+fn run_record_fixture(args: RecordFixtureArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let request = ObserveRequest {
+        session_name: args.session_name.clone(),
+        target_pane: args.pane_id,
+        max_events: args.events,
+        idle_timeout_ms: args.idle_timeout_ms,
+        history_lines: args.history_lines,
+    };
+    let collected = collect_observation(&client, &request)?;
+    let expected_state = parse_expected_state_arg(
+        args.expected_state.as_deref(),
+        collected.report.classification.state,
+    )?;
+
+    let recorded = record_case(FixtureRecordInput {
+        case_name: &args.case_name,
+        output_dir: &args.output_dir,
+        expected_state,
+        classified_state: collected.report.classification.state,
+        session_name: &collected.report.session_name,
+        target_pane: &collected.report.target_pane,
+        output_events: collected.report.output_events,
+        notifications: collected.report.notifications,
+        signals: &collected.report.classification.signals,
+        frame_text: &collected.report.captured_frame,
+        raw_control_lines: &collected.raw_control_lines,
+    })?;
+
+    Ok(format!(
+        "recorded fixture case={} dir={} pane={} expected={} classified={}",
+        args.case_name,
+        recorded.case_dir.display(),
+        recorded.target_pane,
+        recorded.expected_state.as_str(),
+        recorded.classified_state.as_str()
+    ))
+}
+
 fn run_classify(args: ClassifyArgs) -> AppResult<String> {
     let frame = load_frame_text(&args.path)?;
     let classification = Classifier.classify("fixture", &frame);
@@ -156,6 +206,91 @@ fn run_send_action(args: SendActionArgs) -> AppResult<String> {
     ))
 }
 
+fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
+    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
+    let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
+    Ok(format!(
+        "prepared prompt session={} path={}",
+        args.session_name,
+        pending_path.display()
+    ))
+}
+
+fn run_editor_helper(args: EditorHelperArgs) -> AppResult<String> {
+    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let content = match args.source.as_deref() {
+        Some(source_path) => {
+            let prompt_text = resolve_prompt_text(PromptSource::File(source_path))?;
+            write_editor_target(&args.target, &prompt_text)?;
+            prompt_text
+        }
+        None => write_editor_target_from_pending(
+            &state_dir,
+            &args.session_name,
+            &args.target,
+            !args.keep_pending,
+        )?,
+    };
+
+    Ok(format!(
+        "editor helper wrote {} bytes to {}",
+        content.len(),
+        args.target.display()
+    ))
+}
+
+fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
+    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
+    let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
+
+    let client = TmuxClient::default();
+    for action in prompt_submission_sequence() {
+        client.send_keys(&args.pane_id, action.tmux_keys())?;
+        if matches!(action, AutomationAction::ExternalEditor) {
+            thread::sleep(Duration::from_millis(args.submit_delay_ms));
+        }
+    }
+
+    Ok(format!(
+        "submitted prepared prompt session={} pane={} pending_path={} delay_ms={}",
+        args.session_name,
+        args.pane_id,
+        pending_path.display(),
+        args.submit_delay_ms
+    ))
+}
+
 fn load_frame_text(path: &PathBuf) -> AppResult<String> {
     std::fs::read_to_string(path).map_err(AppError::from)
+}
+
+fn resolve_state_dir(path: Option<&Path>) -> PathBuf {
+    path.map(Path::to_path_buf)
+        .unwrap_or_else(default_state_dir)
+}
+
+fn read_prompt_input(source: Option<&Path>, text: Option<&str>) -> AppResult<String> {
+    match (source, text) {
+        (Some(path), None) => resolve_prompt_text(PromptSource::File(path)),
+        (None, Some(text)) => resolve_prompt_text(PromptSource::Text(text)),
+        (Some(_), Some(_)) => Err(AppError::new(
+            "prompt input must use either --source PATH or --text TEXT, not both",
+        )),
+        (None, None) => Err(AppError::new(
+            "prompt input requires either --source PATH or --text TEXT",
+        )),
+    }
+}
+
+fn parse_expected_state_arg(
+    raw_state: Option<&str>,
+    fallback: SessionState,
+) -> AppResult<SessionState> {
+    match raw_state {
+        Some(value) => SessionState::from_str(value)
+            .ok_or_else(|| AppError::new(format!("unknown session state: {value}"))),
+        None => Ok(fallback),
+    }
 }

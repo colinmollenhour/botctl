@@ -2,6 +2,18 @@
 
 This file tracks features that are not implemented yet in the current scaffold.
 
+## Recap
+
+The current scaffold already includes:
+
+- a Rust CLI with commands for session start planning, pane listing, capture, observe, replay, fixture recording, prompt preparation, editor-helper writes, and named Claude actions
+- tmux wrappers for session launch, pane discovery, pane capture, key sending, and bounded control-mode attachment
+- a first-pass classifier for chat-ready, permission, survey, diff, external-editor, busy, and unknown states
+- a fixture corpus format with replay tests and recorded metadata
+- a deterministic prompt handoff path built around pending prompts plus an external-editor helper
+
+The remaining items below are the major missing capabilities and hardening work.
+
 ## Session Lifecycle
 
 - Stop, restart, and destroy managed Claude sessions from the CLI.
@@ -75,3 +87,12 @@ This file tracks features that are not implemented yet in the current scaffold.
 - Add a `README.md` with usage examples and architecture notes.
 - Add release automation and versioning strategy.
 - Add CI for formatting, tests, and fixture regression checks.
+
+## Next Steps
+
+- Replace the current bounded `script`-backed control-mode probe with a longer-lived observer that reliably captures live `%output` pane events.
+- Build a real terminal screen reconstruction layer so classification is based on frames instead of plain captured text.
+- Add higher-level guarded workflows for prompt submission, permission handling, and survey dismissal that check classifier state before acting.
+- Install and validate the Claude automation keymap automatically so action routing is not a manual prerequisite.
+- Extend fixture capture so recorded cases always include meaningful control-mode event tapes, not just pane snapshots and notifications.
+- Add end-to-end tests against real tmux sessions, then start exercising the flows against a real Claude Code session.

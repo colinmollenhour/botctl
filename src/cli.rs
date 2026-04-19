@@ -8,10 +8,14 @@ pub enum Command {
     ListPanes,
     Capture(CaptureArgs),
     Observe(ObserveArgs),
+    RecordFixture(RecordFixtureArgs),
     Classify(ClassifyArgs),
     Replay(ReplayArgs),
     Bindings,
     SendAction(SendActionArgs),
+    PreparePrompt(PreparePromptArgs),
+    EditorHelper(EditorHelperArgs),
+    SubmitPrompt(SubmitPromptArgs),
     Help,
 }
 
@@ -40,6 +44,18 @@ pub struct ObserveArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct RecordFixtureArgs {
+    pub session_name: String,
+    pub pane_id: Option<String>,
+    pub case_name: String,
+    pub output_dir: PathBuf,
+    pub expected_state: Option<String>,
+    pub events: usize,
+    pub idle_timeout_ms: u64,
+    pub history_lines: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct ClassifyArgs {
     pub path: PathBuf,
 }
@@ -53,6 +69,33 @@ pub struct ReplayArgs {
 pub struct SendActionArgs {
     pub pane_id: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparePromptArgs {
+    pub session_name: String,
+    pub state_dir: Option<PathBuf>,
+    pub source: Option<PathBuf>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorHelperArgs {
+    pub session_name: String,
+    pub state_dir: Option<PathBuf>,
+    pub source: Option<PathBuf>,
+    pub target: PathBuf,
+    pub keep_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmitPromptArgs {
+    pub session_name: String,
+    pub pane_id: String,
+    pub state_dir: Option<PathBuf>,
+    pub source: Option<PathBuf>,
+    pub text: Option<String>,
+    pub submit_delay_ms: u64,
 }
 
 pub fn parse_args<I>(args: I) -> AppResult<Command>
@@ -72,10 +115,14 @@ where
         "list-panes" => Ok(Command::ListPanes),
         "capture" => parse_capture(rest),
         "observe" => parse_observe(rest),
+        "record-fixture" => parse_record_fixture(rest),
         "classify" => parse_classify(rest),
         "replay" => parse_replay(rest),
         "bindings" => Ok(Command::Bindings),
         "send-action" => parse_send_action(rest),
+        "prepare-prompt" => parse_prepare_prompt(rest),
+        "editor-helper" => parse_editor_helper(rest),
+        "submit-prompt" => parse_submit_prompt(rest),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(AppError::new(format!("unknown subcommand: {other}"))),
     }
@@ -90,10 +137,14 @@ pub fn usage() -> String {
            list-panes\n\
            capture --pane %ID [--history-lines N]\n\
            observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
+           record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
            classify --path PATH\n\
            replay --path PATH\n\
            bindings\n\
-           send-action --pane %ID --action NAME\n",
+           send-action --pane %ID --action NAME\n\
+           prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
+           editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
+           submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n",
     )
 }
 
@@ -225,6 +276,77 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
     }))
 }
 
+fn parse_record_fixture(args: Vec<String>) -> AppResult<Command> {
+    let mut session_name = None;
+    let mut pane_id = None;
+    let mut case_name = None;
+    let mut output_dir = PathBuf::from("fixtures/cases");
+    let mut expected_state = None;
+    let mut events = 25usize;
+    let mut idle_timeout_ms = 1500u64;
+    let mut history_lines = 120usize;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--case" => {
+                case_name = Some(read_value(&args, &mut i, "--case")?);
+            }
+            "--output-dir" => {
+                output_dir = PathBuf::from(read_value(&args, &mut i, "--output-dir")?);
+            }
+            "--expected-state" => {
+                expected_state = Some(read_value(&args, &mut i, "--expected-state")?);
+            }
+            "--events" => {
+                let raw = read_value(&args, &mut i, "--events")?;
+                events = raw
+                    .parse::<usize>()
+                    .map_err(|_| AppError::new(format!("invalid value for --events: {raw}")))?;
+            }
+            "--idle-timeout-ms" => {
+                let raw = read_value(&args, &mut i, "--idle-timeout-ms")?;
+                idle_timeout_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --idle-timeout-ms: {raw}"))
+                })?;
+            }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown record-fixture flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    let session_name =
+        session_name.ok_or_else(|| AppError::new("missing required flag: --session"))?;
+    let case_name = case_name.ok_or_else(|| AppError::new("missing required flag: --case"))?;
+
+    Ok(Command::RecordFixture(RecordFixtureArgs {
+        session_name,
+        pane_id,
+        case_name,
+        output_dir,
+        expected_state,
+        events,
+        idle_timeout_ms,
+        history_lines,
+    }))
+}
+
 fn parse_classify(args: Vec<String>) -> AppResult<Command> {
     let path = parse_single_path_flag(args, "--path", "classify")?;
     Ok(Command::Classify(ClassifyArgs { path }))
@@ -261,6 +383,154 @@ fn parse_send_action(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::SendAction(SendActionArgs { pane_id, action }))
 }
 
+fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
+    let mut session_name = None;
+    let mut state_dir = None;
+    let mut source = None;
+    let mut text = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--source" => {
+                source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
+            }
+            "--text" => {
+                text = Some(read_value(&args, &mut i, "--text")?);
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown prepare-prompt flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    let session_name =
+        session_name.ok_or_else(|| AppError::new("missing required flag: --session"))?;
+    validate_prompt_input(&source, &text)?;
+
+    Ok(Command::PreparePrompt(PreparePromptArgs {
+        session_name,
+        state_dir,
+        source,
+        text,
+    }))
+}
+
+fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
+    let mut session_name = None;
+    let mut state_dir = None;
+    let mut source = None;
+    let mut keep_pending = false;
+    let mut target = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--source" => {
+                source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
+            }
+            "--keep-pending" => {
+                keep_pending = true;
+            }
+            value if value.starts_with("--") => {
+                return Err(AppError::new(format!(
+                    "unknown editor-helper flag: {value}"
+                )));
+            }
+            value => {
+                if target.is_some() {
+                    return Err(AppError::new(format!(
+                        "unexpected extra editor-helper target: {value}"
+                    )));
+                }
+                target = Some(PathBuf::from(value));
+            }
+        }
+        i += 1;
+    }
+
+    let session_name =
+        session_name.ok_or_else(|| AppError::new("missing required flag: --session"))?;
+    let target = target.ok_or_else(|| AppError::new("missing required editor-helper target"))?;
+
+    Ok(Command::EditorHelper(EditorHelperArgs {
+        session_name,
+        state_dir,
+        source,
+        target,
+        keep_pending,
+    }))
+}
+
+fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
+    let mut session_name = None;
+    let mut pane_id = None;
+    let mut state_dir = None;
+    let mut source = None;
+    let mut text = None;
+    let mut submit_delay_ms = 250u64;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--source" => {
+                source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
+            }
+            "--text" => {
+                text = Some(read_value(&args, &mut i, "--text")?);
+            }
+            "--submit-delay-ms" => {
+                let raw = read_value(&args, &mut i, "--submit-delay-ms")?;
+                submit_delay_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --submit-delay-ms: {raw}"))
+                })?;
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown submit-prompt flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+
+    let session_name =
+        session_name.ok_or_else(|| AppError::new("missing required flag: --session"))?;
+    let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+    validate_prompt_input(&source, &text)?;
+
+    Ok(Command::SubmitPrompt(SubmitPromptArgs {
+        session_name,
+        pane_id,
+        state_dir,
+        source,
+        text,
+        submit_delay_ms,
+    }))
+}
+
 fn parse_single_path_flag(
     args: Vec<String>,
     flag_name: &str,
@@ -292,8 +562,22 @@ fn read_value(args: &[String], index: &mut usize, flag: &str) -> AppResult<Strin
         .ok_or_else(|| AppError::new(format!("missing value for {flag}")))
 }
 
+fn validate_prompt_input(source: &Option<PathBuf>, text: &Option<String>) -> AppResult<()> {
+    match (source, text) {
+        (Some(_), Some(_)) => Err(AppError::new(
+            "prompt input must use either --source PATH or --text TEXT, not both",
+        )),
+        (None, None) => Err(AppError::new(
+            "prompt input requires either --source PATH or --text TEXT",
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{Command, parse_args};
 
     #[test]
@@ -335,6 +619,26 @@ mod tests {
                 assert_eq!(args.session_name, "demo");
                 assert_eq!(args.events, 10);
                 assert_eq!(args.idle_timeout_ms, 1500);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_editor_helper_with_positional_target() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("editor-helper"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("/tmp/target.txt"),
+        ])
+        .expect("editor helper command should parse");
+
+        match command {
+            Command::EditorHelper(args) => {
+                assert_eq!(args.session_name, "demo");
+                assert_eq!(args.target, PathBuf::from("/tmp/target.txt"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

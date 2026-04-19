@@ -125,12 +125,17 @@ impl TmuxClient {
         max_events: usize,
         idle_timeout_ms: u64,
     ) -> AppResult<Vec<String>> {
-        let mut child = Command::new(&self.program)
-            .arg("-CC")
-            .arg("attach-session")
-            .arg("-t")
-            .arg(session_name)
-            .stdin(Stdio::null())
+        let control_command = format!(
+            "{} -C attach-session -t {}",
+            shell_escape(&self.program),
+            shell_escape(session_name)
+        );
+
+        let mut child = Command::new("script")
+            .arg("-q")
+            .arg("-c")
+            .arg(control_command)
+            .arg("/dev/null")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;

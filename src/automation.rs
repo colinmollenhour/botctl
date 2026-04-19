@@ -52,6 +52,14 @@ impl AutomationAction {
     }
 }
 
+pub fn prompt_submission_sequence() -> [AutomationAction; 3] {
+    [
+        AutomationAction::ClearInput,
+        AutomationAction::ExternalEditor,
+        AutomationAction::Submit,
+    ]
+}
+
 pub fn render_keybindings_json() -> String {
     String::from(
         "{\n\
@@ -88,7 +96,7 @@ pub fn render_keybindings_json() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutomationAction, render_keybindings_json};
+    use super::{AutomationAction, prompt_submission_sequence, render_keybindings_json};
 
     #[test]
     fn action_lookup_round_trips() {
@@ -103,5 +111,17 @@ mod tests {
         assert!(json.contains("\"f7\": \"chat:externalEditor\""));
         assert!(json.contains("\"f9\": \"confirm:no\""));
         assert!(json.contains("\"f10\": \"app:interrupt\""));
+    }
+
+    #[test]
+    fn prompt_submission_sequence_is_stable() {
+        assert_eq!(
+            prompt_submission_sequence(),
+            [
+                AutomationAction::ClearInput,
+                AutomationAction::ExternalEditor,
+                AutomationAction::Submit,
+            ]
+        );
     }
 }

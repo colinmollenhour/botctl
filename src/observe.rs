@@ -39,6 +39,12 @@ pub struct ObserveReport {
     pub classification: Classification,
 }
 
+#[derive(Debug, Clone)]
+pub struct CollectedObservation {
+    pub raw_control_lines: Vec<String>,
+    pub report: ObserveReport,
+}
+
 impl ObserveReport {
     pub fn render(&self) -> String {
         format!(
@@ -60,6 +66,13 @@ impl ObserveReport {
 }
 
 pub fn observe_session(client: &TmuxClient, request: &ObserveRequest) -> AppResult<ObserveReport> {
+    collect_observation(client, request).map(|collected| collected.report)
+}
+
+pub fn collect_observation(
+    client: &TmuxClient,
+    request: &ObserveRequest,
+) -> AppResult<CollectedObservation> {
     let raw_lines = client.control_mode_lines(
         &request.session_name,
         request.max_events,
@@ -71,8 +84,8 @@ pub fn observe_session(client: &TmuxClient, request: &ObserveRequest) -> AppResu
     let mut seen_panes = BTreeSet::new();
     let mut pane_output = BTreeMap::<String, String>::new();
 
-    for line in raw_lines {
-        match parse_control_line(&line) {
+    for line in &raw_lines {
+        match parse_control_line(line) {
             Some(ControlEvent::Output { pane_id, payload }) => {
                 output_events += 1;
                 seen_panes.insert(pane_id.clone());
@@ -116,15 +129,18 @@ pub fn observe_session(client: &TmuxClient, request: &ObserveRequest) -> AppResu
     let captured_frame = client.capture_pane(&target_pane, request.history_lines)?;
     let classification = Classifier.classify(&target_pane, &captured_frame);
 
-    Ok(ObserveReport {
-        session_name: request.session_name.clone(),
-        target_pane,
-        output_events,
-        notifications,
-        seen_panes: seen_panes.into_iter().collect(),
-        live_excerpt,
-        captured_frame,
-        classification,
+    Ok(CollectedObservation {
+        raw_control_lines: raw_lines,
+        report: ObserveReport {
+            session_name: request.session_name.clone(),
+            target_pane,
+            output_events,
+            notifications,
+            seen_panes: seen_panes.into_iter().collect(),
+            live_excerpt,
+            captured_frame,
+            classification,
+        },
     })
 }
 
