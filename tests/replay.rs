@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use sdmux::classifier::Classifier;
-use sdmux::fixtures::{FixtureCase, discover_cases};
+use botctl::classifier::Classifier;
+use botctl::fixtures::{FixtureCase, discover_cases};
 
 #[test]
 fn fixture_cases_classify_as_expected() {

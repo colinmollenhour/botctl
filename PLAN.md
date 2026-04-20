@@ -1,4 +1,4 @@
-# sdmux Plan
+# botctl Plan
 
 ## Phase 1: Executable Scaffold
 

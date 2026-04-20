@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn classifies_folder_trust_prompt() {
-        let frame = "Accessing workspace:\n/home/colin/Projects/sdmux\nQuick safety check: Is this a project you created or one you trust?\nSecurity guide\n1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel";
+        let frame = "Accessing workspace:\n/home/colin/Projects/botctl\nQuick safety check: Is this a project you created or one you trust?\nSecurity guide\n1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::FolderTrustPrompt);
     }

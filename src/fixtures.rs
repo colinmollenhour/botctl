@@ -216,6 +216,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
             .as_nanos();
-        std::env::temp_dir().join(format!("sdmux-{label}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("botctl-{label}-{}-{nanos}", std::process::id()))
     }
 }

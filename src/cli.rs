@@ -199,7 +199,7 @@ where
 
 pub fn usage() -> String {
     String::from(
-        "sdmux\n\
+        "botctl\n\
           \n\
           Commands:\n\
             start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn parses_start_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("start"),
             String::from("--session"),
             String::from("demo"),
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn parses_attach_command_with_session_window_target() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("attach"),
             String::from("--session"),
             String::from("demo"),
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn rejects_attach_window_without_session() {
         let error = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("attach"),
             String::from("--window"),
             String::from("claude"),
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn parses_observe_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("observe"),
             String::from("--session"),
             String::from("demo"),
@@ -962,7 +962,7 @@ mod tests {
     #[test]
     fn parses_status_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("status"),
             String::from("--pane"),
             String::from("%7"),
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn parses_doctor_command_with_session() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("doctor"),
             String::from("--session"),
             String::from("demo"),
@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn parses_install_bindings_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("install-bindings"),
         ])
         .expect("install-bindings command should parse");
@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn parses_editor_helper_with_positional_target() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("editor-helper"),
             String::from("--session"),
             String::from("demo"),
@@ -1036,7 +1036,7 @@ mod tests {
     #[test]
     fn parses_approve_permission_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("approve-permission"),
             String::from("--pane"),
             String::from("%9"),
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn parses_continue_session_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("continue-session"),
             String::from("--session"),
             String::from("demo"),
@@ -1076,7 +1076,7 @@ mod tests {
     #[test]
     fn rejects_continue_session_session_only_target() {
         let error = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("continue-session"),
             String::from("--session"),
             String::from("demo"),
@@ -1091,7 +1091,7 @@ mod tests {
     #[test]
     fn parses_auto_unstick_command() {
         let command = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("auto-unstick"),
             String::from("--pane"),
             String::from("%9"),
@@ -1112,7 +1112,7 @@ mod tests {
     #[test]
     fn rejects_auto_unstick_zero_steps() {
         let error = parse_args(vec![
-            String::from("sdmux"),
+            String::from("botctl"),
             String::from("auto-unstick"),
             String::from("--pane"),
             String::from("%9"),

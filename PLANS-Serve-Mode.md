@@ -1,8 +1,8 @@
-# sdmux Serve Mode Vision
+# botctl Serve Mode Vision
 
 ## Goal
 
-Add a long-lived local `sdmux serve` process that can observe, classify, and safely drive many Claude Code instances running inside `tmux`.
+Add a long-lived local `botctl serve` process that can observe, classify, and safely drive many Claude Code instances running inside `tmux`.
 
 The main product outcome is a stable control plane for Claude sessions:
 
@@ -15,7 +15,7 @@ This is the natural evolution of the current CLI from one-shot probing into dura
 
 ## Why This Exists
 
-Today, `sdmux` can probe a pane, capture text, classify a state, and send guarded actions. That is enough for single-shot commands, but it is not enough for durable automation.
+Today, `botctl` can probe a pane, capture text, classify a state, and send guarded actions. That is enough for single-shot commands, but it is not enough for durable automation.
 
 The missing capability is a persistent observer that stays attached to tmux, maintains current state over time, and serves that state to multiple clients without repeated attach and capture cycles.
 
@@ -25,8 +25,8 @@ Serve mode should solve that gap first. The HTTP API is a delivery mechanism for
 
 The user-facing surface should be:
 
-- `sdmux serve` to run the local daemon
-- `sdmux` client commands that talk to the daemon when it is available
+- `botctl serve` to run the local daemon
+- `botctl` client commands that talk to the daemon when it is available
 - a local HTTP API for structured control
 - SSE endpoints for real-time updates
 
@@ -36,7 +36,7 @@ SSE is one-way from server to client. Command and mutation traffic should remain
 
 The default managed layout should be:
 
-- one managed tmux session owned by `sdmux`
+- one managed tmux session owned by `botctl`
 - one Claude instance per tmux window
 - explicit tmux pane IDs as the canonical automation target
 
@@ -167,10 +167,10 @@ The server should be opinionated about guarded actions and conservative by defau
 Serve mode should support two ways to bring instances under management:
 
 1. Managed instances
-`sdmux` creates and owns the Claude tmux window.
+`botctl` creates and owns the Claude tmux window.
 
 2. Adopted instances
-`sdmux` attaches to an already-running Claude target discovered in tmux.
+`botctl` attaches to an already-running Claude target discovered in tmux.
 
 Adoption should preserve the same safety guarantees as managed instances. No action should run until the target is verified and resolved to an explicit pane ID.
 

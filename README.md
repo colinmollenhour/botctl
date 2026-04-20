@@ -1,6 +1,6 @@
-# sdmux
+# botctl
 
-`sdmux` is a Rust CLI for launching, inspecting, and driving Claude Code sessions inside `tmux`.
+`botctl` is a Rust CLI for launching, inspecting, and driving Claude Code sessions inside `tmux`.
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
@@ -100,9 +100,9 @@ cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the curre
 
 ## Keybinding Policy
 
-`sdmux` respects the user's existing Claude keybindings. It resolves actions like submit, external editor, and confirmation flows from `~/.claude/keybindings.json` instead of assuming that a hard-coded automation keymap is installed.
+`botctl` respects the user's existing Claude keybindings. It resolves actions like submit, external editor, and confirmation flows from `~/.claude/keybindings.json` instead of assuming that a hard-coded automation keymap is installed.
 
-`install-bindings` is intentionally non-destructive. If the user already has a custom Claude keybinding file, `sdmux` will refuse to overwrite it.
+`install-bindings` is intentionally non-destructive. If the user already has a custom Claude keybinding file, `botctl` will refuse to overwrite it.
 
 Print the recommended automation keymap:
 
@@ -149,11 +149,11 @@ The classifier currently recognizes:
 - `DiffDialog`
 - `Unknown`
 
-`approve-permission` accepts both `PermissionDialog` and `FolderTrustPrompt`. For `FolderTrustPrompt`, `sdmux` sends raw `Enter` because that flow must confirm the default selected option directly.
+`approve-permission` accepts both `PermissionDialog` and `FolderTrustPrompt`. For `FolderTrustPrompt`, `botctl` sends raw `Enter` because that flow must confirm the default selected option directly.
 
 ## Current Limits
 
 - Live classification still uses `capture-pane` plus a recent-lines heuristic.
 - The classifier is keyword-based and intentionally conservative.
-- `sdmux` is strongest with managed sessions today; attaching to arbitrary existing Claude panes is still planned work.
+- `botctl` is strongest with managed sessions today; attaching to arbitrary existing Claude panes is still planned work.
 - There is no long-lived observer or supervisor process yet.

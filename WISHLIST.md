@@ -1,4 +1,4 @@
-# sdmux Wishlist
+# botctl Wishlist
 
 ## Checklist
 
@@ -28,13 +28,13 @@
 ## P0
 
 1. Attach to existing Claude tmux targets.
-Allow `sdmux` to adopt an already-running tmux session, window, or pane when the current command is `claude`. This closes a major workflow gap because operators often start Claude first and only later want structured observation and automation.
+Allow `botctl` to adopt an already-running tmux session, window, or pane when the current command is `claude`. This closes a major workflow gap because operators often start Claude first and only later want structured observation and automation.
 
 2. Add `continue-session` and `auto-unstick` commands.
 These commands should inspect the current pane, clear known blocking prompts like folder trust, permission dialogs, and surveys, and then leave the session in a usable state. This turns the current low-level guarded actions into a practical operator flow.
 
 3. Validate Claude ownership before driving a pane.
-Before any automation sends keys, `sdmux` should confirm the pane is really a Claude session and fail conservatively when it is not. This is a direct safety requirement for attaching to arbitrary existing tmux targets.
+Before any automation sends keys, `botctl` should confirm the pane is really a Claude session and fail conservatively when it is not. This is a direct safety requirement for attaching to arbitrary existing tmux targets.
 
 4. Keep higher-level automation state-aware.
 Prompt submission, permission approval, rejection, survey dismissal, and trust acceptance should continue to fire only in compatible states. The remaining work is to harden the state machine so similar prompts do not collapse into the same bucket.
@@ -45,7 +45,7 @@ Prompt submission, permission approval, rejection, survey dismissal, and trust a
 ## P1
 
 1. Replace the bounded observer with a long-lived control-mode connection.
-The current one-shot observer is enough for probing but not enough for durable automation. A persistent connection is needed so `sdmux` can watch sessions continuously and react without repeated attach/capture cycles.
+The current one-shot observer is enough for probing but not enough for durable automation. A persistent connection is needed so `botctl` can watch sessions continuously and react without repeated attach/capture cycles.
 See `PLANS-Serve-Mode.md` for the high-level serve-mode architecture that this persistent observer enables.
 
 2. Reconstruct a live terminal screen model.
@@ -58,7 +58,7 @@ Streaming is low-latency but imperfect, while pane capture is slower but authori
 Recorded cases should always include the control-mode output that led to a state decision, not just a final pane snapshot. That makes regression testing and classifier debugging much more explainable.
 
 5. Detect pane swaps, session renames, and window changes.
-Once `sdmux` claims a pane, it should keep ownership even as tmux topology changes. This matters much more once existing-session attachment becomes a first-class workflow.
+Once `botctl` claims a pane, it should keep ownership even as tmux topology changes. This matters much more once existing-session attachment becomes a first-class workflow.
 
 ## P2
 
@@ -80,13 +80,13 @@ Operators should be able to capture fresh live fixtures, compare them with expec
 ## P3
 
 1. Add full session lifecycle commands.
-`sdmux` should stop, restart, destroy, and supervise managed Claude sessions instead of only launching and probing them. It should also support opening related windows or panes for multi-step workflows.
+`botctl` should stop, restart, destroy, and supervise managed Claude sessions instead of only launching and probing them. It should also support opening related windows or panes for multi-step workflows.
 
 2. Persist managed-session metadata and recent history.
 The tool currently rediscovers most state ad hoc. Persisting ownership, last-known observations, and action history would make long-lived supervision realistic.
 
 3. Add policy-driven continuous automation.
-Once observation is durable, `sdmux` should be able to run rules continuously, such as always trusting the workspace, allowing a permission once, or declining surveys. That requires a clear policy layer rather than ad hoc command chaining.
+Once observation is durable, `botctl` should be able to run rules continuously, such as always trusting the workspace, allowing a permission once, or declining surveys. That requires a clear policy layer rather than ad hoc command chaining.
 See `PLANS-Serve-Mode.md` for the intended local daemon, API, and continuous policy model.
 
 4. Improve CLI and scripting ergonomics.
@@ -96,7 +96,7 @@ Add better error messages, verbosity controls, JSON output, and possibly a more 
 The unit and replay coverage is useful, but real-session tests are needed to trust the transport and timing behavior. This is the main remaining validation gap before heavier automation should be considered production-ready.
 
 6. Add docs, packaging, and release automation.
-The repo still needs installation instructions, a real `README.md`, CI, and a release story. None of that changes core behavior, but it is required if `sdmux` is going to be used beyond local development.
+The repo still needs installation instructions, a real `README.md`, CI, and a release story. None of that changes core behavior, but it is required if `botctl` is going to be used beyond local development.
 
 7. Add a one-off permission babysit mode for a single instance.
 This mode should temporarily persist automation state for one adopted Claude instance and only accept permission prompts while the operator is away. It should not expand into general continuous automation, and it should stop once that single instance exits or the operator disables it.

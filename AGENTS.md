@@ -1,6 +1,6 @@
-# sdmux Agents
+# botctl Agents
 
-This document describes the internal agent roles that the system will eventually implement. These are logical roles inside `sdmux`, not separate products.
+This document describes the internal agent roles that the system will eventually implement. These are logical roles inside `botctl`, not separate products.
 
 ## Current Modules
 

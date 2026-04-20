@@ -10,7 +10,7 @@ pub enum PromptSource<'a> {
 }
 
 pub fn default_state_dir() -> PathBuf {
-    PathBuf::from(".sdmux/state")
+    PathBuf::from(".botctl/state")
 }
 
 pub fn resolve_prompt_text(source: PromptSource<'_>) -> AppResult<String> {
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn default_state_dir_is_repo_local() {
-        assert_eq!(default_state_dir(), PathBuf::from(".sdmux/state"));
+        assert_eq!(default_state_dir(), PathBuf::from(".botctl/state"));
     }
 
     #[test]
@@ -136,6 +136,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
             .as_nanos();
-        std::env::temp_dir().join(format!("sdmux-{label}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("botctl-{label}-{}-{nanos}", std::process::id()))
     }
 }

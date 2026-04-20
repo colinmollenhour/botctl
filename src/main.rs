@@ -1,4 +1,4 @@
-use sdmux::{app, cli};
+use botctl::{app, cli};
 
 fn main() {
     match cli::parse_args(std::env::args()) {

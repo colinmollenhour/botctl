@@ -1,6 +1,6 @@
-# sdmux Vision
+# botctl Vision
 
-`sdmux` is a CLI for managing and driving Claude Code sessions that run inside `tmux`.
+`botctl` is a CLI for managing and driving Claude Code sessions that run inside `tmux`.
 
 The system is built around one assumption: terminal automation is only reliable when input, observation, and policy are treated as separate concerns. Sending keys is not enough. The CLI needs to know which pane it owns, what the pane is currently showing, and which action is safe to take next.
 
@@ -52,13 +52,13 @@ The classifier currently recognizes these explicit states:
 
 ## Keybinding Policy
 
-`sdmux` must respect the user's existing Claude keybindings. It should resolve the user's configured bindings for actions such as submit, external editor, and confirmation flows, and it must not silently overwrite `~/.claude/keybindings.json`.
+`botctl` must respect the user's existing Claude keybindings. It should resolve the user's configured bindings for actions such as submit, external editor, and confirmation flows, and it must not silently overwrite `~/.claude/keybindings.json`.
 
 The `install-bindings` command exists to write the recommended automation keymap only when there is no conflicting existing file, or when a developer points it at an alternate output path for inspection.
 
 ## Observation Model
 
-`sdmux` uses two observation paths:
+`botctl` uses two observation paths:
 
 - Primary: tmux control mode output for low-latency event streaming.
 - Secondary: `capture-pane` snapshots for reconciliation, fixture capture, and debugging.
@@ -69,13 +69,13 @@ Today, live classification still uses `capture-pane` plus a recent-lines heurist
 
 ## Attachment Model
 
-The current tool is strongest when it launches and manages its own Claude session, but its targeting model is already built around explicit pane IDs and tmux-discovered session metadata. Attaching `sdmux` to arbitrary existing Claude panes is a planned first-class workflow and should preserve the same pane-ID safety rules.
+The current tool is strongest when it launches and manages its own Claude session, but its targeting model is already built around explicit pane IDs and tmux-discovered session metadata. Attaching `botctl` to arbitrary existing Claude panes is a planned first-class workflow and should preserve the same pane-ID safety rules.
 
 ## Known Limits
 
 - The classifier is still keyword-based and intentionally conservative.
 - `status` and `doctor` are probes, not a persistent observer.
-- Live state decisions can still be affected by stale scrollback because `sdmux` does not yet reconstruct the full visible screen.
+- Live state decisions can still be affected by stale scrollback because `botctl` does not yet reconstruct the full visible screen.
 - There is no long-lived policy engine or supervisor process yet.
 
 ## Near-Term Outcome
