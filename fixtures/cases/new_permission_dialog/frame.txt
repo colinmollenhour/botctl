@@ -1,0 +1,7 @@
+Bash command (unsandboxed)
+
+Do you want to proceed?
+❯ 1. Yes
+2. No
+
+Esc to cancel · Tab to amend · ctrl+e to explain

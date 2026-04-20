@@ -72,6 +72,25 @@ impl Classifier {
         let normalized = normalize(frame_text);
         let recap = detect_recap(frame_text, &normalized);
         let mut signals = Vec::new();
+        let has_chat_input = contains_any(
+            &normalized,
+            &["enter submit message", "main chat input area", "chat:"],
+        ) || frame_text.lines().map(str::trim).any(is_chat_input_line);
+        let has_permission_keywords =
+            contains_any(
+                &normalized,
+                &[
+                    "allow once",
+                    "allow for session",
+                    "permission",
+                    "do you want to proceed",
+                    "unsandboxed",
+                    "tab to amend",
+                    "ctrl+e to explain",
+                    "confirm action",
+                    "approve",
+                ],
+            ) && contains_any(&normalized, &["yes", "no", "enter", "escape"]);
 
         let state = if contains_any(
             &normalized,
@@ -88,17 +107,12 @@ impl Classifier {
         {
             signals.push(String::from("folder-trust-keywords"));
             SessionState::FolderTrustPrompt
-        } else if contains_any(
-            &normalized,
-            &[
-                "allow once",
-                "allow for session",
-                "permission",
-                "confirm action",
-                "approve",
-            ],
-        ) && contains_any(&normalized, &["yes", "no", "enter", "escape"])
-        {
+        } else if has_permission_keywords && has_chat_input {
+            signals.push(String::from("permission-keywords"));
+            signals.push(String::from("chat-keywords"));
+            signals.push(String::from("ambiguous-permission-chat"));
+            SessionState::Unknown
+        } else if has_permission_keywords {
             signals.push(String::from("permission-keywords"));
             SessionState::PermissionDialog
         } else if contains_any(
@@ -153,16 +167,7 @@ impl Classifier {
         ) {
             signals.push(String::from("busy-keywords"));
             SessionState::BusyResponding
-        } else if contains_any(
-            &normalized,
-            &[
-                "enter submit message",
-                "main chat input area",
-                "claude",
-                ">",
-                "chat:",
-            ],
-        ) {
+        } else if has_chat_input || contains_any(&normalized, &["claude"]) {
             signals.push(String::from("chat-keywords"));
             SessionState::ChatReady
         } else {
@@ -287,6 +292,24 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn is_chat_input_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == ">" || trimmed == "❯" {
+        return true;
+    }
+
+    let Some(rest) = trimmed.strip_prefix('❯') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !starts_with_numbered_option(rest)
+}
+
+fn starts_with_numbered_option(line: &str) -> bool {
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digits > 0 && line[digits..].starts_with('.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Classifier, SessionState};
@@ -296,6 +319,25 @@ mod tests {
         let frame = "Claude Code needs permission\nAllow once\nAllow for session\nEnter confirms";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::PermissionDialog);
+    }
+
+    #[test]
+    fn classifies_new_permission_dialog_wording() {
+        let frame = "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::PermissionDialog);
+    }
+
+    #[test]
+    fn refuses_permission_dialog_when_chat_input_is_active() {
+        let frame = "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain\n❯ Here's some of the output:";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::Unknown);
+        assert!(
+            result
+                .signals
+                .contains(&String::from("ambiguous-permission-chat"))
+        );
     }
 
     #[test]

@@ -1,0 +1,192 @@
+      545    r.emitTerminalMetrics(v)
+      546 -  if err := r.maybeCleanupAfterTerminal(ctx, v); err != nil {                                                        
+      547 -    log.FromContext(ctx).Error(err, "post-terminal cleanup")                                                         
+      546 +  requeue, cerr := r.maybeCleanupAfterTerminal(ctx, v)                                                               
+      547 +  if cerr != nil {                                                                                                   
+      548 +    log.FromContext(ctx).Error(cerr, "post-terminal cleanup")                                                        
+      549    }
+      549 -  return ctrl.Result{}, nil                                                                                          
+      550 +  return ctrl.Result{RequeueAfter: requeue}, nil                                                                     
+      551  }
+      552  
+      553  // maybeCleanupAfterTerminal implements the success/failure cleanup
+
+● Now fix thread 2 — findBlockingVerification using label selector.
+
+● Update(internal/controller/backup_verification_reconciler.go)
+  ⎿  Added 9 lines, removed 7 lines
+      397  // created strictly earlier than v. Empty result means nothing is
+      398  // blocking us.
+      399  func (r *MysqlBackupVerificationReconciler) findBlockingVerification(ctx context.Context, v *v1alpha1.MysqlBackupVeri
+           fication) (string, error) {
+      400 +  // List in-namespace and filter by spec rather than matching on                                                    
+      401 +  // labels — ad-hoc CRs created via `kubectl create -f` without                                                     
+      402 +  // labels, and the narrow window before a brand-new CR has been                                                    
+      403 +  // label-stamped, would otherwise bypass single-flight entirely.                                                   
+      404    var list v1alpha1.MysqlBackupVerificationList
+      401 -  if err := r.List(ctx, &list,                                                                                       
+      402 -    client.InNamespace(v.Namespace),                                                                                 
+      403 -    client.MatchingLabels{                                                                                           
+      404 -      labelFailoverGroup: v.Spec.FailoverGroupRef.Name,                                                              
+      405 -      labelBackupProfile: v.Spec.ProfileName,                                                                        
+      406 -    },                                                                                                               
+      407 -  ); err != nil {                                                                                                    
+      405 +  if err := r.List(ctx, &list, client.InNamespace(v.Namespace)); err != nil {                                        
+      406      return "", err
+      407    }
+      408    for i := range list.Items {
+     ...
+      410      if other.Name == v.Name {
+      411        continue
+      412      }
+      413 +    if other.Spec.FailoverGroupRef.Name != v.Spec.FailoverGroupRef.Name ||                                           
+      414 +      other.Spec.ProfileName != v.Spec.ProfileName {                                                                 
+      415 +      continue                                                                                                       
+      416 +    }                                                                                                                
+      417      if !other.DeletionTimestamp.IsZero() {
+      418        continue
+      419      }
+
+● Now thread 3 — warn when operator SA is empty in the verification schedule.
+
+● Update(internal/controller/backup_verification_schedule.go)
+  ⎿  Added 3 lines
+      75    }
+      76    sa := operatorServiceAccountFromEnv
+      77    if sa == "" {
+      78 +    r.Recorder.Eventf(fg, corev1.EventTypeWarning, "VerificationScheduleServiceAccountMissing",                       
+      79 +      "operator ServiceAccount not configured (set BLOODRAVEN_OPERATOR_SA env var on the operator deployment); falling
+         + back to %q for verification schedule %q",                                                                            
+      80 +      "bloodraven", profile.Name)                                                                                     
+      81      sa = "bloodraven"
+      82    }
+      83  
+
+● Now thread 4 — the CRD type-level comment promising "Pod, Service, and PVC".
+
+● Update(api/v1alpha1/mysqlbackupverification_types.go)
+  ⎿  Added 7 lines, removed 4 lines
+      23  // bloodraven_backup_verified_timestamp_seconds gauge give operators a
+      24  // concrete signal that recent backups are restorable.
+      25  //
+      26 -// Verification runs in the operator's own namespace with a dedicated                                                 
+      27 -// Pod, Service, and PVC, all cleaned up on success. On failure,                                                      
+      28 -// KeepOnFailure (default true) leaves the PVC and Pod intact for                                                     
+      29 -// inspection; the retention sweep eventually reclaims them.                                                          
+      26 +// Phase 1 implementation runs the ephemeral mysqld inside the                                                        
+      27 +// verification Job's Pod on a dedicated PVC, with a derived                                                          
+      28 +// credentials Secret for the restore script. No Service is created;                                                  
+      29 +// the Pod binds 127.0.0.1 only and is not reachable from outside its                                                 
+      30 +// own network namespace. On success all artifacts are cleaned up; on                                                 
+      31 +// failure KeepOnFailure (default true) leaves the Job Pod and PVC in                                                 
+      32 +// place for inspection until the retention sweep reclaims them.                                                      
+      33  type MysqlBackupVerification struct {
+      34    metav1.TypeMeta   `json:",inline"`
+      35    metav1.ObjectMeta `json:"metadata,omitempty"`
+
+● Now thread 5 — Resources field promising defaults that aren't implemented. I'll remove the incorrect default promise.
+
+● Update(api/v1alpha1/mysqlbackupverification_types.go)
+  ⎿  Added 4 lines, removed 2 lines
+       91    TTLSecondsAfterFinished int32 `json:"ttlSecondsAfterFinished,omitempty"`
+       92  
+       93    // Resources sets requests and limits for the verification MySQL
+       94 -  // container. Defaults to 2x the backup size capped at 8 GiB for                                                   
+       95 -  // memory, 2 CPUs, when unset.                                                                                     
+       94 +  // container. Forwarded to the Job pod verbatim; when unset, no                                                    
+       95 +  // verification-specific resource requests or limits are                                                           
+       96 +  // configured (the container inherits cluster / namespace default                                                  
+       97 +  // limits if any).                                                                                                 
+       98    // +optional
+       99    Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+      100  
+
+● Now thread 6 — --skip-slave-start → --skip-replica-start.
+
+● Update(internal/controller/verify_script.sh)
+  ⎿  Added 1 line, removed 1 line
+      57      --socket="$SOCKET" \
+      58      --log-error="$ERRLOG" \
+      59      --skip-log-bin \
+      60 -    --skip-slave-start \                                                                                              
+      60 +    --skip-replica-start \                                                                                            
+      61      --skip-name-resolve \
+      62      --local-infile=1 &
+      63  MYSQLD_PID=$!
+
+● Regenerating CRD YAML (the type comment change affects it), then running the pre-PR gate.
+
+● Bash(make generate && make manifests && cp config/crd/bases/shipstream.io_mysqlbackupverifications.yaml
+      charts/bloodraven/crds/shipstream.io_mysqlbackupverifications…)
+  ⎿  go run sigs.k8s.io/controller-tools/cmd/controller-gen object paths=./api/...
+     go run sigs.k8s.io/controller-tools/cmd/controller-gen crd paths=./api/... output:crd:dir=config/crd/bases
+     go run sigs.k8s.io/controller-tools/cmd/controller-gen rbac:roleName=bloodraven-role paths=./internal/controller/... output:r
+     … +2 lines (ctrl+o to expand)
+
+● Bash(PATH="$(go env GOPATH)/bin:$PATH" make lint 2>&1 | tail -10 && echo "---" && go test ./... -count=1 2>&1 | tail -20 && echo
+      "---" && KUBEBUILDER_ASSETS="$(ls -d…)
+  ⎿  golangci-lint run ./...
+     ---
+     ok         github.com/shipstream/bloodraven/api/v1alpha1   0.009s
+     … +15 lines (ctrl+o to expand)
+
+● All green. Committing and pushing.
+
+● Bash(git status --short)
+  ⎿   M api/v1alpha1/mysqlbackupverification_types.go
+      M charts/bloodraven/crds/shipstream.io_mysqlbackupverifications.yaml
+      M config/crd/bases/shipstream.io_mysqlbackupverifications.yaml
+     … +14 lines (ctrl+o to expand)
+
+● Bash(git add api/v1alpha1/mysqlbackupverification_types.go \
+        charts/bloodraven/crds/shipstream.io_mysqlbackupverifications.yaml \…)
+  ⎿  [wishlist/backup-verification cce0291] Address Copilot review on #56
+      6 files changed, 84 insertions(+), 51 deletions(-)
+     To https://github.com/ShipStream/bloodraven.git
+        dc9c80a..cce0291  wishlist/backup-verification -> wishlist/backup-verification
+
+● Now mark the review threads resolved and post a summary comment.
+
+● Write(/tmp/claude/resolve_thread.graphql)                                                                                            
+  ⎿  Error writing file
+                                                                                                                                       
+● Bash(mkdir -p /tmp/claude && cat > /tmp/claude/resolve_thread.graphql <<'EOF'
+      mutation($id: ID!) {…)                                                                                                           
+  ⎿  mutation($id: ID\!) {                                                                                                             
+       resolveReviewThread(input: {threadId: $id}) {                                                                                   
+         thread { id isResolved }                                                                                                      
+     … +2 lines (ctrl+o to expand)                                            
+                                                                                                                                       
+  Read 1 file (ctrl+o to expand)                                              
+                                                                                                                                       
+● Write(/tmp/claude/resolve_thread.graphql)                                                                                            
+  ⎿  Added 1 line, removed 1 line                                                                                                    
+      1 -mutation($id: ID\!) {                                                                                                         
+      1 +mutation($id: ID!) {                                                                                                          
+      2    resolveReviewThread(input: {threadId: $id}) {                                                                               
+      3      thread { id isResolved }                                                                                                  
+      4    }                                                                                                                         
+                                                                                                                                       
+● Bash(for id in PRRT_kwDOR9hCa858TsAG PRRT_kwDOR9hCa858TsAZ PRRT_kwDOR9hCa858TsA3 PRRT_kwDOR9hCa858TsBV PRRT_kwDOR9hCa858TsBj
+      PRRT_kwDOR9hCa858TsCB; do                                               
+        gh api graph…)                                                                                                                 
+  ⎿  Running…                                                                 
+                                                                                                                                       
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command (unsandboxed)           
+                                                   
+   for id in PRRT_kwDOR9hCa858TsAG PRRT_kwDOR9hCa858TsAZ PRRT_kwDOR9hCa858TsA3 PRRT_kwDOR9hCa858TsBV PRRT_kwDOR9hCa858TsBj
+   PRRT_kwDOR9hCa858TsCB; do                                                 
+     gh api graphql -F query=@/tmp/claude/resolve_thread.graphql -f id="$id" --jq ".data.resolveReviewThread.thread | \"$id
+   resolved=\" + (.isResolved|tostring)"
+   done
+   Resolve all six review threads
+
+ Unhandled node type: string
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+

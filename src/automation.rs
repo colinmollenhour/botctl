@@ -141,8 +141,8 @@ impl GuardedWorkflow {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SubmitPrompt => "submit-prompt",
-            Self::ApprovePermission => "approve-permission",
-            Self::RejectPermission => "reject-permission",
+            Self::ApprovePermission => "approve",
+            Self::RejectPermission => "reject",
             Self::DismissSurvey => "dismiss-survey",
         }
     }
@@ -622,7 +622,7 @@ mod tests {
         };
 
         validate_workflow_state(GuardedWorkflow::ApprovePermission, &classification)
-            .expect("approve-permission should accept folder trust prompt");
+            .expect("approve should accept folder trust prompt");
     }
 
     #[test]

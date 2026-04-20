@@ -30,6 +30,12 @@ pub enum Command {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BabysitFormat {
+    Human,
+    Jsonl,
+}
+
 #[derive(Debug, Clone)]
 pub struct StartArgs {
     pub session_name: String,
@@ -127,6 +133,7 @@ pub struct SendActionArgs {
 #[derive(Debug, Clone)]
 pub struct PaneCommandArgs {
     pub pane_id: String,
+    pub format: BabysitFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -163,14 +170,18 @@ pub struct SubmitPromptArgs {
 
 #[derive(Debug, Clone)]
 pub struct PermissionBabysitStartArgs {
-    pub pane_id: String,
+    pub pane_id: Option<String>,
+    pub all: bool,
     pub poll_ms: u64,
+    pub live_preview: bool,
+    pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PermissionBabysitStopArgs {
-    pub pane_id: String,
+    pub pane_id: Option<String>,
+    pub all: bool,
     pub state_dir: Option<PathBuf>,
 }
 
@@ -189,7 +200,7 @@ where
     match subcommand.as_str() {
         "start" => parse_start(rest),
         "attach" => parse_attach(rest),
-        "list-panes" => parse_list_panes(rest),
+        "list-panes" | "list" => parse_list_panes(rest),
         "capture" => parse_capture(rest),
         "status" => parse_status(rest),
         "doctor" => parse_doctor(rest),
@@ -200,19 +211,15 @@ where
         "bindings" => Ok(Command::Bindings),
         "install-bindings" => parse_install_bindings(rest),
         "send-action" => parse_send_action(rest),
-        "approve-permission" => {
-            parse_pane_command(rest, "approve-permission", Command::ApprovePermission)
-        }
-        "reject-permission" => {
-            parse_pane_command(rest, "reject-permission", Command::RejectPermission)
-        }
+        "approve" | "approve-permission" => parse_approve_reject(rest, Command::ApprovePermission),
+        "reject" | "reject-permission" => parse_approve_reject(rest, Command::RejectPermission),
         "dismiss-survey" => parse_pane_command(rest, "dismiss-survey", Command::DismissSurvey),
         "continue-session" => parse_continue_session(rest),
         "auto-unstick" => parse_auto_unstick(rest),
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
-        "permission-babysit" => parse_permission_babysit(rest),
+        "yolo" | "permission-babysit" | "babysit" => parse_permission_babysit(rest),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(AppError::new(format!("unknown subcommand: {other}"))),
     }
@@ -225,7 +232,7 @@ pub fn usage() -> String {
           Commands:\n\
             start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
             attach (--pane %ID | --session NAME [--window NAME])\n\
-            list-panes [--all]\n\
+            list-panes|list [--all]\n\
             capture --pane %ID [--history-lines N]\n\
             status --pane %ID [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]\n\
@@ -236,16 +243,16 @@ pub fn usage() -> String {
             bindings\n\
             install-bindings [--path PATH]\n\
             send-action --pane %ID --action NAME\n\
-            approve-permission --pane %ID\n\
-            reject-permission --pane %ID\n\
+            approve --pane %ID [--format human|jsonl]\n\
+            reject --pane %ID [--format human|jsonl]\n\
             dismiss-survey --pane %ID\n\
             continue-session (--pane %ID | --session NAME --window NAME)\n\
             auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
             submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
-            permission-babysit start --pane %ID [--poll-ms N] [--state-dir PATH]\n\
-            permission-babysit stop --pane %ID [--state-dir PATH]\n",
+            yolo [start] (--pane %ID | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]\n\
+            yolo stop (--pane %ID | --all) [--state-dir PATH]\n",
     )
 }
 
@@ -296,6 +303,36 @@ fn parse_start(args: Vec<String>) -> AppResult<Command> {
 fn parse_attach(args: Vec<String>) -> AppResult<Command> {
     let target = parse_pane_target_args(args, "attach")?;
     Ok(Command::Attach(AttachArgs { target }))
+}
+
+fn parse_approve_reject(
+    args: Vec<String>,
+    command: fn(PaneCommandArgs) -> Command,
+) -> AppResult<Command> {
+    let mut pane_id = None;
+    let mut format = BabysitFormat::Human;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+            "--format" => {
+                let raw = read_value(&args, &mut i, "--format")?;
+                format = match raw.as_str() {
+                    "human" => BabysitFormat::Human,
+                    "jsonl" => BabysitFormat::Jsonl,
+                    _ => {
+                        return Err(AppError::new(format!("invalid value for --format: {raw}")));
+                    }
+                };
+            }
+            flag => return Err(AppError::new(format!("unknown approve/reject flag: {flag}"))),
+        }
+        i += 1;
+    }
+
+    let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+    Ok(command(PaneCommandArgs { pane_id, format }))
 }
 
 fn parse_list_panes(args: Vec<String>) -> AppResult<Command> {
@@ -620,7 +657,7 @@ fn parse_pane_command(
     }
 
     let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
-    Ok(command(PaneCommandArgs { pane_id }))
+    Ok(command(PaneCommandArgs { pane_id, format: BabysitFormat::Human }))
 }
 
 fn parse_continue_session(args: Vec<String>) -> AppResult<Command> {
@@ -867,79 +904,106 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
 }
 
 fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
-    let Some(mode) = args.first() else {
-        return Err(AppError::new(
-            "permission-babysit requires start or stop subcommand",
-        ));
+    let (mode, start_index) = match args.first().map(String::as_str) {
+        Some("start") => ("start", 1),
+        Some("stop") => ("stop", 1),
+        Some(_) | None => ("start", 0),
     };
 
-    match mode.as_str() {
+    match mode {
         "start" => {
             let mut pane_id = None;
+            let mut all = false;
             let mut poll_ms = 1000u64;
+            let mut live_preview = false;
+            let mut format = BabysitFormat::Human;
             let mut state_dir = None;
-            let mut i = 1;
+            let mut i = start_index;
             while i < args.len() {
                 match args[i].as_str() {
                     "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+                    "--all" => all = true,
                     "--poll-ms" => {
                         let raw = read_value(&args, &mut i, "--poll-ms")?;
                         poll_ms = raw.parse::<u64>().map_err(|_| {
                             AppError::new(format!("invalid value for --poll-ms: {raw}"))
                         })?;
                     }
+                    "--live-preview" => {
+                        live_preview = true;
+                    }
+                    "--format" => {
+                        let raw = read_value(&args, &mut i, "--format")?;
+                        format = match raw.as_str() {
+                            "human" => BabysitFormat::Human,
+                            "jsonl" => BabysitFormat::Jsonl,
+                            _ => {
+                                return Err(AppError::new(format!(
+                                    "invalid value for --format: {raw}"
+                                )));
+                            }
+                        };
+                    }
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
                     }
                     flag => {
-                        return Err(AppError::new(format!(
-                            "unknown permission-babysit flag: {flag}"
-                        )));
+                        return Err(AppError::new(format!("unknown yolo flag: {flag}")));
                     }
                 }
                 i += 1;
             }
             if poll_ms == 0 {
                 return Err(AppError::new(
-                    "permission-babysit start requires --poll-ms to be at least 1",
+                    "yolo start requires --poll-ms to be at least 1",
                 ));
             }
-            let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+            if pane_id.is_some() == all {
+                return Err(AppError::new(
+                    "yolo start requires exactly one of --pane or --all",
+                ));
+            }
             Ok(Command::PermissionBabysitStart(
                 PermissionBabysitStartArgs {
                     pane_id,
+                    all,
                     poll_ms,
+                    live_preview,
+                    format,
                     state_dir,
                 },
             ))
         }
         "stop" => {
             let mut pane_id = None;
+            let mut all = false;
             let mut state_dir = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+                    "--all" => all = true,
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
                     }
                     flag => {
-                        return Err(AppError::new(format!(
-                            "unknown permission-babysit flag: {flag}"
-                        )));
+                        return Err(AppError::new(format!("unknown yolo flag: {flag}")));
                     }
                 }
                 i += 1;
             }
-            let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+            if pane_id.is_some() == all {
+                return Err(AppError::new(
+                    "yolo stop requires exactly one of --pane or --all",
+                ));
+            }
             Ok(Command::PermissionBabysitStop(PermissionBabysitStopArgs {
                 pane_id,
+                all,
                 state_dir,
             }))
         }
-        _ => Err(AppError::new(
-            "permission-babysit requires start or stop subcommand",
-        )),
+        _ => Err(AppError::new("yolo requires start or stop subcommand")),
     }
 }
 
@@ -1018,6 +1082,17 @@ mod tests {
     fn parses_list_panes_default_as_claude_only() {
         let command = parse_args(vec![String::from("botctl"), String::from("list-panes")])
             .expect("list-panes command should parse");
+
+        match command {
+            Command::ListPanes(args) => assert!(!args.all),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_list_alias() {
+        let command = parse_args(vec![String::from("botctl"), String::from("list")])
+            .expect("list alias should parse");
 
         match command {
             Command::ListPanes(args) => assert!(!args.all),
@@ -1176,18 +1251,60 @@ mod tests {
     }
 
     #[test]
-    fn parses_approve_permission_command() {
+    fn parses_approve_command_with_format() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("approve"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--format"),
+            String::from("jsonl"),
+        ])
+        .expect("approve command should parse");
+
+        match command {
+            Command::ApprovePermission(args) => {
+                assert_eq!(args.pane_id, "%9");
+                assert_eq!(args.format, super::BabysitFormat::Jsonl);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_approve_permission_alias() {
         let command = parse_args(vec![
             String::from("botctl"),
             String::from("approve-permission"),
             String::from("--pane"),
             String::from("%9"),
         ])
-        .expect("approve-permission command should parse");
+        .expect("alias should parse");
 
         match command {
             Command::ApprovePermission(args) => {
-                assert_eq!(args.pane_id, "%9");
+                assert_eq!(args.format, super::BabysitFormat::Human);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_reject_command_with_format() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("reject"),
+            String::from("--pane"),
+            String::from("%4"),
+            String::from("--format"),
+            String::from("human"),
+        ])
+        .expect("reject command should parse");
+
+        match command {
+            Command::RejectPermission(args) => {
+                assert_eq!(args.pane_id, "%4");
+                assert_eq!(args.format, super::BabysitFormat::Human);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1273,78 +1390,158 @@ mod tests {
     }
 
     #[test]
-    fn parses_permission_babysit_start_command() {
+    fn parses_yolo_pane_start_command() {
         let command = parse_args(vec![
             String::from("botctl"),
-            String::from("permission-babysit"),
+            String::from("yolo"),
             String::from("start"),
             String::from("--pane"),
             String::from("%9"),
             String::from("--poll-ms"),
             String::from("250"),
         ])
-        .expect("permission-babysit start should parse");
+        .expect("yolo start should parse");
 
         match command {
             Command::PermissionBabysitStart(args) => {
-                assert_eq!(args.pane_id, "%9");
+                assert_eq!(args.pane_id.as_deref(), Some("%9"));
+                assert!(!args.all);
                 assert_eq!(args.poll_ms, 250);
+                assert!(!args.live_preview);
+                assert_eq!(args.format, super::BabysitFormat::Human);
             }
             other => panic!("unexpected command: {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_permission_babysit_zero_poll_interval() {
+    fn parses_yolo_all_and_jsonl_format() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("--all"),
+            String::from("--format"),
+            String::from("jsonl"),
+        ])
+        .expect("yolo all should parse");
+
+        match command {
+            Command::PermissionBabysitStart(args) => {
+                assert!(args.all);
+                assert!(args.pane_id.is_none());
+                assert_eq!(args.format, super::BabysitFormat::Jsonl);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_yolo_foreground_command_without_subcommand() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("--pane"),
+            String::from("%9"),
+        ])
+        .expect("yolo foreground mode should parse");
+
+        match command {
+            Command::PermissionBabysitStart(args) => {
+                assert_eq!(args.pane_id.as_deref(), Some("%9"));
+                assert!(!args.all);
+                assert_eq!(args.poll_ms, 1000);
+                assert!(!args.live_preview);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_yolo_live_preview_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--live-preview"),
+        ])
+        .expect("yolo live preview should parse");
+
+        match command {
+            Command::PermissionBabysitStart(args) => {
+                assert_eq!(args.pane_id.as_deref(), Some("%9"));
+                assert!(args.live_preview);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_yolo_zero_poll_interval() {
         let error = parse_args(vec![
             String::from("botctl"),
-            String::from("permission-babysit"),
+            String::from("yolo"),
             String::from("start"),
             String::from("--pane"),
             String::from("%9"),
             String::from("--poll-ms"),
             String::from("0"),
         ])
-        .expect_err("permission-babysit should reject zero poll interval");
+        .expect_err("yolo should reject zero poll interval");
 
         assert!(
             error
                 .to_string()
-                .contains("permission-babysit start requires --poll-ms to be at least 1")
+                .contains("yolo start requires --poll-ms to be at least 1")
         );
     }
 
     #[test]
-    fn rejects_permission_babysit_session_target() {
+    fn rejects_yolo_missing_target() {
         let error = parse_args(vec![
             String::from("botctl"),
-            String::from("permission-babysit"),
+            String::from("yolo"),
             String::from("start"),
-            String::from("--session"),
-            String::from("demo"),
         ])
-        .expect_err("permission-babysit should reject session targeting");
+        .expect_err("yolo should reject missing target");
 
         assert!(
             error
                 .to_string()
-                .contains("unknown permission-babysit flag: --session")
+                .contains("requires exactly one of --pane or --all")
         );
     }
 
     #[test]
-    fn parses_permission_babysit_stop_command() {
-        let command = parse_args(vec![
+    fn rejects_yolo_invalid_combination() {
+        let error = parse_args(vec![
             String::from("botctl"),
-            String::from("permission-babysit"),
-            String::from("stop"),
+            String::from("yolo"),
+            String::from("start"),
             String::from("--pane"),
             String::from("%9"),
+            String::from("--all"),
         ])
-        .expect("permission-babysit stop should parse");
+        .expect_err("yolo should reject mixed targets");
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one of --pane or --all")
+        );
+    }
+
+    #[test]
+    fn parses_yolo_stop_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("stop"),
+            String::from("--all"),
+        ])
+        .expect("yolo stop should parse");
 
         match command {
-            Command::PermissionBabysitStop(args) => assert_eq!(args.pane_id, "%9"),
+            Command::PermissionBabysitStop(args) => assert!(args.all),
             other => panic!("unexpected command: {other:?}"),
         }
     }

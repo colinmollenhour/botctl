@@ -1,7 +1,15 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
+use time::OffsetDateTime;
+use time::macros::format_description;
 
 use crate::automation::{
     AutomationAction, GuardedWorkflow, KeybindingsInspection, KeybindingsStatus,
@@ -11,10 +19,11 @@ use crate::automation::{
 };
 use crate::classifier::{Classification, Classifier, SessionState};
 use crate::cli::{
-    AttachArgs, AutoUnstickArgs, CaptureArgs, ClassifyArgs, Command, ContinueSessionArgs,
-    DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs,
-    PaneTargetArgs, PermissionBabysitStartArgs, PermissionBabysitStopArgs, PreparePromptArgs,
-    RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs, StatusArgs, SubmitPromptArgs,
+    AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
+    ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ListPanesArgs,
+    ObserveArgs, PaneCommandArgs, PaneTargetArgs, PermissionBabysitStartArgs,
+    PermissionBabysitStopArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs,
+    StartArgs, StatusArgs, SubmitPromptArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
@@ -363,12 +372,17 @@ fn run_guarded_pane_workflow(
         render_action_names(workflow.actions())
     };
 
-    Ok(format!(
-        "executed workflow={} pane={} state={} actions={}",
-        workflow.as_str(),
-        pane.pane_id,
-        classification.state.as_str(),
-        executed_actions
+    let pane_label = pane_label_from_path(&pane.current_path, &pane.pane_id);
+    Ok(render_guarded_workflow_output(
+        workflow,
+        &pane_label,
+        &pane.pane_id,
+        &classification,
+        &executed_actions,
+        matches!(workflow, GuardedWorkflow::ApprovePermission)
+            && classification.state == SessionState::FolderTrustPrompt,
+        args.format,
+        supports_babysit_color(),
     ))
 }
 
@@ -527,108 +541,957 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
 fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let state_dir = resolve_babysit_state_dir(args.state_dir.as_deref());
-    if matches!(
-        read_babysit_record(&state_dir, &args.pane_id)?,
-        Some(record) if record.enabled
-    ) {
-        return Err(AppError::new(format!(
-            "permission-babysit is already active for pane {}; run permission-babysit stop first",
-            args.pane_id
-        )));
-    }
-    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    ensure_pane_owned_by_claude(&pane)?;
-    let bindings = load_automation_keybindings(None)?;
-    let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
-    let record = BabysitRecord::from_pane(&pane);
-    let record_path = write_babysit_record(&state_dir, &record)?;
-
-    loop {
-        if !babysit_enabled(&state_dir, &args.pane_id)? {
-            return Ok(format!(
-                "permission-babysit stopped pane={} reason=disabled",
-                pane.pane_id
-            ));
-        }
-        let Some(current) = client.pane_by_id(&args.pane_id)? else {
-            return Ok(format!(
-                "permission-babysit stopped pane={} reason=missing-pane",
-                pane.pane_id
-            ));
-        };
-        if !record.matches_pane(&current) {
-            return Ok(format!(
-                "permission-babysit stopped pane={} reason=identity-changed",
-                pane.pane_id
-            ));
-        }
-        let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-        match permission_babysit_action_for_state(classification.state) {
-            PermissionBabysitAction::Approve => {
-                send_actions(
-                    &client,
-                    &pane.pane_id,
-                    GuardedWorkflow::ApprovePermission.actions(),
-                    &bindings,
-                    0,
-                )?;
-                thread::sleep(Duration::from_millis(args.poll_ms));
-                let after = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                if after.state == SessionState::PermissionDialog {
-                    return Ok(format!(
-                        "permission-babysit stopped pane={} reason=stale-permission-dialog",
-                        pane.pane_id
-                    ));
-                }
-            }
-            PermissionBabysitAction::Wait => {
-                thread::sleep(Duration::from_millis(args.poll_ms));
-            }
-            PermissionBabysitAction::Stop => {
-                return Ok(format!(
-                    "permission-babysit stopped pane={} reason=unhandled-state:{} record={}",
-                    pane.pane_id,
-                    classification.state.as_str(),
-                    record_path.display()
-                ));
-            }
-        }
+    let interrupted = Arc::new(AtomicBool::new(false));
+    install_babysit_sigint_handler(Arc::clone(&interrupted))?;
+    if args.all {
+        run_yolo_all(
+            &client,
+            &state_dir,
+            args.poll_ms,
+            args.live_preview,
+            args.format,
+            interrupted,
+        )
+    } else {
+        let pane_id = args.pane_id.as_deref().unwrap();
+        run_yolo_single(
+            &client,
+            &state_dir,
+            pane_id,
+            args.poll_ms,
+            args.live_preview,
+            args.format,
+            interrupted,
+        )
     }
 }
 
 fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<String> {
     let state_dir = resolve_babysit_state_dir(args.state_dir.as_deref());
-    let disabled = disable_babysit_record(&state_dir, &args.pane_id)?;
-    Ok(format!(
-        "permission-babysit stop pane={} disabled={}",
-        args.pane_id, disabled
-    ))
+    if args.all {
+        let mut out = Vec::new();
+        for pane_id in tracked_pane_ids(&state_dir)? {
+            let pane_label = babysit_pane_label(&state_dir, &pane_id);
+            let disabled = disable_babysit_record(&state_dir, &pane_id)?;
+            out.push(render_babysit_stop_event(
+                &pane_label,
+                &pane_id,
+                if disabled {
+                    "disabled"
+                } else {
+                    "already-disabled"
+                },
+                BabysitFormat::Human,
+                supports_babysit_color(),
+            ));
+        }
+        Ok(out.join("\n"))
+    } else {
+        let pane_id = args.pane_id.as_deref().unwrap();
+        let pane_label = babysit_pane_label(&state_dir, pane_id);
+        let disabled = disable_babysit_record(&state_dir, pane_id)?;
+        Ok(render_babysit_stop_event(
+            &pane_label,
+            pane_id,
+            if disabled {
+                "disabled"
+            } else {
+                "already-disabled"
+            },
+            BabysitFormat::Human,
+            supports_babysit_color(),
+        ))
+    }
 }
 
-fn babysit_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
-    Ok(matches!(
-        read_babysit_record(state_dir, pane_id)?,
-        Some(record) if record.enabled
-    ))
+fn run_yolo_single(
+    client: &TmuxClient,
+    state_dir: &Path,
+    pane_id: &str,
+    poll_ms: u64,
+    live_preview: bool,
+    format: BabysitFormat,
+    interrupted: Arc<AtomicBool>,
+) -> AppResult<String> {
+    if matches!(read_babysit_record(state_dir, pane_id)?, Some(record) if record.enabled) {
+        return Err(AppError::new(format!(
+            "yolo is already active for pane {pane_id}"
+        )));
+    }
+    let pane = resolve_pane_by_id(client, pane_id)?;
+    ensure_pane_owned_by_claude(&pane)?;
+    let bindings = load_automation_keybindings(None)?;
+    let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
+    let record = BabysitRecord::from_pane(&pane);
+    let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
+    let record_path = write_babysit_record(state_dir, &record)?;
+    emit_babysit_output(render_babysit_start_event(
+        &pane_label,
+        &pane.pane_id,
+        poll_ms,
+        live_preview,
+        &record,
+        &record_path,
+        format,
+        supports_babysit_color(),
+    ))?;
+    loop_yolo_pane(
+        client,
+        state_dir,
+        pane,
+        record,
+        pane_label,
+        poll_ms,
+        live_preview,
+        format,
+        interrupted,
+        bindings,
+    )
+}
+
+fn loop_yolo_pane(
+    client: &TmuxClient,
+    state_dir: &Path,
+    pane: TmuxPane,
+    record: BabysitRecord,
+    pane_label: String,
+    poll_ms: u64,
+    live_preview: bool,
+    format: BabysitFormat,
+    interrupted: Arc<AtomicBool>,
+    bindings: crate::automation::ResolvedKeybindings,
+) -> AppResult<String> {
+    let mut last_state: Option<SessionState> = None;
+    let mut poll_count: usize = 0;
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            cleanup_babysit_record(state_dir, &pane.pane_id)?;
+            emit_babysit_output(render_babysit_stop_event(
+                &pane_label,
+                &pane.pane_id,
+                "sigint",
+                format,
+                supports_babysit_color(),
+            ))?;
+            return Ok(String::new());
+        }
+        poll_count += 1;
+        if !yolo_record_enabled(state_dir, &pane.pane_id)? {
+            emit_babysit_output(render_babysit_stop_event(
+                &pane_label,
+                &pane.pane_id,
+                "disabled",
+                format,
+                supports_babysit_color(),
+            ))?;
+            return Ok(String::new());
+        }
+        let Some(current) = client.pane_by_id(&pane.pane_id)? else {
+            cleanup_babysit_record(state_dir, &pane.pane_id)?;
+            emit_babysit_output(render_babysit_stop_event(
+                &pane_label,
+                &pane.pane_id,
+                "missing-pane",
+                format,
+                supports_babysit_color(),
+            ))?;
+            return Ok(String::new());
+        };
+        if !record.matches_pane(&current) {
+            cleanup_babysit_record(state_dir, &pane.pane_id)?;
+            emit_babysit_output(render_babysit_stop_event(
+                &pane_label,
+                &pane.pane_id,
+                "identity-changed",
+                format,
+                supports_babysit_color(),
+            ))?;
+            return Ok(String::new());
+        }
+        let current_view = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        let classification = &current_view.classification;
+        if last_state != Some(classification.state) {
+            emit_babysit_output(render_babysit_wait_event(
+                &pane_label,
+                &pane.pane_id,
+                poll_count,
+                &current_view,
+                live_preview,
+                format,
+                supports_babysit_color(),
+            ))?;
+            last_state = Some(classification.state);
+        }
+        match permission_babysit_action_for_state(classification.state) {
+            PermissionBabysitAction::Approve => {
+                if !is_yolo_safe_to_approve(&current_view) {
+                    thread::sleep(Duration::from_millis(poll_ms));
+                    continue;
+                }
+                emit_babysit_output(render_babysit_approval_event(
+                    &pane_label,
+                    &pane.pane_id,
+                    poll_count,
+                    &current_view,
+                    live_preview,
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                send_actions(
+                    client,
+                    &pane.pane_id,
+                    GuardedWorkflow::ApprovePermission.actions(),
+                    &bindings,
+                    0,
+                )?;
+                thread::sleep(Duration::from_millis(poll_ms));
+                let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+                emit_babysit_output(render_babysit_approved_event(
+                    &pane_label,
+                    &pane.pane_id,
+                    poll_count,
+                    &after,
+                    live_preview,
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                last_state = Some(after.classification.state);
+            }
+            PermissionBabysitAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
+        }
+    }
+}
+
+fn run_yolo_all(
+    client: &TmuxClient,
+    state_dir: &Path,
+    poll_ms: u64,
+    live_preview: bool,
+    format: BabysitFormat,
+    interrupted: Arc<AtomicBool>,
+) -> AppResult<String> {
+    let bindings = load_automation_keybindings(None)?;
+    let mut tracked: HashMap<String, TrackedYoloPane> = HashMap::new();
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            cleanup_all_babysit_records(state_dir, tracked.keys())?;
+            return Ok(String::new());
+        }
+        for pane in client
+            .list_panes()?
+            .into_iter()
+            .filter(is_pane_command_claude)
+        {
+            if tracked.contains_key(&pane.pane_id) {
+                continue;
+            }
+            let record = BabysitRecord::from_pane(&pane);
+            let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
+            let record_path = write_babysit_record(state_dir, &record)?;
+            emit_babysit_output(render_babysit_start_event(
+                &pane_label,
+                &pane.pane_id,
+                poll_ms,
+                live_preview,
+                &record,
+                &record_path,
+                format,
+                supports_babysit_color(),
+            ))?;
+            tracked.insert(
+                pane.pane_id.clone(),
+                TrackedYoloPane {
+                    record,
+                    pane_label,
+                    last_state: None,
+                    poll_count: 0,
+                },
+            );
+        }
+        let ids = tracked.keys().cloned().collect::<Vec<_>>();
+        for pane_id in ids {
+            if interrupted.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(tracked_pane) = tracked.get_mut(&pane_id) else {
+                continue;
+            };
+            if !yolo_record_enabled(state_dir, &pane_id)? {
+                tracked.remove(&pane_id);
+                continue;
+            }
+            let Some(current) = client.pane_by_id(&pane_id)? else {
+                cleanup_babysit_record(state_dir, &pane_id)?;
+                emit_babysit_output(render_babysit_stop_event(
+                    &tracked_pane.pane_label,
+                    &pane_id,
+                    "missing-pane",
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                tracked.remove(&pane_id);
+                continue;
+            };
+            if !tracked_pane.record.matches_pane(&current) {
+                cleanup_babysit_record(state_dir, &pane_id)?;
+                emit_babysit_output(render_babysit_stop_event(
+                    &tracked_pane.pane_label,
+                    &pane_id,
+                    "identity-changed",
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                tracked.remove(&pane_id);
+                continue;
+            }
+            let current_view = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            let classification = current_view.classification.state;
+            tracked_pane.poll_count += 1;
+            if tracked_pane.last_state != Some(classification) {
+                emit_babysit_output(render_babysit_wait_event(
+                    &tracked_pane.pane_label,
+                    &pane_id,
+                    tracked_pane.poll_count,
+                    &current_view,
+                    live_preview,
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                tracked_pane.last_state = Some(classification);
+            }
+            match permission_babysit_action_for_state(classification) {
+                PermissionBabysitAction::Approve => {
+                    if !is_yolo_safe_to_approve(&current_view) {
+                        continue;
+                    }
+                    emit_babysit_output(render_babysit_approval_event(
+                        &tracked_pane.pane_label,
+                        &pane_id,
+                        tracked_pane.poll_count,
+                        &current_view,
+                        live_preview,
+                        format,
+                        supports_babysit_color(),
+                    ))?;
+                    send_actions(
+                        client,
+                        &pane_id,
+                        GuardedWorkflow::ApprovePermission.actions(),
+                        &bindings,
+                        0,
+                    )?;
+                    thread::sleep(Duration::from_millis(poll_ms));
+                    let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
+                    emit_babysit_output(render_babysit_approved_event(
+                        &tracked_pane.pane_label,
+                        &pane_id,
+                        tracked_pane.poll_count,
+                        &after,
+                        live_preview,
+                        format,
+                        supports_babysit_color(),
+                    ))?;
+                    tracked_pane.last_state = Some(after.classification.state);
+                }
+                PermissionBabysitAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
+            }
+        }
+        thread::sleep(Duration::from_millis(poll_ms));
+    }
+}
+
+struct TrackedYoloPane {
+    record: BabysitRecord,
+    pane_label: String,
+    last_state: Option<SessionState>,
+    poll_count: usize,
+}
+
+fn yolo_record_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
+    Ok(matches!(read_babysit_record(state_dir, pane_id)?, Some(record) if record.enabled))
+}
+
+fn tracked_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
+    let dir = state_dir.join("permission-babysit");
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                ids.push(name.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn cleanup_all_babysit_records<'a, I: IntoIterator<Item = &'a String>>(
+    state_dir: &Path,
+    pane_ids: I,
+) -> AppResult<()> {
+    for pane_id in pane_ids {
+        cleanup_babysit_record(state_dir, pane_id)?;
+    }
+    Ok(())
+}
+
+fn cleanup_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<()> {
+    let _ = disable_babysit_record(state_dir, pane_id)?;
+    Ok(())
+}
+
+fn install_babysit_sigint_handler(flag: Arc<AtomicBool>) -> AppResult<()> {
+    ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| AppError::new(error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionBabysitAction {
     Wait,
     Approve,
-    Stop,
 }
 
 fn permission_babysit_action_for_state(state: SessionState) -> PermissionBabysitAction {
     match state {
-        SessionState::ChatReady | SessionState::BusyResponding => PermissionBabysitAction::Wait,
-        SessionState::PermissionDialog => PermissionBabysitAction::Approve,
-        SessionState::FolderTrustPrompt
+        SessionState::ChatReady
+        | SessionState::BusyResponding
+        | SessionState::FolderTrustPrompt
         | SessionState::SurveyPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
-        | SessionState::Unknown => PermissionBabysitAction::Stop,
+        | SessionState::Unknown => PermissionBabysitAction::Wait,
+        SessionState::PermissionDialog => PermissionBabysitAction::Approve,
     }
+}
+
+fn emit_babysit_output(line: String) -> AppResult<()> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn supports_babysit_color() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn current_babysit_timestamp() -> String {
+    let format = format_description!("[hour]:[minute]:[second].[subsecond digits:3]");
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(format)
+        .unwrap_or_else(|_| String::from("00:00:00.000"))
+}
+
+fn pane_label_from_path(current_path: &str, fallback: &str) -> String {
+    std::path::Path::new(current_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn babysit_pane_label(state_dir: &std::path::Path, pane_id: &str) -> String {
+    read_babysit_record(state_dir, pane_id)
+        .ok()
+        .flatten()
+        .map(|record| pane_label_from_path(&record.current_path, pane_id))
+        .unwrap_or_else(|| pane_id.to_string())
+}
+
+fn style_babysit(text: impl AsRef<str>, code: &str, use_color: bool) -> String {
+    let text = text.as_ref();
+    if use_color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BabysitOutputFormat {
+    Human,
+    Jsonl,
+}
+
+impl From<BabysitFormat> for BabysitOutputFormat {
+    fn from(value: BabysitFormat) -> Self {
+        match value {
+            BabysitFormat::Human => Self::Human,
+            BabysitFormat::Jsonl => Self::Jsonl,
+        }
+    }
+}
+
+fn render_babysit_output(
+    format: BabysitOutputFormat,
+    event: serde_json::Value,
+    use_color: bool,
+) -> String {
+    match format {
+        BabysitOutputFormat::Jsonl => event.to_string(),
+        BabysitOutputFormat::Human => render_babysit_human(event, use_color),
+    }
+}
+
+fn render_babysit_human(event: serde_json::Value, use_color: bool) -> String {
+    let kind = event
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("event");
+    let timestamp = style_babysit(
+        format!("[{}]", current_babysit_timestamp()),
+        "2;37",
+        use_color,
+    );
+    let (icon, label, label_color) = match kind {
+        "start" => ("🚀", "START", "1;32"),
+        "wait" => ("👀", "WAIT", "1;33"),
+        "approve" => ("🔐", "APPROVE", "1;36"),
+        "approved" => ("✅", "APPROVED", "1;32"),
+        "reject" => ("⛔", "REJECT", "1;31"),
+        "dismiss-survey" => ("🙈", "DISMISS", "1;35"),
+        _ => ("⛔", "STOP", "1;31"),
+    };
+    let label = style_babysit(format!("{icon} {label:<8}"), label_color, use_color);
+    let mut lines = vec![format!(
+        "{timestamp} {label} {}",
+        event.get("summary").and_then(|v| v.as_str()).unwrap_or("")
+    )];
+    for detail in event
+        .get("details")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(text) = detail.as_str() {
+            lines.push(format!("  │ {text}"));
+        }
+    }
+    if let Some(body_title) = event.get("body_title").and_then(|v| v.as_str()) {
+        lines.push(format!(
+            "  │ {}",
+            style_babysit(body_title, "1;37", use_color)
+        ));
+        if let Some(body_lines) = event.get("body_lines").and_then(|v| v.as_array()) {
+            if body_lines.is_empty() {
+                lines.push(String::from("  │   <empty>"));
+            } else {
+                for line in body_lines {
+                    if let Some(text) = line.as_str() {
+                        lines.push(format!("  │   {text}"));
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn babysit_prompt_json(details: Option<&PermissionPromptDetails>) -> serde_json::Value {
+    match details {
+        Some(details) => serde_json::json!({
+            "type": details.prompt_type,
+            "sandbox": details.sandbox_mode,
+            "command": details.command,
+            "reason": details.reason,
+            "question": details.question,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn render_babysit_start_event(
+    pane_label: &str,
+    pane_id: &str,
+    poll_ms: u64,
+    live_preview: bool,
+    record: &BabysitRecord,
+    record_path: &Path,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "start",
+            "pane_label": pane_label,
+            "pane_id": pane_id,
+            "poll_ms": poll_ms,
+            "live_preview": live_preview,
+            "session": record.session_name,
+            "window": record.window_name,
+            "command": record.current_command,
+            "cwd": record.current_path,
+            "record_path": record_path.display().to_string(),
+            "summary": format!("YOLO started for {pane_label} (id:{pane_id})"),
+            "details": [
+                format!("Poll interval: {poll_ms}ms"),
+                format!("Session: {}", record.session_name),
+                format!("Window: {}", record.window_name),
+                format!("Command: {}", record.current_command),
+                format!("Cwd: {}", record.current_path),
+                format!("Record: {}", record_path.display()),
+                format!("Live preview: {live_preview}"),
+            ],
+        }),
+        use_color,
+    )
+}
+
+fn render_babysit_stop_event(
+    pane_label: &str,
+    pane_id: &str,
+    reason: &str,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "stop",
+            "pane_label": pane_label,
+            "pane_id": pane_id,
+            "reason": reason,
+            "summary": format!("YOLO stopped for {pane_label} (id:{pane_id})"),
+            "details": [format!("Reason: {reason}")]
+        }),
+        use_color,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct InspectedPane {
+    classification: Classification,
+    focused_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionPromptDetails {
+    prompt_type: String,
+    sandbox_mode: Option<String>,
+    command: Option<String>,
+    reason: Option<String>,
+    question: Option<String>,
+}
+
+fn inspect_pane(
+    client: &TmuxClient,
+    pane_id: &str,
+    history_lines: usize,
+) -> AppResult<InspectedPane> {
+    let frame = client.capture_pane(pane_id, history_lines)?;
+    let focused_source = focused_frame_source(&frame);
+    Ok(InspectedPane {
+        classification: Classifier.classify(pane_id, &focused_source),
+        focused_source,
+    })
+}
+
+fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<PermissionPromptDetails> {
+    if inspected.classification.state != SessionState::PermissionDialog {
+        return None;
+    }
+
+    let lines = inspected.focused_source.lines().collect::<Vec<_>>();
+    let question_idx = lines.iter().rposition(|line| is_permission_question_line(line.trim()))?;
+    let title_idx = find_permission_prompt_title_idx(&lines[..question_idx])?;
+    let title = lines[title_idx].trim();
+    let (mut prompt_type, sandbox_mode) = parse_permission_prompt_title(title);
+
+    let mut content_lines = Vec::new();
+    let mut question = None;
+    for line in lines.iter().take(question_idx + 1).skip(title_idx + 1) {
+        let line = line.trim();
+        if line.is_empty() || is_permission_decoration_line(line) {
+            continue;
+        }
+        if is_permission_question_line(line) {
+            question = Some(line.to_string());
+            continue;
+        }
+        if is_permission_ignored_line(line) {
+            continue;
+        }
+        content_lines.push(line.to_string());
+    }
+
+    if question.is_none() {
+        return None;
+    }
+
+    let mut content_lines = content_lines;
+    if let Some(aside) = content_lines.last().filter(|line| is_permission_annotation_line(line)) {
+        prompt_type = format!("{prompt_type} ({aside})");
+        content_lines.pop();
+    }
+
+    let (command, reason) = match content_lines.as_slice() {
+        [] => (None, None),
+        [command] => (Some(command.clone()), None),
+        [command, reason] => (Some(command.clone()), Some(reason.clone())),
+        _ => {
+            let reason = content_lines.last().cloned();
+            let command = Some(content_lines[..content_lines.len() - 1].join(" "));
+            (command, reason)
+        }
+    };
+
+    Some(PermissionPromptDetails {
+        prompt_type,
+        sandbox_mode,
+        command,
+        reason,
+        question,
+    })
+}
+
+fn find_permission_prompt_title_idx(lines: &[&str]) -> Option<usize> {
+    lines.iter().enumerate().rfind(|(_, line)| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && !is_permission_decoration_line(trimmed)
+            && is_plausible_permission_prompt_title(trimmed)
+    }).map(|(idx, _)| idx)
+}
+
+fn is_plausible_permission_prompt_title(title: &str) -> bool {
+    let Some((base, suffix)) = title.rsplit_once(" (") else {
+        return matches!(title, "Bash command" | "JavaScript code" | "TypeScript code" | "Python code" | "Rust code" | "SQL query" | "Shell command" | "Command" );
+    };
+    let Some(suffix) = suffix.strip_suffix(')') else { return false; };
+    if matches!(suffix, "sandboxed" | "unsandboxed") {
+        return is_plausible_permission_prompt_title(base);
+    }
+    matches!(suffix, "Contains simple_expansion" | "Contains command substitution" | "Contains variable expansion" | "Contains globbing") && is_plausible_permission_prompt_title(base)
+}
+
+fn parse_permission_prompt_title(title: &str) -> (String, Option<String>) {
+    if let Some((label, suffix)) = title.rsplit_once(" (") {
+        if let Some(mode) = suffix.strip_suffix(')') {
+            if matches!(mode, "sandboxed" | "unsandboxed") {
+                return (label.to_string(), Some(mode.to_string()));
+            }
+        }
+    }
+    (title.to_string(), None)
+}
+
+fn is_permission_decoration_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '─' | '━' | '═' | '[' | ']' | '|' | ' '))
+}
+
+fn is_permission_question_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("do you want to proceed") || lower.ends_with('?')
+}
+
+fn is_permission_ignored_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("❯")
+        || lower.starts_with("1.")
+        || lower.starts_with("2.")
+        || lower.starts_with("allow once")
+        || lower.starts_with("allow for session")
+        || lower == "no"
+        || lower.starts_with("enter ")
+        || lower.starts_with("escape ")
+        || lower.starts_with("esc ")
+        || lower.starts_with("tab ")
+        || lower.starts_with("ctrl+")
+}
+
+fn is_permission_annotation_line(line: &str) -> bool {
+    matches!(line.trim(),
+        "Contains simple_expansion"
+            | "Contains command substitution"
+            | "Contains variable expansion"
+            | "Contains globbing"
+    )
+}
+
+fn render_permission_prompt_details(details: &PermissionPromptDetails) -> Vec<String> {
+    let mut lines = vec![format!("Type: {}", details.prompt_type)];
+    if let Some(mode) = &details.sandbox_mode {
+        lines.push(format!("Sandbox: {mode}"));
+    }
+    if let Some(command) = &details.command {
+        lines.push(format!("Command: {command}"));
+    }
+    if let Some(reason) = &details.reason {
+        lines.push(format!("Reason: {reason}"));
+    }
+    if let Some(question) = &details.question {
+        lines.push(format!("Question: {question}"));
+    }
+    lines
+}
+
+fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
+    if inspected.classification.state != SessionState::PermissionDialog {
+        return false;
+    }
+
+    let Some(details) = extract_permission_prompt_details(inspected) else {
+        return false;
+    };
+
+    details.question.is_some()
+        && details.command.is_some()
+        && !inspected
+            .focused_source
+            .lines()
+            .map(str::trim)
+            .any(is_chat_input_line_for_yolo)
+}
+
+fn is_chat_input_line_for_yolo(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == ">" || trimmed == "❯" {
+        return true;
+    }
+
+    let Some(rest) = trimmed.strip_prefix('❯') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !starts_with_numbered_option_for_yolo(rest)
+}
+
+fn starts_with_numbered_option_for_yolo(line: &str) -> bool {
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digits > 0 && line[digits..].starts_with('.')
+}
+
+fn render_babysit_wait_event(
+    pane_label: &str,
+    pane_id: &str,
+    poll_count: usize,
+    inspected: &InspectedPane,
+    _live_preview: bool,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    let classification = &inspected.classification;
+    let mut details = Vec::new();
+    if classification.recap_present {
+        details.push(String::from("Recap: present"));
+    }
+    if let Some(permission_details) = extract_permission_prompt_details(inspected) {
+        details.extend(render_permission_prompt_details(&permission_details));
+    }
+    let body_title: Option<&str> = None;
+    let body_lines: Vec<String> = Vec::new();
+    let prompt_details = extract_permission_prompt_details(inspected);
+    let json_details = serde_json::json!([format!("Signals: {}", render_signals(classification))]);
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "wait",
+            "pane_label": pane_label,
+            "pane_id": pane_id,
+            "poll": poll_count,
+            "state": classification.state.as_str(),
+            "signals": classification.signals.clone(),
+            "recap_present": classification.recap_present,
+            "recap_excerpt": classification.recap_excerpt,
+            "prompt": babysit_prompt_json(prompt_details.as_ref()),
+            "summary": format!("Watching {pane_label} (id:{pane_id}) (poll #{poll_count})"),
+            "details": if format == BabysitFormat::Human { serde_json::json!(details) } else { json_details },
+            "body_title": body_title,
+            "body_lines": body_lines,
+        }),
+        use_color,
+    )
+}
+
+fn render_babysit_approval_event(
+    pane_label: &str,
+    pane_id: &str,
+    poll_count: usize,
+    inspected: &InspectedPane,
+    live_preview: bool,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    let classification = &inspected.classification;
+    let prompt_details = extract_permission_prompt_details(inspected);
+    let json_details = serde_json::json!([format!("Signals: {}", render_signals(classification))]);
+    let human_details: Vec<String> = Vec::new();
+    let body_title = if live_preview {
+        Some("Permission prompt")
+    } else {
+        None
+    };
+    let body_lines = if live_preview {
+        inspected
+            .focused_source
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "approve",
+            "pane_label": pane_label,
+            "pane_id": pane_id,
+            "poll": poll_count,
+            "state": classification.state.as_str(),
+            "signals": classification.signals.clone(),
+            "prompt": babysit_prompt_json(prompt_details.as_ref()),
+            "summary": format!("Auto-approving {pane_label} (id:{pane_id}) (poll #{poll_count})"),
+            "details": if format == BabysitFormat::Human { serde_json::json!(human_details) } else { json_details },
+            "body_title": body_title,
+            "body_lines": body_lines
+        }),
+        use_color,
+    )
+}
+
+fn render_babysit_approved_event(
+    pane_label: &str,
+    pane_id: &str,
+    poll_count: usize,
+    inspected: &InspectedPane,
+    live_preview: bool,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    let classification = &inspected.classification;
+    let _live_preview = live_preview;
+    let body_title: Option<&str> = None;
+    let body_lines: Vec<String> = Vec::new();
+    let json_details = serde_json::json!([format!("Signals: {}", render_signals(classification))]);
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "approved",
+            "pane_label": pane_label,
+            "pane_id": pane_id,
+            "poll": poll_count,
+            "state": classification.state.as_str(),
+            "signals": classification.signals.clone(),
+            "summary": format!("Approval sent for {pane_label} (id:{pane_id}) (poll #{poll_count})"),
+            "details": if format == BabysitFormat::Human { serde_json::json!([]) } else { json_details },
+            "body_title": body_title,
+            "body_lines": body_lines
+        }),
+        use_color,
+    )
 }
 
 fn classify_pane(
@@ -715,9 +1578,9 @@ fn continue_from_classification(
             )?;
             thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
             let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-            ensure_state_transition(classification, &after, "approve-permission")?;
+            ensure_state_transition(classification, &after, "approve")?;
             Ok(ContinueOutcome {
-                action: String::from("approve-permission"),
+                action: String::from("approve"),
                 outcome: render_continue_outcome(after.state),
                 after,
                 used_permission_approval: true,
@@ -949,9 +1812,9 @@ fn render_next_safe_action(
     match classification.state {
         SessionState::ChatReady => String::from("safe-action: submit-prompt"),
         SessionState::BusyResponding => String::from("safe-action: wait"),
-        SessionState::PermissionDialog => String::from("safe-action: approve-permission"),
+        SessionState::PermissionDialog => String::from("safe-action: approve"),
         SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey"),
-        SessionState::FolderTrustPrompt => String::from("safe-action: approve-permission (Enter)"),
+        SessionState::FolderTrustPrompt => String::from("safe-action: approve (Enter)"),
         SessionState::DiffDialog => {
             String::from("manual-review: diff dialog needs operator confirmation")
         }
@@ -960,6 +1823,52 @@ fn render_next_safe_action(
         }
         SessionState::Unknown => String::from("manual-review: classify the pane before acting"),
     }
+}
+
+fn render_guarded_workflow_output(
+    workflow: GuardedWorkflow,
+    pane_label: &str,
+    pane_id: &str,
+    classification: &Classification,
+    actions: &str,
+    used_raw_enter: bool,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    let summary = format!(
+        "{} for {pane_label} (id:{pane_id}) in state {}",
+        match workflow {
+            GuardedWorkflow::ApprovePermission => "Approval sent",
+            GuardedWorkflow::RejectPermission => "Rejection sent",
+            GuardedWorkflow::DismissSurvey => "Survey dismissed",
+            GuardedWorkflow::SubmitPrompt => "Prompt submitted",
+        },
+        classification.state.as_str()
+    );
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": workflow.as_str(),
+            "workflow": workflow.as_str(),
+            "action": workflow.as_str(),
+            "pane_label": pane_label,
+            "pane_id": pane_id,
+            "state": classification.state.as_str(),
+            "signals": classification.signals.clone(),
+            "actions": actions,
+            "used_raw_enter": used_raw_enter,
+            "summary": summary,
+            "details": [
+                format!("Workflow: {}", workflow.as_str()),
+                format!("State: {}", classification.state.as_str()),
+                format!("Signals: {}", render_signals(classification)),
+                format!("Actions: {actions}"),
+                format!("Folder trust raw Enter: {used_raw_enter}"),
+            ],
+        }),
+        use_color,
+    )
 }
 
 fn render_cursor(pane: &TmuxPane) -> String {
@@ -1059,14 +1968,18 @@ fn parse_expected_state_arg(
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionBabysitAction, RecoveryAction, ensure_pane_owned_by_claude,
-        ensure_state_transition, is_usable_state, permission_babysit_action_for_state,
-        recovery_action_for_state, render_list_panes, render_next_safe_action,
+        BabysitFormat, InspectedPane, PermissionBabysitAction, RecoveryAction,
+        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
+        extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
+        permission_babysit_action_for_state, recovery_action_for_state,
+        render_babysit_approval_event, render_babysit_start_event, render_babysit_wait_event,
+        render_guarded_workflow_output, render_list_panes, render_next_safe_action,
         render_screen_excerpt, render_status_report,
     };
-    use crate::automation::{KeybindingsInspection, KeybindingsStatus};
+    use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::Classification;
     use crate::classifier::SessionState;
+    use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
     use crate::tmux::TmuxPane;
 
     fn sample_pane(current_command: &str) -> TmuxPane {
@@ -1155,7 +2068,7 @@ mod tests {
         };
         let after = before.clone();
 
-        let error = ensure_state_transition(&before, &after, "approve-permission")
+        let error = ensure_state_transition(&before, &after, "approve")
             .expect_err("unchanged state should fail");
         assert!(error.to_string().contains("potentially stale screen data"));
     }
@@ -1181,7 +2094,7 @@ mod tests {
                 &sample_pane("claude"),
                 &sample_bindings(KeybindingsStatus::Valid)
             ),
-            "safe-action: approve-permission"
+            "safe-action: approve"
         );
         assert!(
             render_next_safe_action(
@@ -1196,6 +2109,61 @@ mod tests {
             )
             .starts_with("manual-review:")
         );
+    }
+
+    #[test]
+    fn guarded_workflow_human_output_mentions_pane_state_and_raw_enter() {
+        let output = render_guarded_workflow_output(
+            GuardedWorkflow::ApprovePermission,
+            "bloodraven",
+            "%20",
+            &Classification {
+                source: String::from("pane"),
+                state: SessionState::FolderTrustPrompt,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("folder-trust")],
+            },
+            "enter",
+            true,
+            BabysitFormat::Human,
+            false,
+        );
+
+        assert!(output.contains("bloodraven"));
+        assert!(output.contains("%20"));
+        assert!(output.contains("Approval sent"));
+        assert!(output.contains("State: FolderTrustPrompt"));
+        assert!(output.contains("Folder trust raw Enter: true"));
+        assert!(!output.contains("key=value"));
+    }
+
+    #[test]
+    fn guarded_workflow_jsonl_is_structured() {
+        let output = render_guarded_workflow_output(
+            GuardedWorkflow::RejectPermission,
+            "bloodraven",
+            "%20",
+            &Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            "escape",
+            false,
+            BabysitFormat::Jsonl,
+            false,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("jsonl should parse");
+        assert_eq!(parsed["workflow"], "reject");
+        assert_eq!(parsed["action"], "reject");
+        assert_eq!(parsed["pane_label"], "bloodraven");
+        assert_eq!(parsed["pane_id"], "%20");
+        assert_eq!(parsed["state"], "PermissionDialog");
+        assert_eq!(parsed["used_raw_enter"], false);
     }
 
     #[test]
@@ -1251,10 +2219,18 @@ mod tests {
             permission_babysit_action_for_state(SessionState::BusyResponding),
             PermissionBabysitAction::Wait
         );
+        assert_eq!(
+            permission_babysit_action_for_state(SessionState::FolderTrustPrompt),
+            PermissionBabysitAction::Wait
+        );
+        assert_eq!(
+            permission_babysit_action_for_state(SessionState::Unknown),
+            PermissionBabysitAction::Wait
+        );
     }
 
     #[test]
-    fn permission_babysit_stops_on_non_permission_blockers() {
+    fn permission_babysit_keeps_waiting_on_non_permission_blockers() {
         for state in [
             SessionState::FolderTrustPrompt,
             SessionState::SurveyPrompt,
@@ -1264,8 +2240,357 @@ mod tests {
         ] {
             assert_eq!(
                 permission_babysit_action_for_state(state),
-                PermissionBabysitAction::Stop
+                PermissionBabysitAction::Wait
             );
         }
+    }
+
+    #[test]
+    fn yolo_wait_log_includes_state_signals_and_excerpt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: true,
+                recap_excerpt: Some(String::from("allow access")),
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes",
+            ),
+        };
+
+        let log = render_babysit_wait_event(
+            "bloodraven",
+            "%20",
+            3,
+            &inspected,
+            false,
+            BabysitFormat::Human,
+            false,
+        );
+        assert!(log.contains("Watching bloodraven (id:%20)"));
+        assert!(!log.to_lowercase().contains("babysit"));
+        assert!(log.contains("poll #3"));
+        assert!(log.contains("Recap: present"));
+        assert!(log.contains("Type: Bash command"));
+        assert!(log.contains("Sandbox: unsandboxed"));
+        assert!(!log.contains("Extracted prompt"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_from_bash_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\n  bun run scripts/test-prompt-safety.ts 2>&1\n  Run classifier test cases\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(details.sandbox_mode.as_deref(), Some("unsandboxed"));
+        assert_eq!(
+            details.command.as_deref(),
+            Some("bun run scripts/test-prompt-safety.ts 2>&1")
+        );
+        assert_eq!(details.reason.as_deref(), Some("Run classifier test cases"));
+        assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_from_exact_unsandboxed_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "  Bash command (unsandboxed)\n    make generate 2>&1 | tail -40\n    Run make generate to regenerate deepcopy (no sandbox)\n  Do you want to proceed?\n",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(
+            details.command.as_deref(),
+            Some("make generate 2>&1 | tail -40")
+        );
+        assert_eq!(
+            details.reason.as_deref(),
+            Some("Run make generate to regenerate deepcopy (no sandbox)")
+        );
+        assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_when_wrapped_by_border_lines() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "[────────────────────────────────────────────────────────]\nJavaScript code (unsandboxed)\n\n  let pass = 0, fail = 0\n  for (const [pat, path, expected] of cases) {\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "JavaScript code");
+        assert_eq!(details.sandbox_mode.as_deref(), Some("unsandboxed"));
+        assert_eq!(details.command.as_deref(), Some("let pass = 0, fail = 0"));
+        assert_eq!(
+            details.reason.as_deref(),
+            Some("for (const [pat, path, expected] of cases) {")
+        );
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_with_aside_annotation() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command\n\n  GOCACHE=$TMPDIR/go-cache make manifests 2>&1 | tail-40\n  Regenerate manifests\nContains simple_expansion\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(
+            details.command.as_deref(),
+            Some("GOCACHE=$TMPDIR/go-cache make manifests 2>&1 | tail-40")
+        );
+        assert_eq!(
+            details.reason.as_deref(),
+            Some("Regenerate manifests")
+        );
+        assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_skips_preceding_chat_text() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "✔ Add MysqlBackup.status.mysqlImage field (◼ Write tests for Phase 2 changes)\n✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\nBash command (unsandboxed)\n  mysql --execute=\"SELECT 1\"\n  Run permission prompt extraction test\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Bash command");
+        assert_eq!(details.command.as_deref(), Some("mysql --execute=\"SELECT 1\""));
+        assert_eq!(details.reason.as_deref(), Some("Run permission prompt extraction test"));
+        assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_with_wrapped_command_after_todo_list() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\n✔ Write tests for Phase 2 changes\n✔ Regenerate manifests + RBAC mirror + docs\n◼ Run pre-PR gate\n────────────────────────────────────────────────────────────────────────\nBash command\n  export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 |\n  tail -40\n  Run golangci-lint\nContains simple_expansion\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(
+            details.command.as_deref(),
+            Some("export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail -40")
+        );
+        assert_eq!(details.reason.as_deref(), Some("Run golangci-lint"));
+    }
+
+    #[test]
+    fn extract_permission_prompt_details_refuses_bogus_titles() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "✔ Add MysqlBackup.status.mysqlImage field\n✔ Add PITR verification spec + binlog replay\nDo you want to proceed?\n❯ 1. Yes",
+            ),
+        };
+
+        assert!(extract_permission_prompt_details(&inspected).is_none());
+    }
+
+    #[test]
+    fn yolo_refuses_to_approve_when_chat_input_is_active() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ Here's some of the output:",
+            ),
+        };
+
+        assert!(!is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_wait_log_omits_live_preview_even_when_enabled() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from("Bash command (unsandboxed)\nDo you want to proceed?"),
+        };
+
+        let log = render_babysit_wait_event(
+            "bloodraven",
+            "%20",
+            4,
+            &inspected,
+            true,
+            BabysitFormat::Human,
+            false,
+        );
+        assert!(!log.contains("Extracted prompt"));
+        assert!(!log.to_lowercase().contains("babysit"));
+    }
+
+    #[test]
+    fn yolo_approve_log_shows_only_permission_preview_in_human_mode() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRegenerate manifests\nDo you want to proceed?\n❯ 1. Yes",
+            ),
+        };
+
+        let log = render_babysit_approval_event(
+            "bloodraven",
+            "%20",
+            3,
+            &inspected,
+            true,
+            BabysitFormat::Human,
+            false,
+        );
+
+        assert!(log.contains("Auto-approving bloodraven (id:%20) (poll #3)"));
+        assert!(!log.contains("Signals:"));
+        assert!(!log.contains("Type:"));
+        assert!(log.contains("Permission prompt"));
+        assert!(log.contains("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn yolo_jsonl_renders_one_object_per_line() {
+        let output = render_babysit_start_event(
+            "bloodraven",
+            "%20",
+            500,
+            false,
+            &BabysitRecord {
+                enabled: true,
+                pane_id: String::from("%20"),
+                pane_tty: String::from("/dev/pts/1"),
+                pane_pid: Some(123),
+                session_id: String::from("$1"),
+                session_name: String::from("demo"),
+                window_id: String::from("@1"),
+                window_name: String::from("claude"),
+                current_command: String::from("bash"),
+                current_path: String::from("/tmp/demo"),
+            },
+            std::path::Path::new("/tmp/record.txt"),
+            BabysitFormat::Jsonl,
+            false,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("jsonl should parse");
+        assert_eq!(parsed["kind"], "start");
+        assert_eq!(parsed["pane_label"], "bloodraven");
+        assert_eq!(parsed["pane_id"], "%20");
+        assert_eq!(parsed["poll_ms"], 500);
+        assert_eq!(parsed["command"], "bash");
+        assert_eq!(parsed["record_path"], "/tmp/record.txt");
+        assert!(parsed.get("timestamp").is_some());
+        assert!(!output.to_lowercase().contains("babysit"));
+    }
+
+    #[test]
+    fn pane_label_from_path_uses_cwd_basename() {
+        assert_eq!(
+            super::pane_label_from_path("/home/colin/Projects/bloodraven", "%10"),
+            "bloodraven"
+        );
+        assert_eq!(super::pane_label_from_path("/", "%10"), "%10");
+    }
+
+    #[test]
+    fn cleanup_babysit_record_disables_record() {
+        let unique = format!("botctl-test-{}", std::process::id());
+        let dir = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&dir);
+        let pane_id = "%99";
+        let record = BabysitRecord {
+            enabled: true,
+            pane_id: pane_id.to_string(),
+            pane_tty: String::from("/dev/pts/9"),
+            pane_pid: Some(9),
+            session_id: String::from("$9"),
+            session_name: String::from("demo"),
+            window_id: String::from("@9"),
+            window_name: String::from("claude"),
+            current_command: String::from("claude"),
+            current_path: String::from("/tmp"),
+        };
+        write_babysit_record(&dir, &record).expect("write record");
+        cleanup_babysit_record(&dir, pane_id).expect("cleanup record");
+        let reread = read_babysit_record(&dir, pane_id)
+            .expect("read record")
+            .expect("record exists");
+        assert!(!reread.enabled);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
