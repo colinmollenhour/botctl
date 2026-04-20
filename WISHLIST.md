@@ -2,16 +2,27 @@
 
 ## Checklist
 
-1. [ ] Add higher-level `continue-session` and `auto-unstick` commands that clear trust, permission, and survey prompts before normal prompt submission.
-2. [ ] Support attaching `sdmux` to any existing tmux session, window, or pane that is already running Claude.
-3. [ ] Validate that the target pane is actually running Claude before any automation runs.
-4. [ ] Replace the bounded observer with a long-lived control-mode connection.
-5. [ ] Reconstruct a live terminal screen model instead of classifying plain captured text.
-6. [ ] Capture structured control-mode event tapes for fixtures and replay.
-7. [ ] Expand classification coverage for more Claude UI states and similar confirmation flows.
-8. [ ] Add end-to-end tests against real tmux sessions and realistic Claude behavior.
-9. [ ] Add lifecycle commands for stopping, restarting, destroying, and supervising managed sessions.
-10. [ ] Improve CLI ergonomics, JSON output, logging, docs, and packaging.
+1. [ ] P0-1 Attach to existing Claude tmux targets.
+2. [ ] P0-2 Add `continue-session` and `auto-unstick` commands.
+3. [ ] P0-3 Validate Claude ownership before driving a pane.
+4. [ ] P0-4 Keep higher-level automation state-aware.
+5. [ ] P0-5 Improve live status and doctor output.
+6. [ ] P1-1 Replace the bounded observer with a long-lived control-mode connection.
+7. [ ] P1-2 Reconstruct a live terminal screen model.
+8. [ ] P1-3 Merge streamed output with periodic `capture-pane` reconciliation.
+9. [ ] P1-4 Capture structured event tapes for fixtures.
+10. [ ] P1-5 Detect pane swaps, session renames, and window changes.
+11. [ ] P2-1 Expand the classifier to cover more Claude UI states.
+12. [ ] P2-2 Distinguish similar confirmation flows.
+13. [ ] P2-3 Track classifier confidence and drift.
+14. [ ] P2-4 Improve fixture organization and coverage.
+15. [ ] P2-5 Add tooling to diff and refresh fixture corpora.
+16. [ ] P3-1 Add full session lifecycle commands.
+17. [ ] P3-2 Persist managed-session metadata and recent history.
+18. [ ] P3-3 Add policy-driven continuous automation.
+19. [ ] P3-4 Improve CLI and scripting ergonomics.
+20. [ ] P3-5 Add end-to-end tests against real tmux sessions.
+21. [ ] P3-6 Add docs, packaging, and release automation.
 
 ## P0
 
@@ -34,6 +45,7 @@ Prompt submission, permission approval, rejection, survey dismissal, and trust a
 
 1. Replace the bounded observer with a long-lived control-mode connection.
 The current one-shot observer is enough for probing but not enough for durable automation. A persistent connection is needed so `sdmux` can watch sessions continuously and react without repeated attach/capture cycles.
+See `PLANS-Serve-Mode.md` for the high-level serve-mode architecture that this persistent observer enables.
 
 2. Reconstruct a live terminal screen model.
 Classification should be based on a reconstructed frame from streaming output plus reconciliation, not plain text snapshots. That is the real fix for stale scrollback and fragile keyword matching.
@@ -74,6 +86,7 @@ The tool currently rediscovers most state ad hoc. Persisting ownership, last-kno
 
 3. Add policy-driven continuous automation.
 Once observation is durable, `sdmux` should be able to run rules continuously, such as always trusting the workspace, allowing a permission once, or declining surveys. That requires a clear policy layer rather than ad hoc command chaining.
+See `PLANS-Serve-Mode.md` for the intended local daemon, API, and continuous policy model.
 
 4. Improve CLI and scripting ergonomics.
 Add better error messages, verbosity controls, JSON output, and possibly a more ergonomic argument parser when the hand-rolled CLI becomes a drag. This is quality-of-life work, but it will matter once the command surface grows.
