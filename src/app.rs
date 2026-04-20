@@ -12,12 +12,16 @@ use crate::automation::{
 use crate::classifier::{Classification, Classifier, SessionState};
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, CaptureArgs, ClassifyArgs, Command, ContinueSessionArgs,
-    DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ObserveArgs, PaneCommandArgs,
-    PaneTargetArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs,
-    StatusArgs, SubmitPromptArgs,
+    DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs,
+    PaneTargetArgs, PermissionBabysitStartArgs, PermissionBabysitStopArgs, PreparePromptArgs,
+    RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs, StatusArgs, SubmitPromptArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
+use crate::permission_babysit::{
+    BabysitRecord, disable_babysit_record, read_babysit_record,
+    resolve_state_dir as resolve_babysit_state_dir, write_babysit_record,
+};
 use crate::prompt::{
     PromptSource, default_state_dir, prepare_prompt, resolve_prompt_text, write_editor_target,
     write_editor_target_from_pending,
@@ -60,7 +64,7 @@ pub fn run(command: Command) -> AppResult<String> {
     match command {
         Command::Start(args) => run_start(args),
         Command::Attach(args) => run_attach(args),
-        Command::ListPanes => run_list_panes(),
+        Command::ListPanes(args) => run_list_panes(args),
         Command::Capture(args) => run_capture(args),
         Command::Status(args) => run_status(args),
         Command::Doctor(args) => run_doctor(args),
@@ -85,6 +89,8 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
+        Command::PermissionBabysitStart(args) => run_permission_babysit_start(args),
+        Command::PermissionBabysitStop(args) => run_permission_babysit_stop(args),
         Command::Help => Ok(crate::cli::usage()),
     }
 }
@@ -128,10 +134,26 @@ fn run_attach(args: AttachArgs) -> AppResult<String> {
     ))
 }
 
-fn run_list_panes() -> AppResult<String> {
+fn run_list_panes(args: ListPanesArgs) -> AppResult<String> {
     let panes = TmuxClient::default().list_panes()?;
+    Ok(render_list_panes(&panes, args.all))
+}
+
+fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
+    let panes = if include_all {
+        panes.iter().collect::<Vec<_>>()
+    } else {
+        panes
+            .iter()
+            .filter(|pane| is_pane_command_claude(pane))
+            .collect::<Vec<_>>()
+    };
     if panes.is_empty() {
-        return Ok(String::from("no panes found"));
+        return if include_all {
+            String::from("no panes found")
+        } else {
+            String::from("no claude panes found")
+        };
     }
 
     let mut out = String::new();
@@ -151,7 +173,7 @@ fn run_list_panes() -> AppResult<String> {
             cursor
         ));
     }
-    Ok(out.trim_end().to_string())
+    out.trim_end().to_string()
 }
 
 fn run_capture(args: CaptureArgs) -> AppResult<String> {
@@ -189,7 +211,7 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         is_pane_command_claude(&pane) && bindings.status == KeybindingsStatus::Valid;
 
     Ok(format!(
-        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
+        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
         automation_ready,
         pane.pane_id,
         pane.session_name,
@@ -200,6 +222,8 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         pane.current_path,
         render_cursor(&pane),
         classification.state.as_str(),
+        classification.recap_present,
+        classification.recap_excerpt.as_deref().unwrap_or("none"),
         render_signals(&classification),
         render_screen_excerpt(&frame),
         render_next_safe_action(&classification, &pane, &bindings),
@@ -267,6 +291,8 @@ fn run_record_fixture(args: RecordFixtureArgs) -> AppResult<String> {
         target_pane: &collected.report.target_pane,
         output_events: collected.report.output_events,
         notifications: collected.report.notifications,
+        recap_present: collected.report.classification.recap_present,
+        recap_excerpt: collected.report.classification.recap_excerpt.as_deref(),
         signals: &collected.report.classification.signals,
         frame_text: &collected.report.captured_frame,
         raw_control_lines: &collected.raw_control_lines,
@@ -498,6 +524,113 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     ))
 }
 
+fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let state_dir = resolve_babysit_state_dir(args.state_dir.as_deref());
+    if matches!(
+        read_babysit_record(&state_dir, &args.pane_id)?,
+        Some(record) if record.enabled
+    ) {
+        return Err(AppError::new(format!(
+            "permission-babysit is already active for pane {}; run permission-babysit stop first",
+            args.pane_id
+        )));
+    }
+    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    ensure_pane_owned_by_claude(&pane)?;
+    let bindings = load_automation_keybindings(None)?;
+    let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
+    let record = BabysitRecord::from_pane(&pane);
+    let record_path = write_babysit_record(&state_dir, &record)?;
+
+    loop {
+        if !babysit_enabled(&state_dir, &args.pane_id)? {
+            return Ok(format!(
+                "permission-babysit stopped pane={} reason=disabled",
+                pane.pane_id
+            ));
+        }
+        let Some(current) = client.pane_by_id(&args.pane_id)? else {
+            return Ok(format!(
+                "permission-babysit stopped pane={} reason=missing-pane",
+                pane.pane_id
+            ));
+        };
+        if !record.matches_pane(&current) {
+            return Ok(format!(
+                "permission-babysit stopped pane={} reason=identity-changed",
+                pane.pane_id
+            ));
+        }
+        let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        match permission_babysit_action_for_state(classification.state) {
+            PermissionBabysitAction::Approve => {
+                send_actions(
+                    &client,
+                    &pane.pane_id,
+                    GuardedWorkflow::ApprovePermission.actions(),
+                    &bindings,
+                    0,
+                )?;
+                thread::sleep(Duration::from_millis(args.poll_ms));
+                let after = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+                if after.state == SessionState::PermissionDialog {
+                    return Ok(format!(
+                        "permission-babysit stopped pane={} reason=stale-permission-dialog",
+                        pane.pane_id
+                    ));
+                }
+            }
+            PermissionBabysitAction::Wait => {
+                thread::sleep(Duration::from_millis(args.poll_ms));
+            }
+            PermissionBabysitAction::Stop => {
+                return Ok(format!(
+                    "permission-babysit stopped pane={} reason=unhandled-state:{} record={}",
+                    pane.pane_id,
+                    classification.state.as_str(),
+                    record_path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<String> {
+    let state_dir = resolve_babysit_state_dir(args.state_dir.as_deref());
+    let disabled = disable_babysit_record(&state_dir, &args.pane_id)?;
+    Ok(format!(
+        "permission-babysit stop pane={} disabled={}",
+        args.pane_id, disabled
+    ))
+}
+
+fn babysit_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
+    Ok(matches!(
+        read_babysit_record(state_dir, pane_id)?,
+        Some(record) if record.enabled
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionBabysitAction {
+    Wait,
+    Approve,
+    Stop,
+}
+
+fn permission_babysit_action_for_state(state: SessionState) -> PermissionBabysitAction {
+    match state {
+        SessionState::ChatReady | SessionState::BusyResponding => PermissionBabysitAction::Wait,
+        SessionState::PermissionDialog => PermissionBabysitAction::Approve,
+        SessionState::FolderTrustPrompt
+        | SessionState::SurveyPrompt
+        | SessionState::ExternalEditorActive
+        | SessionState::DiffDialog
+        | SessionState::Unknown => PermissionBabysitAction::Stop,
+    }
+}
+
 fn classify_pane(
     client: &TmuxClient,
     pane_id: &str,
@@ -508,9 +641,13 @@ fn classify_pane(
     Ok(Classifier.classify(pane_id, &focused))
 }
 
-fn focused_frame_source(frame: &str) -> String {
+pub(crate) fn focused_frame_source(frame: &str) -> String {
     let focused = focus_live_frame(frame, 15);
-    if focused.is_empty() { frame.to_string() } else { focused }
+    if focused.is_empty() {
+        frame.to_string()
+    } else {
+        focused
+    }
 }
 
 fn ensure_workflow_state(
@@ -547,7 +684,10 @@ fn render_action_names(actions: &[AutomationAction]) -> String {
 }
 
 fn is_usable_state(state: SessionState) -> bool {
-    matches!(state, SessionState::ChatReady | SessionState::BusyResponding)
+    matches!(
+        state,
+        SessionState::ChatReady | SessionState::BusyResponding
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -722,7 +862,9 @@ fn resolve_target_pane(client: &TmuxClient, target: &PaneTargetArgs) -> AppResul
         (Some(pane_id), None, None) => resolve_pane_by_id(client, pane_id),
         (None, Some(session_name), None) => client
             .active_pane_for_session(session_name)?
-            .ok_or_else(|| AppError::new(format!("no active pane found for session {session_name}"))),
+            .ok_or_else(|| {
+                AppError::new(format!("no active pane found for session {session_name}"))
+            }),
         (None, Some(session_name), Some(window_name)) => client
             .active_pane_for_window(session_name, window_name)?
             .ok_or_else(|| {
@@ -764,7 +906,7 @@ fn render_status_report(
     frame: &str,
 ) -> String {
     format!(
-        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
+        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
         pane.pane_id,
         pane.session_name,
         pane.window_name,
@@ -773,6 +915,8 @@ fn render_status_report(
         pane.current_path,
         render_cursor(pane),
         classification.state.as_str(),
+        classification.recap_present,
+        classification.recap_excerpt.as_deref().unwrap_or("none"),
         render_signals(classification),
         render_screen_excerpt(frame),
         render_next_safe_action(classification, pane, bindings),
@@ -784,7 +928,11 @@ fn render_status_report(
 
 fn render_screen_excerpt(frame: &str) -> String {
     let excerpt = focus_live_frame(frame, 8);
-    if excerpt.is_empty() { String::from("none") } else { excerpt.replace('\n', " | ") }
+    if excerpt.is_empty() {
+        String::from("none")
+    } else {
+        excerpt.replace('\n', " | ")
+    }
 }
 
 fn render_next_safe_action(
@@ -804,8 +952,12 @@ fn render_next_safe_action(
         SessionState::PermissionDialog => String::from("safe-action: approve-permission"),
         SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey"),
         SessionState::FolderTrustPrompt => String::from("safe-action: approve-permission (Enter)"),
-        SessionState::DiffDialog => String::from("manual-review: diff dialog needs operator confirmation"),
-        SessionState::ExternalEditorActive => String::from("manual-review: external editor is active"),
+        SessionState::DiffDialog => {
+            String::from("manual-review: diff dialog needs operator confirmation")
+        }
+        SessionState::ExternalEditorActive => {
+            String::from("manual-review: external editor is active")
+        }
         SessionState::Unknown => String::from("manual-review: classify the pane before acting"),
     }
 }
@@ -907,18 +1059,24 @@ fn parse_expected_state_arg(
 #[cfg(test)]
 mod tests {
     use super::{
-        RecoveryAction, ensure_pane_owned_by_claude, ensure_state_transition, is_usable_state,
-        recovery_action_for_state, render_next_safe_action, render_screen_excerpt,
+        PermissionBabysitAction, RecoveryAction, ensure_pane_owned_by_claude,
+        ensure_state_transition, is_usable_state, permission_babysit_action_for_state,
+        recovery_action_for_state, render_list_panes, render_next_safe_action,
+        render_screen_excerpt, render_status_report,
     };
+    use crate::automation::{KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::Classification;
     use crate::classifier::SessionState;
-    use crate::automation::{KeybindingsInspection, KeybindingsStatus};
     use crate::tmux::TmuxPane;
 
     fn sample_pane(current_command: &str) -> TmuxPane {
         TmuxPane {
             pane_id: String::from("%1"),
+            pane_tty: String::from("/dev/pts/1"),
+            pane_pid: Some(123),
+            session_id: String::from("$1"),
             session_name: String::from("demo"),
+            window_id: String::from("@2"),
             window_name: String::from("claude"),
             current_command: current_command.to_string(),
             current_path: String::from("/tmp/demo"),
@@ -991,6 +1149,8 @@ mod tests {
         let before = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            recap_present: false,
+            recap_excerpt: None,
             signals: vec![String::from("permission-keywords")],
         };
         let after = before.clone();
@@ -1011,6 +1171,8 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            recap_present: false,
+            recap_excerpt: None,
             signals: vec![],
         };
         assert_eq!(
@@ -1021,14 +1183,89 @@ mod tests {
             ),
             "safe-action: approve-permission"
         );
-        assert!(render_next_safe_action(
-            &Classification {
-                state: SessionState::Unknown,
-                ..classification.clone()
-            },
+        assert!(
+            render_next_safe_action(
+                &Classification {
+                    state: SessionState::Unknown,
+                    recap_present: false,
+                    recap_excerpt: None,
+                    ..classification.clone()
+                },
+                &sample_pane("claude"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            )
+            .starts_with("manual-review:")
+        );
+    }
+
+    #[test]
+    fn status_report_includes_recap_metadata() {
+        let report = render_status_report(
             &sample_pane("claude"),
-            &sample_bindings(KeybindingsStatus::Valid)
-        )
-        .starts_with("manual-review:"));
+            &Classification {
+                source: String::from("pane"),
+                state: SessionState::ChatReady,
+                recap_present: true,
+                recap_excerpt: Some(String::from("Fixed parser edge cases")),
+                signals: vec![String::from("chat-keywords")],
+            },
+            &sample_bindings(KeybindingsStatus::Valid),
+            "While you were away\nFixed parser edge cases\nEnter submit message",
+        );
+
+        assert!(report.contains("recap_present=true"));
+        assert!(report.contains("recap_excerpt=Fixed parser edge cases"));
+    }
+
+    #[test]
+    fn list_panes_defaults_to_claude_only_output() {
+        let output = render_list_panes(&[sample_pane("claude"), sample_pane("bash")], false);
+        assert!(output.contains("command=claude"));
+        assert!(!output.contains("command=bash"));
+    }
+
+    #[test]
+    fn list_panes_all_flag_includes_non_claude_output() {
+        let output = render_list_panes(&[sample_pane("claude"), sample_pane("bash")], true);
+        assert!(output.contains("command=claude"));
+        assert!(output.contains("command=bash"));
+    }
+
+    #[test]
+    fn list_panes_claude_only_reports_empty_state() {
+        let output = render_list_panes(&[sample_pane("bash")], false);
+        assert_eq!(output, "no claude panes found");
+    }
+
+    #[test]
+    fn permission_babysit_only_approves_permission_dialogs() {
+        assert_eq!(
+            permission_babysit_action_for_state(SessionState::PermissionDialog),
+            PermissionBabysitAction::Approve
+        );
+        assert_eq!(
+            permission_babysit_action_for_state(SessionState::ChatReady),
+            PermissionBabysitAction::Wait
+        );
+        assert_eq!(
+            permission_babysit_action_for_state(SessionState::BusyResponding),
+            PermissionBabysitAction::Wait
+        );
+    }
+
+    #[test]
+    fn permission_babysit_stops_on_non_permission_blockers() {
+        for state in [
+            SessionState::FolderTrustPrompt,
+            SessionState::SurveyPrompt,
+            SessionState::ExternalEditorActive,
+            SessionState::DiffDialog,
+            SessionState::Unknown,
+        ] {
+            assert_eq!(
+                permission_babysit_action_for_state(state),
+                PermissionBabysitAction::Stop
+            );
+        }
     }
 }

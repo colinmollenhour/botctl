@@ -600,6 +600,8 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::BusyResponding,
+            recap_present: false,
+            recap_excerpt: None,
             signals: vec![String::from("busy-keywords")],
         };
 
@@ -614,6 +616,8 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::FolderTrustPrompt,
+            recap_present: false,
+            recap_excerpt: None,
             signals: vec![String::from("folder-trust-keywords")],
         };
 

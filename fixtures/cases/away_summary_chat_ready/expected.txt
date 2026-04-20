@@ -1,0 +1,3 @@
+state=ChatReady
+recap_present=true
+recap_excerpt=Fixed parser edge cases and resumed diagnostics review.

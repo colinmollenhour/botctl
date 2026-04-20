@@ -23,7 +23,7 @@
 19. [ ] P3-4 Improve CLI and scripting ergonomics.
 20. [ ] P3-5 Add end-to-end tests against real tmux sessions.
 21. [ ] P3-6 Add docs, packaging, and release automation.
-22. [ ] P3-7 Add a one-off permission babysit mode for a single instance.
+22. [x] P3-7 Add a one-off permission babysit mode for a single instance.
 
 ## P0
 

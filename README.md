@@ -149,6 +149,8 @@ The classifier currently recognizes:
 - `DiffDialog`
 - `Unknown`
 
+Recap is auxiliary metadata, not a primary state. Strong anchors like `while you were away` and `away summary` can surface it, but `/recap` by itself does not.
+
 `approve-permission` accepts both `PermissionDialog` and `FolderTrustPrompt`. For `FolderTrustPrompt`, `botctl` sends raw `Enter` because that flow must confirm the default selected option directly.
 
 ## Current Limits

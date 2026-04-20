@@ -24,7 +24,11 @@ pub struct StartedSession {
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
     pub pane_id: String,
+    pub pane_tty: String,
+    pub pane_pid: Option<u32>,
+    pub session_id: String,
     pub session_name: String,
+    pub window_id: String,
     pub window_name: String,
     pub current_command: String,
     pub current_path: String,
@@ -103,7 +107,7 @@ impl TmuxClient {
         }
         args.push(String::from("-F"));
         args.push(String::from(
-            "#{pane_id}\t#{session_name}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
+            "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
         ));
 
         let output = self.run_output(args)?;
@@ -294,19 +298,23 @@ enum ControlStreamItem {
 
 fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 8 {
+    if parts.len() != 12 {
         return None;
     }
 
     Some(TmuxPane {
         pane_id: parts[0].to_string(),
-        session_name: parts[1].to_string(),
-        window_name: parts[2].to_string(),
-        current_command: parts[3].to_string(),
-        current_path: parts[4].to_string(),
-        pane_active: parts[5] == "1",
-        cursor_x: parse_cursor(parts[6]),
-        cursor_y: parse_cursor(parts[7]),
+        pane_tty: parts[1].to_string(),
+        pane_pid: parts[2].parse::<u32>().ok(),
+        session_id: parts[3].to_string(),
+        session_name: parts[4].to_string(),
+        window_id: parts[5].to_string(),
+        window_name: parts[6].to_string(),
+        current_command: parts[7].to_string(),
+        current_path: parts[8].to_string(),
+        pane_active: parts[9] == "1",
+        cursor_x: parse_cursor(parts[10]),
+        cursor_y: parse_cursor(parts[11]),
     })
 }
 
@@ -361,8 +369,10 @@ mod tests {
 
     #[test]
     fn parses_pane_listing() {
-        let pane = parse_pane_line("%1\tdemo\tclaude\tclaude\t/tmp/demo\t1\t12\t4")
-            .expect("pane should parse");
+        let pane = parse_pane_line(
+            "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\tclaude\tclaude\t/tmp/demo\t1\t12\t4",
+        )
+        .expect("pane should parse");
         assert_eq!(pane.pane_id, "%1");
         assert!(pane.pane_active);
         assert_eq!(pane.cursor_x, Some(12));

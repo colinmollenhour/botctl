@@ -6,7 +6,7 @@ use crate::app::{AppError, AppResult};
 pub enum Command {
     Start(StartArgs),
     Attach(AttachArgs),
-    ListPanes,
+    ListPanes(ListPanesArgs),
     Capture(CaptureArgs),
     Status(StatusArgs),
     Doctor(DoctorArgs),
@@ -25,6 +25,8 @@ pub enum Command {
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
+    PermissionBabysitStart(PermissionBabysitStartArgs),
+    PermissionBabysitStop(PermissionBabysitStopArgs),
     Help,
 }
 
@@ -64,6 +66,11 @@ pub struct AutoUnstickArgs {
 pub struct CaptureArgs {
     pub pane_id: String,
     pub history_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListPanesArgs {
+    pub all: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +161,19 @@ pub struct SubmitPromptArgs {
     pub submit_delay_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PermissionBabysitStartArgs {
+    pub pane_id: String,
+    pub poll_ms: u64,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionBabysitStopArgs {
+    pub pane_id: String,
+    pub state_dir: Option<PathBuf>,
+}
+
 pub fn parse_args<I>(args: I) -> AppResult<Command>
 where
     I: IntoIterator<Item = String>,
@@ -169,7 +189,7 @@ where
     match subcommand.as_str() {
         "start" => parse_start(rest),
         "attach" => parse_attach(rest),
-        "list-panes" => Ok(Command::ListPanes),
+        "list-panes" => parse_list_panes(rest),
         "capture" => parse_capture(rest),
         "status" => parse_status(rest),
         "doctor" => parse_doctor(rest),
@@ -192,6 +212,7 @@ where
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
+        "permission-babysit" => parse_permission_babysit(rest),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(AppError::new(format!("unknown subcommand: {other}"))),
     }
@@ -204,7 +225,7 @@ pub fn usage() -> String {
           Commands:\n\
             start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
             attach (--pane %ID | --session NAME [--window NAME])\n\
-            list-panes\n\
+            list-panes [--all]\n\
             capture --pane %ID [--history-lines N]\n\
             status --pane %ID [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]\n\
@@ -222,7 +243,9 @@ pub fn usage() -> String {
             auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
-            submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n",
+            submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
+            permission-babysit start --pane %ID [--poll-ms N] [--state-dir PATH]\n\
+            permission-babysit stop --pane %ID [--state-dir PATH]\n",
     )
 }
 
@@ -273,6 +296,20 @@ fn parse_start(args: Vec<String>) -> AppResult<Command> {
 fn parse_attach(args: Vec<String>) -> AppResult<Command> {
     let target = parse_pane_target_args(args, "attach")?;
     Ok(Command::Attach(AttachArgs { target }))
+}
+
+fn parse_list_panes(args: Vec<String>) -> AppResult<Command> {
+    let mut all = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--all" => all = true,
+            flag => return Err(AppError::new(format!("unknown list-panes flag: {flag}"))),
+        }
+        i += 1;
+    }
+
+    Ok(Command::ListPanes(ListPanesArgs { all }))
 }
 
 fn parse_capture(args: Vec<String>) -> AppResult<Command> {
@@ -829,6 +866,83 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     }))
 }
 
+fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
+    let Some(mode) = args.first() else {
+        return Err(AppError::new(
+            "permission-babysit requires start or stop subcommand",
+        ));
+    };
+
+    match mode.as_str() {
+        "start" => {
+            let mut pane_id = None;
+            let mut poll_ms = 1000u64;
+            let mut state_dir = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+                    "--poll-ms" => {
+                        let raw = read_value(&args, &mut i, "--poll-ms")?;
+                        poll_ms = raw.parse::<u64>().map_err(|_| {
+                            AppError::new(format!("invalid value for --poll-ms: {raw}"))
+                        })?;
+                    }
+                    "--state-dir" => {
+                        state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+                    }
+                    flag => {
+                        return Err(AppError::new(format!(
+                            "unknown permission-babysit flag: {flag}"
+                        )));
+                    }
+                }
+                i += 1;
+            }
+            if poll_ms == 0 {
+                return Err(AppError::new(
+                    "permission-babysit start requires --poll-ms to be at least 1",
+                ));
+            }
+            let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+            Ok(Command::PermissionBabysitStart(
+                PermissionBabysitStartArgs {
+                    pane_id,
+                    poll_ms,
+                    state_dir,
+                },
+            ))
+        }
+        "stop" => {
+            let mut pane_id = None;
+            let mut state_dir = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+                    "--state-dir" => {
+                        state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+                    }
+                    flag => {
+                        return Err(AppError::new(format!(
+                            "unknown permission-babysit flag: {flag}"
+                        )));
+                    }
+                }
+                i += 1;
+            }
+            let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+            Ok(Command::PermissionBabysitStop(PermissionBabysitStopArgs {
+                pane_id,
+                state_dir,
+            }))
+        }
+        _ => Err(AppError::new(
+            "permission-babysit requires start or stop subcommand",
+        )),
+    }
+}
+
 fn parse_single_path_flag(
     args: Vec<String>,
     flag_name: &str,
@@ -901,6 +1015,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_list_panes_default_as_claude_only() {
+        let command = parse_args(vec![String::from("botctl"), String::from("list-panes")])
+            .expect("list-panes command should parse");
+
+        match command {
+            Command::ListPanes(args) => assert!(!args.all),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_list_panes_all_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("list-panes"),
+            String::from("--all"),
+        ])
+        .expect("list-panes --all command should parse");
+
+        match command {
+            Command::ListPanes(args) => assert!(args.all),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_attach_command_with_session_window_target() {
         let command = parse_args(vec![
             String::from("botctl"),
@@ -932,9 +1072,11 @@ mod tests {
         ])
         .expect_err("attach should reject window-only target");
 
-        assert!(error
-            .to_string()
-            .contains("attach requires --session NAME when --window NAME is provided"));
+        assert!(
+            error
+                .to_string()
+                .contains("attach requires --session NAME when --window NAME is provided")
+        );
     }
 
     #[test]
@@ -1083,9 +1225,11 @@ mod tests {
         ])
         .expect_err("continue-session should reject ambiguous session-only targets");
 
-        assert!(error
-            .to_string()
-            .contains("continue-session requires --pane %ID or --session NAME --window NAME"));
+        assert!(
+            error
+                .to_string()
+                .contains("continue-session requires --pane %ID or --session NAME --window NAME")
+        );
     }
 
     #[test]
@@ -1121,8 +1265,87 @@ mod tests {
         ])
         .expect_err("auto-unstick should reject zero max steps");
 
-        assert!(error
-            .to_string()
-            .contains("auto-unstick requires --max-steps to be at least 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("auto-unstick requires --max-steps to be at least 1")
+        );
+    }
+
+    #[test]
+    fn parses_permission_babysit_start_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("permission-babysit"),
+            String::from("start"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--poll-ms"),
+            String::from("250"),
+        ])
+        .expect("permission-babysit start should parse");
+
+        match command {
+            Command::PermissionBabysitStart(args) => {
+                assert_eq!(args.pane_id, "%9");
+                assert_eq!(args.poll_ms, 250);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_permission_babysit_zero_poll_interval() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("permission-babysit"),
+            String::from("start"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--poll-ms"),
+            String::from("0"),
+        ])
+        .expect_err("permission-babysit should reject zero poll interval");
+
+        assert!(
+            error
+                .to_string()
+                .contains("permission-babysit start requires --poll-ms to be at least 1")
+        );
+    }
+
+    #[test]
+    fn rejects_permission_babysit_session_target() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("permission-babysit"),
+            String::from("start"),
+            String::from("--session"),
+            String::from("demo"),
+        ])
+        .expect_err("permission-babysit should reject session targeting");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown permission-babysit flag: --session")
+        );
+    }
+
+    #[test]
+    fn parses_permission_babysit_stop_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("permission-babysit"),
+            String::from("stop"),
+            String::from("--pane"),
+            String::from("%9"),
+        ])
+        .expect("permission-babysit stop should parse");
+
+        match command {
+            Command::PermissionBabysitStop(args) => assert_eq!(args.pane_id, "%9"),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

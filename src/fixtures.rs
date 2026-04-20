@@ -9,6 +9,8 @@ use crate::classifier::SessionState;
 pub struct FixtureCase {
     pub name: String,
     pub expected_state: SessionState,
+    pub recap_present: bool,
+    pub recap_excerpt: Option<String>,
     pub frame_text: String,
 }
 
@@ -30,6 +32,8 @@ pub struct FixtureRecordInput<'a> {
     pub target_pane: &'a str,
     pub output_events: usize,
     pub notifications: usize,
+    pub recap_present: bool,
+    pub recap_excerpt: Option<&'a str>,
     pub signals: &'a [String],
     pub frame_text: &'a str,
     pub raw_control_lines: &'a [String],
@@ -46,12 +50,14 @@ impl FixtureCase {
         let expected_path = path.join("expected.txt");
         let frame_path = path.join("frame.txt");
 
-        let expected_state = parse_expected_state(&expected_path)?;
+        let expected = parse_expected_state(&expected_path)?;
         let frame_text = fs::read_to_string(&frame_path)?;
 
         Ok(Self {
             name,
-            expected_state,
+            expected_state: expected.state,
+            recap_present: expected.recap_present,
+            recap_excerpt: expected.recap_excerpt,
             frame_text,
         })
     }
@@ -75,7 +81,11 @@ pub fn record_case(input: FixtureRecordInput<'_>) -> AppResult<RecordedFixture> 
 
     fs::write(
         case_dir.join("expected.txt"),
-        format!("state={}\n", input.expected_state.as_str()),
+        render_expected(
+            input.expected_state,
+            input.recap_present,
+            input.recap_excerpt,
+        ),
     )?;
     fs::write(case_dir.join("frame.txt"), input.frame_text)?;
     fs::write(
@@ -91,6 +101,8 @@ pub fn record_case(input: FixtureRecordInput<'_>) -> AppResult<RecordedFixture> 
             input.notifications,
             input.classified_state,
             input.expected_state,
+            input.recap_present,
+            input.recap_excerpt,
             input.signals,
         ),
     )?;
@@ -103,23 +115,44 @@ pub fn record_case(input: FixtureRecordInput<'_>) -> AppResult<RecordedFixture> 
     })
 }
 
-fn parse_expected_state(path: &Path) -> AppResult<SessionState> {
+struct ExpectedFixture {
+    state: SessionState,
+    recap_present: bool,
+    recap_excerpt: Option<String>,
+}
+
+fn parse_expected_state(path: &Path) -> AppResult<ExpectedFixture> {
     let content = fs::read_to_string(path)?;
+    let mut state = None;
+    let mut recap_present = false;
+    let mut recap_excerpt = None;
     for line in content.lines() {
         if let Some(value) = line.strip_prefix("state=") {
-            return SessionState::from_str(value).ok_or_else(|| {
+            state = Some(SessionState::from_str(value).ok_or_else(|| {
                 AppError::new(format!(
                     "unknown session state in {}: {value}",
                     path.display()
                 ))
-            });
+            })?);
+        } else if let Some(value) = line.strip_prefix("recap_present=") {
+            recap_present = matches!(value.trim(), "true" | "yes" | "1");
+        } else if let Some(value) = line.strip_prefix("recap_excerpt=") {
+            let value = value.trim();
+            recap_excerpt = if value == "none" || value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
     }
 
-    Err(AppError::new(format!(
-        "missing state=... entry in {}",
-        path.display()
-    )))
+    Ok(ExpectedFixture {
+        state: state.ok_or_else(|| {
+            AppError::new(format!("missing state=... entry in {}", path.display()))
+        })?,
+        recap_present,
+        recap_excerpt,
+    })
 }
 
 fn render_control_log(lines: &[String]) -> String {
@@ -132,6 +165,22 @@ fn render_control_log(lines: &[String]) -> String {
     }
 }
 
+fn render_expected(
+    expected_state: SessionState,
+    recap_present: bool,
+    recap_excerpt: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "state={}\nrecap_present={}\n",
+        expected_state.as_str(),
+        recap_present
+    );
+    if let Some(recap_excerpt) = recap_excerpt {
+        out.push_str(&format!("recap_excerpt={}\n", recap_excerpt));
+    }
+    out
+}
+
 fn render_metadata(
     session_name: &str,
     target_pane: &str,
@@ -139,6 +188,8 @@ fn render_metadata(
     notifications: usize,
     classified_state: SessionState,
     expected_state: SessionState,
+    recap_present: bool,
+    recap_excerpt: Option<&str>,
     signals: &[String],
 ) -> String {
     let recorded_at_unix = SystemTime::now()
@@ -152,10 +203,14 @@ fn render_metadata(
         format!("signals={}", signals.join(","))
     };
 
+    let recap_excerpt_line = recap_excerpt.unwrap_or("none");
+
     format!(
-        "recorded_at_unix={recorded_at_unix}\nsession={session_name}\npane={target_pane}\noutput_events={output_events}\nnotifications={notifications}\nclassified_state={}\nexpected_state={}\n{signal_line}\n",
+        "recorded_at_unix={recorded_at_unix}\nsession={session_name}\npane={target_pane}\noutput_events={output_events}\nnotifications={notifications}\nclassified_state={}\nexpected_state={}\nrecap_present={}\nrecap_excerpt={}\n{signal_line}\n",
         classified_state.as_str(),
-        expected_state.as_str()
+        expected_state.as_str(),
+        recap_present,
+        recap_excerpt_line,
     )
 }
 
@@ -175,6 +230,7 @@ mod tests {
 
         assert_eq!(case.name, "permission_dialog");
         assert_eq!(case.expected_state, SessionState::PermissionDialog);
+        assert!(!case.recap_present);
         assert!(case.frame_text.contains("Allow once"));
     }
 
@@ -193,6 +249,8 @@ mod tests {
             target_pane: "%1",
             output_events: 3,
             notifications: 1,
+            recap_present: true,
+            recap_excerpt: Some("Summarized changes"),
             signals: &signals,
             frame_text: "Allow once",
             raw_control_lines: &[String::from("%output %1 test")],
@@ -208,6 +266,11 @@ mod tests {
             fs::read_to_string(recorded.case_dir.join("metadata.txt"))
                 .expect("metadata should load")
                 .contains("classified_state=PermissionDialog")
+        );
+        assert!(
+            fs::read_to_string(recorded.case_dir.join("expected.txt"))
+                .expect("expected should load")
+                .contains("recap_present=true")
         );
     }
 

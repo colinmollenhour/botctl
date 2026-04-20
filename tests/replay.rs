@@ -19,5 +19,7 @@ fn fixture_cases_classify_as_expected() {
             "fixture {} did not classify as expected",
             case.name
         );
+        assert_eq!(classification.recap_present, case.recap_present);
+        assert_eq!(classification.recap_excerpt, case.recap_excerpt);
     }
 }

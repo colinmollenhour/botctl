@@ -1,0 +1,9 @@
+Claude Code
+
+While you were away
+Away summary
+Fixed parser edge cases and resumed diagnostics review.
+
+Main chat input area
+
+Enter submit message

@@ -43,12 +43,17 @@ impl SessionState {
 pub struct Classification {
     pub source: String,
     pub state: SessionState,
+    pub recap_present: bool,
+    pub recap_excerpt: Option<String>,
     pub signals: Vec<String>,
 }
 
 impl Classification {
     pub fn render(&self) -> String {
         let mut out = format!("source={}\nstate={}", self.source, self.state.as_str());
+        out.push_str(&format!("\nrecap_present={}", self.recap_present));
+        out.push_str("\nrecap_excerpt=");
+        out.push_str(self.recap_excerpt.as_deref().unwrap_or("none"));
         if self.signals.is_empty() {
             out.push_str("\nsignals=none");
         } else {
@@ -65,6 +70,7 @@ pub struct Classifier;
 impl Classifier {
     pub fn classify(&self, source: &str, frame_text: &str) -> Classification {
         let normalized = normalize(frame_text);
+        let recap = detect_recap(frame_text, &normalized);
         let mut signals = Vec::new();
 
         let state = if contains_any(
@@ -166,9 +172,106 @@ impl Classifier {
         Classification {
             source: source.to_string(),
             state,
+            recap_present: recap.recap_present,
+            recap_excerpt: recap.recap_excerpt,
             signals,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RecapDetection {
+    recap_present: bool,
+    recap_excerpt: Option<String>,
+}
+
+fn detect_recap(frame_text: &str, normalized: &str) -> RecapDetection {
+    let strong_anchor = contains_any(normalized, &["while you were away", "away summary"])
+        || frame_text.lines().map(str::trim).any(is_recap_anchor);
+    if !strong_anchor {
+        return RecapDetection {
+            recap_present: false,
+            recap_excerpt: None,
+        };
+    }
+
+    let excerpt = extract_recap_excerpt(frame_text);
+
+    RecapDetection {
+        recap_present: true,
+        recap_excerpt: excerpt,
+    }
+}
+
+fn extract_recap_excerpt(frame_text: &str) -> Option<String> {
+    let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
+    let anchor_index = lines.iter().position(|line| is_recap_anchor(line))?;
+
+    if let Some(inline) = inline_recap_excerpt(lines[anchor_index]) {
+        return Some(inline);
+    }
+
+    let mut summary_lines = Vec::new();
+    let mut i = anchor_index;
+    while i < lines.len() && is_recap_anchor(lines[i]) {
+        i += 1;
+    }
+
+    while i < lines.len() && summary_lines.len() < 3 {
+        let line = lines[i];
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+        if is_recap_stop(line) {
+            break;
+        }
+        summary_lines.push(line.chars().take(120).collect::<String>());
+        i += 1;
+    }
+
+    if summary_lines.is_empty() {
+        lines.get(anchor_index).map(|line| (*line).to_string())
+    } else {
+        Some(summary_lines.join(" | "))
+    }
+}
+
+fn is_recap_anchor(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("while you were away")
+        || lower.contains("away summary")
+        || lower.starts_with("※ recap:")
+        || lower.starts_with("recap:")
+}
+
+fn inline_recap_excerpt(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    for prefix in ["※ recap:", "recap:"] {
+        if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            let excerpt = trimmed[prefix.len()..].trim();
+            if excerpt.is_empty() {
+                return None;
+            }
+            return Some(excerpt.chars().take(240).collect::<String>());
+        }
+    }
+    None
+}
+
+fn is_recap_stop(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "main chat input area",
+            "enter submit message",
+            "chat:",
+            "press esc to interrupt",
+            "esc to interrupt",
+        ],
+    ) || line == "Claude"
+        || line == ">"
 }
 
 fn normalize(input: &str) -> String {
@@ -228,5 +331,51 @@ mod tests {
         let frame = "Open in your editor\nClose the editor to continue";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::ExternalEditorActive);
+    }
+
+    #[test]
+    fn detects_recap_only_with_strong_anchors() {
+        let frame = "While you were away\nSummarized changes";
+        let result = Classifier.classify("test", frame);
+        assert!(result.recap_present);
+        assert_eq!(result.recap_excerpt.as_deref(), Some("Summarized changes"));
+    }
+
+    #[test]
+    fn ignores_recap_command_mention_alone() {
+        let frame = "/recap\nEnter submit message\nClaude";
+        let result = Classifier.classify("test", frame);
+        assert!(!result.recap_present);
+    }
+
+    #[test]
+    fn detects_inline_recap_banner() {
+        let frame = "※ recap: Goal: DEV-2812 Step 1 landed on MR !2505. Next: watch the next pipeline run.\n❯";
+        let result = Classifier.classify("test", frame);
+        assert!(result.recap_present);
+        assert_eq!(
+            result.recap_excerpt.as_deref(),
+            Some("Goal: DEV-2812 Step 1 landed on MR !2505. Next: watch the next pipeline run.")
+        );
+    }
+
+    #[test]
+    fn renders_recap_metadata() {
+        let result = Classifier.classify("test", "While you were away\nFixed parser edge cases");
+        let rendered = result.render();
+        assert!(rendered.contains("recap_present=true"));
+        assert!(rendered.contains("recap_excerpt=Fixed parser edge cases"));
+    }
+
+    #[test]
+    fn recap_can_coexist_with_chat_ready() {
+        let frame = "While you were away\nFixed parser edge cases\nMain chat input area\nEnter submit message";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.recap_present);
+        assert_eq!(
+            result.recap_excerpt.as_deref(),
+            Some("Fixed parser edge cases")
+        );
     }
 }

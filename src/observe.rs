@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::app::{AppError, AppResult};
+use crate::app::{AppError, AppResult, focused_frame_source};
 use crate::classifier::{Classification, Classifier};
 use crate::tmux::TmuxClient;
 
@@ -127,7 +127,7 @@ pub fn collect_observation(
 
     let live_excerpt = pane_output.remove(&target_pane).unwrap_or_default();
     let captured_frame = client.capture_pane(&target_pane, request.history_lines)?;
-    let classification = Classifier.classify(&target_pane, &captured_frame);
+    let classification = Classifier.classify(&target_pane, &focused_frame_source(&captured_frame));
 
     Ok(CollectedObservation {
         raw_control_lines: raw_lines,
@@ -215,6 +215,7 @@ fn trim_block(input: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ControlEvent, decode_tmux_escaped, parse_control_line};
+    use crate::classifier::{Classification, SessionState};
 
     #[test]
     fn parses_output_event() {
@@ -246,5 +247,29 @@ mod tests {
     fn decodes_tmux_octal_escapes() {
         let decoded = decode_tmux_escaped("hello\\040world\\015\\012");
         assert_eq!(decoded, "hello world\r\n");
+    }
+
+    #[test]
+    fn renders_recap_in_observe_report() {
+        let report = super::ObserveReport {
+            session_name: String::from("demo"),
+            target_pane: String::from("%1"),
+            output_events: 1,
+            notifications: 0,
+            seen_panes: vec![String::from("%1")],
+            live_excerpt: String::from("While you were away"),
+            captured_frame: String::from("While you were away\nClaude"),
+            classification: Classification {
+                source: String::from("test"),
+                state: SessionState::ChatReady,
+                recap_present: true,
+                recap_excerpt: Some(String::from("While you were away")),
+                signals: vec![],
+            },
+        };
+
+        let rendered = report.render();
+        assert!(rendered.contains("recap_present=true"));
+        assert!(rendered.contains("recap_excerpt=While you were away"));
     }
 }
