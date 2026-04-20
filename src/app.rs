@@ -161,10 +161,17 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
 fn run_status(args: StatusArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    let classification = classify_pane(&client, &args.pane_id, args.history_lines)?;
+    let frame = client.capture_pane(&args.pane_id, args.history_lines)?;
+    let focused = focused_frame_source(&frame);
+    let classification = Classifier.classify(&args.pane_id, &focused);
     let bindings = inspect_keybindings(None).map_err(AppError::new)?;
 
-    Ok(render_status_report(&pane, &classification, &bindings))
+    Ok(render_status_report(
+        &pane,
+        &classification,
+        &bindings,
+        &frame,
+    ))
 }
 
 fn run_doctor(args: DoctorArgs) -> AppResult<String> {
@@ -174,13 +181,15 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         args.session_name.as_deref(),
         args.pane_id.as_deref(),
     )?;
-    let classification = classify_pane(&client, &pane.pane_id, args.history_lines)?;
+    let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
+    let focused = focused_frame_source(&frame);
+    let classification = Classifier.classify(&pane.pane_id, &focused);
     let bindings = inspect_keybindings(args.bindings_path.as_deref()).map_err(AppError::new)?;
     let automation_ready =
         is_pane_command_claude(&pane) && bindings.status == KeybindingsStatus::Valid;
 
     Ok(format!(
-        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nsignals={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
+        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
         automation_ready,
         pane.pane_id,
         pane.session_name,
@@ -192,6 +201,8 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         render_cursor(&pane),
         classification.state.as_str(),
         render_signals(&classification),
+        render_screen_excerpt(&frame),
+        render_next_safe_action(&classification, &pane, &bindings),
         bindings.path.display(),
         bindings.status.as_str(),
         render_missing_bindings(&bindings),
@@ -493,9 +504,13 @@ fn classify_pane(
     history_lines: usize,
 ) -> AppResult<Classification> {
     let frame = client.capture_pane(pane_id, history_lines)?;
-    let focused = focus_live_frame(&frame, 15);
-    let frame_for_classification = if focused.is_empty() { &frame } else { &focused };
-    Ok(Classifier.classify(pane_id, frame_for_classification))
+    let focused = focused_frame_source(&frame);
+    Ok(Classifier.classify(pane_id, &focused))
+}
+
+fn focused_frame_source(frame: &str) -> String {
+    let focused = focus_live_frame(frame, 15);
+    if focused.is_empty() { frame.to_string() } else { focused }
 }
 
 fn ensure_workflow_state(
@@ -746,9 +761,10 @@ fn render_status_report(
     pane: &TmuxPane,
     classification: &Classification,
     bindings: &KeybindingsInspection,
+    frame: &str,
 ) -> String {
     format!(
-        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nsignals={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
+        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
         pane.pane_id,
         pane.session_name,
         pane.window_name,
@@ -758,10 +774,40 @@ fn render_status_report(
         render_cursor(pane),
         classification.state.as_str(),
         render_signals(classification),
+        render_screen_excerpt(frame),
+        render_next_safe_action(classification, pane, bindings),
         bindings.path.display(),
         bindings.status.as_str(),
         render_missing_bindings(bindings)
     )
+}
+
+fn render_screen_excerpt(frame: &str) -> String {
+    let excerpt = focus_live_frame(frame, 8);
+    if excerpt.is_empty() { String::from("none") } else { excerpt.replace('\n', " | ") }
+}
+
+fn render_next_safe_action(
+    classification: &Classification,
+    pane: &TmuxPane,
+    bindings: &KeybindingsInspection,
+) -> String {
+    if !is_pane_command_claude(pane) {
+        return format!("manual-review: pane is running {}", pane.current_command);
+    }
+    if bindings.status != KeybindingsStatus::Valid {
+        return String::from("manual-review: fix Claude keybindings before automation");
+    }
+    match classification.state {
+        SessionState::ChatReady => String::from("safe-action: submit-prompt"),
+        SessionState::BusyResponding => String::from("safe-action: wait"),
+        SessionState::PermissionDialog => String::from("safe-action: approve-permission"),
+        SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey"),
+        SessionState::FolderTrustPrompt => String::from("safe-action: approve-permission (Enter)"),
+        SessionState::DiffDialog => String::from("manual-review: diff dialog needs operator confirmation"),
+        SessionState::ExternalEditorActive => String::from("manual-review: external editor is active"),
+        SessionState::Unknown => String::from("manual-review: classify the pane before acting"),
+    }
 }
 
 fn render_cursor(pane: &TmuxPane) -> String {
@@ -862,10 +908,11 @@ fn parse_expected_state_arg(
 mod tests {
     use super::{
         RecoveryAction, ensure_pane_owned_by_claude, ensure_state_transition, is_usable_state,
-        recovery_action_for_state,
+        recovery_action_for_state, render_next_safe_action, render_screen_excerpt,
     };
     use crate::classifier::Classification;
     use crate::classifier::SessionState;
+    use crate::automation::{KeybindingsInspection, KeybindingsStatus};
     use crate::tmux::TmuxPane;
 
     fn sample_pane(current_command: &str) -> TmuxPane {
@@ -878,6 +925,14 @@ mod tests {
             pane_active: true,
             cursor_x: Some(0),
             cursor_y: Some(0),
+        }
+    }
+
+    fn sample_bindings(status: KeybindingsStatus) -> KeybindingsInspection {
+        KeybindingsInspection {
+            path: std::path::PathBuf::from("/tmp/keybindings.json"),
+            status,
+            missing_bindings: vec![],
         }
     }
 
@@ -943,5 +998,37 @@ mod tests {
         let error = ensure_state_transition(&before, &after, "approve-permission")
             .expect_err("unchanged state should fail");
         assert!(error.to_string().contains("potentially stale screen data"));
+    }
+
+    #[test]
+    fn renders_a_focused_screen_excerpt() {
+        let excerpt = render_screen_excerpt("\n\nfirst\n\nsecond\nthird\n");
+        assert_eq!(excerpt, "first | second | third");
+    }
+
+    #[test]
+    fn maps_state_to_safe_next_action_or_review() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            signals: vec![],
+        };
+        assert_eq!(
+            render_next_safe_action(
+                &classification,
+                &sample_pane("claude"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "safe-action: approve-permission"
+        );
+        assert!(render_next_safe_action(
+            &Classification {
+                state: SessionState::Unknown,
+                ..classification.clone()
+            },
+            &sample_pane("claude"),
+            &sample_bindings(KeybindingsStatus::Valid)
+        )
+        .starts_with("manual-review:"));
     }
 }
