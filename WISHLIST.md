@@ -2,9 +2,9 @@
 
 ## Checklist
 
-1. [ ] P0-1 Attach to existing Claude tmux targets.
-2. [ ] P0-2 Add `continue-session` and `auto-unstick` commands.
-3. [ ] P0-3 Validate Claude ownership before driving a pane.
+1. [x] P0-1 Attach to existing Claude tmux targets.
+2. [x] P0-2 Add `continue-session` and `auto-unstick` commands.
+3. [x] P0-3 Validate Claude ownership before driving a pane.
 4. [ ] P0-4 Keep higher-level automation state-aware.
 5. [ ] P0-5 Improve live status and doctor output.
 6. [ ] P1-1 Replace the bounded observer with a long-lived control-mode connection.
@@ -96,3 +96,15 @@ The unit and replay coverage is useful, but real-session tests are needed to tru
 
 6. Add docs, packaging, and release automation.
 The repo still needs installation instructions, a real `README.md`, CI, and a release story. None of that changes core behavior, but it is required if `sdmux` is going to be used beyond local development.
+
+## Questions For Review
+
+- Should `attach` stay a one-shot target resolver, or should it persist adopted target metadata for later commands?
+- Is `pane_current_command == "claude"` sufficient ownership validation, or do adopted panes need a stronger proof before automation is allowed?
+- Should `continue-session` and `auto-unstick` stay limited to trust, permission, and survey blockers, or should they grow to cover repeated permissions, diff dialogs, and other flows?
+- Which confirmation-style screens must become distinct classifier states before more automation is allowed, and which should remain manual-review only?
+- Is the current focused `capture-pane` excerpt good enough for `status` and `doctor`, or should those commands wait for a persistent observer before claiming stronger live-screen accuracy?
+- What should trigger `capture-pane` reconciliation once streamed observation lands: timer, post-action validation, ambiguity, or all three?
+- Should tracked session identity remain raw `pane_id`, or do we need persisted instance metadata that survives pane swaps, renames, and window changes?
+- Do classifier confidence/drift and versioned fixture corpora need to land before more automation, or can they wait for the persistent observer?
+- Before expanding the feature surface further, is the next investment JSON/CLI contracts, real tmux end-to-end tests, or docs/packaging/release automation?
