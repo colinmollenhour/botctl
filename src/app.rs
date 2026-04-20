@@ -11,9 +11,9 @@ use crate::automation::{
 };
 use crate::classifier::{Classification, Classifier, SessionState};
 use crate::cli::{
-    CaptureArgs, ClassifyArgs, Command, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
-    ObserveArgs, PaneCommandArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs,
-    StartArgs, StatusArgs, SubmitPromptArgs,
+    AttachArgs, CaptureArgs, ClassifyArgs, Command, DoctorArgs, EditorHelperArgs,
+    InstallBindingsArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
+    RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs, StatusArgs, SubmitPromptArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
@@ -57,6 +57,7 @@ impl From<std::io::Error> for AppError {
 pub fn run(command: Command) -> AppResult<String> {
     match command {
         Command::Start(args) => run_start(args),
+        Command::Attach(args) => run_attach(args),
         Command::ListPanes => run_list_panes(),
         Command::Capture(args) => run_capture(args),
         Command::Status(args) => run_status(args),
@@ -110,6 +111,17 @@ fn run_start(args: StartArgs) -> AppResult<String> {
             started.cwd.display()
         ))
     }
+}
+
+fn run_attach(args: AttachArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = resolve_target_pane(&client, &args.target)?;
+    ensure_pane_owned_by_claude(&pane)?;
+
+    Ok(format!(
+        "attached pane={} session={} window={} command={} cwd={}",
+        pane.pane_id, pane.session_name, pane.window_name, pane.current_command, pane.current_path
+    ))
 }
 
 fn run_list_panes() -> AppResult<String> {
@@ -462,6 +474,30 @@ fn resolve_pane_by_id(client: &TmuxClient, pane_id: &str) -> AppResult<TmuxPane>
         .ok_or_else(|| AppError::new(format!("pane not found: {pane_id}")))
 }
 
+fn resolve_target_pane(client: &TmuxClient, target: &PaneTargetArgs) -> AppResult<TmuxPane> {
+    match (
+        target.pane_id.as_deref(),
+        target.session_name.as_deref(),
+        target.window_name.as_deref(),
+    ) {
+        (Some(pane_id), None, None) => resolve_pane_by_id(client, pane_id),
+        (None, Some(session_name), None) => client
+            .active_pane_for_session(session_name)?
+            .ok_or_else(|| AppError::new(format!("no active pane found for session {session_name}"))),
+        (None, Some(session_name), Some(window_name)) => client
+            .active_pane_for_window(session_name, window_name)?
+            .ok_or_else(|| {
+                AppError::new(format!(
+                    "no active pane found for session {} window {}",
+                    session_name, window_name
+                ))
+            }),
+        _ => Err(AppError::new(
+            "target must use either --pane %ID or --session NAME [--window NAME]",
+        )),
+    }
+}
+
 fn resolve_doctor_pane(
     client: &TmuxClient,
     session_name: Option<&str>,
@@ -529,6 +565,17 @@ fn render_missing_bindings(bindings: &KeybindingsInspection) -> String {
 
 fn is_pane_command_claude(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("claude")
+}
+
+fn ensure_pane_owned_by_claude(pane: &TmuxPane) -> AppResult<()> {
+    if is_pane_command_claude(pane) {
+        Ok(())
+    } else {
+        Err(AppError::new(format!(
+            "refusing to drive pane {} because current command is {} instead of claude",
+            pane.pane_id, pane.current_command
+        )))
+    }
 }
 
 fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspection) -> String {

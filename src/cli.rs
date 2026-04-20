@@ -5,6 +5,7 @@ use crate::app::{AppError, AppResult};
 #[derive(Debug, Clone)]
 pub enum Command {
     Start(StartArgs),
+    Attach(AttachArgs),
     ListPanes,
     Capture(CaptureArgs),
     Status(StatusArgs),
@@ -32,6 +33,18 @@ pub struct StartArgs {
     pub cwd: Option<PathBuf>,
     pub command: String,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTargetArgs {
+    pub pane_id: Option<String>,
+    pub session_name: Option<String>,
+    pub window_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachArgs {
+    pub target: PaneTargetArgs,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +155,7 @@ where
 
     match subcommand.as_str() {
         "start" => parse_start(rest),
+        "attach" => parse_attach(rest),
         "list-panes" => Ok(Command::ListPanes),
         "capture" => parse_capture(rest),
         "status" => parse_status(rest),
@@ -174,6 +188,7 @@ pub fn usage() -> String {
           \n\
           Commands:\n\
             start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
+            attach (--pane %ID | --session NAME [--window NAME])\n\
             list-panes\n\
             capture --pane %ID [--history-lines N]\n\
             status --pane %ID [--history-lines N]\n\
@@ -236,6 +251,11 @@ fn parse_start(args: Vec<String>) -> AppResult<Command> {
         command,
         dry_run,
     }))
+}
+
+fn parse_attach(args: Vec<String>) -> AppResult<Command> {
+    let target = parse_pane_target_args(args, "attach")?;
+    Ok(Command::Attach(AttachArgs { target }))
 }
 
 fn parse_capture(args: Vec<String>) -> AppResult<Command> {
@@ -549,6 +569,55 @@ fn parse_pane_command(
     Ok(command(PaneCommandArgs { pane_id }))
 }
 
+fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<PaneTargetArgs> {
+    let mut pane_id = None;
+    let mut session_name = None;
+    let mut window_name = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--window" => {
+                window_name = Some(read_value(&args, &mut i, "--window")?);
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown {command_name} flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    match (&pane_id, &session_name, &window_name) {
+        (Some(_), None, None) => Ok(PaneTargetArgs {
+            pane_id,
+            session_name,
+            window_name,
+        }),
+        (None, Some(_), _) => Ok(PaneTargetArgs {
+            pane_id,
+            session_name,
+            window_name,
+        }),
+        (Some(_), Some(_), _) | (Some(_), None, Some(_)) => Err(AppError::new(format!(
+            "{command_name} target must use either --pane %ID or --session NAME [--window NAME]"
+        ))),
+        (None, None, Some(_)) => Err(AppError::new(format!(
+            "{command_name} requires --session NAME when --window NAME is provided"
+        ))),
+        (None, None, None) => Err(AppError::new(format!(
+            "{command_name} requires either --pane %ID or --session NAME"
+        ))),
+    }
+}
+
 fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut state_dir = None;
@@ -766,6 +835,43 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_attach_command_with_session_window_target() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("attach"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--window"),
+            String::from("claude"),
+        ])
+        .expect("attach command should parse");
+
+        match command {
+            Command::Attach(args) => {
+                assert_eq!(args.target.session_name.as_deref(), Some("demo"));
+                assert_eq!(args.target.window_name.as_deref(), Some("claude"));
+                assert!(args.target.pane_id.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_attach_window_without_session() {
+        let error = parse_args(vec![
+            String::from("sdmux"),
+            String::from("attach"),
+            String::from("--window"),
+            String::from("claude"),
+        ])
+        .expect_err("attach should reject window-only target");
+
+        assert!(error
+            .to_string()
+            .contains("attach requires --session NAME when --window NAME is provided"));
     }
 
     #[test]

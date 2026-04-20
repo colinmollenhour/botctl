@@ -119,6 +119,16 @@ impl TmuxClient {
         Ok(panes.into_iter().find(|pane| pane.pane_active))
     }
 
+    pub fn active_pane_for_window(
+        &self,
+        session_name: &str,
+        window_name: &str,
+    ) -> AppResult<Option<TmuxPane>> {
+        let target = format!("{session_name}:{window_name}");
+        let panes = self.list_panes_for_target(Some(&target))?;
+        Ok(panes.into_iter().find(|pane| pane.pane_active))
+    }
+
     pub fn pane_by_id(&self, pane_id: &str) -> AppResult<Option<TmuxPane>> {
         let panes = self.list_panes_for_target(Some(pane_id))?;
         Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
