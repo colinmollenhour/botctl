@@ -11,9 +11,10 @@ use crate::automation::{
 };
 use crate::classifier::{Classification, Classifier, SessionState};
 use crate::cli::{
-    AttachArgs, CaptureArgs, ClassifyArgs, Command, DoctorArgs, EditorHelperArgs,
-    InstallBindingsArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
-    RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs, StatusArgs, SubmitPromptArgs,
+    AttachArgs, AutoUnstickArgs, CaptureArgs, ClassifyArgs, Command, ContinueSessionArgs,
+    DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ObserveArgs, PaneCommandArgs,
+    PaneTargetArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs, StartArgs,
+    StatusArgs, SubmitPromptArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
@@ -24,6 +25,7 @@ use crate::prompt::{
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
+const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -78,6 +80,8 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::DismissSurvey(args) => {
             run_guarded_pane_workflow(args, GuardedWorkflow::DismissSurvey)
         }
+        Command::ContinueSession(args) => run_continue_session(args),
+        Command::AutoUnstick(args) => run_auto_unstick(args),
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
@@ -331,6 +335,94 @@ fn run_guarded_pane_workflow(
     ))
 }
 
+fn run_continue_session(args: ContinueSessionArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = resolve_target_pane(&client, &args.target)?;
+    ensure_pane_owned_by_claude(&pane)?;
+    let before = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let outcome = continue_from_classification(&client, &pane, &before)?;
+
+    if !is_usable_state(outcome.after.state) && outcome.action != "none" {
+        return Err(AppError::new(format!(
+            "continue-session sent {} but pane {} is still in state {}",
+            outcome.action,
+            pane.pane_id,
+            outcome.after.state.as_str()
+        )));
+    }
+
+    Ok(format!(
+        "continue-session pane={} before={} after={} action={} outcome={}",
+        pane.pane_id,
+        before.state.as_str(),
+        outcome.after.state.as_str(),
+        outcome.action,
+        outcome.outcome
+    ))
+}
+
+fn run_auto_unstick(args: AutoUnstickArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = resolve_target_pane(&client, &args.target)?;
+    ensure_pane_owned_by_claude(&pane)?;
+    let mut actions = Vec::new();
+    let mut approved_permission = false;
+    let mut current = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+
+    for _ in 0..args.max_steps {
+        if is_usable_state(current.state) {
+            let action_summary = if actions.is_empty() {
+                String::from("none")
+            } else {
+                actions.join(",")
+            };
+            return Ok(format!(
+                "auto-unstick pane={} final_state={} actions={} steps={}",
+                pane.pane_id,
+                current.state.as_str(),
+                action_summary,
+                actions.len()
+            ));
+        }
+
+        if approved_permission && current.state == SessionState::PermissionDialog {
+            return Err(AppError::new(format!(
+                "auto-unstick refuses to approve more than one permission dialog for pane {}",
+                pane.pane_id
+            )));
+        }
+
+        let outcome = continue_from_classification(&client, &pane, &current)?;
+        if outcome.used_permission_approval {
+            approved_permission = true;
+        }
+        actions.push(outcome.action);
+        current = outcome.after;
+    }
+
+    if is_usable_state(current.state) {
+        let action_summary = if actions.is_empty() {
+            String::from("none")
+        } else {
+            actions.join(",")
+        };
+        Ok(format!(
+            "auto-unstick pane={} final_state={} actions={} steps={}",
+            pane.pane_id,
+            current.state.as_str(),
+            action_summary,
+            actions.len()
+        ))
+    } else {
+        Err(AppError::new(format!(
+            "auto-unstick stopped after {} steps with pane {} still in state {}",
+            args.max_steps,
+            pane.pane_id,
+            current.state.as_str()
+        )))
+    }
+}
+
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
@@ -437,6 +529,131 @@ fn render_action_names(actions: &[AutomationAction]) -> String {
         .map(|action| action.as_str())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn is_usable_state(state: SessionState) -> bool {
+    matches!(state, SessionState::ChatReady | SessionState::BusyResponding)
+}
+
+#[derive(Debug, Clone)]
+struct ContinueOutcome {
+    action: String,
+    outcome: String,
+    after: Classification,
+    used_permission_approval: bool,
+}
+
+fn continue_from_classification(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    classification: &Classification,
+) -> AppResult<ContinueOutcome> {
+    match recovery_action_for_state(classification.state)? {
+        Some(RecoveryAction::ApprovePermission) => {
+            let bindings = load_automation_keybindings(None)?;
+            send_actions(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::ApprovePermission.actions(),
+                &bindings,
+                0,
+            )?;
+            thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
+            let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            ensure_state_transition(classification, &after, "approve-permission")?;
+            Ok(ContinueOutcome {
+                action: String::from("approve-permission"),
+                outcome: render_continue_outcome(after.state),
+                after,
+                used_permission_approval: true,
+            })
+        }
+        Some(RecoveryAction::DismissSurvey) => {
+            let bindings = load_automation_keybindings(None)?;
+            send_actions(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::DismissSurvey.actions(),
+                &bindings,
+                0,
+            )?;
+            thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
+            let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            ensure_state_transition(classification, &after, "dismiss-survey")?;
+            Ok(ContinueOutcome {
+                action: String::from("dismiss-survey"),
+                outcome: render_continue_outcome(after.state),
+                after,
+                used_permission_approval: false,
+            })
+        }
+        Some(RecoveryAction::ConfirmFolderTrust) => {
+            client.send_keys(&pane.pane_id, &["Enter"])?;
+            thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
+            let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            ensure_state_transition(classification, &after, "confirm-folder-trust")?;
+            Ok(ContinueOutcome {
+                action: String::from("confirm-folder-trust"),
+                outcome: render_continue_outcome(after.state),
+                after,
+                used_permission_approval: false,
+            })
+        }
+        None => Ok(ContinueOutcome {
+            action: String::from("none"),
+            outcome: String::from("already-usable"),
+            after: classification.clone(),
+            used_permission_approval: false,
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAction {
+    ApprovePermission,
+    DismissSurvey,
+    ConfirmFolderTrust,
+}
+
+fn recovery_action_for_state(state: SessionState) -> AppResult<Option<RecoveryAction>> {
+    match state {
+        SessionState::ChatReady | SessionState::BusyResponding => Ok(None),
+        SessionState::PermissionDialog => Ok(Some(RecoveryAction::ApprovePermission)),
+        SessionState::SurveyPrompt => Ok(Some(RecoveryAction::DismissSurvey)),
+        SessionState::FolderTrustPrompt => Ok(Some(RecoveryAction::ConfirmFolderTrust)),
+        SessionState::DiffDialog => Err(AppError::new(
+            "no safe automatic recovery is defined for DiffDialog; review the pane manually",
+        )),
+        SessionState::ExternalEditorActive => Err(AppError::new(
+            "no safe automatic recovery is defined while the external editor is active",
+        )),
+        SessionState::Unknown => Err(AppError::new(
+            "no safe automatic recovery is defined for Unknown state; refusing to guess",
+        )),
+    }
+}
+
+fn render_continue_outcome(state: SessionState) -> String {
+    if is_usable_state(state) {
+        String::from("usable")
+    } else {
+        format!("still-blocked:{}", state.as_str())
+    }
+}
+
+fn ensure_state_transition(
+    before: &Classification,
+    after: &Classification,
+    action: &str,
+) -> AppResult<()> {
+    if before.state == after.state {
+        Err(AppError::new(format!(
+            "{action} did not change the classified state from {}; refusing to retry on potentially stale screen data",
+            before.state.as_str()
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn focus_live_frame(frame: &str, max_non_empty_lines: usize) -> String {
@@ -643,7 +860,12 @@ fn parse_expected_state_arg(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_pane_owned_by_claude;
+    use super::{
+        RecoveryAction, ensure_pane_owned_by_claude, ensure_state_transition, is_usable_state,
+        recovery_action_for_state,
+    };
+    use crate::classifier::Classification;
+    use crate::classifier::SessionState;
     use crate::tmux::TmuxPane;
 
     fn sample_pane(current_command: &str) -> TmuxPane {
@@ -671,5 +893,55 @@ mod tests {
             .expect_err("non-claude pane should fail ownership check");
 
         assert!(error.to_string().contains("instead of claude"));
+    }
+
+    #[test]
+    fn auto_unstick_treats_busy_and_ready_as_usable() {
+        assert!(is_usable_state(SessionState::ChatReady));
+        assert!(is_usable_state(SessionState::BusyResponding));
+        assert!(!is_usable_state(SessionState::PermissionDialog));
+    }
+
+    #[test]
+    fn chooses_recovery_actions_for_known_blockers() {
+        assert_eq!(
+            recovery_action_for_state(SessionState::PermissionDialog)
+                .expect("permission dialog should map")
+                .expect("permission dialog should need recovery"),
+            RecoveryAction::ApprovePermission
+        );
+        assert_eq!(
+            recovery_action_for_state(SessionState::SurveyPrompt)
+                .expect("survey should map")
+                .expect("survey should need recovery"),
+            RecoveryAction::DismissSurvey
+        );
+        assert_eq!(
+            recovery_action_for_state(SessionState::FolderTrustPrompt)
+                .expect("folder trust should map")
+                .expect("folder trust should need recovery"),
+            RecoveryAction::ConfirmFolderTrust
+        );
+    }
+
+    #[test]
+    fn refuses_recovery_for_ambiguous_states() {
+        let error = recovery_action_for_state(SessionState::Unknown)
+            .expect_err("unknown state should fail recovery planning");
+        assert!(error.to_string().contains("refusing to guess"));
+    }
+
+    #[test]
+    fn refuses_retry_when_state_does_not_change() {
+        let before = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            signals: vec![String::from("permission-keywords")],
+        };
+        let after = before.clone();
+
+        let error = ensure_state_transition(&before, &after, "approve-permission")
+            .expect_err("unchanged state should fail");
+        assert!(error.to_string().contains("potentially stale screen data"));
     }
 }

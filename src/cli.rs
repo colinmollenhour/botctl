@@ -20,6 +20,8 @@ pub enum Command {
     ApprovePermission(PaneCommandArgs),
     RejectPermission(PaneCommandArgs),
     DismissSurvey(PaneCommandArgs),
+    ContinueSession(ContinueSessionArgs),
+    AutoUnstick(AutoUnstickArgs),
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
@@ -45,6 +47,17 @@ pub struct PaneTargetArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachArgs {
     pub target: PaneTargetArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinueSessionArgs {
+    pub target: PaneTargetArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoUnstickArgs {
+    pub target: PaneTargetArgs,
+    pub max_steps: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +187,8 @@ where
             parse_pane_command(rest, "reject-permission", Command::RejectPermission)
         }
         "dismiss-survey" => parse_pane_command(rest, "dismiss-survey", Command::DismissSurvey),
+        "continue-session" => parse_continue_session(rest),
+        "auto-unstick" => parse_auto_unstick(rest),
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
@@ -203,6 +218,8 @@ pub fn usage() -> String {
             approve-permission --pane %ID\n\
             reject-permission --pane %ID\n\
             dismiss-survey --pane %ID\n\
+            continue-session (--pane %ID | --session NAME --window NAME)\n\
+            auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
             submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n",
@@ -569,6 +586,39 @@ fn parse_pane_command(
     Ok(command(PaneCommandArgs { pane_id }))
 }
 
+fn parse_continue_session(args: Vec<String>) -> AppResult<Command> {
+    let target = parse_pane_target_args(args, "continue-session")?;
+    validate_send_target(&target, "continue-session")?;
+    Ok(Command::ContinueSession(ContinueSessionArgs { target }))
+}
+
+fn parse_auto_unstick(args: Vec<String>) -> AppResult<Command> {
+    let mut max_steps = 6usize;
+    let mut target_args = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--max-steps" {
+            let raw = read_value(&args, &mut i, "--max-steps")?;
+            max_steps = raw
+                .parse::<usize>()
+                .map_err(|_| AppError::new(format!("invalid value for --max-steps: {raw}")))?;
+        } else {
+            target_args.push(args[i].clone());
+        }
+        i += 1;
+    }
+
+    let target = parse_pane_target_args(target_args, "auto-unstick")?;
+    validate_send_target(&target, "auto-unstick")?;
+    if max_steps == 0 {
+        return Err(AppError::new(
+            "auto-unstick requires --max-steps to be at least 1",
+        ));
+    }
+    Ok(Command::AutoUnstick(AutoUnstickArgs { target, max_steps }))
+}
+
 fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<PaneTargetArgs> {
     let mut pane_id = None;
     let mut session_name = None;
@@ -614,6 +664,19 @@ fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<Pa
         ))),
         (None, None, None) => Err(AppError::new(format!(
             "{command_name} requires either --pane %ID or --session NAME"
+        ))),
+    }
+}
+
+fn validate_send_target(target: &PaneTargetArgs, command_name: &str) -> AppResult<()> {
+    match (
+        target.pane_id.as_deref(),
+        target.session_name.as_deref(),
+        target.window_name.as_deref(),
+    ) {
+        (Some(_), None, None) | (None, Some(_), Some(_)) => Ok(()),
+        _ => Err(AppError::new(format!(
+            "{command_name} requires --pane %ID or --session NAME --window NAME"
         ))),
     }
 }
@@ -986,5 +1049,80 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_continue_session_command() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("continue-session"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--window"),
+            String::from("claude"),
+        ])
+        .expect("continue-session command should parse");
+
+        match command {
+            Command::ContinueSession(args) => {
+                assert_eq!(args.target.session_name.as_deref(), Some("demo"));
+                assert_eq!(args.target.window_name.as_deref(), Some("claude"));
+                assert!(args.target.pane_id.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_continue_session_session_only_target() {
+        let error = parse_args(vec![
+            String::from("sdmux"),
+            String::from("continue-session"),
+            String::from("--session"),
+            String::from("demo"),
+        ])
+        .expect_err("continue-session should reject ambiguous session-only targets");
+
+        assert!(error
+            .to_string()
+            .contains("continue-session requires --pane %ID or --session NAME --window NAME"));
+    }
+
+    #[test]
+    fn parses_auto_unstick_command() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("auto-unstick"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--max-steps"),
+            String::from("4"),
+        ])
+        .expect("auto-unstick command should parse");
+
+        match command {
+            Command::AutoUnstick(args) => {
+                assert_eq!(args.target.pane_id.as_deref(), Some("%9"));
+                assert_eq!(args.max_steps, 4);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_auto_unstick_zero_steps() {
+        let error = parse_args(vec![
+            String::from("sdmux"),
+            String::from("auto-unstick"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--max-steps"),
+            String::from("0"),
+        ])
+        .expect_err("auto-unstick should reject zero max steps");
+
+        assert!(error
+            .to_string()
+            .contains("auto-unstick requires --max-steps to be at least 1"));
     }
 }
