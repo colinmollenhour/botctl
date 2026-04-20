@@ -1,0 +1,5 @@
+Review changes before applying
+
+Keep changes
+Discard changes
+View details

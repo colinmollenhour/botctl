@@ -72,8 +72,11 @@ impl Classifier {
             &[
                 "quick safety check",
                 "yes, i trust this folder",
+                "i trust this folder",
+                "trust this folder",
                 "accessing workspace:",
                 "security guide",
+                "this folder",
             ],
         ) && contains_any(&normalized, &["enter to confirm", "esc to cancel"])
         {
@@ -86,7 +89,7 @@ impl Classifier {
                 "allow for session",
                 "permission",
                 "confirm action",
-                "confirm",
+                "approve",
             ],
         ) && contains_any(&normalized, &["yes", "no", "enter", "escape"])
         {
@@ -99,6 +102,7 @@ impl Classifier {
                 "rate your experience",
                 "take our survey",
                 "survey",
+                "rate this conversation",
             ],
         ) {
             signals.push(String::from("survey-keywords"));
@@ -107,13 +111,26 @@ impl Classifier {
             &normalized,
             &[
                 "external editor",
+                "open in your editor",
                 "waiting for editor",
                 "close the editor to continue",
+                "editor to continue",
             ],
         ) {
             signals.push(String::from("external-editor-keywords"));
             SessionState::ExternalEditorActive
-        } else if contains_any(&normalized, &["diff", "accept", "reject", "view details"]) {
+        } else if contains_any(
+            &normalized,
+            &[
+                "diff",
+                "review changes",
+                "accept",
+                "reject",
+                "view details",
+                "keep changes",
+                "discard changes",
+            ],
+        ) {
             signals.push(String::from("diff-keywords"));
             SessionState::DiffDialog
         } else if contains_any(
@@ -124,6 +141,8 @@ impl Classifier {
                 "thinking",
                 "running",
                 "background task",
+                "still thinking",
+                "working",
             ],
         ) {
             signals.push(String::from("busy-keywords"));
@@ -177,6 +196,13 @@ mod tests {
     }
 
     #[test]
+    fn classifies_diff_dialog() {
+        let frame = "Review changes\nKeep changes\nDiscard changes\nView details";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::DiffDialog);
+    }
+
+    #[test]
     fn classifies_folder_trust_prompt() {
         let frame = "Accessing workspace:\n/home/colin/Projects/sdmux\nQuick safety check: Is this a project you created or one you trust?\nSecurity guide\n1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel";
         let result = Classifier.classify("test", frame);
@@ -188,5 +214,19 @@ mod tests {
         let frame = "How likely are you to recommend Claude Code to a friend?";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::SurveyPrompt);
+    }
+
+    #[test]
+    fn classifies_busy_responding() {
+        let frame = "Still thinking\nPress Esc to interrupt";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::BusyResponding);
+    }
+
+    #[test]
+    fn classifies_external_editor_active() {
+        let frame = "Open in your editor\nClose the editor to continue";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ExternalEditorActive);
     }
 }
