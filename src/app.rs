@@ -290,13 +290,16 @@ fn run_replay(args: ReplayArgs) -> AppResult<String> {
 fn run_send_action(args: SendActionArgs) -> AppResult<String> {
     let action = AutomationAction::from_str(&args.action)
         .ok_or_else(|| AppError::new(format!("unknown action: {}", args.action)))?;
+    let client = TmuxClient::default();
+    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    ensure_pane_owned_by_claude(&pane)?;
     let bindings = load_automation_keybindings(None)?;
     let keys = keys_for_action(&bindings, action)?;
-    TmuxClient::default().send_keys(&args.pane_id, keys)?;
+    client.send_keys(&pane.pane_id, keys)?;
     Ok(format!(
         "sent action={} pane={} keys={}",
         action.as_str(),
-        args.pane_id,
+        pane.pane_id,
         keys.join("+")
     ))
 }
@@ -306,21 +309,23 @@ fn run_guarded_pane_workflow(
     workflow: GuardedWorkflow,
 ) -> AppResult<String> {
     let client = TmuxClient::default();
+    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    ensure_pane_owned_by_claude(&pane)?;
     let bindings = load_automation_keybindings(None)?;
-    let classification = classify_pane(&client, &args.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     ensure_workflow_state(workflow, &classification)?;
     let executed_actions = if should_confirm_folder_trust_with_enter(workflow, &classification) {
-        client.send_keys(&args.pane_id, &["Enter"])?;
+        client.send_keys(&pane.pane_id, &["Enter"])?;
         String::from("enter")
     } else {
-        send_actions(&client, &args.pane_id, workflow.actions(), &bindings, 0)?;
+        send_actions(&client, &pane.pane_id, workflow.actions(), &bindings, 0)?;
         render_action_names(workflow.actions())
     };
 
     Ok(format!(
         "executed workflow={} pane={} state={} actions={}",
         workflow.as_str(),
-        args.pane_id,
+        pane.pane_id,
         classification.state.as_str(),
         executed_actions
     ))
@@ -362,8 +367,10 @@ fn run_editor_helper(args: EditorHelperArgs) -> AppResult<String> {
 
 fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     let client = TmuxClient::default();
+    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    ensure_pane_owned_by_claude(&pane)?;
     let bindings = load_automation_keybindings(None)?;
-    let classification = classify_pane(&client, &args.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     ensure_workflow_state(GuardedWorkflow::SubmitPrompt, &classification)?;
 
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
@@ -372,7 +379,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
 
     send_actions(
         &client,
-        &args.pane_id,
+        &pane.pane_id,
         &prompt_submission_sequence(),
         &bindings,
         args.submit_delay_ms,
@@ -381,7 +388,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     Ok(format!(
         "submitted prepared prompt session={} pane={} state={} pending_path={} delay_ms={}",
         args.session_name,
-        args.pane_id,
+        pane.pane_id,
         classification.state.as_str(),
         pending_path.display(),
         args.submit_delay_ms
@@ -631,5 +638,38 @@ fn parse_expected_state_arg(
         Some(value) => SessionState::from_str(value)
             .ok_or_else(|| AppError::new(format!("unknown session state: {value}"))),
         None => Ok(fallback),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_pane_owned_by_claude;
+    use crate::tmux::TmuxPane;
+
+    fn sample_pane(current_command: &str) -> TmuxPane {
+        TmuxPane {
+            pane_id: String::from("%1"),
+            session_name: String::from("demo"),
+            window_name: String::from("claude"),
+            current_command: current_command.to_string(),
+            current_path: String::from("/tmp/demo"),
+            pane_active: true,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+        }
+    }
+
+    #[test]
+    fn accepts_claude_owned_pane() {
+        ensure_pane_owned_by_claude(&sample_pane("claude"))
+            .expect("claude pane should pass ownership check");
+    }
+
+    #[test]
+    fn rejects_non_claude_owned_pane() {
+        let error = ensure_pane_owned_by_claude(&sample_pane("bash"))
+            .expect_err("non-claude pane should fail ownership check");
+
+        assert!(error.to_string().contains("instead of claude"));
     }
 }
