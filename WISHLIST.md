@@ -23,6 +23,7 @@
 19. [ ] P3-4 Improve CLI and scripting ergonomics.
 20. [ ] P3-5 Add end-to-end tests against real tmux sessions.
 21. [ ] P3-6 Add docs, packaging, and release automation.
+22. [ ] P3-7 Add a one-off permission babysit mode for a single instance.
 
 ## P0
 
@@ -97,14 +98,21 @@ The unit and replay coverage is useful, but real-session tests are needed to tru
 6. Add docs, packaging, and release automation.
 The repo still needs installation instructions, a real `README.md`, CI, and a release story. None of that changes core behavior, but it is required if `sdmux` is going to be used beyond local development.
 
+7. Add a one-off permission babysit mode for a single instance.
+This mode should temporarily persist automation state for one adopted Claude instance and only accept permission prompts while the operator is away. It should not expand into general continuous automation, and it should stop once that single instance exits or the operator disables it.
+
 ## Questions For Review
 
-- Should `attach` stay a one-shot target resolver, or should it persist adopted target metadata for later commands?
-- Is `pane_current_command == "claude"` sufficient ownership validation, or do adopted panes need a stronger proof before automation is allowed?
-- Should `continue-session` and `auto-unstick` stay limited to trust, permission, and survey blockers, or should they grow to cover repeated permissions, diff dialogs, and other flows?
-- Which confirmation-style screens must become distinct classifier states before more automation is allowed, and which should remain manual-review only?
+- Should automation remain limited to `PermissionDialog`, `FolderTrustPrompt`, and `SurveyPrompt`, with diff-like and ambiguous dialogs staying manual-review only?
 - Is the current focused `capture-pane` excerpt good enough for `status` and `doctor`, or should those commands wait for a persistent observer before claiming stronger live-screen accuracy?
 - What should trigger `capture-pane` reconciliation once streamed observation lands: timer, post-action validation, ambiguity, or all three?
-- Should tracked session identity remain raw `pane_id`, or do we need persisted instance metadata that survives pane swaps, renames, and window changes?
 - Do classifier confidence/drift and versioned fixture corpora need to land before more automation, or can they wait for the persistent observer?
 - Before expanding the feature surface further, is the next investment JSON/CLI contracts, real tmux end-to-end tests, or docs/packaging/release automation?
+
+## Decisions
+
+- `attach` stays one-shot and non-persistent for now. When serve mode lands, it should persist adopted target metadata.
+- `pane_current_command == "claude"` is sufficient ownership validation for now.
+- `continue-session` and `auto-unstick` should stay limited. A separate one-off mode should persist for a single adopted instance and only accept permission prompts while the operator is away.
+- For now, automation stays limited to `PermissionDialog`, `FolderTrustPrompt`, and `SurveyPrompt`. Diff-like and ambiguous dialogs stay manual-review only unless a specific scenario justifies expanding automation.
+- Persisted instance identity should include more than raw `pane_id`. Start with `pane_id`, `pane_tty`, Claude PID plus PID start time, Claude session id, and workspace root; keep tmux/window IDs and names as secondary metadata.
