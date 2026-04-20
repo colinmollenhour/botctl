@@ -23,7 +23,7 @@ use crate::cli::{
     ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ListPanesArgs,
     ObserveArgs, PaneCommandArgs, PaneTargetArgs, PermissionBabysitStartArgs,
     PermissionBabysitStopArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs,
-    StartArgs, StatusArgs, SubmitPromptArgs,
+    ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
@@ -35,6 +35,7 @@ use crate::prompt::{
     PromptSource, default_state_dir, prepare_prompt, resolve_prompt_text, write_editor_target,
     write_editor_target_from_pending,
 };
+use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
@@ -78,6 +79,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Status(args) => run_status(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Observe(args) => run_observe(args),
+        Command::Serve(args) => run_serve(args),
         Command::RecordFixture(args) => run_record_fixture(args),
         Command::Classify(args) => run_classify(args),
         Command::Replay(args) => run_replay(args),
@@ -274,6 +276,26 @@ fn run_observe(args: ObserveArgs) -> AppResult<String> {
     };
     let report = observe_session(&client, &request)?;
     Ok(report.render())
+}
+
+fn run_serve(args: ServeArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    install_babysit_sigint_handler(Arc::clone(&interrupted))?;
+    let request = ServeRequest {
+        session_name: args.session_name,
+        target_pane: args.pane_id,
+        history_lines: args.history_lines,
+        reconcile_ms: args.reconcile_ms,
+    };
+    let format = args.format;
+    let use_color = supports_babysit_color();
+
+    run_serve_loop(&client, &request, interrupted, |event| {
+        emit_babysit_output(render_serve_event(&request, &event, format, use_color))
+    })?;
+
+    Ok(String::new())
 }
 
 fn run_record_fixture(args: RecordFixtureArgs) -> AppResult<String> {
@@ -1048,11 +1070,15 @@ fn render_babysit_human(event: serde_json::Value, use_color: bool) -> String {
     );
     let (icon, label, label_color) = match kind {
         "start" => ("🚀", "START", "1;32"),
+        "serve-start" => ("📡", "SERVE", "1;34"),
         "wait" => ("👀", "WAIT", "1;33"),
+        "snapshot" => ("👀", "STATE", "1;33"),
+        "notify" => ("🔔", "NOTE", "1;36"),
         "approve" => ("🔐", "APPROVE", "1;36"),
         "approved" => ("✅", "APPROVED", "1;32"),
         "reject" => ("⛔", "REJECT", "1;31"),
         "dismiss-survey" => ("🙈", "DISMISS", "1;35"),
+        "serve-stop" => ("🛑", "STOP", "1;31"),
         _ => ("⛔", "STOP", "1;31"),
     };
     let label = style_babysit(format!("{icon} {label:<8}"), label_color, use_color);
@@ -1162,6 +1188,144 @@ fn render_babysit_stop_event(
         }),
         use_color,
     )
+}
+
+fn render_serve_event(
+    request: &ServeRequest,
+    event: &ServeEvent,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    match event {
+        ServeEvent::Started {
+            session_name,
+            target_pane,
+            tracked_panes,
+        } => render_babysit_output(
+            format.into(),
+            serde_json::json!({
+                "timestamp": current_babysit_timestamp(),
+                "kind": "serve-start",
+                "session": session_name,
+                "target_pane": target_pane,
+                "tracked_panes": tracked_panes,
+                "summary": format!("Serve mode attached to session {session_name}"),
+                "details": [
+                    format!("Target: {}", target_pane.as_deref().unwrap_or("all panes")),
+                    format!("Reconcile interval: {}ms", request.reconcile_ms),
+                    format!("History lines: {}", request.history_lines),
+                    format!(
+                        "Tracked panes: {}",
+                        if tracked_panes.is_empty() {
+                            String::from("none yet")
+                        } else {
+                            tracked_panes.join(", ")
+                        }
+                    )
+                ]
+            }),
+            use_color,
+        ),
+        ServeEvent::Snapshot(snapshot) => render_serve_snapshot_event(snapshot, format, use_color),
+        ServeEvent::Notification(message) => render_babysit_output(
+            format.into(),
+            serde_json::json!({
+                "timestamp": current_babysit_timestamp(),
+                "kind": "notify",
+                "summary": format!("tmux notification: {message}"),
+                "details": [format!("Session: {}", request.session_name)],
+                "body_title": "Notification",
+                "body_lines": [message]
+            }),
+            use_color,
+        ),
+        ServeEvent::PaneRemoved { pane_id } => render_babysit_output(
+            format.into(),
+            serde_json::json!({
+                "timestamp": current_babysit_timestamp(),
+                "kind": "notify",
+                "pane_id": pane_id,
+                "summary": format!("Observed pane {pane_id} disappeared"),
+                "details": [format!("Session: {}", request.session_name)]
+            }),
+            use_color,
+        ),
+        ServeEvent::Stopped { reason } => render_babysit_output(
+            format.into(),
+            serde_json::json!({
+                "timestamp": current_babysit_timestamp(),
+                "kind": "serve-stop",
+                "summary": format!("Serve mode stopped for session {}", request.session_name),
+                "details": [format!("Reason: {reason}")]
+            }),
+            use_color,
+        ),
+    }
+}
+
+fn render_serve_snapshot_event(
+    snapshot: &ServePaneSnapshot,
+    format: BabysitFormat,
+    use_color: bool,
+) -> String {
+    render_babysit_output(
+        format.into(),
+        serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "snapshot",
+            "pane_id": snapshot.pane.pane_id,
+            "session": snapshot.pane.session_name,
+            "window": snapshot.pane.window_name,
+            "command": snapshot.pane.current_command,
+            "cwd": snapshot.pane.current_path,
+            "state": snapshot.classification.state.as_str(),
+            "signals": snapshot.classification.signals.clone(),
+            "changed": snapshot.changed,
+            "reason": snapshot.reason.as_str(),
+            "summary": if snapshot.changed {
+                serde_json::json!(format!(
+                    "Pane {} changed to {} ({})",
+                    snapshot.pane.pane_id,
+                    snapshot.classification.state.as_str(),
+                    snapshot.reason.as_str()
+                ))
+            } else {
+                serde_json::json!(format!(
+                    "Pane {} reconciled at {} ({})",
+                    snapshot.pane.pane_id,
+                    snapshot.classification.state.as_str(),
+                    snapshot.reason.as_str()
+                ))
+            },
+            "details": [
+                format!("Window: {}", snapshot.pane.window_name),
+                format!("Command: {}", snapshot.pane.current_command),
+                format!("Cwd: {}", snapshot.pane.current_path),
+                format!("Signals: {}", render_signals(&snapshot.classification)),
+                format!("Recap: {}", snapshot.classification.recap_excerpt.as_deref().unwrap_or("none")),
+                format!("Changed: {}", snapshot.changed),
+            ],
+            "body_title": if snapshot.live_excerpt.is_empty() { serde_json::Value::Null } else { serde_json::json!("Recent output") },
+            "body_lines": if snapshot.live_excerpt.is_empty() {
+                serde_json::json!([])
+            } else {
+                serde_json::json!(serve_body_lines(&snapshot.live_excerpt))
+            }
+        }),
+        use_color,
+    )
+}
+
+fn serve_body_lines(input: &str) -> Vec<String> {
+    input
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| line.to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2294,7 +2458,7 @@ mod tests {
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
-        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(details.prompt_type, "Bash command");
         assert_eq!(details.sandbox_mode.as_deref(), Some("unsandboxed"));
         assert_eq!(
             details.command.as_deref(),

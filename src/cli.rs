@@ -11,6 +11,7 @@ pub enum Command {
     Status(StatusArgs),
     Doctor(DoctorArgs),
     Observe(ObserveArgs),
+    Serve(ServeArgs),
     RecordFixture(RecordFixtureArgs),
     Classify(ClassifyArgs),
     Replay(ReplayArgs),
@@ -100,6 +101,15 @@ pub struct ObserveArgs {
     pub events: usize,
     pub idle_timeout_ms: u64,
     pub history_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServeArgs {
+    pub session_name: String,
+    pub pane_id: Option<String>,
+    pub reconcile_ms: u64,
+    pub history_lines: usize,
+    pub format: BabysitFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +215,7 @@ where
         "status" => parse_status(rest),
         "doctor" => parse_doctor(rest),
         "observe" => parse_observe(rest),
+        "serve" => parse_serve(rest),
         "record-fixture" => parse_record_fixture(rest),
         "classify" => parse_classify(rest),
         "replay" => parse_replay(rest),
@@ -237,6 +248,7 @@ pub fn usage() -> String {
             status --pane %ID [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]\n\
             observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
+            serve --session NAME [--pane %ID] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]\n\
             record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
             classify --path PATH\n\
             replay --path PATH\n\
@@ -318,13 +330,7 @@ fn parse_approve_reject(
             "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
             "--format" => {
                 let raw = read_value(&args, &mut i, "--format")?;
-                format = match raw.as_str() {
-                    "human" => BabysitFormat::Human,
-                    "jsonl" => BabysitFormat::Jsonl,
-                    _ => {
-                        return Err(AppError::new(format!("invalid value for --format: {raw}")));
-                    }
-                };
+                format = parse_human_jsonl_format(&raw)?;
             }
             flag => return Err(AppError::new(format!("unknown approve/reject flag: {flag}"))),
         }
@@ -505,6 +511,62 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
         events,
         idle_timeout_ms,
         history_lines,
+    }))
+}
+
+fn parse_serve(args: Vec<String>) -> AppResult<Command> {
+    let mut session_name = None;
+    let mut pane_id = None;
+    let mut reconcile_ms = 1500u64;
+    let mut history_lines = 120usize;
+    let mut format = BabysitFormat::Human;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--reconcile-ms" => {
+                let raw = read_value(&args, &mut i, "--reconcile-ms")?;
+                reconcile_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --reconcile-ms: {raw}"))
+                })?;
+            }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            "--format" => {
+                let raw = read_value(&args, &mut i, "--format")?;
+                format = parse_human_jsonl_format(&raw)?;
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown serve flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+
+    let session_name =
+        session_name.ok_or_else(|| AppError::new("missing required flag: --session"))?;
+    if reconcile_ms == 0 {
+        return Err(AppError::new(
+            "serve requires --reconcile-ms to be at least 1",
+        ));
+    }
+
+    Ok(Command::Serve(ServeArgs {
+        session_name,
+        pane_id,
+        reconcile_ms,
+        history_lines,
+        format,
     }))
 }
 
@@ -934,15 +996,7 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                     }
                     "--format" => {
                         let raw = read_value(&args, &mut i, "--format")?;
-                        format = match raw.as_str() {
-                            "human" => BabysitFormat::Human,
-                            "jsonl" => BabysitFormat::Jsonl,
-                            _ => {
-                                return Err(AppError::new(format!(
-                                    "invalid value for --format: {raw}"
-                                )));
-                            }
-                        };
+                        format = parse_human_jsonl_format(&raw)?;
                     }
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
@@ -1036,6 +1090,14 @@ fn read_value(args: &[String], index: &mut usize, flag: &str) -> AppResult<Strin
     args.get(*index)
         .cloned()
         .ok_or_else(|| AppError::new(format!("missing value for {flag}")))
+}
+
+fn parse_human_jsonl_format(raw: &str) -> AppResult<BabysitFormat> {
+    match raw {
+        "human" => Ok(BabysitFormat::Human),
+        "jsonl" => Ok(BabysitFormat::Jsonl),
+        _ => Err(AppError::new(format!("invalid value for --format: {raw}"))),
+    }
 }
 
 fn validate_prompt_input(source: &Option<PathBuf>, text: &Option<String>) -> AppResult<()> {
@@ -1174,6 +1236,52 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_serve_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("serve"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--reconcile-ms"),
+            String::from("750"),
+            String::from("--format"),
+            String::from("jsonl"),
+        ])
+        .expect("serve command should parse");
+
+        match command {
+            Command::Serve(args) => {
+                assert_eq!(args.session_name, "demo");
+                assert_eq!(args.pane_id.as_deref(), Some("%7"));
+                assert_eq!(args.reconcile_ms, 750);
+                assert_eq!(args.format, super::BabysitFormat::Jsonl);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_serve_zero_reconcile_interval() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("serve"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--reconcile-ms"),
+            String::from("0"),
+        ])
+        .expect_err("serve should reject zero reconcile interval");
+
+        assert!(
+            error
+                .to_string()
+                .contains("serve requires --reconcile-ms to be at least 1")
+        );
     }
 
     #[test]

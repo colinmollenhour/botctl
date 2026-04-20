@@ -6,4 +6,6 @@ pub mod fixtures;
 pub mod observe;
 pub mod permission_babysit;
 pub mod prompt;
+pub mod screen_model;
+pub mod serve;
 pub mod tmux;

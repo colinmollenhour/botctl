@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -56,6 +56,20 @@ impl TmuxCommandPlan {
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     program: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlModeReceive {
+    Line(String),
+    Idle,
+    Closed,
+}
+
+pub struct ControlModeSession {
+    session_name: String,
+    child: Child,
+    stdout_rx: mpsc::Receiver<ControlStreamItem>,
+    stderr_rx: mpsc::Receiver<String>,
 }
 
 impl Default for TmuxClient {
@@ -138,12 +152,7 @@ impl TmuxClient {
         Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
     }
 
-    pub fn control_mode_lines(
-        &self,
-        session_name: &str,
-        max_events: usize,
-        idle_timeout_ms: u64,
-    ) -> AppResult<Vec<String>> {
+    pub fn control_mode_session(&self, session_name: &str) -> AppResult<ControlModeSession> {
         let control_command = format!(
             "{} -C attach-session -t {}",
             shell_escape(&self.program),
@@ -152,6 +161,7 @@ impl TmuxClient {
 
         let mut child = Command::new("script")
             .arg("-q")
+            .arg("-e")
             .arg("-c")
             .arg(control_command)
             .arg("/dev/null")
@@ -201,41 +211,29 @@ impl TmuxClient {
             }
         });
 
+        Ok(ControlModeSession {
+            session_name: session_name.to_string(),
+            child,
+            stdout_rx,
+            stderr_rx,
+        })
+    }
+
+    pub fn control_mode_lines(
+        &self,
+        session_name: &str,
+        max_events: usize,
+        idle_timeout_ms: u64,
+    ) -> AppResult<Vec<String>> {
+        let mut control = self.control_mode_session(session_name)?;
         let timeout = Duration::from_millis(idle_timeout_ms);
         let mut lines = Vec::new();
 
         while lines.len() < max_events {
-            match stdout_rx.recv_timeout(timeout) {
-                Ok(ControlStreamItem::Stdout(line)) => lines.push(line),
-                Ok(ControlStreamItem::ReadError(message)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(AppError::new(format!(
-                        "failed to read tmux control mode output: {message}"
-                    )));
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            match control.recv_timeout(timeout)? {
+                ControlModeReceive::Line(line) => lines.push(line),
+                ControlModeReceive::Idle | ControlModeReceive::Closed => break,
             }
-        }
-
-        let status_before_shutdown = child.try_wait()?;
-        if status_before_shutdown.is_none() {
-            let _ = child.kill();
-        }
-        let _ = child.wait()?;
-
-        let stderr_lines = drain_channel(stderr_rx);
-        if lines.is_empty() && matches!(status_before_shutdown, Some(status) if !status.success()) {
-            let stderr_text = if stderr_lines.is_empty() {
-                String::from("no stderr")
-            } else {
-                stderr_lines.join("\n")
-            };
-            return Err(AppError::new(format!(
-                "tmux control mode attach failed for session {}: {}",
-                session_name, stderr_text
-            )));
         }
 
         Ok(lines)
@@ -296,6 +294,54 @@ enum ControlStreamItem {
     ReadError(String),
 }
 
+impl ControlModeSession {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> AppResult<ControlModeReceive> {
+        match self.stdout_rx.recv_timeout(timeout) {
+            Ok(ControlStreamItem::Stdout(line)) => Ok(ControlModeReceive::Line(line)),
+            Ok(ControlStreamItem::ReadError(message)) => {
+                self.shutdown_child();
+                Err(AppError::new(format!(
+                    "failed to read tmux control mode output: {message}"
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => self.poll_child_state(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.poll_child_state(),
+        }
+    }
+
+    fn poll_child_state(&mut self) -> AppResult<ControlModeReceive> {
+        match self.child.try_wait()? {
+            Some(status) if !status.success() => {
+                let stderr_lines = drain_channel(&self.stderr_rx);
+                let stderr_text = if stderr_lines.is_empty() {
+                    String::from("no stderr")
+                } else {
+                    stderr_lines.join("\n")
+                };
+                Err(AppError::new(format!(
+                    "tmux control mode attach failed for session {}: {}",
+                    self.session_name, stderr_text
+                )))
+            }
+            Some(_) => Ok(ControlModeReceive::Closed),
+            None => Ok(ControlModeReceive::Idle),
+        }
+    }
+
+    fn shutdown_child(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ControlModeSession {
+    fn drop(&mut self) {
+        self.shutdown_child();
+    }
+}
+
 fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     let parts: Vec<&str> = line.split('\t').collect();
     if parts.len() != 12 {
@@ -337,7 +383,7 @@ fn shell_escape(value: &str) -> String {
     }
 }
 
-fn drain_channel(rx: mpsc::Receiver<String>) -> Vec<String> {
+fn drain_channel(rx: &mpsc::Receiver<String>) -> Vec<String> {
     let mut lines = Vec::new();
     while let Ok(line) = rx.try_recv() {
         lines.push(line);

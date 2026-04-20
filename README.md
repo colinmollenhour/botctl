@@ -10,9 +10,17 @@ The project is built around a simple rule: terminal automation is only safe when
 - list panes and inspect tmux metadata
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude pane
+- run `serve` as a foreground long-lived observer for one tmux session
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
+
+## Docs
+
+- [`docs/README.md`](docs/README.md) - docs index
+- [`docs/getting-started.md`](docs/getting-started.md) - quick setup and operator workflow
+- [`docs/architecture.md`](docs/architecture.md) - module boundaries and design rules
+- [`docs/serve-mode.md`](docs/serve-mode.md) - current serve-mode behavior and next steps
 
 ## Requirements
 
@@ -70,6 +78,12 @@ Check the live classified state for a pane:
 
 ```bash
 cargo run -- status --pane %19
+```
+
+Run the long-lived observer for one tmux session:
+
+```bash
+cargo run -- serve --session demo
 ```
 
 ## Real Session Workflow
@@ -157,5 +171,5 @@ Recap is auxiliary metadata, not a primary state. Strong anchors like `while you
 
 - Live classification still uses `capture-pane` plus a recent-lines heuristic.
 - The classifier is keyword-based and intentionally conservative.
-- `botctl` is strongest with managed sessions today; attaching to arbitrary existing Claude panes is still planned work.
-- There is no long-lived observer or supervisor process yet.
+- `botctl` can attach to existing Claude panes, but the strongest and most tested path is still managed sessions.
+- `serve` is an initial foreground observer, not the full daemon/API/SSE control plane described in `PLANS-Serve-Mode.md` yet.

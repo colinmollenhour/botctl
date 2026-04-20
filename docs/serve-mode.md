@@ -1,0 +1,114 @@
+# Serve mode
+
+`botctl serve` is the first long-lived observation mode in the project.
+
+It replaces the old purely bounded observer model for the served tmux session by holding a persistent tmux control-mode connection open and reconciling with periodic `capture-pane` snapshots.
+
+## What it does today
+
+`serve` currently runs as a foreground process and emits structured events to stdout.
+
+Current behavior:
+
+- attaches to one tmux session in control mode
+- optionally narrows observation to one explicit pane
+- parses tmux output and topology notifications
+- reconstructs a best-effort per-pane live screen from streamed output
+- debounces stream activity before reconciling
+- captures pane text on initial attach, on stream activity, and on periodic reconcile
+- seeds and periodically rebases the stream model from `capture-pane`
+- may classify stream-driven reconciliations from merged stream state when capture is ambiguous
+- falls back conservatively to captured pane state when merged state is not trustworthy
+- emits human-readable or JSONL events
+
+## Basic usage
+
+Observe one session:
+
+```bash
+cargo run -- serve --session demo
+```
+
+Observe one specific pane inside that session:
+
+```bash
+cargo run -- serve --session demo --pane %19
+```
+
+Use JSONL output for tooling:
+
+```bash
+cargo run -- serve --session demo --format jsonl
+```
+
+Slow down periodic reconciliation:
+
+```bash
+cargo run -- serve --session demo --reconcile-ms 5000
+```
+
+## Event kinds
+
+The current stream includes:
+
+- `serve-start`
+- `snapshot`
+- `notify`
+- `serve-stop`
+
+Snapshot events include:
+
+- pane metadata
+- current classified state
+- classifier signals
+- whether the state changed
+- why reconciliation happened
+- recent streamed output excerpt when available
+
+## Current scope
+
+This is the P1-1 foundation, not the full serve-mode product yet.
+
+Implemented now:
+
+- long-lived control-mode connection
+- live screen reconstruction from streamed output
+- periodic reconciliation and model rebasing
+- conservative stream-over-capture merge for stream-driven reconciliation
+- basic topology-change detection
+- foreground event stream
+
+Not implemented yet:
+
+- persistent daemon lifecycle
+- HTTP API
+- SSE endpoints
+- full reconstructed terminal screen model
+- persistent registry of managed/adopted instances
+- continuous policy execution
+
+## Safety rules
+
+Serve mode keeps the same safety rules as the rest of `botctl`:
+
+- targeting stays explicit
+- pane ownership still matters
+- `Unknown` remains a refusal state
+- serve mode does not bypass guarded workflow checks
+
+## Relationship to the larger plan
+
+The long-term serve-mode plan is documented in [`../PLANS-Serve-Mode.md`](../PLANS-Serve-Mode.md).
+
+The current implementation maps most directly to these wishlist items:
+
+- P1-1 replace the bounded observer with a long-lived control-mode connection
+- P1-3 merge streamed output with periodic reconciliation
+- part of P1-5 detect topology changes
+
+The next meaningful improvements are:
+
+1. reconstruct a live screen model from streamed output
+2. preserve pane ownership across more tmux topology changes
+3. introduce a tracked-instance registry
+4. expose the observer through a local API
