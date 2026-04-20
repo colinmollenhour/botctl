@@ -1,98 +1,85 @@
 # sdmux Wishlist
 
-This file tracks features that are not implemented yet in the current scaffold.
+## Checklist
 
-## Recap
+1. [ ] Add higher-level `continue-session` and `auto-unstick` commands that clear trust, permission, and survey prompts before normal prompt submission.
+2. [ ] Support attaching `sdmux` to any existing tmux session, window, or pane that is already running Claude.
+3. [ ] Validate that the target pane is actually running Claude before any automation runs.
+4. [ ] Replace the bounded observer with a long-lived control-mode connection.
+5. [ ] Reconstruct a live terminal screen model instead of classifying plain captured text.
+6. [ ] Capture structured control-mode event tapes for fixtures and replay.
+7. [ ] Expand classification coverage for more Claude UI states and similar confirmation flows.
+8. [ ] Add end-to-end tests against real tmux sessions and realistic Claude behavior.
+9. [ ] Add lifecycle commands for stopping, restarting, destroying, and supervising managed sessions.
+10. [ ] Improve CLI ergonomics, JSON output, logging, docs, and packaging.
 
-The current scaffold already includes:
+## P0
 
-- a Rust CLI with commands for session start planning, pane listing, capture, observe, replay, fixture recording, prompt preparation, editor-helper writes, and named Claude actions
-- tmux wrappers for session launch, pane discovery, pane capture, key sending, and bounded control-mode attachment
-- a first-pass classifier for chat-ready, permission, survey, diff, external-editor, busy, and unknown states
-- a fixture corpus format with replay tests and recorded metadata
-- a deterministic prompt handoff path built around pending prompts plus an external-editor helper
+1. Attach to existing Claude tmux targets.
+Allow `sdmux` to adopt an already-running tmux session, window, or pane when the current command is `claude`. This closes a major workflow gap because operators often start Claude first and only later want structured observation and automation.
 
-The remaining items below are the major missing capabilities and hardening work.
+2. Add `continue-session` and `auto-unstick` commands.
+These commands should inspect the current pane, clear known blocking prompts like folder trust, permission dialogs, and surveys, and then leave the session in a usable state. This turns the current low-level guarded actions into a practical operator flow.
 
-## Session Lifecycle
+3. Validate Claude ownership before driving a pane.
+Before any automation sends keys, `sdmux` should confirm the pane is really a Claude session and fail conservatively when it is not. This is a direct safety requirement for attaching to arbitrary existing tmux targets.
 
-- Stop, restart, and destroy managed Claude sessions from the CLI.
-- Create additional windows or panes for related workflows.
-- Persist managed-session metadata instead of discovering it ad hoc.
-- Validate that a launched pane is actually running Claude Code before driving it.
-- Support multiple concurrent managed sessions with clear ownership and naming rules.
+4. Keep higher-level automation state-aware.
+Prompt submission, permission approval, rejection, survey dismissal, and trust acceptance should continue to fire only in compatible states. The remaining work is to harden the state machine so similar prompts do not collapse into the same bucket.
 
-## Observation
+5. Improve live status and doctor output.
+`status` and `doctor` should report the real current screen, not stale scrollback, and should explain exactly which recovery action is safe next. This is essential for debugging automation decisions in live sessions.
 
-- Maintain a long-lived tmux control-mode connection instead of a bounded one-shot observer.
-- Reconstruct a terminal screen model from streamed output rather than classifying plain decoded text.
-- Merge streamed output with periodic `capture-pane` reconciliation.
-- Subscribe to tmux format changes and client notifications that matter for automation.
-- Detect pane swaps, session renames, and window changes without losing ownership of the target pane.
-- Capture structured event tapes from live sessions for replay.
+## P1
 
-## Claude Automation
+1. Replace the bounded observer with a long-lived control-mode connection.
+The current one-shot observer is enough for probing but not enough for durable automation. A persistent connection is needed so `sdmux` can watch sessions continuously and react without repeated attach/capture cycles.
 
-- Install or update the recommended Claude keybindings automatically.
-- Verify that the expected Claude automation keymap is active before sending actions.
-- Add higher-level actions such as prompt submission, permission approval, permission rejection, survey dismissal, and interrupt recovery.
-- Implement the external-editor helper so prompts can be injected deterministically.
-- Add guardrails so actions only fire in compatible Claude UI states.
-- Add a state machine for chat, confirmation, diff, survey, and editor flows.
+2. Reconstruct a live terminal screen model.
+Classification should be based on a reconstructed frame from streaming output plus reconciliation, not plain text snapshots. That is the real fix for stale scrollback and fragile keyword matching.
 
-## Classification
+3. Merge streamed output with periodic `capture-pane` reconciliation.
+Streaming is low-latency but imperfect, while pane capture is slower but authoritative. The system should combine both so it can stay current and still recover from drift or dropped events.
 
-- Replace the keyword classifier with a more robust frame classifier.
-- Track classifier confidence and supporting evidence.
-- Classify more Claude states such as autocomplete, history search, transcript view, model picker, settings, tabs, and task mode.
-- Distinguish between similar confirmation flows instead of collapsing them into one dialog bucket.
-- Detect classifier drift across Claude Code releases.
+4. Capture structured event tapes for fixtures.
+Recorded cases should always include the control-mode output that led to a state decision, not just a final pane snapshot. That makes regression testing and classifier debugging much more explainable.
 
-## Fixtures And Regression Testing
+5. Detect pane swaps, session renames, and window changes.
+Once `sdmux` claims a pane, it should keep ownership even as tmux topology changes. This matters much more once existing-session attachment becomes a first-class workflow.
 
-- Record real control-mode event streams alongside captured pane snapshots.
-- Group fixtures by Claude Code version and scenario.
-- Add snapshot-style regression tests for classifier outputs and signals.
-- Add tooling to diff new fixture corpora against expected classifications.
-- Add commands to refresh fixtures from a live tmux session.
-- Add fixture coverage for busy responses, diffs, editor mode, unknown states, and failure cases.
+## P2
 
-## CLI And UX
+1. Expand the classifier to cover more Claude UI states.
+Add support for autocomplete, history search, transcript view, model picker, settings, tabs, task mode, and other non-chat screens. The current scaffold only covers the most obvious blocking states.
 
-- Replace the hand-rolled CLI parser with a more ergonomic command-line interface if needed.
-- Add JSON output modes for scripting and machine consumption.
-- Add clearer error messages for missing sessions, panes, and tmux failures.
-- Add logging and verbosity controls for debugging automation runs.
-- Add commands for status, inspect, doctor, and fixture capture.
+2. Distinguish similar confirmation flows.
+Permission prompts, folder trust prompts, diff confirmations, and future dialogs should not all look the same to the policy layer. Better separation makes automation safer and lets commands express clearer intent.
 
-## Reliability And Safety
+3. Track classifier confidence and drift.
+Each classification should include evidence and a confidence signal, and fixture replay should reveal when a Claude release changes the UI. This is the foundation for deciding when automation should refuse to act.
 
-- Enforce pane ID targeting everywhere and reject ambiguous targets.
-- Add retry, timeout, and backoff policies around tmux interactions.
-- Prevent unsafe actions when the classifier returns `Unknown`.
-- Add explicit recovery paths for lost control-mode connections.
-- Handle non-UTF-8 pane output and ANSI escapes more carefully.
-- Add integration tests against real tmux sessions and realistic terminal behavior.
+4. Improve fixture organization and coverage.
+Fixtures should be grouped by Claude Code version and scenario, with better coverage for busy responses, diffs, editor mode, unknown states, and failure cases. Snapshot-style regression output would make changes much easier to review.
 
-## Persistence And Supervision
+5. Add tooling to diff and refresh fixture corpora.
+Operators should be able to capture fresh live fixtures, compare them with expected outcomes, and quickly see what changed. That will make release hardening much cheaper.
 
-- Add a supervisor process or daemon mode for long-lived orchestration.
-- Persist last-known state, recent observations, and action history.
-- Expose a local control socket or API for external tooling.
-- Support policy-driven automation rules that can run continuously.
+## P3
 
-## Packaging And Distribution
+1. Add full session lifecycle commands.
+`sdmux` should stop, restart, destroy, and supervise managed Claude sessions instead of only launching and probing them. It should also support opening related windows or panes for multi-step workflows.
 
-- Add installation instructions and operator documentation.
-- Add a `README.md` with usage examples and architecture notes.
-- Add release automation and versioning strategy.
-- Add CI for formatting, tests, and fixture regression checks.
+2. Persist managed-session metadata and recent history.
+The tool currently rediscovers most state ad hoc. Persisting ownership, last-known observations, and action history would make long-lived supervision realistic.
 
-## Next Steps
+3. Add policy-driven continuous automation.
+Once observation is durable, `sdmux` should be able to run rules continuously, such as always trusting the workspace, allowing a permission once, or declining surveys. That requires a clear policy layer rather than ad hoc command chaining.
 
-- Replace the current bounded `script`-backed control-mode probe with a longer-lived observer that reliably captures live `%output` pane events.
-- Build a real terminal screen reconstruction layer so classification is based on frames instead of plain captured text.
-- Add higher-level guarded workflows for prompt submission, permission handling, and survey dismissal that check classifier state before acting.
-- Install and validate the Claude automation keymap automatically so action routing is not a manual prerequisite.
-- Extend fixture capture so recorded cases always include meaningful control-mode event tapes, not just pane snapshots and notifications.
-- Add end-to-end tests against real tmux sessions, then start exercising the flows against a real Claude Code session.
+4. Improve CLI and scripting ergonomics.
+Add better error messages, verbosity controls, JSON output, and possibly a more ergonomic argument parser when the hand-rolled CLI becomes a drag. This is quality-of-life work, but it will matter once the command surface grows.
+
+5. Add end-to-end tests against real tmux sessions.
+The unit and replay coverage is useful, but real-session tests are needed to trust the transport and timing behavior. This is the main remaining validation gap before heavier automation should be considered production-ready.
+
+6. Add docs, packaging, and release automation.
+The repo still needs installation instructions, a real `README.md`, CI, and a release story. None of that changes core behavior, but it is required if `sdmux` is going to be used beyond local development.

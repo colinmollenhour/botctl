@@ -7,12 +7,18 @@ pub enum Command {
     Start(StartArgs),
     ListPanes,
     Capture(CaptureArgs),
+    Status(StatusArgs),
+    Doctor(DoctorArgs),
     Observe(ObserveArgs),
     RecordFixture(RecordFixtureArgs),
     Classify(ClassifyArgs),
     Replay(ReplayArgs),
     Bindings,
+    InstallBindings(InstallBindingsArgs),
     SendAction(SendActionArgs),
+    ApprovePermission(PaneCommandArgs),
+    RejectPermission(PaneCommandArgs),
+    DismissSurvey(PaneCommandArgs),
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
@@ -32,6 +38,20 @@ pub struct StartArgs {
 pub struct CaptureArgs {
     pub pane_id: String,
     pub history_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusArgs {
+    pub pane_id: String,
+    pub history_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DoctorArgs {
+    pub session_name: Option<String>,
+    pub pane_id: Option<String>,
+    pub history_lines: usize,
+    pub bindings_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +89,16 @@ pub struct ReplayArgs {
 pub struct SendActionArgs {
     pub pane_id: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaneCommandArgs {
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallBindingsArgs {
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,12 +144,22 @@ where
         "start" => parse_start(rest),
         "list-panes" => Ok(Command::ListPanes),
         "capture" => parse_capture(rest),
+        "status" => parse_status(rest),
+        "doctor" => parse_doctor(rest),
         "observe" => parse_observe(rest),
         "record-fixture" => parse_record_fixture(rest),
         "classify" => parse_classify(rest),
         "replay" => parse_replay(rest),
         "bindings" => Ok(Command::Bindings),
+        "install-bindings" => parse_install_bindings(rest),
         "send-action" => parse_send_action(rest),
+        "approve-permission" => {
+            parse_pane_command(rest, "approve-permission", Command::ApprovePermission)
+        }
+        "reject-permission" => {
+            parse_pane_command(rest, "reject-permission", Command::RejectPermission)
+        }
+        "dismiss-survey" => parse_pane_command(rest, "dismiss-survey", Command::DismissSurvey),
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
@@ -131,20 +171,26 @@ where
 pub fn usage() -> String {
     String::from(
         "sdmux\n\
-         \n\
-         Commands:\n\
-           start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
-           list-panes\n\
-           capture --pane %ID [--history-lines N]\n\
-           observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
-           record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
-           classify --path PATH\n\
-           replay --path PATH\n\
-           bindings\n\
-           send-action --pane %ID --action NAME\n\
-           prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
-           editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
-           submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n",
+          \n\
+          Commands:\n\
+            start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
+            list-panes\n\
+            capture --pane %ID [--history-lines N]\n\
+            status --pane %ID [--history-lines N]\n\
+            doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]\n\
+            observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
+            record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
+            classify --path PATH\n\
+            replay --path PATH\n\
+            bindings\n\
+            install-bindings [--path PATH]\n\
+            send-action --pane %ID --action NAME\n\
+            approve-permission --pane %ID\n\
+            reject-permission --pane %ID\n\
+            dismiss-survey --pane %ID\n\
+            prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
+            editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
+            submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n",
     )
 }
 
@@ -220,6 +266,81 @@ fn parse_capture(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::Capture(CaptureArgs {
         pane_id,
         history_lines,
+    }))
+}
+
+fn parse_status(args: Vec<String>) -> AppResult<Command> {
+    let mut pane_id = None;
+    let mut history_lines = 120usize;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown status flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+
+    let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+    Ok(Command::Status(StatusArgs {
+        pane_id,
+        history_lines,
+    }))
+}
+
+fn parse_doctor(args: Vec<String>) -> AppResult<Command> {
+    let mut session_name = None;
+    let mut pane_id = None;
+    let mut history_lines = 120usize;
+    let mut bindings_path = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                session_name = Some(read_value(&args, &mut i, "--session")?);
+            }
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            "--bindings-path" => {
+                bindings_path = Some(PathBuf::from(read_value(&args, &mut i, "--bindings-path")?));
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown doctor flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+
+    if pane_id.is_none() && session_name.is_none() {
+        return Err(AppError::new(
+            "doctor requires either --pane %ID or --session NAME",
+        ));
+    }
+
+    Ok(Command::Doctor(DoctorArgs {
+        session_name,
+        pane_id,
+        history_lines,
+        bindings_path,
     }))
 }
 
@@ -381,6 +502,51 @@ fn parse_send_action(args: Vec<String>) -> AppResult<Command> {
     let action = action.ok_or_else(|| AppError::new("missing required flag: --action"))?;
 
     Ok(Command::SendAction(SendActionArgs { pane_id, action }))
+}
+
+fn parse_install_bindings(args: Vec<String>) -> AppResult<Command> {
+    let mut path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path" => {
+                path = Some(PathBuf::from(read_value(&args, &mut i, "--path")?));
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown install-bindings flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(Command::InstallBindings(InstallBindingsArgs { path }))
+}
+
+fn parse_pane_command(
+    args: Vec<String>,
+    command_name: &str,
+    command: fn(PaneCommandArgs) -> Command,
+) -> AppResult<Command> {
+    let mut pane_id = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown {command_name} flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+    Ok(command(PaneCommandArgs { pane_id }))
 }
 
 fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
@@ -625,6 +791,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_status_command() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("status"),
+            String::from("--pane"),
+            String::from("%7"),
+        ])
+        .expect("status command should parse");
+
+        match command {
+            Command::Status(args) => {
+                assert_eq!(args.pane_id, "%7");
+                assert_eq!(args.history_lines, 120);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_doctor_command_with_session() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("doctor"),
+            String::from("--session"),
+            String::from("demo"),
+        ])
+        .expect("doctor command should parse");
+
+        match command {
+            Command::Doctor(args) => {
+                assert_eq!(args.session_name.as_deref(), Some("demo"));
+                assert!(args.pane_id.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_install_bindings_command() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("install-bindings"),
+        ])
+        .expect("install-bindings command should parse");
+
+        match command {
+            Command::InstallBindings(args) => {
+                assert!(args.path.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_editor_helper_with_positional_target() {
         let command = parse_args(vec![
             String::from("sdmux"),
@@ -639,6 +859,24 @@ mod tests {
             Command::EditorHelper(args) => {
                 assert_eq!(args.session_name, "demo");
                 assert_eq!(args.target, PathBuf::from("/tmp/target.txt"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_approve_permission_command() {
+        let command = parse_args(vec![
+            String::from("sdmux"),
+            String::from("approve-permission"),
+            String::from("--pane"),
+            String::from("%9"),
+        ])
+        .expect("approve-permission command should parse");
+
+        match command {
+            Command::ApprovePermission(args) => {
+                assert_eq!(args.pane_id, "%9");
             }
             other => panic!("unexpected command: {other:?}"),
         }

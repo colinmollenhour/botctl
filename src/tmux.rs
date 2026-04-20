@@ -119,6 +119,11 @@ impl TmuxClient {
         Ok(panes.into_iter().find(|pane| pane.pane_active))
     }
 
+    pub fn pane_by_id(&self, pane_id: &str) -> AppResult<Option<TmuxPane>> {
+        let panes = self.list_panes_for_target(Some(pane_id))?;
+        Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
+    }
+
     pub fn control_mode_lines(
         &self,
         session_name: &str,
@@ -234,13 +239,13 @@ impl TmuxClient {
         ])
     }
 
-    pub fn send_keys(&self, pane_id: &str, keys: &[&str]) -> AppResult<()> {
+    pub fn send_keys<S: AsRef<str>>(&self, pane_id: &str, keys: &[S]) -> AppResult<()> {
         let mut args = vec![
             String::from("send-keys"),
             String::from("-t"),
             pane_id.to_string(),
         ];
-        args.extend(keys.iter().map(|key| (*key).to_string()));
+        args.extend(keys.iter().map(|key| key.as_ref().to_string()));
         self.run_status(args)
     }
 

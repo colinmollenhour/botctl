@@ -3,6 +3,7 @@ pub enum SessionState {
     ChatReady,
     BusyResponding,
     PermissionDialog,
+    FolderTrustPrompt,
     SurveyPrompt,
     ExternalEditorActive,
     DiffDialog,
@@ -15,6 +16,7 @@ impl SessionState {
             Self::ChatReady => "ChatReady",
             Self::BusyResponding => "BusyResponding",
             Self::PermissionDialog => "PermissionDialog",
+            Self::FolderTrustPrompt => "FolderTrustPrompt",
             Self::SurveyPrompt => "SurveyPrompt",
             Self::ExternalEditorActive => "ExternalEditorActive",
             Self::DiffDialog => "DiffDialog",
@@ -27,6 +29,7 @@ impl SessionState {
             "ChatReady" => Some(Self::ChatReady),
             "BusyResponding" => Some(Self::BusyResponding),
             "PermissionDialog" => Some(Self::PermissionDialog),
+            "FolderTrustPrompt" => Some(Self::FolderTrustPrompt),
             "SurveyPrompt" => Some(Self::SurveyPrompt),
             "ExternalEditorActive" => Some(Self::ExternalEditorActive),
             "DiffDialog" => Some(Self::DiffDialog),
@@ -65,6 +68,18 @@ impl Classifier {
         let mut signals = Vec::new();
 
         let state = if contains_any(
+            &normalized,
+            &[
+                "quick safety check",
+                "yes, i trust this folder",
+                "accessing workspace:",
+                "security guide",
+            ],
+        ) && contains_any(&normalized, &["enter to confirm", "esc to cancel"])
+        {
+            signals.push(String::from("folder-trust-keywords"));
+            SessionState::FolderTrustPrompt
+        } else if contains_any(
             &normalized,
             &[
                 "allow once",
@@ -159,6 +174,13 @@ mod tests {
         let frame = "Claude Code needs permission\nAllow once\nAllow for session\nEnter confirms";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::PermissionDialog);
+    }
+
+    #[test]
+    fn classifies_folder_trust_prompt() {
+        let frame = "Accessing workspace:\n/home/colin/Projects/sdmux\nQuick safety check: Is this a project you created or one you trust?\nSecurity guide\n1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::FolderTrustPrompt);
     }
 
     #[test]
