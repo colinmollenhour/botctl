@@ -7,7 +7,7 @@
 - [x] Add `state.db` under the state root and initialize a schema-version table.
 - [x] Move prompt handoff state from ad hoc files into SQLite.
 - [x] Move babysit / continuous-automation registrations from ad hoc files into SQLite.
-- [ ] Add stable workspace/worktree scoping so multiple repos do not bleed into each other.
+- [?] Add stable workspace/worktree scoping so multiple repos do not bleed into each other.
 - [ ] Add durable tracked-instance tables that can support serve mode.
 - [ ] Add durable action-history tables for restart-safe automation and operator auditability.
 - [ ] Keep bulky artifacts, event tapes, and exported diagnostics as regular files.
@@ -161,3 +161,7 @@ It is most valuable for:
 - future serve-mode tracked-instance registries and local APIs
 
 See `PLANS-Serve-Mode.md` for the higher-level daemon and API shape. This document only defines how botctl should persist its local runtime state reliably.
+
+## Questions
+
+- For stable workspace/worktree scoping, what is the canonical scope key for `botctl` runtime state: the git worktree root, the repo/common git dir, the raw cwd, or something else? Related behavior question: should `yolo --all` / `yolo stop --all` remain global across the whole `state.db`, or become workspace-scoped?
