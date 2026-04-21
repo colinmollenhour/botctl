@@ -76,25 +76,58 @@ pub fn ensure_schema_version_table(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-pub fn ensure_current_schema_version(connection: &Connection) -> AppResult<()> {
+fn read_schema_version(connection: &Connection) -> AppResult<Option<i64>> {
+    Ok(connection
+        .query_row(
+            "SELECT version FROM schema_version WHERE id = ?1",
+            params![SCHEMA_VERSION_ROW_ID],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?)
+}
+
+fn write_schema_version(connection: &Connection, version: i64) -> AppResult<()> {
     connection.execute(
-        "INSERT OR IGNORE INTO schema_version (id, version) VALUES (?1, ?2)",
-        params![SCHEMA_VERSION_ROW_ID, CURRENT_SCHEMA_VERSION],
+        "INSERT INTO schema_version (id, version) VALUES (?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+        params![SCHEMA_VERSION_ROW_ID, version],
     )?;
+    Ok(())
+}
 
-    let version = connection.query_row(
-        "SELECT version FROM schema_version WHERE id = ?1",
-        params![SCHEMA_VERSION_ROW_ID],
-        |row| row.get::<_, i64>(0),
-    )?;
+pub fn migrate_state_db(connection: &Connection) -> AppResult<()> {
+    let tx = connection.unchecked_transaction()?;
+    let mut version = read_schema_version(&tx)?.unwrap_or(0);
 
-    if version != CURRENT_SCHEMA_VERSION {
+    if version > CURRENT_SCHEMA_VERSION {
         return Err(AppError::new(format!(
-            "unsupported state.db schema version: expected {}, found {}",
+            "unsupported state.db schema version: expected <= {}, found {}",
             CURRENT_SCHEMA_VERSION, version
         )));
     }
 
+    while version < CURRENT_SCHEMA_VERSION {
+        match version {
+            0 => migrate_to_v1(&tx)?,
+            other => {
+                return Err(AppError::new(format!(
+                    "no state.db migration path from version {} to {}",
+                    other, CURRENT_SCHEMA_VERSION
+                )));
+            }
+        }
+
+        version += 1;
+        write_schema_version(&tx, version)?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_to_v1(connection: &Connection) -> AppResult<()> {
+    ensure_pending_prompts_table(connection)?;
+    ensure_babysit_registrations_table(connection)?;
     Ok(())
 }
 
@@ -131,9 +164,7 @@ fn ensure_babysit_registrations_table(connection: &Connection) -> AppResult<()> 
 fn open_bootstrapped_state_db(state_dir: &Path) -> AppResult<Connection> {
     let connection = open_state_db(state_dir)?;
     ensure_schema_version_table(&connection)?;
-    ensure_current_schema_version(&connection)?;
-    ensure_pending_prompts_table(&connection)?;
-    ensure_babysit_registrations_table(&connection)?;
+    migrate_state_db(&connection)?;
     Ok(connection)
 }
 
@@ -281,9 +312,12 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rusqlite::params;
+
     use super::{
-        CURRENT_SCHEMA_VERSION, bootstrap_state_db, capture_artifact_path, delete_pending_prompt,
-        export_artifact_path, load_pending_prompt, open_state_db, runtime_artifacts_root,
+        CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_ROW_ID, bootstrap_state_db, capture_artifact_path,
+        delete_pending_prompt, ensure_schema_version_table, export_artifact_path,
+        load_pending_prompt, migrate_state_db, open_state_db, runtime_artifacts_root,
         state_db_path, store_pending_prompt, tape_artifact_path,
     };
 
@@ -441,6 +475,77 @@ mod tests {
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(foreign_keys, 1);
         assert_eq!(busy_timeout, 5_000);
+
+        drop(connection);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn migrate_state_db_upgrades_version_zero_to_current() {
+        let state_dir = unique_temp_dir("storage-migrate-v0");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let connection = open_state_db(&state_dir).expect("db should open");
+        ensure_schema_version_table(&connection).expect("schema_version should exist");
+        connection
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (?1, 0)",
+                params![SCHEMA_VERSION_ROW_ID],
+            )
+            .expect("version row should insert");
+
+        migrate_state_db(&connection).expect("migration should succeed");
+
+        let version: i64 = connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = ?1",
+                params![SCHEMA_VERSION_ROW_ID],
+                |row| row.get(0),
+            )
+            .expect("schema version should load");
+        let prompt_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_prompts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending_prompts table should exist");
+        let babysit_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'babysit_registrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("babysit_registrations table should exist");
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(prompt_table_count, 1);
+        assert_eq!(babysit_table_count, 1);
+
+        drop(connection);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn migrate_state_db_rejects_newer_schema_versions() {
+        let state_dir = unique_temp_dir("storage-migrate-newer");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let connection = open_state_db(&state_dir).expect("db should open");
+        ensure_schema_version_table(&connection).expect("schema_version should exist");
+        connection
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_ROW_ID, CURRENT_SCHEMA_VERSION + 1],
+            )
+            .expect("version row should insert");
+
+        let error = migrate_state_db(&connection).expect_err("newer schema should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported state.db schema version")
+        );
 
         drop(connection);
         let _ = fs::remove_dir_all(&state_dir);

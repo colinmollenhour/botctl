@@ -23,7 +23,7 @@ The default state root is `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set 
 
 `--state-dir PATH` overrides that root for commands that support it.
 
-Relevant stateful commands now bootstrap `<state-dir>/state.db` with a minimal `schema_version` table plus the prompt-handoff table used for staged prompts.
+Relevant stateful commands now bootstrap `<state-dir>/state.db`, run any supported schema migrations, and ensure the prompt-handoff table used for staged prompts exists.
 
 Prompt handoff now uses the `pending_prompts` table inside `<state-dir>/state.db`, keyed by the CLI session name.
 

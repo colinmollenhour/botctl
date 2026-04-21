@@ -14,6 +14,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - `--state-dir PATH` overrides that default state root for commands that support it.
 - Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and babysit registrations now both use SQLite-backed records there.
 - Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
+- Startup bootstrapping also runs in-place schema migrations for supported older `state.db` versions.
 
 ## Session and pane management
 

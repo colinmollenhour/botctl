@@ -12,7 +12,7 @@
 - [ ] Add durable action-history tables for restart-safe automation and operator auditability.
 - [x] Keep bulky artifacts, event tapes, and exported diagnostics as regular files.
 - [x] Use SQLite in WAL mode with foreign keys and a busy timeout.
-- [ ] Add startup schema migration logic for future versions of `state.db`.
+- [x] Add startup schema migration logic for future versions of `state.db`.
 - [ ] Do **not** migrate existing `.botctl` state; start fresh when the new state root is introduced.
 
 ## Goal
