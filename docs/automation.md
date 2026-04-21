@@ -1,0 +1,87 @@
+# Automation
+
+`botctl` automation is intentionally guarded. It only acts when it has an explicit pane target, a Claude-owned pane, a supported classified state, and the required keybindings.
+
+## Model
+
+Automation is split into separate checks:
+
+1. **Targeting** — resolve an explicit pane id, or a session/window target that resolves to one active pane.
+2. **Ownership** — refuse if the pane is not currently running `claude`.
+3. **Classification** — inspect the pane state before sending keys.
+4. **Policy** — only execute a workflow from the state it supports.
+5. **Keybinding routing** — resolve the user's Claude keybindings instead of assuming a hard-coded map.
+
+This is why raw `send-keys` success is not enough: a keypress can land in the wrong app, the wrong Claude state, or the wrong workflow.
+
+## Explicit targeting and ownership
+
+Prefer `--pane %ID` for all automation. Session-based targeting is only a convenience for resolving the active pane.
+
+Before any guarded workflow runs, `botctl` checks that the pane is owned by Claude. If the pane is running anything else, automation refuses.
+
+## Keybinding policy
+
+`botctl` reads `~/.claude/keybindings.json` and routes actions from the user's bindings.
+
+- `bindings` prints the recommended mapping.
+- `install-bindings` is non-destructive.
+- If a Claude keybinding file already exists, `install-bindings` merges in missing required bindings when it can.
+- If the existing file is invalid or a required key is already used for something else, install fails clearly instead of overwriting the file.
+- Missing bindings are surfaced by `doctor`, and action routing fails clearly when required bindings are absent.
+
+## Guarded workflows
+
+Guarded workflows validate state before acting:
+
+- `submit-prompt` requires `ChatReady`
+- `approve-permission` accepts `PermissionDialog` and `FolderTrustPrompt`
+- `reject-permission` requires `PermissionDialog`
+- `dismiss-survey` requires `SurveyPrompt`
+
+Refusal states are part of the safety model:
+
+- `Unknown` — manual review required
+- `DiffDialog` — manual review required
+- `ExternalEditorActive` — manual review required
+
+`FolderTrustPrompt` is a special case. Approval uses raw `Enter`, not the normal `confirm-yes` binding.
+
+`SurveyPrompt` is also special. Dismissal uses the raw `0` key, not a Claude keybinding-resolved action.
+
+## Refusal semantics
+
+`botctl` refuses when:
+
+- the target is ambiguous
+- the pane is not Claude-owned
+- classification is `Unknown`
+- the workflow does not match the current state
+- required Claude keybindings are missing or invalid
+
+That refusal is deliberate: it is safer to stop than to guess.
+
+## keep-going, auto-unstick, and babysit
+
+These commands are recovery loops, not magic fixers.
+
+- `auto-unstick` walks a pane through a bounded number of safe recovery steps.
+- `keep-going` watches a pane, submits the built-in audit prompt by default or a custom loop prompt via `--source` / `--text`, and can optionally respond to supported blockers.
+- `keep-going` expects each loop reply to end with exactly one terminal token: `OKIE_DOKIE`, `ALL_DONE`, or `PANIC`.
+- the built-in `keep-going` prompt tells Claude to verify completion, commit before `ALL_DONE`, push on branches other than `main`, `master`, `develop`, `dev`, `trunk`, or `release/*`, and open a PR only when the user explicitly asked for one
+- `--no-yolo` turns `PermissionDialog` and `FolderTrustPrompt` into manual-review exits.
+- `permission-babysit` / `yolo` is the long-running loop for supported permission dialogs and survey dismissal.
+
+Limits:
+
+- they still require Claude-owned panes
+- they still refuse on ambiguous or unsupported states
+- they do not bypass classifier or keybinding checks
+- `permission-babysit` does not auto-handle `FolderTrustPrompt`
+- `keep-going` will stop on manual-review blockers when `--no-yolo` is set
+
+## Related docs
+
+- [`command-reference.md`](command-reference.md)
+- [`workflows.md`](workflows.md)
+- [`prompt-handoff.md`](prompt-handoff.md)

@@ -1,0 +1,37 @@
+# Contributing
+
+Contributions should preserve `botctl`'s safety model first and optimize for explicit, explainable automation.
+
+## Contributor expectations
+
+- keep transport, observation, classification, and policy separate
+- prefer explicit pane IDs; do not automate ambiguous targets
+- treat `Unknown` as safer than a false positive
+- preserve the user's Claude keybindings as the source of truth
+- never silently overwrite `~/.claude/keybindings.json`
+- keep folder-trust approval on raw `Enter`, not the user's confirm binding
+- keep `status` and `doctor` useful for humans troubleshooting a session
+- make fixture cases explain *why* the classifier chose a state, not just what state it returned
+
+## Code and workflow rules
+
+- when a classifier state changes, update guarded workflows and tests in the same change
+- when action routing changes, verify keybinding resolution and any special-case raw keys
+- when adding a new observed flow, refuse to guess until the classifier can explain it
+- do not rely on `send-keys` success alone to decide whether an action was safe
+
+## Testing expectations
+
+- run `cargo test`
+- update replay fixtures when classifier behavior changes intentionally
+- keep fixture regressions close to the classifier and guarded workflow behavior
+
+## Useful references
+
+- [`architecture.md`](architecture.md)
+- [`classifier.md`](classifier.md)
+- [`testing-and-fixtures.md`](testing-and-fixtures.md)
+- [`automation.md`](automation.md)
+- [`workflows.md`](workflows.md)
+- [`command-reference.md`](command-reference.md)
+- [`serve-mode.md`](serve-mode.md)

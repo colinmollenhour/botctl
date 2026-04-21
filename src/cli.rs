@@ -77,6 +77,8 @@ pub struct KeepGoingArgs {
     pub poll_ms: u64,
     pub submit_delay_ms: u64,
     pub state_dir: Option<PathBuf>,
+    pub prompt_source: Option<PathBuf>,
+    pub prompt_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +273,7 @@ pub fn usage() -> String {
             dismiss-survey --pane %ID\n\
             continue-session (--pane %ID | --session NAME --window NAME)\n\
             auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]\n\
-            keep-going (--pane %ID | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--no-yolo]\n\
+            keep-going (--pane %ID | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
             submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
@@ -779,6 +781,8 @@ fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
     let mut poll_ms = 1000u64;
     let mut submit_delay_ms = 250u64;
     let mut state_dir = None;
+    let mut prompt_source = None;
+    let mut prompt_text = None;
     let mut target_args = Vec::new();
     let mut i = 0;
 
@@ -800,6 +804,12 @@ fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
             }
+            "--source" => {
+                prompt_source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
+            }
+            "--text" => {
+                prompt_text = Some(read_value(&args, &mut i, "--text")?);
+            }
             _ => target_args.push(args[i].clone()),
         }
         i += 1;
@@ -817,6 +827,7 @@ fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
             "keep-going requires --submit-delay-ms to be at least 1",
         ));
     }
+    validate_optional_prompt_input(&prompt_source, &prompt_text)?;
 
     Ok(Command::KeepGoing(KeepGoingArgs {
         target,
@@ -824,6 +835,8 @@ fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
         poll_ms,
         submit_delay_ms,
         state_dir,
+        prompt_source,
+        prompt_text,
     }))
 }
 
@@ -886,6 +899,18 @@ fn validate_send_target(target: &PaneTargetArgs, command_name: &str) -> AppResul
         _ => Err(AppError::new(format!(
             "{command_name} requires --pane %ID or --session NAME --window NAME"
         ))),
+    }
+}
+
+fn validate_optional_prompt_input(
+    source: &Option<PathBuf>,
+    text: &Option<String>,
+) -> AppResult<()> {
+    match (source, text) {
+        (Some(_), Some(_)) => Err(AppError::new(
+            "prompt input must use either --source PATH or --text TEXT, not both",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1574,6 +1599,8 @@ mod tests {
                 assert_eq!(args.submit_delay_ms, 250);
                 assert!(!args.no_yolo);
                 assert!(args.state_dir.is_none());
+                assert!(args.prompt_source.is_none());
+                assert!(args.prompt_text.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1603,9 +1630,79 @@ mod tests {
                 assert!(args.no_yolo);
                 assert_eq!(args.submit_delay_ms, 600);
                 assert_eq!(args.state_dir, Some(std::path::PathBuf::from("/tmp/state")));
+                assert!(args.prompt_source.is_none());
+                assert!(args.prompt_text.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_keep_going_custom_prompt_source() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--source"),
+            String::from("/tmp/loop-prompt.txt"),
+        ])
+        .expect("keep-going custom prompt command should parse");
+
+        match command {
+            Command::KeepGoing(args) => {
+                assert_eq!(args.target.pane_id.as_deref(), Some("%9"));
+                assert_eq!(
+                    args.prompt_source,
+                    Some(std::path::PathBuf::from("/tmp/loop-prompt.txt"))
+                );
+                assert!(args.prompt_text.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_keep_going_custom_prompt_text() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--text"),
+            String::from("Custom loop"),
+        ])
+        .expect("keep-going custom prompt text should parse");
+
+        match command {
+            Command::KeepGoing(args) => {
+                assert_eq!(args.target.pane_id.as_deref(), Some("%9"));
+                assert!(args.prompt_source.is_none());
+                assert_eq!(args.prompt_text.as_deref(), Some("Custom loop"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_keep_going_multiple_prompt_inputs() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--source"),
+            String::from("/tmp/loop-prompt.txt"),
+            String::from("--text"),
+            String::from("continue"),
+        ])
+        .expect_err("keep-going should reject multiple prompt inputs");
+
+        assert!(
+            error
+                .to_string()
+                .contains("prompt input must use either --source PATH or --text TEXT, not both")
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@
 23. [x] P3-7 Add a one-off permission babysit mode for a single instance.
 24. [ ] P3-8 Add interactive target selection for single-pane commands.
 25. [ ] P3-9 Move runtime state to XDG and split SQLite control-plane state from file artifacts.
-26. [ ] P3-10 Let `keep-going` run user-supplied prompt loops.
+26. [x] P3-10 Let `keep-going` run user-supplied prompt loops.
 
 ## P0
 

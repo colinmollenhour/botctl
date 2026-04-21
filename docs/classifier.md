@@ -1,0 +1,72 @@
+# Classifier
+
+The classifier maps a captured pane frame to a conservative session state.
+
+## What it looks at
+
+Classification normally runs on the authoritative `capture-pane` frame. In serve mode, a merged stream model can be preferred during stream-driven reconciliation when the capture-based result is `Unknown` and the merged view yields a clearer state.
+
+The classifier also records recap detection:
+
+- `recap_present` indicates a recap anchor was seen
+- `recap_excerpt` stores a short summary snippet when one can be extracted
+
+Recap data is auxiliary metadata, not a primary state.
+
+## States
+
+- `ChatReady` — Claude is ready for input
+- `BusyResponding` — Claude appears to be working
+- `PermissionDialog` — a permission confirmation flow is open
+- `FolderTrustPrompt` — the folder trust prompt is open
+- `SurveyPrompt` — a feedback/survey prompt is open
+- `ExternalEditorActive` — Claude is waiting on an external editor
+- `DiffDialog` — a diff/review dialog is open
+- `Unknown` — classification is uncertain or ambiguous
+
+`Unknown` is the safe outcome. Prefer it over a false positive that could trigger the wrong automation.
+
+## Signals
+
+Classifier output includes signals that explain the decision, such as:
+
+- permission keywords
+- chat keywords
+- ambiguous permission/chat overlap
+- folder trust keywords
+- survey keywords
+- external editor keywords
+- diff keywords
+- busy keywords
+- sensitive Claude path references
+- self-settings language references
+
+Signals are meant to explain why a state was chosen, not to override the state contract.
+
+## Recap handling
+
+Recap detection is intentionally separate from the main state machine.
+
+- recap anchors are detected as extra evidence
+- recap text is preserved for reporting and fixtures
+- recap presence does not automatically imply a new state
+
+This keeps recap-related UI changes from breaking guarded workflows.
+
+## Extension rules
+
+When adding or changing a classifier state:
+
+1. update the guarded workflow assumptions
+2. update or add replay fixtures
+3. update tests in the same change
+
+If a new flow is ambiguous, prefer `Unknown` until the classifier and fixtures can explain it.
+
+## CLI usage
+
+- `cargo run -- classify --path <fixture-or-frame>`
+- `cargo run -- replay --path <fixture-case>`
+- `cargo test`
+
+Related docs: [`command-reference.md`](command-reference.md), [`automation.md`](automation.md), [`workflows.md`](workflows.md), [`serve-mode.md`](serve-mode.md).

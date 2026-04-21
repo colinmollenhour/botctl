@@ -19,6 +19,7 @@ The project is built around a simple rule: terminal automation is only safe when
 
 - [`docs/README.md`](docs/README.md) - docs index
 - [`docs/getting-started.md`](docs/getting-started.md) - quick setup and operator workflow
+- [`docs/workflows.md`](docs/workflows.md) - end-to-end operator flows
 - [`docs/architecture.md`](docs/architecture.md) - module boundaries and design rules
 - [`docs/serve-mode.md`](docs/serve-mode.md) - current serve-mode behavior and next steps
 
@@ -116,7 +117,7 @@ cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the curre
 
 `botctl` respects the user's existing Claude keybindings. It resolves actions like submit, external editor, and confirmation flows from `~/.claude/keybindings.json` instead of assuming that a hard-coded automation keymap is installed.
 
-`install-bindings` is intentionally non-destructive. If the user already has a custom Claude keybinding file, `botctl` will refuse to overwrite it.
+`install-bindings` is intentionally non-destructive. If the user already has a Claude keybinding file, `botctl` will merge in any missing required bindings when it can, and fail clearly on invalid JSON or key conflicts instead of overwriting the file.
 
 Print the recommended automation keymap:
 
@@ -124,7 +125,7 @@ Print the recommended automation keymap:
 cargo run -- bindings
 ```
 
-Write the recommended keymap only when no conflicting file already exists:
+Create or update the keymap with any missing required bindings:
 
 ```bash
 cargo run -- install-bindings
@@ -169,7 +170,7 @@ Recap is auxiliary metadata, not a primary state. Strong anchors like `while you
 
 ## Current Limits
 
-- Live classification still uses `capture-pane` plus a recent-lines heuristic.
+- Live classification is still built around `capture-pane`, with `serve` using a best-effort merged stream model when that helps break `Unknown` states.
 - The classifier is keyword-based and intentionally conservative.
 - `botctl` can attach to existing Claude panes, but the strongest and most tested path is still managed sessions.
 - `serve` is an initial foreground observer, not the full daemon/API/SSE control plane described in `PLANS-Serve-Mode.md` yet.

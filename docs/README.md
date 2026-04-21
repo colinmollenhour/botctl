@@ -1,32 +1,38 @@
 # botctl docs
 
-This folder is the beginning of the real product docs for `botctl`.
+Operator-facing docs for `botctl`.
 
-## Guides
+## Start here
 
-- [Getting started](getting-started.md)
-- [Serve mode](serve-mode.md)
+- [Getting started](getting-started.md) — first successful run
+- [Workflows](workflows.md) — end-to-end operator flows
 
-## Reference
+## Understand the modes
 
-- [Architecture](architecture.md)
+- [Serve mode](serve-mode.md) — current foreground observer behavior
+- [Architecture](architecture.md) — module boundaries and safety rules
+
+## Find command details
+
+- [Command reference](command-reference.md)
+- [Automation](automation.md)
+- [Prompt handoff](prompt-handoff.md)
+- [Troubleshooting](troubleshooting.md)
+
+## Build, test, and contribute
+
+- [Classifier](classifier.md)
+- [Testing and fixtures](testing-and-fixtures.md)
+- [Contributing](contributing.md)
 
 ## Planning docs still in the repo root
 
-These are still useful while the docs set is being moved into `docs/`:
+These remain the source of longer-term plans:
 
 - [`../VISION.md`](../VISION.md)
 - [`../WISHLIST.md`](../WISHLIST.md)
 - [`../PLANS-Serve-Mode.md`](../PLANS-Serve-Mode.md)
 
-## What belongs here
+## Scope
 
-Going forward, `docs/` should hold operator-facing and contributor-facing documentation such as:
-
-- setup and usage guides
-- command reference
-- architecture notes
-- serve-mode behavior and rollout notes
-- fixture and testing workflows
-
-The root planning docs can stay for now, but new polished documentation should start here.
+Keep docs here aligned with shipped behavior. If a flow is not implemented yet, link to the relevant plan instead of describing it as current behavior.

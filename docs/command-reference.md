@@ -1,0 +1,619 @@
+# botctl command reference
+
+This page is the current CLI reference for shipped commands and aliases.
+
+## Common targeting and safety rules
+
+- `--pane %ID` targets a specific tmux pane.
+- `--session NAME [--window NAME]` targets a session; when a window is required, both `--session` and `--window` must be provided.
+- Several workflow commands refuse ambiguous targets.
+- Automation commands generally require the target pane to be a Claude pane and will refuse to act otherwise.
+- `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
+
+## Session and pane management
+
+### `start`
+
+Purpose: start a tmux session running Claude.
+
+Syntax:
+```bash
+botctl start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]
+```
+
+Flags:
+- `--session NAME` (required)
+- `--window NAME` (default: `claude`)
+- `--cwd PATH` (default: current working directory)
+- `--command CMD` (default: `claude`)
+- `--dry-run` (print the tmux plan instead of starting)
+
+Targeting: creates/starts the named session; no pane target is used.
+
+Example:
+```bash
+botctl start --session demo --dry-run
+```
+
+### `attach`
+
+Purpose: resolve and report a Claude pane target.
+
+Syntax:
+```bash
+botctl attach (--pane %ID | --session NAME [--window NAME])
+```
+
+Flags:
+- `--pane %ID` or `--session NAME [--window NAME]` (required)
+
+Targeting: accepts either an explicit pane or a session target; a window-only target is refused.
+
+Safety: refuses panes not owned by Claude.
+
+Example:
+```bash
+botctl attach --session demo --window claude
+```
+
+### `list-panes` / `list`
+
+Purpose: list tmux panes.
+
+Syntax:
+```bash
+botctl list-panes [--all]
+botctl list [--all]
+```
+
+Flags:
+- `--all` (default: off; without it, only Claude panes are shown)
+
+Targeting: no explicit target; scans all panes.
+
+Example:
+```bash
+botctl list
+```
+
+### `capture`
+
+Purpose: print a pane capture.
+
+Syntax:
+```bash
+botctl capture --pane %ID [--history-lines N]
+```
+
+Flags:
+- `--pane %ID` (required)
+- `--history-lines N` (default: `200`)
+
+Targeting: explicit pane only.
+
+Example:
+```bash
+botctl capture --pane %7 --history-lines 80
+```
+
+### `status`
+
+Purpose: inspect a pane, classify its state, and report keybinding/next-action diagnostics.
+
+Syntax:
+```bash
+botctl status --pane %ID [--history-lines N]
+```
+
+Flags:
+- `--pane %ID` (required)
+- `--history-lines N` (default: `120`)
+
+Targeting: explicit pane only.
+
+Example:
+```bash
+botctl status --pane %7
+```
+
+### `doctor`
+
+Purpose: diagnose a pane or session and report automation readiness.
+
+Syntax:
+```bash
+botctl doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]
+```
+
+Flags:
+- `--session NAME` (optional)
+- `--pane %ID` (optional)
+- `--history-lines N` (default: `120`)
+- `--bindings-path PATH` (optional)
+
+Targeting: requires at least one of `--pane` or `--session`.
+
+Safety: refuses if both are missing.
+
+Example:
+```bash
+botctl doctor --session demo
+```
+
+## Observation and serving
+
+### `observe`
+
+Purpose: stream a bounded observation of a session.
+
+Syntax:
+```bash
+botctl observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]
+```
+
+Flags:
+- `--session NAME` (required)
+- `--pane %ID` (optional)
+- `--events N` (default: `25`)
+- `--idle-timeout-ms N` (default: `1500`)
+- `--history-lines N` (default: `120`)
+
+Targeting: session required; pane target is optional.
+
+Example:
+```bash
+botctl observe --session demo --events 10
+```
+
+### `serve`
+
+Purpose: run the babysit/serve loop for a session.
+
+Syntax:
+```bash
+botctl serve --session NAME [--pane %ID] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]
+```
+
+Flags:
+- `--session NAME` (required)
+- `--pane %ID` (optional)
+- `--reconcile-ms N` (default: `1500`, must be at least `1`)
+- `--history-lines N` (default: `120`)
+- `--format human|jsonl` (default: `human`)
+
+Targeting: session required; optional explicit pane target.
+
+Safety: rejects `--reconcile-ms 0`.
+
+Example:
+```bash
+botctl serve --session demo --format jsonl
+```
+
+## Fixtures and replay
+
+### `record-fixture`
+
+Purpose: capture a fixture case from a live session.
+
+Syntax:
+```bash
+botctl record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]
+```
+
+Flags:
+- `--session NAME` (required)
+- `--case NAME` (required)
+- `--pane %ID` (optional)
+- `--output-dir PATH` (default: `fixtures/cases`)
+- `--expected-state STATE` (optional)
+- `--events N` (default: `25`)
+- `--idle-timeout-ms N` (default: `1500`)
+- `--history-lines N` (default: `120`)
+
+Targeting: session required; pane optional.
+
+Example:
+```bash
+botctl record-fixture --session demo --case permission-dialog
+```
+
+### `classify`
+
+Purpose: classify a saved frame file.
+
+Syntax:
+```bash
+botctl classify --path PATH
+```
+
+Flags:
+- `--path PATH` (required)
+
+Targeting: file input only.
+
+Example:
+```bash
+botctl classify --path fixtures/frames/demo.txt
+```
+
+### `replay`
+
+Purpose: replay and compare a saved fixture case.
+
+Syntax:
+```bash
+botctl replay --path PATH
+```
+
+Flags:
+- `--path PATH` (required)
+
+Targeting: file input only.
+
+Example:
+```bash
+botctl replay --path fixtures/cases/demo
+```
+
+## Keybindings
+
+### `bindings`
+
+Purpose: print the built-in keybinding definition as JSON.
+
+Syntax:
+```bash
+botctl bindings
+```
+
+Example:
+```bash
+botctl bindings
+```
+
+### `install-bindings`
+
+Purpose: install the recommended Claude keybindings.
+
+Syntax:
+```bash
+botctl install-bindings [--path PATH]
+```
+
+Flags:
+- `--path PATH` (optional)
+
+Targeting: path only.
+
+Safety: creates the file if it is missing, merges in any missing required bindings when possible, and fails clearly on invalid JSON or key conflicts.
+
+Example:
+```bash
+botctl install-bindings
+```
+
+### `send-action`
+
+Purpose: send one named automation action to a pane.
+
+Syntax:
+```bash
+botctl send-action --pane %ID --action NAME
+```
+
+Flags:
+- `--pane %ID` (required)
+- `--action NAME` (required)
+
+Valid actions:
+- `clear-input`
+- `external-editor`
+- `submit`
+- `interrupt`
+- `confirm-previous`
+- `confirm-next`
+- `confirm-yes`
+- `confirm-no`
+
+Targeting: explicit pane only.
+
+Safety: refuses non-Claude panes and unknown action names.
+
+Example:
+```bash
+botctl send-action --pane %7 --action submit
+```
+
+## Guarded workflows
+
+### `approve` / `approve-permission`
+
+Purpose: approve a permission dialog.
+
+Syntax:
+```bash
+botctl approve --pane %ID [--format human|jsonl]
+botctl approve-permission --pane %ID [--format human|jsonl]
+```
+
+Flags:
+- `--pane %ID` (required)
+- `--format human|jsonl` (default: `human`)
+
+Targeting: explicit pane only.
+
+Safety: validates the pane state before sending keys.
+
+Example:
+```bash
+botctl approve --pane %7
+```
+
+### `reject` / `reject-permission`
+
+Purpose: decline a permission dialog.
+
+Syntax:
+```bash
+botctl reject --pane %ID [--format human|jsonl]
+botctl reject-permission --pane %ID [--format human|jsonl]
+```
+
+Flags:
+- `--pane %ID` (required)
+- `--format human|jsonl` (default: `human`)
+
+Targeting: explicit pane only.
+
+Safety: validates the pane state before sending keys.
+
+Example:
+```bash
+botctl reject --pane %7 --format jsonl
+```
+
+### `dismiss-survey`
+
+Purpose: dismiss a survey prompt.
+
+Syntax:
+```bash
+botctl dismiss-survey --pane %ID
+```
+
+Flags:
+- `--pane %ID` (required)
+
+Targeting: explicit pane only.
+
+Safety: validates the pane state before sending keys.
+
+Example:
+```bash
+botctl dismiss-survey --pane %7
+```
+
+### `continue-session`
+
+Purpose: continue a paused or interrupted Claude session.
+
+Syntax:
+```bash
+botctl continue-session (--pane %ID | --session NAME --window NAME)
+```
+
+Flags:
+- `--pane %ID` or `--session NAME --window NAME` (required)
+
+Targeting: accepts either one explicit pane or a fully qualified session/window target.
+
+Safety: rejects session-only targeting and refuses ambiguous targets.
+
+Example:
+```bash
+botctl continue-session --session demo --window claude
+```
+
+### `auto-unstick`
+
+Purpose: try a bounded sequence of recovery actions until the pane becomes usable.
+
+Syntax:
+```bash
+botctl auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]
+```
+
+Flags:
+- `--pane %ID` or `--session NAME --window NAME` (required)
+- `--max-steps N` (default: `6`, must be at least `1`)
+
+Targeting: accepts either one explicit pane or a fully qualified session/window target.
+
+Safety: refuses ambiguous targets and `--max-steps 0`; it may stop early if a permission dialog would require more than one approval.
+
+Example:
+```bash
+botctl auto-unstick --pane %7 --max-steps 4
+```
+
+### `keep-going`
+
+Purpose: continuously babysit a pane, submit the loop prompt when Claude is ready, and return only when the loop yields `ALL_DONE`, `PANIC`, or an error.
+
+Syntax:
+```bash
+botctl keep-going (--pane %ID | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]
+```
+
+Flags:
+- `--pane %ID` or `--session NAME --window NAME` (required)
+- `--poll-ms N` (default: `1000`, must be at least `1`)
+- `--submit-delay-ms N` (default: `250`, must be at least `1`)
+- `--state-dir PATH` (optional)
+- `--source PATH` or `--text TEXT` (optional; defaults to the built-in audit loop prompt)
+- `--no-yolo` (default: off)
+
+Targeting: accepts either one explicit pane or a fully qualified session/window target.
+
+Safety: refuses ambiguous targets and zero polling/submission intervals.
+
+Custom prompt contract: custom loop prompts are wrapped with an internal botctl marker, but your prompt still needs to tell Claude to end each reply with the expected literal loop token (`OKIE_DOKIE`, `ALL_DONE`, or `PANIC`). Empty custom prompts are rejected.
+
+Completion contract:
+- `OKIE_DOKIE` — continue looping after reporting remaining work
+- `ALL_DONE` — return the final completion summary and stop
+- `PANIC` — return blocking details and stop
+
+Default loop behavior:
+- the built-in audit prompt tells Claude to verify completion before `ALL_DONE`
+- it instructs Claude to commit before `ALL_DONE` when there are changes to commit
+- it instructs Claude to push automatically only on branches other than `main`, `master`, `develop`, `dev`, `trunk`, or `release/*`
+- it instructs Claude to open a PR only if the user explicitly asked for one
+
+Example:
+```bash
+botctl keep-going --pane %7 --no-yolo
+```
+
+Custom loop example:
+```bash
+botctl keep-going --pane %7 --source ./prompts/review-loop.txt
+```
+
+## Prompt preparation and submission
+
+### `prepare-prompt`
+
+Purpose: prepare a prompt payload for a session.
+
+Syntax:
+```bash
+botctl prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]
+```
+
+Flags:
+- `--session NAME` (required)
+- `--state-dir PATH` (optional)
+- `--source PATH` or `--text TEXT` (exactly one required)
+
+Targeting: session only.
+
+Safety: refuses if both prompt inputs are provided or if neither is provided.
+
+Example:
+```bash
+botctl prepare-prompt --session demo --text "Write the summary"
+```
+
+### `editor-helper`
+
+Purpose: generate an editor target file for the prompt workflow.
+
+Syntax:
+```bash
+botctl editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET
+```
+
+Flags:
+- `--session NAME` (required)
+- `--state-dir PATH` (optional)
+- `--source PATH` (optional)
+- `--keep-pending` (optional)
+- `TARGET` (required positional path)
+
+Targeting: session plus a single positional target path.
+
+Safety: refuses unknown flags and multiple positional targets.
+
+Example:
+```bash
+botctl editor-helper --session demo /tmp/botctl-prompt.txt
+```
+
+### `submit-prompt`
+
+Purpose: resolve prompt text from `--text` or `--source`, stage it, and submit it into a pane.
+
+Syntax:
+```bash
+botctl submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]
+```
+
+Flags:
+- `--session NAME` (required)
+- `--pane %ID` (required)
+- `--state-dir PATH` (optional)
+- `--source PATH` or `--text TEXT` (exactly one required)
+- `--submit-delay-ms N` (default: `250`, must be at least `1`)
+
+Targeting: session plus explicit pane.
+
+Safety: refuses if both prompt inputs are provided, if neither is provided, or if `--submit-delay-ms 0` is used.
+
+Example:
+```bash
+botctl submit-prompt --session demo --pane %7 --text "Continue"
+```
+
+## Permission babysitting
+
+### `yolo` / `permission-babysit` / `babysit`
+
+Purpose: start or stop the permission babysit loop.
+
+Syntax:
+```bash
+botctl yolo [start] (--pane %ID | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]
+botctl yolo stop (--pane %ID | --all) [--state-dir PATH]
+botctl permission-babysit [same as yolo]
+botctl babysit [same as yolo]
+```
+
+Aliases:
+- `yolo`, `permission-babysit`, and `babysit` are the same command family.
+
+Subcommands:
+- `start` (optional; omitted by default)
+- `stop`
+
+Start flags:
+- `--pane %ID` or `--all` (exactly one required)
+- `--poll-ms N` (default: `1000`, must be at least `1`)
+- `--format human|jsonl` (default: `human`)
+- `--live-preview` (default: off)
+- `--state-dir PATH` (optional)
+
+Stop flags:
+- `--pane %ID` or `--all` (exactly one required)
+- `--state-dir PATH` (optional)
+
+Targeting:
+- `start` can target one pane or scan all Claude panes with `--all`
+- `stop --all` disables all tracked babysit records
+- neither mode allows mixing `--pane` and `--all`
+
+Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed targets.
+
+Example:
+```bash
+botctl yolo start --pane %7 --live-preview
+```
+
+## Help
+
+### `help`
+
+Purpose: print the command list and usage summary.
+
+Syntax:
+```bash
+botctl help
+botctl --help
+botctl -h
+```
+
+Example:
+```bash
+botctl --help
+```

@@ -1,12 +1,12 @@
 # Serve mode
 
-`botctl serve` is the first long-lived observation mode in the project.
+`botctl serve` is the current long-lived observation path.
 
-It replaces the old purely bounded observer model for the served tmux session by holding a persistent tmux control-mode connection open and reconciling with periodic `capture-pane` snapshots.
+It holds a persistent tmux control-mode connection open for one session, then rebases that stream with periodic `capture-pane` snapshots.
 
 ## What it does today
 
-`serve` currently runs as a foreground process and emits structured events to stdout.
+`serve` runs in the foreground and emits structured events to stdout.
 
 Current behavior:
 
@@ -67,7 +67,7 @@ Snapshot events include:
 
 ## Current scope
 
-This is the P1-1 foundation, not the full serve-mode product yet.
+This is the current implementation, not the full serve-mode product yet.
 
 Implemented now:
 
@@ -92,9 +92,16 @@ Not implemented yet:
 Serve mode keeps the same safety rules as the rest of `botctl`:
 
 - targeting stays explicit
-- pane ownership still matters
+- observation stays scoped to the requested tmux session or explicit pane
 - `Unknown` remains a refusal state
 - serve mode does not bypass guarded workflow checks
+
+Current limits:
+
+- it is still a foreground observer
+- it does not expose a daemon, HTTP API, or SSE yet
+- it does not replace guarded workflow execution
+- classification still depends on capture-plus-merge heuristics, not a full terminal model
 
 ## Relationship to the larger plan
 
@@ -108,7 +115,7 @@ The current implementation maps most directly to these wishlist items:
 
 The next meaningful improvements are:
 
-1. reconstruct a live screen model from streamed output
+1. improve the live screen model from streamed output
 2. preserve pane ownership across more tmux topology changes
 3. introduce a tracked-instance registry
 4. expose the observer through a local API

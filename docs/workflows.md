@@ -1,0 +1,119 @@
+# Workflows
+
+This guide collects the operator flows that are currently shipped.
+
+For command syntax, see [command reference](command-reference.md). For prompt handoff details, see [prompt handoff](prompt-handoff.md).
+
+## Managed session flow
+
+Use this when `botctl` launches Claude for you.
+
+1. Start the managed session:
+
+   ```bash
+   cargo run -- start --session demo --cwd /path/to/project
+   ```
+
+2. Find the pane and inspect the session:
+
+   ```bash
+   cargo run -- list-panes
+   cargo run -- doctor --session demo
+   cargo run -- status --pane %19
+   ```
+
+3. Attach with tmux when you want the terminal UI:
+
+   ```bash
+   tmux attach -t demo
+   ```
+
+## Resolve an existing pane
+
+Use this when Claude is already running inside tmux and you want to verify the pane before acting.
+
+1. List panes, including non-managed ones:
+
+   ```bash
+   cargo run -- list-panes --all
+   ```
+
+2. Resolve only a specific explicit pane:
+
+   ```bash
+   cargo run -- attach --pane %19
+   ```
+
+3. Verify the pane before acting:
+
+   ```bash
+   cargo run -- doctor --pane %19
+   cargo run -- status --pane %19
+   ```
+
+## Blocker recovery flow
+
+Use the direct pane-targeted actions only when the classified state matches the flow.
+
+- permission dialog: `approve-permission` or `reject-permission`
+- survey prompt: `dismiss-survey`
+- blocked but usable session: `continue-session`
+- repeated prompt recovery: `auto-unstick`
+
+Examples:
+
+```bash
+cargo run -- approve-permission --pane %19
+cargo run -- reject-permission --pane %19
+cargo run -- dismiss-survey --pane %19
+cargo run -- continue-session --pane %19
+cargo run -- auto-unstick --pane %19
+```
+
+Notes:
+
+- `Unknown` is a refusal state; do not guess.
+- `approve-permission` accepts `PermissionDialog` and `FolderTrustPrompt`.
+- Folder trust approval is special and uses raw `Enter`.
+- Prefer explicit pane IDs over session names for recovery.
+
+## Prompt flow overview
+
+There are two prompt paths today:
+
+1. **One-shot submission** — pass `--text` or `--source` directly to `submit-prompt`.
+2. **Manual staging** — use `prepare-prompt`, then `editor-helper` when Claude requests an external editor target.
+
+One-shot example:
+
+```bash
+cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the current repo"
+```
+
+Manual staging example:
+
+```bash
+cargo run -- prepare-prompt --session demo --text "Summarize the current repo"
+cargo run -- editor-helper --session demo /tmp/claude-editor.txt
+```
+
+For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](prompt-handoff.md).
+
+## Observe versus serve
+
+- `observe` is bounded: it returns a fixed sample of events and pane state.
+- `serve` is the current long-lived foreground observer for one session.
+- `serve` still depends on tmux control mode and periodic pane snapshots.
+- `serve` is not yet a full daemon/API/SSE product.
+
+Use `observe` when you want a bounded diagnostic sample; use `serve` when you want a live foreground stream.
+
+## Safety rules
+
+- Explicit pane IDs are preferred.
+- Never automate an ambiguous target.
+- Claude ownership must be established before automation.
+- Guarded workflows validate the classified state before sending keys.
+- `Unknown` means stop and inspect.
+
+For deeper rationale and current limits, see [architecture](architecture.md) and [troubleshooting](troubleshooting.md).

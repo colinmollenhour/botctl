@@ -1,0 +1,61 @@
+# Testing and fixtures
+
+`botctl` uses recorded fixtures to keep classifier behavior stable as Claude UI text changes.
+
+## Corpus layout
+
+Fixture cases live under `fixtures/cases/*`.
+
+Each case directory is a self-contained scenario, usually containing:
+
+- `expected.txt` — expected state plus recap metadata
+- `frame.txt` — the captured pane text used by the classifier
+- `control-mode.log` — raw control-mode lines when the case was recorded
+- `metadata.txt` — record-time summary for debugging and review
+
+Some older cases only contain `expected.txt` and `frame.txt`; replay still reads those.
+
+## Recording a fixture
+
+Use `record-fixture` when you have a live session to capture:
+
+```bash
+cargo run -- record-fixture --session demo --pane %19 --case new_case --output-dir fixtures/cases
+```
+
+Recording stores the frame, expected state, and supporting evidence in a new case directory.
+
+## Replaying a fixture
+
+Replay verifies that the classifier still matches the recorded expectation:
+
+```bash
+cargo run -- replay --path fixtures/cases/new_case
+```
+
+The replay test suite also walks every directory under `fixtures/cases/*`.
+
+## Classification checks
+
+Use the direct classifier command for a single frame or fixture file:
+
+```bash
+cargo run -- classify --path fixtures/cases/chat_ready/frame.txt
+```
+
+## Regression workflow
+
+1. add or update the fixture case
+2. update the classifier if needed
+3. update guarded workflows if the state contract changed
+4. run `cargo test`
+
+The most important regression test is `tests/replay.rs`, which ensures every fixture case still classifies as expected.
+
+## Test basics
+
+```bash
+cargo test
+```
+
+Related docs: [`command-reference.md`](command-reference.md), [`workflows.md`](workflows.md), [`automation.md`](automation.md), [`serve-mode.md`](serve-mode.md).

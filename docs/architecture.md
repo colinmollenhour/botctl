@@ -2,17 +2,21 @@
 
 `botctl` is built around one constraint: terminal automation is only safe when transport, observation, classification, and policy stay separate.
 
-## Core modules
+## Current module map
 
-- `src/tmux.rs` - tmux transport, pane discovery, pane capture, key sending, and control-mode session management
-- `src/observe.rs` - bounded observation and control-line parsing helpers
-- `src/classifier.rs` - frame-to-state classification
-- `src/automation.rs` - action definitions, keybinding resolution, and guarded workflow rules
-- `src/app.rs` - CLI orchestration and user-facing command behavior
-- `src/serve.rs` - long-lived foreground observer loop for serve mode
-- `src/fixtures.rs` - fixture recording and replay support
-- `src/prompt.rs` - prompt staging and external-editor handoff helpers
-- `src/permission_babysit.rs` - one-off permission babysit state persistence
+- `src/tmux.rs` — tmux transport, pane discovery, capture, key sending, and control-mode session management
+- `src/observe.rs` — bounded observation, control-line parsing, and capture-backed reports
+- `src/serve.rs` — long-lived foreground observer loop for `serve`
+- `src/screen_model.rs` — best-effort stream reconstruction helper for serve mode
+- `src/classifier.rs` — frame-to-state classification and recap metadata detection
+- `src/automation.rs` — action definitions, keybinding resolution, and guarded workflow rules
+- `src/fixtures.rs` — fixture recording, loading, and replay support
+- `src/prompt.rs` — prompt staging and external-editor handoff helpers
+- `src/permission_babysit.rs` — one-off permission babysit state persistence
+- `src/app.rs` — command execution, status/doctor output, and top-level workflow orchestration
+- `src/cli.rs` — argument parsing and command definitions
+- `src/main.rs` — process entry point and error printing
+- `src/lib.rs` — crate module exports
 
 ## Safety boundaries
 
@@ -36,7 +40,7 @@ Observation is responsible for gathering terminal evidence:
 - tmux notifications
 - `capture-pane` snapshots for reconciliation
 
-Observation should preserve enough evidence to explain later classifier decisions.
+`capture-pane` is still the primary source for classification. In `serve`, the live stream model is a best-effort helper that can break ties when stream-driven reconciliation would otherwise stay `Unknown`, but capture-backed snapshots remain the base truth.
 
 ### Classification
 
@@ -87,6 +91,7 @@ The current `serve` implementation is intentionally small:
 - one foreground process
 - one tmux control-mode session per served tmux session
 - per-pane buffering of recent streamed output
+- `screen_model` reconstruction as a helper layer, not the source of truth
 - debounced reconciliation via `capture-pane`
 - structured human or JSONL events on stdout
 
@@ -99,3 +104,4 @@ This is the first slice of the larger serve-mode plan described in `PLANS-Serve-
 - keep observation and policy separate
 - preserve the user's Claude keybindings as the source of truth
 - keep fixture-based regression coverage close to classifier behavior
+- update guarded workflows and tests in the same change when classifier states change

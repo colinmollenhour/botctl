@@ -45,6 +45,7 @@ const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
 const KEEP_GOING_HISTORY_LINES: usize = 2000;
 const KEEP_GOING_PROMPT_ANCHOR: &str = "Audit the task currently in scope";
+const KEEP_GOING_CUSTOM_PROMPT_ANCHOR: &str = "[[BOTCTL_KEEP_GOING_END_PROMPT]]";
 const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
 const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
 const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
@@ -537,6 +538,10 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
     let pane = resolve_target_pane(&client, &args.target)?;
     ensure_pane_owned_by_claude(&pane)?;
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let prompt = resolve_keep_going_prompt(
+        args.prompt_source.as_deref(),
+        args.prompt_text.as_deref(),
+    )?;
     let bindings = load_automation_keybindings(None)?;
     let mut awaiting_reply = false;
     let mut last_state: Option<SessionState> = None;
@@ -618,7 +623,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
 
         if awaiting_reply {
             let frame = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-            let response = extract_keep_going_response(&frame);
+            let response = extract_keep_going_response(&frame, prompt.anchor.as_deref());
             let terminal_reply_ready = classification.state == SessionState::ChatReady
                 || frame_has_keep_going_chat_input(&frame);
 
@@ -653,6 +658,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                 &pane.pane_id,
                 &current_pane.session_name,
                 &state_dir,
+                &prompt.text,
                 &bindings,
                 args.submit_delay_ms,
             )?;
@@ -664,12 +670,12 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                 &client,
                 &pane.pane_id,
                 &before_submit,
-                Some(KEEP_GOING_PROMPT_ANCHOR),
+                prompt.anchor.as_deref(),
             )
             .map_err(
                 |_| {
                     AppError::new(format!(
-                        "keep-going submitted the audit prompt but pane {} did not show a prompt-submission transition",
+                        "keep-going submitted the loop prompt but pane {} did not show a prompt-submission transition",
                         pane.pane_id
                     ))
                 },
@@ -686,10 +692,11 @@ fn submit_keep_going_prompt(
     pane_id: &str,
     session_name: &str,
     state_dir: &Path,
+    prompt_text: &str,
     bindings: &ResolvedKeybindings,
     submit_delay_ms: u64,
 ) -> AppResult<()> {
-    prepare_prompt(state_dir, session_name, KEEP_GOING_PROMPT)?;
+    prepare_prompt(state_dir, session_name, prompt_text)?;
     send_actions(
         client,
         pane_id,
@@ -863,6 +870,12 @@ struct KeepGoingResponse {
     body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeepGoingPromptConfig {
+    text: String,
+    anchor: Option<String>,
+}
+
 impl KeepGoingResponse {
     fn render(&self) -> String {
         if self.body.is_empty() {
@@ -873,7 +886,10 @@ impl KeepGoingResponse {
     }
 }
 
-fn extract_keep_going_response(frame: &str) -> Option<KeepGoingResponse> {
+fn extract_keep_going_response(
+    frame: &str,
+    prompt_anchor: Option<&str>,
+) -> Option<KeepGoingResponse> {
     let lines = frame.lines().collect::<Vec<_>>();
     let mut search_end = lines.len();
     while search_end > 0
@@ -888,7 +904,7 @@ fn extract_keep_going_response(frame: &str) -> Option<KeepGoingResponse> {
 
     let token_idx = search_end - 1;
     let directive = KeepGoingDirective::from_line(lines[token_idx])?;
-    let body_start = keep_going_body_start(&lines, token_idx);
+    let body_start = keep_going_body_start(&lines, token_idx, prompt_anchor);
 
     let mut body_lines = lines[body_start..token_idx]
         .iter()
@@ -907,12 +923,14 @@ fn extract_keep_going_response(frame: &str) -> Option<KeepGoingResponse> {
     })
 }
 
-fn keep_going_body_start(lines: &[&str], token_idx: usize) -> usize {
-    if let Some(prompt_idx) = lines[..token_idx]
-        .iter()
-        .rposition(|line| line.contains(KEEP_GOING_PROMPT_ANCHOR))
-    {
-        return prompt_idx + 1;
+fn keep_going_body_start(lines: &[&str], token_idx: usize, prompt_anchor: Option<&str>) -> usize {
+    if let Some(anchor) = prompt_anchor.filter(|anchor| !anchor.trim().is_empty()) {
+        if let Some(prompt_idx) = lines[..token_idx]
+            .iter()
+            .rposition(|line| line.contains(anchor))
+        {
+            return prompt_idx + 1;
+        }
     }
 
     lines[..token_idx]
@@ -928,6 +946,32 @@ fn frame_has_keep_going_chat_input(frame: &str) -> bool {
         .rev()
         .take(4)
         .any(is_keep_going_chat_input_line)
+}
+
+fn resolve_keep_going_prompt(
+    source: Option<&Path>,
+    text: Option<&str>,
+) -> AppResult<KeepGoingPromptConfig> {
+    match (source, text) {
+        (None, None) => Ok(KeepGoingPromptConfig {
+            text: KEEP_GOING_PROMPT.to_string(),
+            anchor: Some(KEEP_GOING_PROMPT_ANCHOR.to_string()),
+        }),
+        _ => {
+            let text = read_prompt_input(source, text)?;
+            if text.trim().is_empty() {
+                return Err(AppError::new(
+                    "keep-going custom prompt must not be empty",
+                ));
+            }
+            Ok(KeepGoingPromptConfig {
+                anchor: Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR.to_string()),
+                text: format!(
+                    "{text}\n\n(Do not repeat the marker line below in your reply.)\n{KEEP_GOING_CUSTOM_PROMPT_ANCHOR}"
+                ),
+            })
+        }
+    }
 }
 
 fn is_keep_going_chat_input_line(line: &str) -> bool {
@@ -1861,6 +1905,7 @@ fn serve_body_lines(input: &str) -> Vec<String> {
 struct InspectedPane {
     classification: Classification,
     focused_source: String,
+    raw_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1882,6 +1927,7 @@ fn inspect_pane(
     Ok(InspectedPane {
         classification: Classifier.classify(pane_id, &focused_source),
         focused_source,
+        raw_source: frame,
     })
 }
 
@@ -1890,12 +1936,10 @@ fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<Permis
         return None;
     }
 
-    let lines = inspected.focused_source.lines().collect::<Vec<_>>();
-    let question_idx = lines
-        .iter()
-        .rposition(|line| is_permission_question_line(line.trim()))?;
-    let title_idx = find_permission_prompt_title_idx(&lines[..question_idx])?;
-    let title = lines[title_idx].trim();
+    let lines = permission_prompt_lines(inspected)?;
+    let line_refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+    let (title_idx, question_idx) = extract_permission_prompt_region(&line_refs)?;
+    let title = line_refs[title_idx].trim();
     let (mut prompt_type, sandbox_mode) = parse_permission_prompt_title(title);
 
     let mut content_lines = Vec::new();
@@ -1946,6 +1990,31 @@ fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<Permis
         reason,
         question,
     })
+}
+
+fn permission_prompt_lines(inspected: &InspectedPane) -> Option<Vec<String>> {
+    permission_prompt_region_lines(&inspected.focused_source).or_else(|| {
+        if inspected.raw_source == inspected.focused_source {
+            None
+        } else {
+            permission_prompt_region_lines(&inspected.raw_source)
+        }
+    })
+}
+
+fn permission_prompt_region_lines(source: &str) -> Option<Vec<String>> {
+    let lines = source.lines().map(|line| line.to_string()).collect::<Vec<_>>();
+    let line_refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+    let (title_idx, _) = extract_permission_prompt_region(&line_refs)?;
+    Some(lines.into_iter().skip(title_idx).collect())
+}
+
+fn extract_permission_prompt_region(lines: &[&str]) -> Option<(usize, usize)> {
+    let question_idx = lines
+        .iter()
+        .rposition(|line| is_permission_question_line(line.trim()))?;
+    let title_idx = find_permission_prompt_title_idx(&lines[..question_idx])?;
+    Some((title_idx, question_idx))
 }
 
 fn find_permission_prompt_title_idx(lines: &[&str]) -> Option<usize> {
@@ -2071,10 +2140,16 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
 
     details.question.is_some()
         && details.command.is_some()
-        && !inspected
-            .focused_source
-            .lines()
-            .map(str::trim)
+        && !permission_prompt_lines(inspected)
+            .unwrap_or_else(|| {
+                inspected
+                    .focused_source
+                    .lines()
+                    .map(|line| line.to_string())
+                    .collect()
+            })
+            .iter()
+            .map(|line| line.trim())
             .any(is_chat_input_line_for_yolo)
 }
 
@@ -2773,15 +2848,17 @@ fn parse_expected_state_arg(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppError, BabysitFormat, InspectedPane, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
+        AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
+        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
         PermissionBabysitAction, RecoveryAction, cleanup_babysit_record,
         ensure_pane_owned_by_claude, ensure_state_transition, extract_keep_going_response,
         extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
         keep_going_no_yolo_blocker, permission_babysit_action_for_state,
         permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
         recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_screen_excerpt, render_status_report,
+        render_babysit_wait_event, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_screen_excerpt, render_status_report, resolve_keep_going_prompt,
         submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
@@ -3181,6 +3258,7 @@ mod tests {
     fn extracts_keep_going_all_done_response() {
         let response = extract_keep_going_response(
             "Audit the task currently in scope — only what the user explicitly asked for.\nCompleted the requested parser change and the tests are passing.\nALL_DONE\nEnter to submit message\n❯",
+            Some(KEEP_GOING_PROMPT_ANCHOR),
         )
         .expect("keep-going response should parse");
 
@@ -3195,6 +3273,7 @@ mod tests {
     fn extracts_latest_keep_going_response_before_chat_input() {
         let response = extract_keep_going_response(
             "Audit the task currently in scope — only what the user explicitly asked for.\nBlocked on repo credentials\nWhat I tried: git push\nPANIC\nEnter to submit message\n❯",
+            Some(KEEP_GOING_PROMPT_ANCHOR),
         )
         .expect("latest keep-going response should parse");
 
@@ -3209,6 +3288,7 @@ mod tests {
     fn ignores_stale_keep_going_token_before_latest_prompt() {
         let response = extract_keep_going_response(
             "Audit the task currently in scope — old audit\nOld summary\nALL_DONE\nAudit the task currently in scope — new audit\nStill working\nEnter to submit message\n❯",
+            Some(KEEP_GOING_PROMPT_ANCHOR),
         );
 
         assert!(response.is_none());
@@ -3218,6 +3298,7 @@ mod tests {
     fn extracts_keep_going_terminal_token_without_visible_prompt_anchor() {
         let response = extract_keep_going_response(
             "long build output\n\nRan targeted checks\nPushed feature branch successfully\nALL_DONE\nEnter to submit message\n❯",
+            Some(KEEP_GOING_PROMPT_ANCHOR),
         )
         .expect("terminal keep-going response should parse without anchor");
 
@@ -3232,9 +3313,61 @@ mod tests {
     fn ignores_non_literal_keep_going_tokens() {
         let response = extract_keep_going_response(
             "Audit the task currently in scope — only what the user explicitly asked for.\nRespond with EXACTLY one token\n- `ALL_DONE` — everything is complete\nEnter to submit message\n❯",
+            Some(KEEP_GOING_PROMPT_ANCHOR),
         );
 
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn extracts_keep_going_response_for_custom_prompt_anchor() {
+        let response = extract_keep_going_response(
+            "Custom loop header\nCheck the branch\n\n(Do not repeat the marker line below in your reply.)\n[[BOTCTL_KEEP_GOING_END_PROMPT]]\nWork completed successfully\nALL_DONE\nEnter to submit message\n❯",
+            Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR),
+        )
+        .expect("custom keep-going response should parse");
+
+        assert_eq!(response.directive, KeepGoingDirective::AllDone);
+        assert_eq!(response.body, "Work completed successfully");
+    }
+
+    #[test]
+    fn ignores_stale_keep_going_token_before_latest_custom_prompt() {
+        let response = extract_keep_going_response(
+            "Custom loop header\n\n(Do not repeat the marker line below in your reply.)\n[[BOTCTL_KEEP_GOING_END_PROMPT]]\nOld result\nALL_DONE\nCustom loop header\n\n(Do not repeat the marker line below in your reply.)\n[[BOTCTL_KEEP_GOING_END_PROMPT]]\nStill working\nEnter to submit message\n❯",
+            Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR),
+        );
+
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn resolve_keep_going_prompt_defaults_to_builtin_audit_prompt() {
+        let prompt = resolve_keep_going_prompt(None, None)
+            .expect("default keep-going prompt should resolve");
+
+        assert_eq!(prompt.anchor.as_deref(), Some(KEEP_GOING_PROMPT_ANCHOR));
+        assert!(prompt.text.contains(KEEP_GOING_PROMPT_ANCHOR));
+    }
+
+    #[test]
+    fn resolve_keep_going_prompt_accepts_custom_text() {
+        let prompt = resolve_keep_going_prompt(None, Some("Custom loop header\nContinue"))
+            .expect("custom keep-going prompt should resolve");
+
+        assert_eq!(prompt.anchor.as_deref(), Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR));
+        assert!(prompt.text.starts_with("Custom loop header\nContinue"));
+        assert!(prompt.text.contains("Do not repeat the marker line below in your reply."));
+        assert!(prompt.text.contains("Custom loop header\nContinue"));
+        assert!(prompt.text.ends_with(KEEP_GOING_CUSTOM_PROMPT_ANCHOR));
+    }
+
+    #[test]
+    fn resolve_keep_going_prompt_rejects_blank_custom_text() {
+        let error = resolve_keep_going_prompt(None, Some("   \n\t  "))
+            .expect_err("blank keep-going prompt should fail");
+
+        assert_eq!(error.to_string(), "keep-going custom prompt must not be empty");
     }
 
     #[test]
@@ -3350,6 +3483,9 @@ mod tests {
             focused_source: String::from(
                 "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes",
             ),
+            raw_source: String::from(
+                "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes",
+            ),
         };
 
         let log = render_babysit_wait_event(
@@ -3383,6 +3519,9 @@ mod tests {
             focused_source: String::from(
                 "Bash command (unsandboxed)\n  bun run scripts/test-prompt-safety.ts 2>&1\n  Run classifier test cases\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+            raw_source: String::from(
+                "Bash command (unsandboxed)\n  bun run scripts/test-prompt-safety.ts 2>&1\n  Run classifier test cases\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
@@ -3407,6 +3546,9 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from(
+                "  Bash command (unsandboxed)\n    make generate 2>&1 | tail -40\n    Run make generate to regenerate deepcopy (no sandbox)\n  Do you want to proceed?\n",
+            ),
+            raw_source: String::from(
                 "  Bash command (unsandboxed)\n    make generate 2>&1 | tail -40\n    Run make generate to regenerate deepcopy (no sandbox)\n  Do you want to proceed?\n",
             ),
         };
@@ -3436,6 +3578,9 @@ mod tests {
             focused_source: String::from(
                 "[────────────────────────────────────────────────────────]\nJavaScript code (unsandboxed)\n\n  let pass = 0, fail = 0\n  for (const [pat, path, expected] of cases) {\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+            raw_source: String::from(
+                "[────────────────────────────────────────────────────────]\nJavaScript code (unsandboxed)\n\n  let pass = 0, fail = 0\n  for (const [pat, path, expected] of cases) {\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
@@ -3459,6 +3604,9 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from(
+                "Bash command\n\n  GOCACHE=$TMPDIR/go-cache make manifests 2>&1 | tail-40\n  Regenerate manifests\nContains simple_expansion\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+            raw_source: String::from(
                 "Bash command\n\n  GOCACHE=$TMPDIR/go-cache make manifests 2>&1 | tail-40\n  Regenerate manifests\nContains simple_expansion\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
         };
@@ -3489,6 +3637,9 @@ mod tests {
             focused_source: String::from(
                 "✔ Add MysqlBackup.status.mysqlImage field (◼ Write tests for Phase 2 changes)\n✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\nBash command (unsandboxed)\n  mysql --execute=\"SELECT 1\"\n  Run permission prompt extraction test\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+            raw_source: String::from(
+                "✔ Add MysqlBackup.status.mysqlImage field (◼ Write tests for Phase 2 changes)\n✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\nBash command (unsandboxed)\n  mysql --execute=\"SELECT 1\"\n  Run permission prompt extraction test\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
@@ -3515,8 +3666,23 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from(
-                "✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\n✔ Write tests for Phase 2 changes\n✔ Regenerate manifests + RBAC mirror + docs\n◼ Run pre-PR gate\n────────────────────────────────────────────────────────────────────────\nBash command\n  export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 |\n  tail -40\n  Run golangci-lint\nContains simple_expansion\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+                "✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\n✔ Write tests for Phase 2 changes\n✔ Regenerate manifests + RBAC mirror + docs\n◼ Run pre-PR gate\n────────────────────────────────────────────────────────────────────────\nBash command\n  export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 |\n  tail-40\n  Run golangci-lint\nContains simple_expansion\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+            raw_source: String::from(r#"✔ Add PITR verification spec + binlog replay
+✔ Add SanityCheck spec + Checking phase
+✔ Write tests for Phase 2 changes
+✔ Regenerate manifests + RBAC mirror + docs
+◼ Run pre-PR gate
+────────────────────────────────────────────────────────────────────────
+Bash command
+  export PATH="$(go env GOPATH)/bin:$PATH" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 |
+  tail-40
+  Run golangci-lint
+Contains simple_expansion
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+Esc to cancel · Tab to amend · ctrl+e to explain"#),
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
@@ -3527,10 +3693,48 @@ mod tests {
         assert_eq!(
             details.command.as_deref(),
             Some(
-                "export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail -40"
+                r#"export PATH="$(go env GOPATH)/bin:$PATH" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail-40"#
             )
         );
         assert_eq!(details.reason.as_deref(), Some("Run golangci-lint"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_from_full_frame_when_focused_view_is_truncated() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\n✔ Write tests for Phase 2 changes\n✔ Regenerate manifests + RBAC mirror + docs\n◼ Run pre-PR gate\nDo you want to proceed?\n❯ 1. Yes\n  2. No",
+            ),
+            raw_source: String::from(r#"❯ commit and push
+✔ Add PITR verification spec + binlog replay
+✔ Add SanityCheck spec + Checking phase
+✔ Write tests for Phase 2 changes
+✔ Regenerate manifests + RBAC mirror + docs
+◼ Run pre-PR gate
+────────────────────────────────────────────────────────────────────────
+Bash command (unsandboxed)
+  export PATH="$(go env GOPATH)/bin:$PATH" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 |
+  tail-40
+  Run golangci-lint
+Contains simple_expansion
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+Esc to cancel · Tab to amend · ctrl+e to explain"#),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(details.command.as_deref(), Some(r#"export PATH="$(go env GOPATH)/bin:$PATH" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail-40"#));
+        assert_eq!(details.reason.as_deref(), Some("Run golangci-lint"));
+        assert!(is_yolo_safe_to_approve(&inspected));
     }
 
     #[test]
@@ -3544,6 +3748,9 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from(
+                "✔ Add MysqlBackup.status.mysqlImage field\n✔ Add PITR verification spec + binlog replay\nDo you want to proceed?\n❯ 1. Yes",
+            ),
+            raw_source: String::from(
                 "✔ Add MysqlBackup.status.mysqlImage field\n✔ Add PITR verification spec + binlog replay\nDo you want to proceed?\n❯ 1. Yes",
             ),
         };
@@ -3562,6 +3769,9 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from(
+                "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ Here's some of the output:",
+            ),
+            raw_source: String::from(
                 "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ Here's some of the output:",
             ),
         };
@@ -3585,6 +3795,9 @@ mod tests {
             focused_source: String::from(
                 "Bash command (unsandboxed)\npython tools/update.py .claude/commands/commit-and-push.md\nUpdate project slash command\nDo you want to proceed?\n❯ 1. Yes\n2. Yes, and allow Claude to edit its own settings for this session\n3. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+            raw_source: String::from(
+                "Bash command (unsandboxed)\npython tools/update.py .claude/commands/commit-and-push.md\nUpdate project slash command\nDo you want to proceed?\n❯ 1. Yes\n2. Yes, and allow Claude to edit its own settings for this session\n3. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
         };
 
         assert!(!is_yolo_safe_to_approve(&inspected));
@@ -3606,6 +3819,9 @@ mod tests {
             focused_source: String::from(
                 "Bash command (unsandboxed)\npython tools/update.py /repo/.claude/commands/commit-and-push.md\nUpdate project slash command\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+            raw_source: String::from(
+                "Bash command (unsandboxed)\npython tools/update.py /repo/.claude/commands/commit-and-push.md\nUpdate project slash command\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
         };
 
         assert!(!is_yolo_safe_to_approve(&inspected));
@@ -3622,6 +3838,7 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from("Bash command (unsandboxed)\nDo you want to proceed?"),
+            raw_source: String::from("Bash command (unsandboxed)\nDo you want to proceed?"),
         };
 
         let log = render_babysit_wait_event(
@@ -3648,6 +3865,9 @@ mod tests {
                 signals: vec![String::from("permission-keywords")],
             },
             focused_source: String::from(
+                "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRegenerate manifests\nDo you want to proceed?\n❯ 1. Yes",
+            ),
+            raw_source: String::from(
                 "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRegenerate manifests\nDo you want to proceed?\n❯ 1. Yes",
             ),
         };
@@ -3681,6 +3901,9 @@ mod tests {
                 signals: vec![String::from("survey-keywords")],
             },
             focused_source: String::from(
+                "How is Claude doing this session? (optional)\n1: Bad    2: Fine   3: Good   0: Dismiss",
+            ),
+            raw_source: String::from(
                 "How is Claude doing this session? (optional)\n1: Bad    2: Fine   3: Good   0: Dismiss",
             ),
         };
