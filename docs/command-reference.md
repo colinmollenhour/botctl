@@ -152,7 +152,7 @@ Purpose: stream a bounded observation of a session.
 
 Syntax:
 ```bash
-botctl observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N]
+botctl observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]
 ```
 
 Flags:
@@ -161,8 +161,18 @@ Flags:
 - `--events N` (default: `25`)
 - `--idle-timeout-ms N` (default: `1500`)
 - `--history-lines N` (default: `120`)
+- `--state-dir PATH` (optional; default machine-state root)
 
 Targeting: session required; pane target is optional.
+
+Artifacts:
+
+- machine artifact files are written under `<state-root>/artifacts`:
+  - `captures/<id>/capture.txt`
+  - `tapes/<id>/control-mode.log`
+  - `exports/<id>/report.json`
+- `observe` output still prints the diagnostic report to stdout.
+- these runtime artifacts stay as regular files; they are not stored in `state.db`.
 
 Example:
 ```bash
@@ -175,7 +185,7 @@ Purpose: run the babysit/serve loop for a session.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]
 ```
 
 Flags:
@@ -184,6 +194,15 @@ Flags:
 - `--reconcile-ms N` (default: `1500`, must be at least `1`)
 - `--history-lines N` (default: `120`)
 - `--format human|jsonl` (default: `human`)
+- `--state-dir PATH` (optional; default machine-state root)
+
+Artifacts:
+
+- per-event tape and session summary are persisted under `<state-root>/artifacts`:
+  - `tapes/<id>/events.jsonl` (JSON lines, one object per event)
+  - `exports/<id>/summary.json` (session summary)
+- events are still streamed to stdout with the same format behavior as before.
+- these runtime artifacts stay as regular files; they are not stored in `state.db`.
 
 Targeting: session required; optional explicit pane target.
 
@@ -216,6 +235,8 @@ Flags:
 - `--history-lines N` (default: `120`)
 
 Targeting: session required; pane optional.
+
+Storage: fixture corpora remain regular repository files under `fixtures/cases` unless you choose a different `--output-dir`; they are intentionally separate from machine-local runtime state under `<state-root>`.
 
 Example:
 ```bash

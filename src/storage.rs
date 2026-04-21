@@ -9,9 +9,41 @@ use crate::permission_babysit::BabysitRecord;
 pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
+const ARTIFACTS_DIR: &str = "artifacts";
+const ARTIFACTS_CAPTURES_SUBDIR: &str = "captures";
+const ARTIFACTS_TAPES_SUBDIR: &str = "tapes";
+const ARTIFACTS_EXPORTS_SUBDIR: &str = "exports";
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_DB_FILENAME)
+}
+
+pub fn runtime_artifacts_root(state_dir: &Path) -> PathBuf {
+    state_dir.join(ARTIFACTS_DIR)
+}
+
+pub fn capture_artifact_path(
+    state_dir: &Path,
+    artifact_id: &str,
+    file_name: &str,
+) -> AppResult<PathBuf> {
+    artifact_path(state_dir, ARTIFACTS_CAPTURES_SUBDIR, artifact_id, file_name)
+}
+
+pub fn tape_artifact_path(
+    state_dir: &Path,
+    artifact_id: &str,
+    file_name: &str,
+) -> AppResult<PathBuf> {
+    artifact_path(state_dir, ARTIFACTS_TAPES_SUBDIR, artifact_id, file_name)
+}
+
+pub fn export_artifact_path(
+    state_dir: &Path,
+    artifact_id: &str,
+    file_name: &str,
+) -> AppResult<PathBuf> {
+    artifact_path(state_dir, ARTIFACTS_EXPORTS_SUBDIR, artifact_id, file_name)
 }
 
 pub fn open_state_db(state_dir: &Path) -> AppResult<Connection> {
@@ -98,6 +130,18 @@ pub fn bootstrap_state_db(state_dir: &Path) -> AppResult<PathBuf> {
     let db_path = state_db_path(state_dir);
     let _connection = open_bootstrapped_state_db(state_dir)?;
     Ok(db_path)
+}
+
+fn artifact_path(
+    state_dir: &Path,
+    subdir: &str,
+    artifact_id: &str,
+    file_name: &str,
+) -> AppResult<PathBuf> {
+    let root = runtime_artifacts_root(state_dir).join(subdir);
+    let artifact_dir = root.join(artifact_id);
+    fs::create_dir_all(&artifact_dir)?;
+    Ok(artifact_dir.join(file_name))
 }
 
 pub fn store_pending_prompt(state_dir: &Path, session_name: &str, content: &str) -> AppResult<()> {
@@ -227,8 +271,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CURRENT_SCHEMA_VERSION, bootstrap_state_db, delete_pending_prompt, load_pending_prompt,
-        open_state_db, state_db_path, store_pending_prompt,
+        CURRENT_SCHEMA_VERSION, bootstrap_state_db, capture_artifact_path, delete_pending_prompt,
+        export_artifact_path, load_pending_prompt, open_state_db, runtime_artifacts_root,
+        state_db_path, store_pending_prompt, tape_artifact_path,
     };
 
     #[test]
@@ -326,6 +371,41 @@ mod tests {
                 .expect("deleted prompt lookup should succeed"),
             None
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn runtime_artifact_paths_live_under_state_root_artifacts() {
+        let state_dir = unique_temp_dir("storage-artifacts");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let captures = capture_artifact_path(&state_dir, "observe-demo", "capture.txt")
+            .expect("capture artifact path should resolve");
+        let tapes = tape_artifact_path(&state_dir, "serve-demo", "events.jsonl")
+            .expect("tape artifact path should resolve");
+        let exports = export_artifact_path(&state_dir, "observe-demo", "report.json")
+            .expect("export artifact path should resolve");
+
+        assert_eq!(
+            runtime_artifacts_root(&state_dir),
+            state_dir.join("artifacts")
+        );
+        assert_eq!(
+            captures,
+            state_dir.join("artifacts/captures/observe-demo/capture.txt")
+        );
+        assert_eq!(
+            tapes,
+            state_dir.join("artifacts/tapes/serve-demo/events.jsonl")
+        );
+        assert_eq!(
+            exports,
+            state_dir.join("artifacts/exports/observe-demo/report.json")
+        );
+        assert!(state_dir.join("artifacts/captures/observe-demo").is_dir());
+        assert!(state_dir.join("artifacts/tapes/serve-demo").is_dir());
+        assert!(state_dir.join("artifacts/exports/observe-demo").is_dir());
 
         let _ = fs::remove_dir_all(&state_dir);
     }

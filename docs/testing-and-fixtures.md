@@ -6,6 +6,8 @@
 
 Fixture cases live under `fixtures/cases/*`.
 
+These checked-in fixture files are intentionally separate from machine-local runtime artifacts under `<state-root>/artifacts`. `state.db` holds control-plane state; fixture corpora, capture logs, and replay inputs stay as regular files.
+
 Each case directory is a self-contained scenario, usually containing:
 
 - `expected.txt` — expected state plus recap metadata
