@@ -387,9 +387,9 @@ fn merge_required_bindings(path: &Path, existing: &str) -> Result<String, String
             continue;
         };
 
-        let existing_entry = binding_entries.iter_mut().find(|entry| {
-            entry.get("context").and_then(Value::as_str) == Some(context)
-        });
+        let existing_entry = binding_entries
+            .iter_mut()
+            .find(|entry| entry.get("context").and_then(Value::as_str) == Some(context));
 
         let entry = if let Some(entry) = existing_entry {
             entry
@@ -403,7 +403,10 @@ fn merge_required_bindings(path: &Path, existing: &str) -> Result<String, String
         };
 
         for (key, command) in desired_map {
-            if existing_map.values().any(|existing_command| existing_command == command) {
+            if existing_map
+                .values()
+                .any(|existing_command| existing_command == command)
+            {
                 continue;
             }
 

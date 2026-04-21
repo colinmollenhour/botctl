@@ -371,10 +371,7 @@ fn choose_frame_for_reconcile(
     }
 }
 
-fn should_prefer_merged_classification(
-    merged: &Classification,
-    capture: &Classification,
-) -> bool {
+fn should_prefer_merged_classification(merged: &Classification, capture: &Classification) -> bool {
     capture.state == SessionState::Unknown && merged.state != SessionState::Unknown
 }
 
@@ -477,11 +474,7 @@ where
     Ok(None)
 }
 
-fn should_emit_snapshot(
-    reason: ServeSnapshotReason,
-    changed: bool,
-    had_previous: bool,
-) -> bool {
+fn should_emit_snapshot(reason: ServeSnapshotReason, changed: bool, had_previous: bool) -> bool {
     match reason {
         ServeSnapshotReason::Initial
         | ServeSnapshotReason::StreamActivity
@@ -529,9 +522,21 @@ mod tests {
 
     #[test]
     fn periodic_snapshots_only_emit_on_change() {
-        assert!(should_emit_snapshot(ServeSnapshotReason::Periodic, true, true));
-        assert!(!should_emit_snapshot(ServeSnapshotReason::Periodic, false, true));
-        assert!(should_emit_snapshot(ServeSnapshotReason::Periodic, false, false));
+        assert!(should_emit_snapshot(
+            ServeSnapshotReason::Periodic,
+            true,
+            true
+        ));
+        assert!(!should_emit_snapshot(
+            ServeSnapshotReason::Periodic,
+            false,
+            true
+        ));
+        assert!(should_emit_snapshot(
+            ServeSnapshotReason::Periodic,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -571,9 +576,17 @@ mod tests {
             },
         );
 
-        note_stream_output(&mut tracked, &request, "%1", "hello\rworld\nnext\x1b[31m line");
+        note_stream_output(
+            &mut tracked,
+            &request,
+            "%1",
+            "hello\rworld\nnext\x1b[31m line",
+        );
         let entry = tracked.get("%1").expect("tracked pane");
-        assert_eq!(entry.screen_model.as_ref().unwrap().render(), "world\nnext line");
+        assert_eq!(
+            entry.screen_model.as_ref().unwrap().render(),
+            "world\nnext line"
+        );
         assert_eq!(entry.live_excerpt, "world\nnext line");
     }
 
@@ -597,7 +610,10 @@ mod tests {
         );
 
         let entry = tracked.get("%1").expect("tracked pane");
-        assert_eq!(entry.screen_model.as_ref().unwrap().render(), "base\nframe\nstream");
+        assert_eq!(
+            entry.screen_model.as_ref().unwrap().render(),
+            "base\nframe\nstream"
+        );
         assert_eq!(entry.live_excerpt, "base\nframe\nstream");
     }
 
@@ -625,7 +641,11 @@ mod tests {
     fn stream_activity_falls_back_to_capture_without_seeded_model() {
         let mut entry = TrackedServePane::default();
         entry.screen_model = Some(crate::screen_model::ScreenModel::new(20));
-        entry.screen_model.as_mut().unwrap().ingest("transient stream");
+        entry
+            .screen_model
+            .as_mut()
+            .unwrap()
+            .ingest("transient stream");
 
         let choice = choose_frame_for_reconcile(
             "%1",

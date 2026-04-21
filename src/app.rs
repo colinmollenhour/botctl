@@ -18,13 +18,13 @@ use crate::automation::{
     validate_workflow_state,
 };
 use crate::classifier::{
-    Classification, Classifier, SessionState, SIGNAL_SELF_SETTINGS_LANGUAGE,
-    SIGNAL_SENSITIVE_CLAUDE_PATH,
+    Classification, Classifier, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
+    SessionState,
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
-    ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ListPanesArgs,
-    ObserveArgs, PaneCommandArgs, PaneTargetArgs, PermissionBabysitStartArgs,
+    ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, KeepGoingArgs,
+    ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PermissionBabysitStartArgs,
     PermissionBabysitStopArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs,
     ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs,
 };
@@ -43,19 +43,57 @@ use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
+const KEEP_GOING_HISTORY_LINES: usize = 2000;
+const KEEP_GOING_PROMPT_ANCHOR: &str = "Audit the task currently in scope";
+const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
+const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
+const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
+
+Check: every deliverable produced (not just described), every file actually written, every stated acceptance criterion met, every test/build you committed to actually run and passing, no unresolved TODOs or stubs in code you just wrote.
+
+End your reply with EXACTLY one token as the literal last non-empty line:
+
+- `OKIE_DOKIE` — before that final token, include a brief note of what's left, then immediately continue working on it. No asking permission.
+- `ALL_DONE` — before that final token, include a one- or two-sentence summary. Stop. No new work, no unsolicited next steps.
+- `PANIC` — before that final token, include: what's done, what's blocking, what you tried, and the specific input you need. Do not use this just because something is hard — only when continuing would be guessing. Do NOT commit or push when emitting PANIC.
+
+Before emitting `ALL_DONE`, perform these git steps in order:
+
+1. **Commit.** Run `git status` to confirm there are changes to commit. Stage the files you modified (`git add <paths>` — do not `git add .` blindly; skip anything unrelated to the task). Write a concise, conventional commit message describing the change. If the working tree is already clean, skip to step 2.
+
+2. **Push — only if on a feature branch.** Run `git rev-parse --abbrev-ref HEAD`. If the branch is `main`, `master`, `develop`, `dev`, `trunk`, or `release/*`, do NOT push — just note in your summary that the commit is local and the user should push manually. Otherwise, `git push` (use `-u origin <branch>` if upstream isn't set).
+
+3. **PR/MR — only if the user explicitly requested one in this conversation.** Re-read the user's messages. If they asked for a PR, MR, pull request, or merge request as part of the completion, open it now (`gh pr create` or equivalent). If they did not, do not open one and do not suggest it.
+
+If any git step fails (push rejected, auth failure, merge conflict, etc.), switch to `PANIC` with what you tried.
+
+Be honest: unsure if something works → `OKIE_DOKIE`, go verify. Don't use `ALL_DONE` just because the turn got long. Don't use `OKIE_DOKIE` to invent new work. Don't use `PANIC` to avoid effort."#;
 
 pub type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug)]
 pub struct AppError {
     message: String,
+    exit_code: i32,
 }
 
 impl AppError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            exit_code: 1,
         }
+    }
+
+    pub fn with_exit_code(message: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            message: message.into(),
+            exit_code,
+        }
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
     }
 }
 
@@ -100,6 +138,7 @@ pub fn run(command: Command) -> AppResult<String> {
         }
         Command::ContinueSession(args) => run_continue_session(args),
         Command::AutoUnstick(args) => run_auto_unstick(args),
+        Command::KeepGoing(args) => run_keep_going(args),
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
@@ -493,6 +532,422 @@ fn run_auto_unstick(args: AutoUnstickArgs) -> AppResult<String> {
     }
 }
 
+fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = resolve_target_pane(&client, &args.target)?;
+    ensure_pane_owned_by_claude(&pane)?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let bindings = load_automation_keybindings(None)?;
+    let mut awaiting_reply = false;
+    let mut last_state: Option<SessionState> = None;
+
+    emit_babysit_output(format!(
+        "keep-going watching pane={} yolo={}",
+        pane.pane_id,
+        if args.no_yolo { "off" } else { "on" }
+    ))?;
+
+    loop {
+        let current_pane = resolve_pane_by_id(&client, &pane.pane_id)?;
+        ensure_pane_owned_by_claude(&current_pane)?;
+        let inspected = inspect_pane(&client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+        let classification = &inspected.classification;
+
+        if last_state != Some(classification.state) {
+            emit_babysit_output(render_keep_going_wait_message(
+                &pane.pane_id,
+                classification,
+                awaiting_reply,
+                args.no_yolo,
+            ))?;
+            last_state = Some(classification.state);
+        }
+
+        if !args.no_yolo {
+            if classification.state == SessionState::FolderTrustPrompt {
+                emit_babysit_output(format!(
+                    "keep-going pane={} action=confirm-folder-trust",
+                    pane.pane_id
+                ))?;
+                execute_keep_going_yolo_action(
+                    &client,
+                    &pane.pane_id,
+                    GuardedWorkflow::ApprovePermission,
+                    classification,
+                )?;
+                thread::sleep(Duration::from_millis(args.poll_ms));
+                continue;
+            }
+
+            match permission_babysit_action_for_state(classification.state) {
+                PermissionBabysitAction::ApprovePermission => {
+                    if is_yolo_safe_to_approve(&inspected) {
+                        emit_babysit_output(format!(
+                            "keep-going pane={} action=approve",
+                            pane.pane_id
+                        ))?;
+                        execute_keep_going_yolo_action(
+                            &client,
+                            &pane.pane_id,
+                            GuardedWorkflow::ApprovePermission,
+                            classification,
+                        )?;
+                        thread::sleep(Duration::from_millis(args.poll_ms));
+                        continue;
+                    }
+                }
+                PermissionBabysitAction::DismissSurvey => {
+                    emit_babysit_output(format!(
+                        "keep-going pane={} action=dismiss-survey",
+                        pane.pane_id
+                    ))?;
+                    execute_keep_going_yolo_action(
+                        &client,
+                        &pane.pane_id,
+                        GuardedWorkflow::DismissSurvey,
+                        classification,
+                    )?;
+                    thread::sleep(Duration::from_millis(args.poll_ms));
+                    continue;
+                }
+                PermissionBabysitAction::Wait => {}
+            }
+        } else if let Some(error) = keep_going_no_yolo_blocker(classification, &pane.pane_id) {
+            return Err(error);
+        }
+
+        if awaiting_reply {
+            let frame = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+            let response = extract_keep_going_response(&frame);
+            let terminal_reply_ready = classification.state == SessionState::ChatReady
+                || frame_has_keep_going_chat_input(&frame);
+
+            if let Some(response) = response {
+                match response.directive {
+                    KeepGoingDirective::OkieDokie => {
+                        if terminal_reply_ready {
+                            emit_babysit_output(format!(
+                                "keep-going pane={} token={}",
+                                pane.pane_id,
+                                response.directive.as_str()
+                            ))?;
+                            awaiting_reply = false;
+                        }
+                    }
+                    KeepGoingDirective::AllDone | KeepGoingDirective::Panic => {
+                        if terminal_reply_ready {
+                            emit_babysit_output(format!(
+                                "keep-going pane={} token={}",
+                                pane.pane_id,
+                                response.directive.as_str()
+                            ))?;
+                            return Ok(response.render());
+                        }
+                    }
+                }
+            }
+        } else if classification.state == SessionState::ChatReady {
+            let before_submit = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+            submit_keep_going_prompt(
+                &client,
+                &pane.pane_id,
+                &current_pane.session_name,
+                &state_dir,
+                &bindings,
+                args.submit_delay_ms,
+            )?;
+            emit_babysit_output(format!(
+                "keep-going pane={} action=submit-prompt",
+                pane.pane_id
+            ))?;
+            wait_for_prompt_submission_start(
+                &client,
+                &pane.pane_id,
+                &before_submit,
+                Some(KEEP_GOING_PROMPT_ANCHOR),
+            )
+            .map_err(
+                |_| {
+                    AppError::new(format!(
+                        "keep-going submitted the audit prompt but pane {} did not show a prompt-submission transition",
+                        pane.pane_id
+                    ))
+                },
+            )?;
+            awaiting_reply = true;
+        }
+
+        thread::sleep(Duration::from_millis(args.poll_ms));
+    }
+}
+
+fn submit_keep_going_prompt(
+    client: &TmuxClient,
+    pane_id: &str,
+    session_name: &str,
+    state_dir: &Path,
+    bindings: &ResolvedKeybindings,
+    submit_delay_ms: u64,
+) -> AppResult<()> {
+    prepare_prompt(state_dir, session_name, KEEP_GOING_PROMPT)?;
+    send_actions(
+        client,
+        pane_id,
+        &prompt_submission_sequence(),
+        bindings,
+        submit_delay_ms,
+    )
+}
+
+fn execute_keep_going_yolo_action(
+    client: &TmuxClient,
+    pane_id: &str,
+    workflow: GuardedWorkflow,
+    classification: &Classification,
+) -> AppResult<()> {
+    execute_classified_workflow(client, pane_id, workflow, classification)?;
+    thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
+    let after = classify_pane(client, pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    ensure_state_transition(classification, &after, workflow.as_str())
+}
+
+fn keep_going_no_yolo_blocker(classification: &Classification, pane_id: &str) -> Option<AppError> {
+    if !matches!(
+        classification.state,
+        SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+    ) {
+        return None;
+    }
+
+    let detail = permission_manual_review_reason(classification)
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+
+    Some(AppError::with_exit_code(
+        format!(
+            "keep-going stopped for pane {} in state {}{}",
+            pane_id,
+            classification.state.as_str(),
+            detail,
+        ),
+        2,
+    ))
+}
+
+fn prompt_submission_started(
+    before_frame: &str,
+    after_frame: &str,
+    after_classification: &Classification,
+    prompt_anchor: Option<&str>,
+) -> bool {
+    match after_classification.state {
+        SessionState::BusyResponding
+        | SessionState::PermissionDialog
+        | SessionState::FolderTrustPrompt
+        | SessionState::SurveyPrompt
+        | SessionState::DiffDialog => return true,
+        SessionState::ExternalEditorActive | SessionState::Unknown => return false,
+        SessionState::ChatReady => {}
+    }
+
+    match prompt_anchor {
+        Some(anchor) => {
+            if count_prompt_anchors(after_frame, anchor)
+                > count_prompt_anchors(before_frame, anchor)
+            {
+                return true;
+            }
+
+            last_prompt_anchor_idx(after_frame, anchor)
+                != last_prompt_anchor_idx(before_frame, anchor)
+                || before_frame != after_frame
+        }
+        None => before_frame != after_frame,
+    }
+}
+
+fn wait_for_prompt_submission_start(
+    client: &TmuxClient,
+    pane_id: &str,
+    before_frame: &str,
+    prompt_anchor: Option<&str>,
+) -> AppResult<()> {
+    let attempts = std::cmp::max(1, PROMPT_SUBMISSION_TIMEOUT_MS / PROMPT_SUBMISSION_POLL_MS);
+    for _ in 0..attempts {
+        thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
+        let after_frame = client.capture_pane(pane_id, KEEP_GOING_HISTORY_LINES)?;
+        let after_classification =
+            Classifier.classify(pane_id, &focused_frame_source(&after_frame));
+        if prompt_submission_started(
+            before_frame,
+            &after_frame,
+            &after_classification,
+            prompt_anchor,
+        ) {
+            return Ok(());
+        }
+    }
+
+    Err(AppError::new(format!(
+        "pane {pane_id} did not show a prompt-submission transition"
+    )))
+}
+
+fn count_prompt_anchors(frame: &str, anchor: &str) -> usize {
+    frame.lines().filter(|line| line.contains(anchor)).count()
+}
+
+fn last_prompt_anchor_idx(frame: &str, anchor: &str) -> Option<usize> {
+    frame
+        .lines()
+        .collect::<Vec<_>>()
+        .iter()
+        .rposition(|line| line.contains(anchor))
+}
+
+fn render_keep_going_wait_message(
+    pane_id: &str,
+    classification: &Classification,
+    awaiting_reply: bool,
+    no_yolo: bool,
+) -> String {
+    let waiting_for = if awaiting_reply {
+        "audit-response"
+    } else {
+        "chat-input"
+    };
+    let yolo = if no_yolo { "off" } else { "on" };
+    let detail = permission_manual_review_reason(classification)
+        .map(|reason| format!(" detail={reason}"))
+        .unwrap_or_default();
+
+    format!(
+        "keep-going pane={} state={} waiting-for={} yolo={}{}",
+        pane_id,
+        classification.state.as_str(),
+        waiting_for,
+        yolo,
+        detail,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepGoingDirective {
+    OkieDokie,
+    AllDone,
+    Panic,
+}
+
+impl KeepGoingDirective {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OkieDokie => "OKIE_DOKIE",
+            Self::AllDone => "ALL_DONE",
+            Self::Panic => "PANIC",
+        }
+    }
+
+    fn from_line(line: &str) -> Option<Self> {
+        match line.trim() {
+            "OKIE_DOKIE" => Some(Self::OkieDokie),
+            "ALL_DONE" => Some(Self::AllDone),
+            "PANIC" => Some(Self::Panic),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeepGoingResponse {
+    directive: KeepGoingDirective,
+    body: String,
+}
+
+impl KeepGoingResponse {
+    fn render(&self) -> String {
+        if self.body.is_empty() {
+            self.directive.as_str().to_string()
+        } else {
+            format!("{}\n{}", self.body, self.directive.as_str())
+        }
+    }
+}
+
+fn extract_keep_going_response(frame: &str) -> Option<KeepGoingResponse> {
+    let lines = frame.lines().collect::<Vec<_>>();
+    let mut search_end = lines.len();
+    while search_end > 0
+        && (is_keep_going_chat_input_line(lines[search_end - 1])
+            || lines[search_end - 1].trim().is_empty())
+    {
+        search_end -= 1;
+    }
+    if search_end == 0 {
+        return None;
+    }
+
+    let token_idx = search_end - 1;
+    let directive = KeepGoingDirective::from_line(lines[token_idx])?;
+    let body_start = keep_going_body_start(&lines, token_idx);
+
+    let mut body_lines = lines[body_start..token_idx]
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>();
+    while matches!(body_lines.first(), Some(line) if line.trim().is_empty()) {
+        body_lines.remove(0);
+    }
+    while matches!(body_lines.last(), Some(line) if line.trim().is_empty()) {
+        body_lines.pop();
+    }
+
+    Some(KeepGoingResponse {
+        directive,
+        body: body_lines.join("\n"),
+    })
+}
+
+fn keep_going_body_start(lines: &[&str], token_idx: usize) -> usize {
+    if let Some(prompt_idx) = lines[..token_idx]
+        .iter()
+        .rposition(|line| line.contains(KEEP_GOING_PROMPT_ANCHOR))
+    {
+        return prompt_idx + 1;
+    }
+
+    lines[..token_idx]
+        .iter()
+        .rposition(|line| line.trim().is_empty())
+        .map(|idx| idx + 1)
+        .unwrap_or(0)
+}
+
+fn frame_has_keep_going_chat_input(frame: &str) -> bool {
+    frame
+        .lines()
+        .rev()
+        .take(4)
+        .any(is_keep_going_chat_input_line)
+}
+
+fn is_keep_going_chat_input_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if matches!(trimmed, ">" | "❯" | "Enter to submit message") {
+        return true;
+    }
+
+    let Some(rest) = trimmed.strip_prefix('❯') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !keep_going_starts_with_numbered_option(rest)
+}
+
+fn keep_going_starts_with_numbered_option(line: &str) -> bool {
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digits > 0 && line[digits..].starts_with('.')
+}
+
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
@@ -546,6 +1001,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
 
     let bindings = load_automation_keybindings(None)?;
+    let before_submit = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
 
     send_actions(
         &client,
@@ -554,6 +1010,12 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
         &bindings,
         args.submit_delay_ms,
     )?;
+    wait_for_prompt_submission_start(&client, &pane.pane_id, &before_submit, None).map_err(|_| {
+        AppError::new(format!(
+            "submit-prompt sent the prepared prompt but pane {} did not show a prompt-submission transition",
+            pane.pane_id
+        ))
+    })?;
 
     Ok(format!(
         "submitted prepared prompt session={} pane={} state={} pending_path={} delay_ms={}",
@@ -1429,7 +1891,9 @@ fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<Permis
     }
 
     let lines = inspected.focused_source.lines().collect::<Vec<_>>();
-    let question_idx = lines.iter().rposition(|line| is_permission_question_line(line.trim()))?;
+    let question_idx = lines
+        .iter()
+        .rposition(|line| is_permission_question_line(line.trim()))?;
     let title_idx = find_permission_prompt_title_idx(&lines[..question_idx])?;
     let title = lines[title_idx].trim();
     let (mut prompt_type, sandbox_mode) = parse_permission_prompt_title(title);
@@ -1456,7 +1920,10 @@ fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<Permis
     }
 
     let mut content_lines = content_lines;
-    if let Some(aside) = content_lines.last().filter(|line| is_permission_annotation_line(line)) {
+    if let Some(aside) = content_lines
+        .last()
+        .filter(|line| is_permission_annotation_line(line))
+    {
         prompt_type = format!("{prompt_type} ({aside})");
         content_lines.pop();
     }
@@ -1482,23 +1949,45 @@ fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<Permis
 }
 
 fn find_permission_prompt_title_idx(lines: &[&str]) -> Option<usize> {
-    lines.iter().enumerate().rfind(|(_, line)| {
-        let trimmed = line.trim();
-        !trimmed.is_empty()
-            && !is_permission_decoration_line(trimmed)
-            && is_plausible_permission_prompt_title(trimmed)
-    }).map(|(idx, _)| idx)
+    lines
+        .iter()
+        .enumerate()
+        .rfind(|(_, line)| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !is_permission_decoration_line(trimmed)
+                && is_plausible_permission_prompt_title(trimmed)
+        })
+        .map(|(idx, _)| idx)
 }
 
 fn is_plausible_permission_prompt_title(title: &str) -> bool {
     let Some((base, suffix)) = title.rsplit_once(" (") else {
-        return matches!(title, "Bash command" | "JavaScript code" | "TypeScript code" | "Python code" | "Rust code" | "SQL query" | "Shell command" | "Command" );
+        return matches!(
+            title,
+            "Bash command"
+                | "JavaScript code"
+                | "TypeScript code"
+                | "Python code"
+                | "Rust code"
+                | "SQL query"
+                | "Shell command"
+                | "Command"
+        );
     };
-    let Some(suffix) = suffix.strip_suffix(')') else { return false; };
+    let Some(suffix) = suffix.strip_suffix(')') else {
+        return false;
+    };
     if matches!(suffix, "sandboxed" | "unsandboxed") {
         return is_plausible_permission_prompt_title(base);
     }
-    matches!(suffix, "Contains simple_expansion" | "Contains command substitution" | "Contains variable expansion" | "Contains globbing") && is_plausible_permission_prompt_title(base)
+    matches!(
+        suffix,
+        "Contains simple_expansion"
+            | "Contains command substitution"
+            | "Contains variable expansion"
+            | "Contains globbing"
+    ) && is_plausible_permission_prompt_title(base)
 }
 
 fn parse_permission_prompt_title(title: &str) -> (String, Option<String>) {
@@ -1541,7 +2030,8 @@ fn is_permission_ignored_line(line: &str) -> bool {
 }
 
 fn is_permission_annotation_line(line: &str) -> bool {
-    matches!(line.trim(),
+    matches!(
+        line.trim(),
         "Contains simple_expansion"
             | "Contains command substitution"
             | "Contains variable expansion"
@@ -2283,20 +2773,20 @@ fn parse_expected_state_arg(
 #[cfg(test)]
 mod tests {
     use super::{
-        BabysitFormat, InspectedPane, PermissionBabysitAction, RecoveryAction,
-        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
+        AppError, BabysitFormat, InspectedPane, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
+        PermissionBabysitAction, RecoveryAction, cleanup_babysit_record,
+        ensure_pane_owned_by_claude, ensure_state_transition, extract_keep_going_response,
         extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
-        permission_manual_review_reason,
-        permission_babysit_action_for_state, recovery_action_for_state,
-        raw_key_for_workflow, render_babysit_action_event, render_babysit_start_event,
-        render_babysit_wait_event, submit_prompt_preflight_workflow,
-        render_guarded_workflow_output, render_list_panes, render_next_safe_action,
-        render_screen_excerpt, render_status_report,
+        keep_going_no_yolo_blocker, permission_babysit_action_for_state,
+        permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
+        recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
+        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
+        render_list_panes, render_next_safe_action, render_screen_excerpt, render_status_report,
+        submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
-        Classification, SessionState, SIGNAL_SELF_SETTINGS_LANGUAGE,
-        SIGNAL_SENSITIVE_CLAUDE_PATH,
+        Classification, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
     use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
     use crate::tmux::TmuxPane;
@@ -2688,6 +3178,166 @@ mod tests {
     }
 
     #[test]
+    fn extracts_keep_going_all_done_response() {
+        let response = extract_keep_going_response(
+            "Audit the task currently in scope — only what the user explicitly asked for.\nCompleted the requested parser change and the tests are passing.\nALL_DONE\nEnter to submit message\n❯",
+        )
+        .expect("keep-going response should parse");
+
+        assert_eq!(response.directive, KeepGoingDirective::AllDone);
+        assert_eq!(
+            response.body,
+            "Completed the requested parser change and the tests are passing."
+        );
+    }
+
+    #[test]
+    fn extracts_latest_keep_going_response_before_chat_input() {
+        let response = extract_keep_going_response(
+            "Audit the task currently in scope — only what the user explicitly asked for.\nBlocked on repo credentials\nWhat I tried: git push\nPANIC\nEnter to submit message\n❯",
+        )
+        .expect("latest keep-going response should parse");
+
+        assert_eq!(response.directive, KeepGoingDirective::Panic);
+        assert_eq!(
+            response.body,
+            "Blocked on repo credentials\nWhat I tried: git push"
+        );
+    }
+
+    #[test]
+    fn ignores_stale_keep_going_token_before_latest_prompt() {
+        let response = extract_keep_going_response(
+            "Audit the task currently in scope — old audit\nOld summary\nALL_DONE\nAudit the task currently in scope — new audit\nStill working\nEnter to submit message\n❯",
+        );
+
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn extracts_keep_going_terminal_token_without_visible_prompt_anchor() {
+        let response = extract_keep_going_response(
+            "long build output\n\nRan targeted checks\nPushed feature branch successfully\nALL_DONE\nEnter to submit message\n❯",
+        )
+        .expect("terminal keep-going response should parse without anchor");
+
+        assert_eq!(response.directive, KeepGoingDirective::AllDone);
+        assert_eq!(
+            response.body,
+            "Ran targeted checks\nPushed feature branch successfully"
+        );
+    }
+
+    #[test]
+    fn ignores_non_literal_keep_going_tokens() {
+        let response = extract_keep_going_response(
+            "Audit the task currently in scope — only what the user explicitly asked for.\nRespond with EXACTLY one token\n- `ALL_DONE` — everything is complete\nEnter to submit message\n❯",
+        );
+
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn prompt_submission_started_accepts_non_ready_transition() {
+        let after = Classification {
+            source: String::from("pane"),
+            state: SessionState::BusyResponding,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("busy-keywords")],
+        };
+
+        assert!(prompt_submission_started("before", "after", &after, None));
+    }
+
+    #[test]
+    fn prompt_submission_started_requires_prompt_anchor_when_still_ready() {
+        let ready = Classification {
+            source: String::from("pane"),
+            state: SessionState::ChatReady,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("chat-keywords")],
+        };
+
+        assert!(prompt_submission_started(
+            "old output",
+            "Audit the task currently in scope — only what the user explicitly asked for.",
+            &ready,
+            Some(KEEP_GOING_PROMPT_ANCHOR),
+        ));
+        assert!(prompt_submission_started(
+            "old output",
+            "different output",
+            &ready,
+            Some(KEEP_GOING_PROMPT_ANCHOR),
+        ));
+        assert!(!prompt_submission_started(
+            "same output",
+            "same output",
+            &ready,
+            Some(KEEP_GOING_PROMPT_ANCHOR),
+        ));
+    }
+
+    #[test]
+    fn prompt_submission_started_accepts_generic_frame_change_without_anchor() {
+        let ready = Classification {
+            source: String::from("pane"),
+            state: SessionState::ChatReady,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("chat-keywords")],
+        };
+
+        assert!(prompt_submission_started("before", "after", &ready, None));
+    }
+
+    #[test]
+    fn keep_going_wait_message_shows_manual_reason_in_no_yolo_mode() {
+        let log = render_keep_going_wait_message(
+            "%9",
+            &Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
+            },
+            false,
+            true,
+        );
+
+        assert!(log.contains("yolo=off"));
+        assert!(log.contains("Claude wants to edit its own settings"));
+    }
+
+    #[test]
+    fn app_error_can_override_exit_code() {
+        let error = AppError::with_exit_code("manual review required", 2);
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(error.to_string(), "manual review required");
+    }
+
+    #[test]
+    fn keep_going_no_yolo_blocker_returns_exit_code_two() {
+        let error = keep_going_no_yolo_blocker(
+            &Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![],
+            },
+            "%9",
+        )
+        .expect("permission dialog should block no-yolo mode");
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("state PermissionDialog"));
+    }
+
+    #[test]
     fn yolo_wait_log_includes_state_signals_and_excerpt() {
         let inspected = InspectedPane {
             classification: Classification {
@@ -2814,15 +3464,15 @@ mod tests {
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
-        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(
+            details.prompt_type,
+            "Bash command (Contains simple_expansion)"
+        );
         assert_eq!(
             details.command.as_deref(),
             Some("GOCACHE=$TMPDIR/go-cache make manifests 2>&1 | tail-40")
         );
-        assert_eq!(
-            details.reason.as_deref(),
-            Some("Regenerate manifests")
-        );
+        assert_eq!(details.reason.as_deref(), Some("Regenerate manifests"));
         assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
     }
 
@@ -2843,8 +3493,14 @@ mod tests {
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
         assert_eq!(details.prompt_type, "Bash command");
-        assert_eq!(details.command.as_deref(), Some("mysql --execute=\"SELECT 1\""));
-        assert_eq!(details.reason.as_deref(), Some("Run permission prompt extraction test"));
+        assert_eq!(
+            details.command.as_deref(),
+            Some("mysql --execute=\"SELECT 1\"")
+        );
+        assert_eq!(
+            details.reason.as_deref(),
+            Some("Run permission prompt extraction test")
+        );
         assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
     }
 
@@ -2864,10 +3520,15 @@ mod tests {
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
-        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
+        assert_eq!(
+            details.prompt_type,
+            "Bash command (Contains simple_expansion)"
+        );
         assert_eq!(
             details.command.as_deref(),
-            Some("export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail -40")
+            Some(
+                "export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail -40"
+            )
         );
         assert_eq!(details.reason.as_deref(), Some("Run golangci-lint"));
     }

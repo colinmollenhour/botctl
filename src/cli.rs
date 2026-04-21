@@ -23,6 +23,7 @@ pub enum Command {
     DismissSurvey(PaneCommandArgs),
     ContinueSession(ContinueSessionArgs),
     AutoUnstick(AutoUnstickArgs),
+    KeepGoing(KeepGoingArgs),
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
@@ -67,6 +68,15 @@ pub struct ContinueSessionArgs {
 pub struct AutoUnstickArgs {
     pub target: PaneTargetArgs,
     pub max_steps: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepGoingArgs {
+    pub target: PaneTargetArgs,
+    pub no_yolo: bool,
+    pub poll_ms: u64,
+    pub submit_delay_ms: u64,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +237,7 @@ where
         "dismiss-survey" => parse_pane_command(rest, "dismiss-survey", Command::DismissSurvey),
         "continue-session" => parse_continue_session(rest),
         "auto-unstick" => parse_auto_unstick(rest),
+        "keep-going" => parse_keep_going(rest),
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
@@ -260,6 +271,7 @@ pub fn usage() -> String {
             dismiss-survey --pane %ID\n\
             continue-session (--pane %ID | --session NAME --window NAME)\n\
             auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]\n\
+            keep-going (--pane %ID | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--no-yolo]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
             submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
@@ -332,7 +344,11 @@ fn parse_approve_reject(
                 let raw = read_value(&args, &mut i, "--format")?;
                 format = parse_human_jsonl_format(&raw)?;
             }
-            flag => return Err(AppError::new(format!("unknown approve/reject flag: {flag}"))),
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown approve/reject flag: {flag}"
+                )));
+            }
         }
         i += 1;
     }
@@ -719,7 +735,10 @@ fn parse_pane_command(
     }
 
     let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
-    Ok(command(PaneCommandArgs { pane_id, format: BabysitFormat::Human }))
+    Ok(command(PaneCommandArgs {
+        pane_id,
+        format: BabysitFormat::Human,
+    }))
 }
 
 fn parse_continue_session(args: Vec<String>) -> AppResult<Command> {
@@ -753,6 +772,59 @@ fn parse_auto_unstick(args: Vec<String>) -> AppResult<Command> {
         ));
     }
     Ok(Command::AutoUnstick(AutoUnstickArgs { target, max_steps }))
+}
+
+fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
+    let mut no_yolo = false;
+    let mut poll_ms = 1000u64;
+    let mut submit_delay_ms = 250u64;
+    let mut state_dir = None;
+    let mut target_args = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-yolo" => no_yolo = true,
+            "--poll-ms" => {
+                let raw = read_value(&args, &mut i, "--poll-ms")?;
+                poll_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| AppError::new(format!("invalid value for --poll-ms: {raw}")))?;
+            }
+            "--submit-delay-ms" => {
+                let raw = read_value(&args, &mut i, "--submit-delay-ms")?;
+                submit_delay_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --submit-delay-ms: {raw}"))
+                })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            _ => target_args.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let target = parse_pane_target_args(target_args, "keep-going")?;
+    validate_send_target(&target, "keep-going")?;
+    if poll_ms == 0 {
+        return Err(AppError::new(
+            "keep-going requires --poll-ms to be at least 1",
+        ));
+    }
+    if submit_delay_ms == 0 {
+        return Err(AppError::new(
+            "keep-going requires --submit-delay-ms to be at least 1",
+        ));
+    }
+
+    Ok(Command::KeepGoing(KeepGoingArgs {
+        target,
+        no_yolo,
+        poll_ms,
+        submit_delay_ms,
+        state_dir,
+    }))
 }
 
 fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<PaneTargetArgs> {
@@ -954,6 +1026,11 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
         session_name.ok_or_else(|| AppError::new("missing required flag: --session"))?;
     let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
     validate_prompt_input(&source, &text)?;
+    if submit_delay_ms == 0 {
+        return Err(AppError::new(
+            "submit-prompt requires --submit-delay-ms to be at least 1",
+        ));
+    }
 
     Ok(Command::SubmitPrompt(SubmitPromptArgs {
         session_name,
@@ -1476,6 +1553,137 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_keep_going_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--poll-ms"),
+            String::from("400"),
+        ])
+        .expect("keep-going command should parse");
+
+        match command {
+            Command::KeepGoing(args) => {
+                assert_eq!(args.target.pane_id.as_deref(), Some("%9"));
+                assert_eq!(args.poll_ms, 400);
+                assert_eq!(args.submit_delay_ms, 250);
+                assert!(!args.no_yolo);
+                assert!(args.state_dir.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_keep_going_no_yolo_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--window"),
+            String::from("claude"),
+            String::from("--no-yolo"),
+            String::from("--submit-delay-ms"),
+            String::from("600"),
+            String::from("--state-dir"),
+            String::from("/tmp/state"),
+        ])
+        .expect("keep-going no-yolo command should parse");
+
+        match command {
+            Command::KeepGoing(args) => {
+                assert_eq!(args.target.session_name.as_deref(), Some("demo"));
+                assert_eq!(args.target.window_name.as_deref(), Some("claude"));
+                assert!(args.no_yolo);
+                assert_eq!(args.submit_delay_ms, 600);
+                assert_eq!(args.state_dir, Some(std::path::PathBuf::from("/tmp/state")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_keep_going_zero_poll_interval() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--poll-ms"),
+            String::from("0"),
+        ])
+        .expect_err("keep-going should reject zero poll interval");
+
+        assert!(
+            error
+                .to_string()
+                .contains("keep-going requires --poll-ms to be at least 1")
+        );
+    }
+
+    #[test]
+    fn rejects_keep_going_zero_submit_delay() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--submit-delay-ms"),
+            String::from("0"),
+        ])
+        .expect_err("keep-going should reject zero submit delay");
+
+        assert!(
+            error
+                .to_string()
+                .contains("keep-going requires --submit-delay-ms to be at least 1")
+        );
+    }
+
+    #[test]
+    fn rejects_keep_going_session_only_target() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("keep-going"),
+            String::from("--session"),
+            String::from("demo"),
+        ])
+        .expect_err("keep-going should reject ambiguous session-only targets");
+
+        assert!(
+            error
+                .to_string()
+                .contains("keep-going requires --pane %ID or --session NAME --window NAME")
+        );
+    }
+
+    #[test]
+    fn rejects_submit_prompt_zero_submit_delay() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("submit-prompt"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--text"),
+            String::from("hello"),
+            String::from("--submit-delay-ms"),
+            String::from("0"),
+        ])
+        .expect_err("submit-prompt should reject zero submit delay");
+
+        assert!(
+            error
+                .to_string()
+                .contains("submit-prompt requires --submit-delay-ms to be at least 1")
+        );
     }
 
     #[test]

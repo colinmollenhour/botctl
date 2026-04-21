@@ -12,19 +12,22 @@
 8. [ ] P1-3 Merge streamed output with periodic `capture-pane` reconciliation.
 9. [ ] P1-4 Capture structured event tapes for fixtures.
 10. [ ] P1-5 Detect pane swaps, session renames, and window changes.
-11. [ ] P2-1 Expand the classifier to cover more Claude UI states.
-12. [ ] P2-2 Distinguish similar confirmation flows.
-13. [ ] P2-3 Track classifier confidence and drift.
-14. [ ] P2-4 Improve fixture organization and coverage.
-15. [ ] P2-5 Add tooling to diff and refresh fixture corpora.
-16. [ ] P3-1 Add full session lifecycle commands.
-17. [ ] P3-2 Persist managed-session metadata and recent history.
-18. [ ] P3-3 Add policy-driven continuous automation.
-19. [ ] P3-4 Improve CLI and scripting ergonomics.
-20. [ ] P3-5 Add end-to-end tests against real tmux sessions.
-21. [ ] P3-6 Add docs, packaging, and release automation.
-22. [x] P3-7 Add a one-off permission babysit mode for a single instance.
-23. [ ] P3-8 Add interactive target selection for single-pane commands.
+11. [ ] P1-6 Decorate tmux window titles when user attention is needed.
+12. [ ] P2-1 Expand the classifier to cover more Claude UI states.
+13. [ ] P2-2 Distinguish similar confirmation flows.
+14. [ ] P2-3 Track classifier confidence and drift.
+15. [ ] P2-4 Improve fixture organization and coverage.
+16. [ ] P2-5 Add tooling to diff and refresh fixture corpora.
+17. [ ] P3-1 Add full session lifecycle commands.
+18. [ ] P3-2 Persist managed-session metadata and recent history.
+19. [ ] P3-3 Add policy-driven continuous automation.
+20. [ ] P3-4 Improve CLI and scripting ergonomics.
+21. [ ] P3-5 Add end-to-end tests against real tmux sessions.
+22. [ ] P3-6 Add docs, packaging, and release automation.
+23. [x] P3-7 Add a one-off permission babysit mode for a single instance.
+24. [ ] P3-8 Add interactive target selection for single-pane commands.
+25. [ ] P3-9 Move runtime state to XDG and split SQLite control-plane state from file artifacts.
+26. [ ] P3-10 Let `keep-going` run user-supplied prompt loops.
 
 ## P0
 
@@ -60,6 +63,9 @@ Recorded cases should always include the control-mode output that led to a state
 
 5. Detect pane swaps, session renames, and window changes.
 Once `botctl` claims a pane, it should keep ownership even as tmux topology changes. This matters much more once existing-session attachment becomes a first-class workflow.
+
+6. Decorate tmux window titles when user attention is needed.
+When any pane in a tmux window is waiting on operator input, `botctl` should add a lightweight marker like `👋` to that window title and remove it once the window is no longer blocked. This is feasible with the current pane classification model, but it fits best once continuous observation/reconciliation owns tmux window metadata so title updates stay accurate and non-destructive.
 
 ## P2
 
@@ -104,6 +110,13 @@ This mode should temporarily persist automation state for one adopted Claude ins
 
 8. Add interactive target selection for single-pane commands.
 When a command acts on a single Claude pane and the operator runs it from an interactive TTY without `--pane`, `--session`, or `--window`, `botctl` should list the available Claude targets and let the operator choose one. A simple numbered prompt is enough, but an up/down + Enter selector would be even better. For example, `auto-unstick` with no explicit target should present the chooser instead of failing immediately.
+
+9. Move runtime state to XDG and split SQLite control-plane state from file artifacts.
+`botctl` should stop using a repo-local `.botctl/` tree as the default runtime state store. The default root should move to `$XDG_STATE_HOME/botctl` (fallback `~/.local/state/botctl`), with durable control-plane state in `state.db` and larger artifacts kept as regular files. This should support persisted instance metadata, automation registrations, prompt handoff state, and future serve-mode history without importing the old repo-local scratch data.
+See `PLANS-Sqlite.md` for the storage split and migration boundary.
+
+10. Let `keep-going` run user-supplied prompt loops.
+`keep-going` should optionally accept a user-supplied prompt file instead of the built-in audit prompt, then keep feeding that prompt to an idle Claude pane until the session returns one of the existing loop stop tokens like `ALL_DONE` or `PANIC`. This would let operators define their own supervised loops without changing botctl code for each workflow.
 
 ## Questions For Review
 

@@ -56,6 +56,38 @@ The classifier currently recognizes these explicit states:
 
 The `install-bindings` command exists to write the recommended automation keymap only when there is no conflicting existing file, or when a developer points it at an alternate output path for inspection.
 
+## Persistence Model
+
+`botctl` should keep runtime state out of the repository by default.
+
+The default machine-local state root should be:
+
+- `$XDG_STATE_HOME/botctl`
+- fallback: `~/.local/state/botctl`
+
+Within that root, `botctl` should use a hybrid persistence model:
+
+- SQLite at `$XDG_STATE_HOME/botctl/state.db` for durable control-plane state
+- regular files for larger artifacts and operator-facing debug exports
+
+SQLite is the right home for data that needs transactional updates, cross-process coordination, stable identity, and restart recovery. That includes things like:
+
+- tracked instance metadata
+- managed/adopted ownership records
+- last-known classifications and timestamps
+- recent action history
+- policy/babysit registrations
+- prompt handoff state
+
+Regular files should remain the home for data that is naturally append-only, bulky, or easier to inspect outside the database. That includes things like:
+
+- captured event tapes
+- pane snapshots and debug bundles
+- exported diagnostics
+- fixture corpora and other reviewable artifacts
+
+The important split is conceptual: control-plane state in SQLite, artifacts in files. `botctl` should not use a repo-local `.botctl/` tree as the default runtime state store.
+
 ## Observation Model
 
 `botctl` uses two observation paths:
