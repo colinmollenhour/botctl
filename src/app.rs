@@ -31,7 +31,8 @@ use crate::cli::{
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
 use crate::permission_babysit::{
-    BabysitRecord, disable_babysit_record, read_babysit_record, write_babysit_record,
+    BabysitRecord, disable_babysit_record, list_babysit_pane_ids, read_babysit_record,
+    write_babysit_record,
 };
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
@@ -1523,16 +1524,7 @@ fn yolo_record_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
 }
 
 fn tracked_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
-    let dir = state_dir.join("permission-babysit");
-    let mut ids = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                ids.push(name.to_string());
-            }
-        }
-    }
-    Ok(ids)
+    list_babysit_pane_ids(state_dir)
 }
 
 fn cleanup_all_babysit_records<'a, I: IntoIterator<Item = &'a String>>(

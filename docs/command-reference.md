@@ -12,7 +12,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
-- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff now uses SQLite-backed pending prompt records, while babysit records remain regular files for now.
+- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and babysit registrations now both use SQLite-backed records there.
 
 ## Session and pane management
 
@@ -594,7 +594,7 @@ Stop flags:
 
 Targeting:
 - `start` can target one pane or scan all Claude panes with `--all`
-- `stop --all` disables all tracked babysit records
+- `stop --all` disables all tracked babysit registrations stored in `<state-root>/state.db`
 - neither mode allows mixing `--pane` and `--all`
 
 Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed targets.

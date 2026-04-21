@@ -1,7 +1,10 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::app::{AppError, AppResult};
+use crate::app::AppResult;
+use crate::storage::{
+    disable_babysit_record as storage_disable_babysit_record, list_babysit_record_pane_ids,
+    load_babysit_record, state_db_path, store_babysit_record,
+};
 use crate::tmux::TmuxPane;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,118 +47,30 @@ impl BabysitRecord {
     }
 }
 
-pub fn babysit_record_path(state_dir: &Path, pane_id: &str) -> PathBuf {
-    state_dir
-        .join("permission-babysit")
-        .join(sanitize(pane_id))
-        .join("record.txt")
-}
-
 pub fn write_babysit_record(state_dir: &Path, record: &BabysitRecord) -> AppResult<PathBuf> {
-    let path = babysit_record_path(state_dir, &record.pane_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, serialize_record(record))?;
-    Ok(path)
+    store_babysit_record(state_dir, record)?;
+    Ok(state_db_path(state_dir))
 }
 
 pub fn read_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<BabysitRecord>> {
-    let path = babysit_record_path(state_dir, pane_id);
-    match fs::read_to_string(&path) {
-        Ok(contents) => Ok(Some(parse_record(&contents)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(AppError::from(error)),
-    }
+    load_babysit_record(state_dir, pane_id)
 }
 
 pub fn disable_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
-    let Some(mut record) = read_babysit_record(state_dir, pane_id)? else {
-        return Ok(false);
-    };
-    record.enabled = false;
-    write_babysit_record(state_dir, &record)?;
-    Ok(true)
+    storage_disable_babysit_record(state_dir, pane_id)
 }
 
-fn serialize_record(record: &BabysitRecord) -> String {
-    format!(
-        "enabled={}\npane_id={}\npane_tty={}\npane_pid={}\nsession_id={}\nsession_name={}\nwindow_id={}\nwindow_name={}\ncurrent_command={}\ncurrent_path={}\n",
-        record.enabled,
-        record.pane_id,
-        record.pane_tty,
-        record
-            .pane_pid
-            .map(|pid| pid.to_string())
-            .unwrap_or_default(),
-        record.session_id,
-        record.session_name,
-        record.window_id,
-        record.window_name,
-        record.current_command,
-        record.current_path,
-    )
-}
-
-fn parse_record(contents: &str) -> AppResult<BabysitRecord> {
-    let mut enabled = false;
-    let mut pane_id = None;
-    let mut pane_tty = None;
-    let mut pane_pid = None;
-    let mut session_id = None;
-    let mut session_name = None;
-    let mut window_id = None;
-    let mut window_name = None;
-    let mut current_command = None;
-    let mut current_path = None;
-    for line in contents.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "enabled" => enabled = value == "true",
-            "pane_id" => pane_id = Some(value.to_string()),
-            "pane_tty" => pane_tty = Some(value.to_string()),
-            "pane_pid" => pane_pid = value.parse::<u32>().ok(),
-            "session_id" => session_id = Some(value.to_string()),
-            "session_name" => session_name = Some(value.to_string()),
-            "window_id" => window_id = Some(value.to_string()),
-            "window_name" => window_name = Some(value.to_string()),
-            "current_command" => current_command = Some(value.to_string()),
-            "current_path" => current_path = Some(value.to_string()),
-            _ => {}
-        }
-    }
-    Ok(BabysitRecord {
-        enabled,
-        pane_id: pane_id.ok_or_else(|| AppError::new("missing pane_id"))?,
-        pane_tty: pane_tty.ok_or_else(|| AppError::new("missing pane_tty"))?,
-        pane_pid,
-        session_id: session_id.ok_or_else(|| AppError::new("missing session_id"))?,
-        session_name: session_name.ok_or_else(|| AppError::new("missing session_name"))?,
-        window_id: window_id.ok_or_else(|| AppError::new("missing window_id"))?,
-        window_name: window_name.ok_or_else(|| AppError::new("missing window_name"))?,
-        current_command: current_command.ok_or_else(|| AppError::new("missing current_command"))?,
-        current_path: current_path.ok_or_else(|| AppError::new("missing current_path"))?,
-    })
-}
-
-fn sanitize(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+pub fn list_babysit_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
+    list_babysit_record_pane_ids(state_dir)
 }
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+    use crate::storage::state_db_path;
     use crate::tmux::TmuxPane;
 
     fn sample_pane() -> TmuxPane {
@@ -180,5 +95,86 @@ mod tests {
         let pane = sample_pane();
         let record = BabysitRecord::from_pane(&pane);
         assert!(record.matches_pane(&pane));
+    }
+
+    #[test]
+    fn sqlite_backed_babysit_record_round_trips_by_pane_id() {
+        let state_dir = unique_temp_dir("permission-babysit-round-trip");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let record = BabysitRecord::from_pane(&sample_pane());
+        let stored_path = write_babysit_record(&state_dir, &record).expect("record should store");
+
+        assert_eq!(stored_path, state_db_path(&state_dir));
+        assert_eq!(
+            read_babysit_record(&state_dir, &record.pane_id).expect("record should load"),
+            Some(record)
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn sqlite_backed_babysit_disable_and_list_preserve_records() {
+        let state_dir = unique_temp_dir("permission-babysit-disable-list");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let first = BabysitRecord::from_pane(&sample_pane());
+        let mut second_pane = sample_pane();
+        second_pane.pane_id = String::from("%22");
+        second_pane.pane_tty = String::from("/dev/pts/22");
+        second_pane.pane_pid = Some(222);
+        second_pane.session_id = String::from("$22");
+        second_pane.session_name = String::from("demo-22");
+        second_pane.window_id = String::from("@22");
+        second_pane.window_name = String::from("claude-22");
+        second_pane.current_path = String::from("/tmp/demo-22");
+        let second = BabysitRecord::from_pane(&second_pane);
+
+        write_babysit_record(&state_dir, &first).expect("first record should store");
+        write_babysit_record(&state_dir, &second).expect("second record should store");
+
+        assert!(
+            disable_babysit_record(&state_dir, &first.pane_id)
+                .expect("existing record should disable")
+        );
+        assert!(
+            disable_babysit_record(&state_dir, &first.pane_id)
+                .expect("existing disabled record should still report tracked")
+        );
+        assert!(
+            !disable_babysit_record(&state_dir, "%404")
+                .expect("missing record should report false")
+        );
+
+        assert_eq!(
+            list_babysit_pane_ids(&state_dir).expect("pane ids should list"),
+            vec![String::from("%1"), String::from("%22")]
+        );
+
+        assert_eq!(
+            read_babysit_record(&state_dir, &first.pane_id)
+                .expect("disabled record should load")
+                .expect("disabled record should still exist")
+                .enabled,
+            false
+        );
+        assert_eq!(
+            read_babysit_record(&state_dir, &second.pane_id)
+                .expect("second record should load")
+                .expect("second record should still exist")
+                .enabled,
+            true
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("botctl-{label}-{}-{nanos}", std::process::id()))
     }
 }

@@ -6,7 +6,7 @@
 - [x] Keep `--state-dir` as an explicit override for the state root.
 - [x] Add `state.db` under the state root and initialize a schema-version table.
 - [x] Move prompt handoff state from ad hoc files into SQLite.
-- [ ] Move babysit / continuous-automation registrations from ad hoc files into SQLite.
+- [x] Move babysit / continuous-automation registrations from ad hoc files into SQLite.
 - [ ] Add stable workspace/worktree scoping so multiple repos do not bleed into each other.
 - [ ] Add durable tracked-instance tables that can support serve mode.
 - [ ] Add durable action-history tables for restart-safe automation and operator auditability.

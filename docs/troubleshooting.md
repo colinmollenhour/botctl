@@ -73,11 +73,11 @@ Fix:
 
 Symptoms:
 
-- starting `permission-babysit` / `yolo` reports an existing record or tracked pane
+- starting `permission-babysit` / `yolo` reports an existing babysit registration or tracked pane
 
 Fix:
 
-- stop the existing babysit record first
+- stop the existing babysit registration in `state.db` first
 - then restart it for the same pane
 
 ## tmux problems

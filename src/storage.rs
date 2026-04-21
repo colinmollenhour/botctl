@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::{AppError, AppResult};
+use crate::permission_babysit::BabysitRecord;
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
@@ -65,11 +66,31 @@ fn ensure_pending_prompts_table(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn ensure_babysit_registrations_table(connection: &Connection) -> AppResult<()> {
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS babysit_registrations (\
+            pane_id TEXT PRIMARY KEY, \
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)), \
+            pane_tty TEXT NOT NULL, \
+            pane_pid INTEGER, \
+            session_id TEXT NOT NULL, \
+            session_name TEXT NOT NULL, \
+            window_id TEXT NOT NULL, \
+            window_name TEXT NOT NULL, \
+            current_command TEXT NOT NULL, \
+            current_path TEXT NOT NULL\
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
 fn open_bootstrapped_state_db(state_dir: &Path) -> AppResult<Connection> {
     let connection = open_state_db(state_dir)?;
     ensure_schema_version_table(&connection)?;
     ensure_current_schema_version(&connection)?;
     ensure_pending_prompts_table(&connection)?;
+    ensure_babysit_registrations_table(&connection)?;
     Ok(connection)
 }
 
@@ -108,6 +129,97 @@ pub fn delete_pending_prompt(state_dir: &Path, session_name: &str) -> AppResult<
     )? > 0)
 }
 
+pub fn store_babysit_record(state_dir: &Path, record: &BabysitRecord) -> AppResult<()> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    connection.execute(
+        "INSERT INTO babysit_registrations (\
+            pane_id, enabled, pane_tty, pane_pid, session_id, session_name, \
+            window_id, window_name, current_command, current_path\
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+        ON CONFLICT(pane_id) DO UPDATE SET \
+            enabled = excluded.enabled, \
+            pane_tty = excluded.pane_tty, \
+            pane_pid = excluded.pane_pid, \
+            session_id = excluded.session_id, \
+            session_name = excluded.session_name, \
+            window_id = excluded.window_id, \
+            window_name = excluded.window_name, \
+            current_command = excluded.current_command, \
+            current_path = excluded.current_path",
+        params![
+            &record.pane_id,
+            record.enabled,
+            &record.pane_tty,
+            record.pane_pid,
+            &record.session_id,
+            &record.session_name,
+            &record.window_id,
+            &record.window_name,
+            &record.current_command,
+            &record.current_path,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<BabysitRecord>> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(connection
+        .query_row(
+            "SELECT enabled, pane_id, pane_tty, pane_pid, session_id, session_name, \
+                window_id, window_name, current_command, current_path \
+             FROM babysit_registrations WHERE pane_id = ?1",
+            params![pane_id],
+            |row| {
+                Ok(BabysitRecord {
+                    enabled: row.get(0)?,
+                    pane_id: row.get(1)?,
+                    pane_tty: row.get(2)?,
+                    pane_pid: row.get(3)?,
+                    session_id: row.get(4)?,
+                    session_name: row.get(5)?,
+                    window_id: row.get(6)?,
+                    window_name: row.get(7)?,
+                    current_command: row.get(8)?,
+                    current_path: row.get(9)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+pub fn disable_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM babysit_registrations WHERE pane_id = ?1",
+            params![pane_id],
+            |_row| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    connection.execute(
+        "UPDATE babysit_registrations SET enabled = 0 WHERE pane_id = ?1",
+        params![pane_id],
+    )?;
+    Ok(true)
+}
+
+pub fn list_babysit_record_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let mut statement =
+        connection.prepare("SELECT pane_id FROM babysit_registrations ORDER BY pane_id")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut pane_ids = Vec::new();
+    for row in rows {
+        pane_ids.push(row?);
+    }
+    Ok(pane_ids)
+}
+
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
@@ -128,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_state_db_creates_schema_version_row_and_prompt_table() {
+    fn bootstrap_state_db_creates_schema_version_row_and_runtime_tables() {
         let state_dir = unique_temp_dir("storage-state-db");
         let _ = fs::remove_dir_all(&state_dir);
 
@@ -159,7 +271,16 @@ mod tests {
             )
             .expect("pending_prompts table should exist");
 
+        let babysit_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'babysit_registrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("babysit_registrations table should exist");
+
         assert_eq!(prompt_table_count, 1);
+        assert_eq!(babysit_table_count, 1);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
