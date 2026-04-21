@@ -1214,7 +1214,7 @@ fn validate_prompt_input(source: &Option<PathBuf>, text: &Option<String>) -> App
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::path::PathBuf;
 

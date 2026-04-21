@@ -140,7 +140,7 @@ impl ScreenModel {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::ScreenModel;
     use crate::classifier::{Classifier, SessionState};

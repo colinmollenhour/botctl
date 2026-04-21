@@ -391,7 +391,7 @@ fn drain_channel(rx: &mpsc::Receiver<String>) -> Vec<String> {
     lines
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::path::PathBuf;
 

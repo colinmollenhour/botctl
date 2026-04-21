@@ -504,7 +504,7 @@ fn notification_requires_reconcile(message: &str) -> bool {
     message.contains("pane") || message.contains("window") || message.contains("session")
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
         ClassificationFrameSource, ServeSnapshotReason, TrackedServePane,

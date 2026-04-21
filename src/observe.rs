@@ -212,7 +212,7 @@ fn trim_block(input: &str, max_lines: usize) -> String {
     lines[lines.len() - max_lines..].join("\n")
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{ControlEvent, decode_tmux_escaped, parse_control_line};
     use crate::classifier::{Classification, SessionState};

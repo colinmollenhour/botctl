@@ -2845,7 +2845,7 @@ fn parse_expected_state_arg(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
         AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,

@@ -214,7 +214,7 @@ fn render_metadata(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};

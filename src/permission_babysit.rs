@@ -159,7 +159,7 @@ fn sanitize(input: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::*;
     use crate::tmux::TmuxPane;

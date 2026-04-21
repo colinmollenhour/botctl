@@ -611,7 +611,7 @@ pub fn render_keybindings_json() -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
     use std::path::PathBuf;

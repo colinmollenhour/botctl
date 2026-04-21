@@ -83,7 +83,7 @@ fn sanitize_session_name(session_name: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
     use std::path::PathBuf;

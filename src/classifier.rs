@@ -356,7 +356,7 @@ fn starts_with_numbered_option(line: &str) -> bool {
     digits > 0 && line[digits..].starts_with('.')
 }
 
-#[cfg(test)]
+#[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
         Classifier, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
