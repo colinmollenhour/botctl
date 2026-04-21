@@ -3935,6 +3935,27 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
     }
 
     #[test]
+    fn yolo_allows_repo_claude_command_prompt_when_parseable() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\nfor f in /repo/.claude/commands/colin/*.md /repo/.claude/commands/coolify.md; do head -20 \"$f\"; done\nRead command headers\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+            raw_source: String::from(
+                "Bash command (unsandboxed)\nfor f in /repo/.claude/commands/colin/*.md /repo/.claude/commands/coolify.md; do head -20 \"$f\"; done\nRead command headers\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
     fn yolo_wait_log_omits_live_preview_even_when_enabled() {
         let inspected = InspectedPane {
             classification: Classification {

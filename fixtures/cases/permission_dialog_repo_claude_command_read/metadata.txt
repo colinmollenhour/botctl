@@ -1,0 +1,10 @@
+recorded_at_unix=1776804451
+session=0
+pane=%28
+output_events=4
+notifications=4
+classified_state=PermissionDialog
+expected_state=PermissionDialog
+recap_present=false
+recap_excerpt=none
+signals=permission-keywords

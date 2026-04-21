@@ -1,0 +1,191 @@
+   ┊ 112┊
+107┊ 113┊Stop if:
+108┊ 114┊- The PR/MR is closed or merged
+109┊ 115┊- The PR/MR is draft/WIP
+
+────────────┐
+•  Stop if: │
+────────────┘
+112┊ 118┊
+113┊ 119┊For git diff mode, skip pre-flight entirely.
+114┊ 120┊
+115┊    ┊### Step 2: Triage and Filter
+   ┊ 121┊### Step 2: Triage, Filter, and Bucket
+   ┊ 122┊
+   ┊ 123┊Generate the file list and per-file changed-line counts **locally** using:
+116┊ 124┊
+117┊    ┊Fetch the file list and diff, then exclude review noise before running agents.
+   ┊ 125┊```bash
+   ┊ 126┊git diff --stat <base>...<head>
+   ┊ 127┊```
+   ┊ 128┊
+   ┊ 129┊Do not read the full diff yet.
+118┊ 130┊
+119┊    ┊Exclude:
+   ┊ 131┊**Exclusions.** Remove the following before bucketing:
+120┊ 132┊- Generated files
+121┊ 133┊- Vendored or dependency directories: `vendor/`, `node_modules/`, `.yarn/`, `dist/`, `build/`, `.next/`, `__pycache__/`, `.ve
+nv/`, `third_party/`
+122┊ 134┊- Lock files and built artifacts: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum`, `composer.lock`, `Gemfile.loc
+k`, `Cargo.lock`, `poetry.lock`, `*.min.js`, `*.min.css`, `*.map`
+123┊    ┊- Any single-file diff larger than `5000` lines
+   ┊ 135┊- Test fixture data dumps and other large non-code blobs: `sample_data.sql`, `*_fixture.sql`, `*.dump`, `*.ndjson`, `*.parque
+t`, `*.tar`, `*.tar.gz`, `*.zip`, `*.bin`; also any `*.sql` file that is clearly a data dump rather than a migration
+   ┊ 136┊- Any single-file change larger than `5000` lines (fallback catch for anything the patterns above missed)
+   ┊ 137┊
+   ┊ 138┊**Bucketing.** Let `T` be the total changed-line count across the filtered file set. Target budget per bucket: **3000 lines**
+.
+   ┊ 139┊
+   ┊ 140┊- If `T ≤ 3000`: one bucket containing all filtered files.
+   ┊ 141┊- Otherwise, split into buckets of ≤3000 lines each using directory-aware packing:
+   ┊ 142┊  1. Group files by top-level directory (first path segment, e.g. `apps/web/`, `packages/core/`, `migrations/`). Keeping rela
+ted files together preserves cross-file context for each reviewer.
+   ┊ 143┊  2. If a group exceeds 3000 lines, subdivide it by second-level directory first; only split a single directory across bucket
+s as a last resort.
+   ┊ 144┊  3. Pack groups greedily into buckets up to the 3000-line budget; never split a group unless its own size forces it.
+   ┊ 145┊  4. A single file over 3000 lines (but under the 5000-line exclusion cap) gets its own bucket.
+   ┊ 146┊
+   ┊ 147┊**Materialize per-bucket diffs locally** — only after bucketing, and only for files in a bucket:
+   ┊ 148┊
+   ┊ 149┊```bash
+   ┊ 150┊git diff <base>...<head> -- <files-in-bucket>
+   ┊ 151┊```
+   ┊ 152┊
+   ┊ 153┊Do not read files that are not in any bucket.
+124┊ 154┊
+125┊ 155┊### Step 3: Role Selection
+126┊ 156┊
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +50 -14 פֿ2 took 31s 
+📦 ❯       
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +52 -14 פֿ2 
+📦 ❯ g s
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .claude/commands/colin/ultra-review.md
+	modified:   .claude/skills/many-brain-one-task/SKILL.md
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +52 -14 פֿ2 
+📦 ❯ g add .claude/commands/
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +52 -14 פֿ1 1 
+📦 ❯ g commit -m "Use diff filtering and bucketing for large diffs in ultra-review"
+[main c3e1a02] Use diff filtering and bucketing for large diffs in ultra-review
+ 1 file changed, 51 insertions(+), 13 deletions(-)
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +1 -1 פֿ1 ⇡ 1 
+📦 ❯ g add .claude/skills/
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +1 -1 1 ⇡ 1 
+📦 ❯ g staged
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[+] .claude/skills/many-brain-one-task/SKILL.md
+
+────────────────────────────────────────────────────────────────────────────────────┐
+•  Not all agents can run subagents with other models. The agents and harnesses ava │
+────────────────────────────────────────────────────────────────────────────────────┘
+48┊ 48┊- Claude Code must use another harness such as OpenCode for non-Claude models
+49┊ 49┊- Codex must use another harness for non-OpenAI models
+50┊ 50┊- Gemini must use another harness for non-Gemini models
+51┊   ┊- OpenCode must use Claude Code for Claude models but can likely use subagents for all other models
+  ┊ 51┊- OpenCode **must** use Claude Code (`claude`) for Claude models (Opus, Sonnet, Haiku) but can likely use subagents for all other models (unless the user preferences specify otherwise)
+52┊ 52┊
+53┊ 53┊- The user may have specified their preferred harness for a given model such as "Use `codex` CLI for OpenAI models".
+54┊ 54┊  These rules will be specified in the User Preferences file if loaded, otherwise just prefer to use OpenCode as available.
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +1 -1 1 ⇡ 1 
+📦 ❯ g commit -m "Try to get OpenCode to use Claude Code cli for Opus.."
+[main 0770255] Try to get OpenCode to use Claude Code cli for Opus..
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main ⇡ 2 
+📦 ❯ g push
+Enumerating objects: 20, done.
+Counting objects: 100% (20/20), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (11/11), done.
+Writing objects: 100% (12/12), 3.05 KiB | 1.52 MiB/s, done.
+Total 12 (delta 8), reused 0 (delta 0), pack-reused 0
+remote: Resolving deltas: 100% (8/8), completed with 6 local objects.
+./To github.com:colinmollenhour/dotfiles.git
+   895a303..0770255  main -> main
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main 
+📦 ❯ ./install.sh --all
+==> Installing dotfiles...
+Installing .bashrc.colin
+Installing .gitattributes.global
+Installing .gitconfig.colin
+Installing .gitignore.global
+Installing .tmux.conf
+Installing .vimrc
+Installing .config/tmux/tmux-onedark-theme.tmux
+Installing .config/starship.toml
+Installing .config/docker-fzf.bash
+Installing .config/delta/themes.gitconfig
+Installing .config/tmux-powerline/config.sh
+Installing .config/tmux-powerline/themes/colin.sh
+==> Updating ~/.bashrc...
+~/.bashrc already sources ~/.bashrc.colin (no change)
+==> Updating ~/.gitconfig...
+~/.gitconfig already includes ~/.gitconfig.colin (no change)
+==> Installing AI agent files...
+Backed up ~/.claude/settings.json to ~/.claude/settings.json.bak
+Added statusLine to ~/.claude/settings.json (statusline.sh detected)
+Installed agents and skills to .agents/, .claude/, .opencode/ and .gemini/antigravity/
+
+All components installed successfully!
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main 
+📦 ❯ 
+
+colin in 🌐 seamus in ~/.local/colin-dotfiles on  main +62 -24 פֿ2 
+📦 ❯ claude
+╭─── Claude Code v2.1.116 ─────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                │
+│                 Welcome back Colin!                │ Run /init to create a CLAUDE.md file with instructions for Claude       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ Recent activity                                                         │
+│                      ▝▜█████▛▘                     │ 1h ago   Also update the non-ultra review command with similar strategy │
+│                        ▘▘ ▝▝                       │ 4h ago   Option A                                                       │
+│        Opus 4.7 (1M context) · Claude Max ·        │ 17h ago  commit                                                         │
+│        cm525i@gmail.com's Organization             │ /resume for more                                                        │
+│               ~/.local/colin-dotfiles              │                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  Your bash commands will be sandboxed. Disable with /sandbox.
+
+❯ write a document in markdown that introduces all of the skills and commands in the .claude directory. I will add this to the        
+  company wiki for devs to know what tools are available to them and how to use them. keep it pretty consicse as our time is          
+  valuable.                                                                                                                           
+                                                                                                                                      
+  Listed 3 directories (ctrl+o to expand)                                                                                             
+                                                                                                                                      
+● Bash(for f in /home/colin/.local/colin-dotfiles/.claude/commands/colin/*.md                                                         
+      /home/colin/.local/colin-dotfiles/.claude/commands/coolify.md; do echo "=== $f ==="; head…)
+  ⎿  Running…                                                                                                                         
+                                                                                                                                      
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command                                                                                                                         
+                                                                                                                                      
+   for f in /home/colin/.local/colin-dotfiles/.claude/commands/colin/*.md
+   /home/colin/.local/colin-dotfiles/.claude/commands/coolify.md; do echo "=== $f ==="; head -20 "$f"; done
+   Read command headers                                                                                                               
+                       
+ Unhandled node type: string
+                            
+ Do you want to proceed?
+ ❯ 1. Yes               
+   2. No 
+        
+ Esc to cancel · Tab to amend · ctrl+e to explain
+                                                                                                                                      
+

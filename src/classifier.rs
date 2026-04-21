@@ -329,11 +329,8 @@ fn contains_sensitive_claude_path(normalized: &str) -> bool {
     contains_any(
         normalized,
         &[
-            "/.claude/commands/",
             "/.claude/settings",
-            "~/.claude/commands/",
             "~/.claude/settings",
-            ".claude/commands/",
             ".claude/settings",
         ],
     )
@@ -469,13 +466,26 @@ mod tests {
     }
 
     #[test]
-    fn adds_sensitive_claude_path_signal_for_project_slash_command_paths() {
-        let frame = "Do you want to make this edit to /repo/.claude/commands/commit-and-push.md?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
+    fn adds_sensitive_claude_path_signal_for_claude_settings_paths() {
+        let frame = "Do you want to make this edit to /repo/.claude/settings.json?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::PermissionDialog);
         assert!(
             result
+                .signals
+                .contains(&String::from(SIGNAL_SENSITIVE_CLAUDE_PATH))
+        );
+    }
+
+    #[test]
+    fn does_not_flag_project_claude_command_paths_as_sensitive() {
+        let frame = "Do you want to make this edit to /repo/.claude/commands/commit-and-push.md?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            !result
                 .signals
                 .contains(&String::from(SIGNAL_SENSITIVE_CLAUDE_PATH))
         );
