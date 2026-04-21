@@ -8,4 +8,5 @@ pub mod permission_babysit;
 pub mod prompt;
 pub mod screen_model;
 pub mod serve;
+pub mod storage;
 pub mod tmux;

@@ -38,6 +38,7 @@ use crate::prompt::{
     write_editor_target_from_pending,
 };
 use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
+use crate::storage::bootstrap_state_db;
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
@@ -107,6 +108,12 @@ impl std::error::Error for AppError {}
 
 impl From<std::io::Error> for AppError {
     fn from(value: std::io::Error) -> Self {
+        Self::new(value.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(value: rusqlite::Error) -> Self {
         Self::new(value.to_string())
     }
 }
@@ -538,7 +545,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_target_pane(&client, &args.target)?;
     ensure_pane_owned_by_claude(&pane)?;
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let prompt =
         resolve_keep_going_prompt(args.prompt_source.as_deref(), args.prompt_text.as_deref())?;
     let bindings = load_automation_keybindings(None)?;
@@ -990,7 +997,7 @@ fn keep_going_starts_with_numbered_option(line: &str) -> bool {
 }
 
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
     let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
     Ok(format!(
@@ -1001,19 +1008,21 @@ fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
 }
 
 fn run_editor_helper(args: EditorHelperArgs) -> AppResult<String> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let content = match args.source.as_deref() {
         Some(source_path) => {
             let prompt_text = resolve_prompt_text(PromptSource::File(source_path))?;
             write_editor_target(&args.target, &prompt_text)?;
             prompt_text
         }
-        None => write_editor_target_from_pending(
-            &state_dir,
-            &args.session_name,
-            &args.target,
-            !args.keep_pending,
-        )?,
+        None => {
+            let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+            write_editor_target_from_pending(
+                &state_dir,
+                &args.session_name,
+                &args.target,
+                !args.keep_pending,
+            )?
+        }
     };
 
     Ok(format!(
@@ -1037,7 +1046,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     }
     ensure_workflow_state(GuardedWorkflow::SubmitPrompt, &classification)?;
 
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
     let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
 
@@ -1070,7 +1079,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
 
 fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
     if args.all {
@@ -1097,7 +1106,7 @@ fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<S
 }
 
 fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<String> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     if args.all {
         let mut out = Vec::new();
         for pane_id in tracked_pane_ids(&state_dir)? {
@@ -1136,6 +1145,12 @@ fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<Str
             supports_babysit_color(),
         ))
     }
+}
+
+fn resolve_bootstrapped_state_dir(path: Option<&Path>) -> AppResult<PathBuf> {
+    let state_dir = resolve_state_dir(path)?;
+    bootstrap_state_db(&state_dir)?;
+    Ok(state_dir)
 }
 
 fn run_yolo_single(
@@ -2847,6 +2862,9 @@ fn parse_expected_state_arg(
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{
         AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
         KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, PermissionBabysitAction, RecoveryAction,
@@ -2857,13 +2875,16 @@ mod tests {
         recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
         render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
         render_list_panes, render_next_safe_action, render_screen_excerpt, render_status_report,
-        resolve_keep_going_prompt, submit_prompt_preflight_workflow,
+        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
         Classification, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
+    use crate::cli::PreparePromptArgs;
     use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
+    use crate::prompt::pending_prompt_path;
+    use crate::storage::{CURRENT_SCHEMA_VERSION, state_db_path};
     use crate::tmux::TmuxPane;
 
     fn sample_pane(current_command: &str) -> TmuxPane {
@@ -3461,6 +3482,39 @@ mod tests {
     }
 
     #[test]
+    fn prepare_prompt_bootstraps_state_db() {
+        let state_dir = unique_temp_dir("app-prepare-prompt-state-db");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        run_prepare_prompt(PreparePromptArgs {
+            session_name: String::from("demo/session"),
+            state_dir: Some(state_dir.clone()),
+            source: None,
+            text: Some(String::from("hello world")),
+        })
+        .expect("prepare-prompt should succeed");
+
+        let pending_path = pending_prompt_path(&state_dir, "demo/session");
+        assert_eq!(
+            fs::read_to_string(&pending_path).expect("pending prompt should exist"),
+            "hello world"
+        );
+
+        let connection = rusqlite::Connection::open(state_db_path(&state_dir))
+            .expect("state db should exist after prepare-prompt");
+        let version = connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("schema version row should exist");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn keep_going_no_yolo_blocker_returns_exit_code_two() {
         let error = keep_going_no_yolo_blocker(
             &Classification {
@@ -4011,5 +4065,13 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             .expect("record exists");
         assert!(!reread.enabled);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("botctl-{label}-{}-{nanos}", std::process::id()))
     }
 }

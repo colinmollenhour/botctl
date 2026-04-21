@@ -12,6 +12,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
+- Relevant stateful commands bootstrap `<state-root>/state.db` with a minimal `schema_version` table; prompt handoff files and babysit records remain regular files for now.
 
 ## Session and pane management
 
