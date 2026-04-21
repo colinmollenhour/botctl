@@ -24,6 +24,7 @@
 20. [ ] P3-5 Add end-to-end tests against real tmux sessions.
 21. [ ] P3-6 Add docs, packaging, and release automation.
 22. [x] P3-7 Add a one-off permission babysit mode for a single instance.
+23. [ ] P3-8 Add interactive target selection for single-pane commands.
 
 ## P0
 
@@ -100,6 +101,9 @@ The repo still needs installation instructions, a real `README.md`, CI, and a re
 
 7. Add a one-off permission babysit mode for a single instance.
 This mode should temporarily persist automation state for one adopted Claude instance and only accept permission prompts while the operator is away. It should not expand into general continuous automation, and it should stop once that single instance exits or the operator disables it.
+
+8. Add interactive target selection for single-pane commands.
+When a command acts on a single Claude pane and the operator runs it from an interactive TTY without `--pane`, `--session`, or `--window`, `botctl` should list the available Claude targets and let the operator choose one. A simple numbered prompt is enough, but an up/down + Enter selector would be even better. For example, `auto-unstick` with no explicit target should present the chooser instead of failing immediately.
 
 ## Questions For Review
 
