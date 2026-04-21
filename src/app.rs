@@ -522,6 +522,7 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
                 }
                 eprintln!("warning: serve artifacts disabled after write failure: {error}");
                 artifacts = None;
+                artifact_root = None;
             }
         }
         emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
