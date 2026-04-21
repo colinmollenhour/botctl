@@ -2047,6 +2047,7 @@ fn is_plausible_permission_prompt_title(title: &str) -> bool {
         return matches!(
             title,
             "Bash command"
+                | "Monitor"
                 | "JavaScript code"
                 | "TypeScript code"
                 | "Python code"
@@ -2102,6 +2103,7 @@ fn is_permission_ignored_line(line: &str) -> bool {
         || lower.starts_with("2.")
         || lower.starts_with("allow once")
         || lower.starts_with("allow for session")
+        || lower.starts_with("unhandled node type:")
         || lower == "no"
         || lower.starts_with("enter ")
         || lower.starts_with("escape ")
@@ -3683,6 +3685,38 @@ mod tests {
         );
         assert_eq!(details.reason.as_deref(), Some("Regenerate manifests"));
         assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_from_monitor_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Monitor\n  until out=$(kubectl -n bloodraven-playground get mysqlfailovergroup playground -o jsonpath='{.status.activeSite}={.status.ready}'\n  2>/dev/null); [[ \"$out\" =~ ^[a-z]+=true$ ]]; do sleep 5; done; echo \"FG ready: $out\"\n  FG ready state\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend",
+            ),
+            raw_source: String::from(
+                "Monitor\n  until out=$(kubectl -n bloodraven-playground get mysqlfailovergroup playground -o jsonpath='{.status.activeSite}={.status.ready}'\n  2>/dev/null); [[ \"$out\" =~ ^[a-z]+=true$ ]]; do sleep 5; done; echo \"FG ready: $out\"\n  FG ready state\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Monitor");
+        assert_eq!(details.sandbox_mode, None);
+        assert_eq!(
+            details.command.as_deref(),
+            Some(
+                "until out=$(kubectl -n bloodraven-playground get mysqlfailovergroup playground -o jsonpath='{.status.activeSite}={.status.ready}' 2>/dev/null); [[ \"$out\" =~ ^[a-z]+=true$ ]]; do sleep 5; done; echo \"FG ready: $out\""
+            )
+        );
+        assert_eq!(details.reason.as_deref(), Some("FG ready state"));
+        assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+        assert!(is_yolo_safe_to_approve(&inspected));
     }
 
     #[test]

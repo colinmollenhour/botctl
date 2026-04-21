@@ -1,0 +1,16 @@
+❯
+● Monitor(FG ready state)
+
+Monitor
+
+  until out=$(kubectl -n bloodraven-playground get mysqlfailovergroup playground -o jsonpath='{.status.activeSite}={.status.ready}'
+  2>/dev/null); [[ "$out" =~ ^[a-z]+=true$ ]]; do sleep 5; done; echo "FG ready: $out"
+  FG ready state
+
+Unhandled node type: string
+
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend
