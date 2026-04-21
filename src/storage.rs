@@ -61,6 +61,12 @@ pub fn open_state_db(state_dir: &Path) -> AppResult<Connection> {
 fn configure_connection(connection: &Connection) -> AppResult<()> {
     connection.busy_timeout(Duration::from_millis(STATE_DB_BUSY_TIMEOUT_MS))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
+    let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(AppError::new(format!(
+            "failed to enable WAL journal mode for state.db: SQLite reported {journal_mode}"
+        )));
+    }
     connection.pragma_update(None, "foreign_keys", 1)?;
     Ok(())
 }
@@ -95,8 +101,9 @@ fn write_schema_version(connection: &Connection, version: i64) -> AppResult<()> 
     Ok(())
 }
 
-pub fn migrate_state_db(connection: &Connection) -> AppResult<()> {
-    let tx = connection.unchecked_transaction()?;
+pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
+    let tx = connection.transaction()?;
+    ensure_schema_version_table(&tx)?;
     let mut version = read_schema_version(&tx)?.unwrap_or(0);
     let starting_version = version;
 
@@ -141,6 +148,29 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
     }
 }
 
+fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppResult<bool> {
+    match version {
+        0 => Ok(true),
+        1 => Ok(table_exists(connection, "pending_prompts")?
+            && table_exists(connection, "babysit_registrations")?),
+        other => Err(AppError::new(format!(
+            "no state.db migration path from version {} to {}",
+            other, CURRENT_SCHEMA_VERSION
+        ))),
+    }
+}
+
+fn table_exists(connection: &Connection, table_name: &str) -> AppResult<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |_row| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 fn migrate_to_v1(connection: &Connection) -> AppResult<()> {
     ensure_pending_prompts_table(connection)?;
     ensure_babysit_registrations_table(connection)?;
@@ -178,9 +208,21 @@ fn ensure_babysit_registrations_table(connection: &Connection) -> AppResult<()> 
 }
 
 fn open_bootstrapped_state_db(state_dir: &Path) -> AppResult<Connection> {
-    let connection = open_state_db(state_dir)?;
+    let mut connection = open_state_db(state_dir)?;
     ensure_schema_version_table(&connection)?;
-    migrate_state_db(&connection)?;
+
+    let version = read_schema_version(&connection)?;
+    let needs_migration = match version {
+        Some(current) if current == CURRENT_SCHEMA_VERSION => {
+            !schema_layout_matches_version(&connection, current)?
+        }
+        Some(_) | None => true,
+    };
+
+    if needs_migration {
+        migrate_state_db(&mut connection)?;
+    }
+
     Ok(connection)
 }
 
@@ -353,7 +395,7 @@ mod tests {
         CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_ROW_ID, bootstrap_state_db, capture_artifact_path,
         delete_pending_prompt, ensure_schema_version_table, export_artifact_path,
         load_pending_prompt, migrate_state_db, open_state_db, runtime_artifacts_root,
-        state_db_path, store_pending_prompt, tape_artifact_path,
+        state_db_path, store_pending_prompt, table_exists, tape_artifact_path,
     };
 
     #[test]
@@ -520,7 +562,7 @@ mod tests {
         let state_dir = unique_temp_dir("storage-migrate-v0");
         let _ = fs::remove_dir_all(&state_dir);
 
-        let connection = open_state_db(&state_dir).expect("db should open");
+        let mut connection = open_state_db(&state_dir).expect("db should open");
         ensure_schema_version_table(&connection).expect("schema_version should exist");
         connection
             .execute(
@@ -529,7 +571,7 @@ mod tests {
             )
             .expect("version row should insert");
 
-        migrate_state_db(&connection).expect("migration should succeed");
+        migrate_state_db(&mut connection).expect("migration should succeed");
 
         let version: i64 = connection
             .query_row(
@@ -566,7 +608,7 @@ mod tests {
         let state_dir = unique_temp_dir("storage-migrate-newer");
         let _ = fs::remove_dir_all(&state_dir);
 
-        let connection = open_state_db(&state_dir).expect("db should open");
+        let mut connection = open_state_db(&state_dir).expect("db should open");
         ensure_schema_version_table(&connection).expect("schema_version should exist");
         connection
             .execute(
@@ -575,7 +617,7 @@ mod tests {
             )
             .expect("version row should insert");
 
-        let error = migrate_state_db(&connection).expect_err("newer schema should fail");
+        let error = migrate_state_db(&mut connection).expect_err("newer schema should fail");
         assert!(
             error
                 .to_string()
@@ -591,7 +633,7 @@ mod tests {
         let state_dir = unique_temp_dir("storage-migrate-repair-v1");
         let _ = fs::remove_dir_all(&state_dir);
 
-        let connection = open_state_db(&state_dir).expect("db should open");
+        let mut connection = open_state_db(&state_dir).expect("db should open");
         ensure_schema_version_table(&connection).expect("schema_version should exist");
         connection
             .execute(
@@ -600,7 +642,7 @@ mod tests {
             )
             .expect("version row should insert");
 
-        migrate_state_db(&connection).expect("migration should repair current schema");
+        migrate_state_db(&mut connection).expect("migration should repair current schema");
 
         let prompt_table_count: i64 = connection
             .query_row(
@@ -640,6 +682,33 @@ mod tests {
         assert!(bad_file.to_string().contains("state artifacts directory"));
         assert!(abs_id.to_string().contains("state artifacts directory"));
 
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn migrate_state_db_bootstraps_fresh_connections() {
+        let state_dir = unique_temp_dir("storage-migrate-fresh");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let mut connection = open_state_db(&state_dir).expect("db should open");
+
+        migrate_state_db(&mut connection).expect("fresh db migration should succeed");
+
+        let version: i64 = connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = ?1",
+                params![SCHEMA_VERSION_ROW_ID],
+                |row| row.get(0),
+            )
+            .expect("schema version should load");
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(&connection, "pending_prompts").expect("table check should succeed"));
+        assert!(
+            table_exists(&connection, "babysit_registrations").expect("table check should succeed")
+        );
+
+        drop(connection);
         let _ = fs::remove_dir_all(&state_dir);
     }
 
