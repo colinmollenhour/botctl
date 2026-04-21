@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -13,6 +14,7 @@ const ARTIFACTS_DIR: &str = "artifacts";
 const ARTIFACTS_CAPTURES_SUBDIR: &str = "captures";
 const ARTIFACTS_TAPES_SUBDIR: &str = "tapes";
 const ARTIFACTS_EXPORTS_SUBDIR: &str = "exports";
+const STATE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_DB_FILENAME)
@@ -51,7 +53,16 @@ pub fn open_state_db(state_dir: &Path) -> AppResult<Connection> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    Ok(Connection::open(&db_path)?)
+    let connection = Connection::open(&db_path)?;
+    configure_connection(&connection)?;
+    Ok(connection)
+}
+
+fn configure_connection(connection: &Connection) -> AppResult<()> {
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "foreign_keys", 1)?;
+    connection.busy_timeout(Duration::from_millis(STATE_DB_BUSY_TIMEOUT_MS))?;
+    Ok(())
 }
 
 pub fn ensure_schema_version_table(connection: &Connection) -> AppResult<()> {
@@ -407,6 +418,31 @@ mod tests {
         assert!(state_dir.join("artifacts/tapes/serve-demo").is_dir());
         assert!(state_dir.join("artifacts/exports/observe-demo").is_dir());
 
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn open_state_db_configures_sqlite_pragmas() {
+        let state_dir = unique_temp_dir("storage-pragmas");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let connection = open_state_db(&state_dir).expect("db should open");
+
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode should load");
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma should load");
+        let busy_timeout: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout pragma should load");
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(busy_timeout, 5_000);
+
+        drop(connection);
         let _ = fs::remove_dir_all(&state_dir);
     }
 

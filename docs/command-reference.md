@@ -13,6 +13,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
 - Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and babysit registrations now both use SQLite-backed records there.
+- Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
 
 ## Session and pane management
 
