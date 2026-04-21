@@ -332,12 +332,15 @@ fn run_observe(args: ObserveArgs) -> AppResult<String> {
     };
     let collected = collect_observation(&client, &request)?;
     let report = collected.report.render();
-    let (state_dir, mut artifact_warning) =
-        resolve_best_effort_artifact_state_dir(args.state_dir.as_deref());
+    let artifacts_required = args.state_dir.is_some();
+    let (state_dir, mut artifact_warning) = resolve_artifact_state_dir(args.state_dir.as_deref())?;
     let artifact_paths = match state_dir {
         Some(state_dir) => match write_observe_artifacts(&state_dir, &collected) {
             Ok(paths) => Some(paths),
             Err(error) => {
+                if artifacts_required {
+                    return Err(error);
+                }
                 artifact_warning = Some(error.to_string());
                 None
             }
@@ -468,10 +471,10 @@ impl ServeExportSummary {
 
 fn run_serve(args: ServeArgs) -> AppResult<String> {
     let client = TmuxClient::default();
+    let artifacts_required = args.state_dir.is_some();
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    let (state_dir, artifact_warning) =
-        resolve_best_effort_artifact_state_dir(args.state_dir.as_deref());
+    let (state_dir, artifact_warning) = resolve_artifact_state_dir(args.state_dir.as_deref())?;
     if let Some(warning) = artifact_warning.as_deref() {
         eprintln!("warning: serve artifacts unavailable: {warning}");
     }
@@ -484,6 +487,7 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
             args.history_lines,
         ) {
             Ok(artifacts) => Some(artifacts),
+            Err(error) if artifacts_required => return Err(error),
             Err(error) => {
                 eprintln!("warning: serve artifacts unavailable: {error}");
                 None
@@ -506,6 +510,9 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
         if let Some(active_artifacts) = artifacts.as_mut() {
             active_artifacts.summary.record_event(&event);
             if let Err(error) = append_jsonl_event(&mut active_artifacts.tape_writer, &payload) {
+                if artifacts_required {
+                    return Err(error);
+                }
                 eprintln!("warning: serve artifacts disabled after write failure: {error}");
                 artifacts = None;
             }
@@ -516,6 +523,9 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
     if let Some(mut artifacts) = artifacts {
         artifacts.summary.finalize();
         if let Err(error) = write_serve_summary_export(&artifacts.export_path, &artifacts.summary) {
+            if artifacts_required {
+                return Err(error);
+            }
             eprintln!("warning: serve summary export failed: {error}");
         }
     }
@@ -670,18 +680,18 @@ fn render_observe_command_output(
     out
 }
 
-fn resolve_best_effort_artifact_state_dir(
-    path: Option<&Path>,
-) -> (Option<PathBuf>, Option<String>) {
-    best_effort_artifact_state_dir_result(resolve_bootstrapped_state_dir(path))
+fn resolve_artifact_state_dir(path: Option<&Path>) -> AppResult<(Option<PathBuf>, Option<String>)> {
+    artifact_state_dir_result(resolve_bootstrapped_state_dir(path), path.is_some())
 }
 
-fn best_effort_artifact_state_dir_result(
+fn artifact_state_dir_result(
     result: AppResult<PathBuf>,
-) -> (Option<PathBuf>, Option<String>) {
+    required: bool,
+) -> AppResult<(Option<PathBuf>, Option<String>)> {
     match result {
-        Ok(state_dir) => (Some(state_dir), None),
-        Err(error) => (None, Some(error.to_string())),
+        Ok(state_dir) => Ok((Some(state_dir), None)),
+        Err(error) if required => Err(error),
+        Err(error) => Ok((None, Some(error.to_string()))),
     }
 }
 
@@ -733,7 +743,7 @@ fn render_serve_event_payload(request: &ServeRequest, event: &ServeEvent) -> ser
         }),
         ServeEvent::PaneRemoved { pane_id } => serde_json::json!({
             "timestamp": current_babysit_timestamp(),
-            "kind": "notify",
+            "kind": "pane-removed",
             "pane_id": pane_id,
             "summary": format!("Observed pane {pane_id} disappeared"),
             "details": [format!("Session: {}", request.session_name)]
@@ -3176,16 +3186,16 @@ mod tests {
     use super::{
         AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
         KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, ObserveArtifactPaths,
-        PermissionBabysitAction, RecoveryAction, best_effort_artifact_state_dir_result,
-        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
-        extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_babysit_action_for_state,
+        PermissionBabysitAction, RecoveryAction, artifact_state_dir_result, cleanup_babysit_record,
+        ensure_pane_owned_by_claude, ensure_state_transition, extract_keep_going_response,
+        extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
+        keep_going_no_yolo_blocker, permission_babysit_action_for_state,
         permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
         recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
         render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
         render_list_panes, render_next_safe_action, render_observe_command_output,
-        render_screen_excerpt, render_status_report, resolve_keep_going_prompt, run_prepare_prompt,
-        submit_prompt_preflight_workflow,
+        render_screen_excerpt, render_serve_event_payload, render_status_report,
+        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -3194,6 +3204,7 @@ mod tests {
     use crate::cli::PreparePromptArgs;
     use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
     use crate::prompt::pending_prompt_text;
+    use crate::serve::{ServeEvent, ServeRequest};
     use crate::storage::{CURRENT_SCHEMA_VERSION, state_db_path};
     use crate::tmux::TmuxPane;
 
@@ -3295,12 +3306,21 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_artifact_state_dir_turns_errors_into_warnings() {
+    fn optional_artifact_state_dir_turns_default_errors_into_warnings() {
         let (state_dir, warning) =
-            best_effort_artifact_state_dir_result(Err(AppError::new("disk full")));
+            artifact_state_dir_result(Err(AppError::new("disk full")), false)
+                .expect("default artifact state dir should degrade to warning");
 
         assert_eq!(state_dir, None);
         assert_eq!(warning.as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn optional_artifact_state_dir_preserves_explicit_errors() {
+        let error = artifact_state_dir_result(Err(AppError::new("disk full")), true)
+            .expect_err("explicit artifact state dir should stay fatal");
+
+        assert_eq!(error.to_string(), "disk full");
     }
 
     #[test]
@@ -3328,6 +3348,23 @@ mod tests {
         assert!(rendered.contains("control_log=/tmp/control-mode.log"));
         assert!(rendered.contains("export=/tmp/report.json"));
         assert!(!rendered.contains("unavailable="));
+    }
+
+    #[test]
+    fn serve_pane_removed_events_keep_their_own_kind() {
+        let payload = render_serve_event_payload(
+            &ServeRequest {
+                session_name: String::from("demo"),
+                target_pane: None,
+                history_lines: 120,
+                reconcile_ms: 1500,
+            },
+            &ServeEvent::PaneRemoved {
+                pane_id: String::from("%7"),
+            },
+        );
+
+        assert_eq!(payload["kind"], "pane-removed");
     }
 
     #[test]
