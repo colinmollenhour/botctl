@@ -4,7 +4,8 @@ This page is the current CLI reference for shipped commands and aliases.
 
 ## Common targeting and safety rules
 
-- `--pane %ID` targets a specific tmux pane.
+- `--pane %ID` targets a specific tmux pane by unique pane id.
+- `--pane session:window.pane` also targets a specific tmux pane using tmux's explicit pane syntax, for example `0:2.3`.
 - `--session NAME [--window NAME]` targets a session; when a window is required, both `--session` and `--window` must be provided.
 - Several workflow commands refuse ambiguous targets.
 - Automation commands generally require the target pane to be a Claude pane and will refuse to act otherwise.
@@ -41,11 +42,11 @@ Purpose: resolve and report a Claude pane target.
 
 Syntax:
 ```bash
-botctl attach (--pane %ID | --session NAME [--window NAME])
+botctl attach (--pane %ID|session:window.pane | --session NAME [--window NAME])
 ```
 
 Flags:
-- `--pane %ID` or `--session NAME [--window NAME]` (required)
+- `--pane %ID|session:window.pane` or `--session NAME [--window NAME]` (required)
 
 Targeting: accepts either an explicit pane or a session target; a window-only target is refused.
 
@@ -82,18 +83,18 @@ Purpose: print a pane capture.
 
 Syntax:
 ```bash
-botctl capture --pane %ID [--history-lines N]
+botctl capture --pane %ID|session:window.pane [--history-lines N]
 ```
 
 Flags:
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 - `--history-lines N` (default: `200`)
 
 Targeting: explicit pane only.
 
 Example:
 ```bash
-botctl capture --pane %7 --history-lines 80
+botctl capture --pane 0:2.3 --history-lines 80
 ```
 
 ### `status`
@@ -102,18 +103,18 @@ Purpose: inspect a pane, classify its state, and report keybinding/next-action d
 
 Syntax:
 ```bash
-botctl status --pane %ID [--history-lines N]
+botctl status --pane %ID|session:window.pane [--history-lines N]
 ```
 
 Flags:
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 - `--history-lines N` (default: `120`)
 
 Targeting: explicit pane only.
 
 Example:
 ```bash
-botctl status --pane %7
+botctl status --pane 0:2.3
 ```
 
 ### `doctor`
@@ -122,12 +123,12 @@ Purpose: diagnose a pane or session and report automation readiness.
 
 Syntax:
 ```bash
-botctl doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]
+botctl doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]
 ```
 
 Flags:
 - `--session NAME` (optional)
-- `--pane %ID` (optional)
+- `--pane %ID|session:window.pane` (optional)
 - `--history-lines N` (default: `120`)
 - `--bindings-path PATH` (optional)
 
@@ -148,12 +149,12 @@ Purpose: stream a bounded observation of a session.
 
 Syntax:
 ```bash
-botctl observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]
+botctl observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N]
 ```
 
 Flags:
 - `--session NAME` (required)
-- `--pane %ID` (optional)
+- `--pane %ID|session:window.pane` (optional)
 - `--events N` (default: `25`)
 - `--idle-timeout-ms N` (default: `1500`)
 - `--history-lines N` (default: `120`)
@@ -171,12 +172,12 @@ Purpose: run the babysit/serve loop for a session.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]
 ```
 
 Flags:
 - `--session NAME` (required)
-- `--pane %ID` (optional)
+- `--pane %ID|session:window.pane` (optional)
 - `--reconcile-ms N` (default: `1500`, must be at least `1`)
 - `--history-lines N` (default: `120`)
 - `--format human|jsonl` (default: `human`)
@@ -198,13 +199,13 @@ Purpose: capture a fixture case from a live session.
 
 Syntax:
 ```bash
-botctl record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]
+botctl record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]
 ```
 
 Flags:
 - `--session NAME` (required)
 - `--case NAME` (required)
-- `--pane %ID` (optional)
+- `--pane %ID|session:window.pane` (optional)
 - `--output-dir PATH` (default: `fixtures/cases`)
 - `--expected-state STATE` (optional)
 - `--events N` (default: `25`)
@@ -299,11 +300,11 @@ Purpose: send one named automation action to a pane.
 
 Syntax:
 ```bash
-botctl send-action --pane %ID --action NAME
+botctl send-action --pane %ID|session:window.pane --action NAME
 ```
 
 Flags:
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 - `--action NAME` (required)
 
 Valid actions:
@@ -322,7 +323,7 @@ Safety: refuses non-Claude panes and unknown action names.
 
 Example:
 ```bash
-botctl send-action --pane %7 --action submit
+botctl send-action --pane 0:2.3 --action submit
 ```
 
 ## Guarded workflows
@@ -333,12 +334,12 @@ Purpose: approve a permission dialog.
 
 Syntax:
 ```bash
-botctl approve --pane %ID [--format human|jsonl]
-botctl approve-permission --pane %ID [--format human|jsonl]
+botctl approve --pane %ID|session:window.pane [--format human|jsonl]
+botctl approve-permission --pane %ID|session:window.pane [--format human|jsonl]
 ```
 
 Flags:
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 - `--format human|jsonl` (default: `human`)
 
 Targeting: explicit pane only.
@@ -347,7 +348,7 @@ Safety: validates the pane state before sending keys.
 
 Example:
 ```bash
-botctl approve --pane %7
+botctl approve --pane 0:2.3
 ```
 
 ### `reject` / `reject-permission`
@@ -356,12 +357,12 @@ Purpose: decline a permission dialog.
 
 Syntax:
 ```bash
-botctl reject --pane %ID [--format human|jsonl]
-botctl reject-permission --pane %ID [--format human|jsonl]
+botctl reject --pane %ID|session:window.pane [--format human|jsonl]
+botctl reject-permission --pane %ID|session:window.pane [--format human|jsonl]
 ```
 
 Flags:
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 - `--format human|jsonl` (default: `human`)
 
 Targeting: explicit pane only.
@@ -370,7 +371,7 @@ Safety: validates the pane state before sending keys.
 
 Example:
 ```bash
-botctl reject --pane %7 --format jsonl
+botctl reject --pane 0:2.3 --format jsonl
 ```
 
 ### `dismiss-survey`
@@ -379,11 +380,11 @@ Purpose: dismiss a survey prompt.
 
 Syntax:
 ```bash
-botctl dismiss-survey --pane %ID
+botctl dismiss-survey --pane %ID|session:window.pane
 ```
 
 Flags:
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 
 Targeting: explicit pane only.
 
@@ -391,7 +392,7 @@ Safety: validates the pane state before sending keys.
 
 Example:
 ```bash
-botctl dismiss-survey --pane %7
+botctl dismiss-survey --pane 0:2.3
 ```
 
 ### `continue-session`
@@ -400,11 +401,11 @@ Purpose: continue a paused or interrupted Claude session.
 
 Syntax:
 ```bash
-botctl continue-session (--pane %ID | --session NAME --window NAME)
+botctl continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)
 ```
 
 Flags:
-- `--pane %ID` or `--session NAME --window NAME` (required)
+- `--pane %ID|session:window.pane` or `--session NAME --window NAME` (required)
 
 Targeting: accepts either one explicit pane or a fully qualified session/window target.
 
@@ -421,11 +422,11 @@ Purpose: try a bounded sequence of recovery actions until the pane becomes usabl
 
 Syntax:
 ```bash
-botctl auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]
+botctl auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]
 ```
 
 Flags:
-- `--pane %ID` or `--session NAME --window NAME` (required)
+- `--pane %ID|session:window.pane` or `--session NAME --window NAME` (required)
 - `--max-steps N` (default: `6`, must be at least `1`)
 
 Targeting: accepts either one explicit pane or a fully qualified session/window target.
@@ -434,7 +435,7 @@ Safety: refuses ambiguous targets and `--max-steps 0`; it may stop early if a pe
 
 Example:
 ```bash
-botctl auto-unstick --pane %7 --max-steps 4
+botctl auto-unstick --pane 0:2.3 --max-steps 4
 ```
 
 ### `keep-going`
@@ -443,11 +444,11 @@ Purpose: continuously babysit a pane, submit the loop prompt when Claude is read
 
 Syntax:
 ```bash
-botctl keep-going (--pane %ID | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]
+botctl keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]
 ```
 
 Flags:
-- `--pane %ID` or `--session NAME --window NAME` (required)
+- `--pane %ID|session:window.pane` or `--session NAME --window NAME` (required)
 - `--poll-ms N` (default: `1000`, must be at least `1`)
 - `--submit-delay-ms N` (default: `250`, must be at least `1`)
 - `--state-dir PATH` (optional)
@@ -473,12 +474,12 @@ Default loop behavior:
 
 Example:
 ```bash
-botctl keep-going --pane %7 --no-yolo
+botctl keep-going --pane 0:2.3 --no-yolo
 ```
 
 Custom loop example:
 ```bash
-botctl keep-going --pane %7 --source ./prompts/review-loop.txt
+botctl keep-going --pane 0:2.3 --source ./prompts/review-loop.txt
 ```
 
 ## Prompt preparation and submission
@@ -537,12 +538,12 @@ Purpose: resolve prompt text from `--text` or `--source`, stage it, and submit i
 
 Syntax:
 ```bash
-botctl submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]
+botctl submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]
 ```
 
 Flags:
 - `--session NAME` (required)
-- `--pane %ID` (required)
+- `--pane %ID|session:window.pane` (required)
 - `--state-dir PATH` (optional)
 - `--source PATH` or `--text TEXT` (exactly one required)
 - `--submit-delay-ms N` (default: `250`, must be at least `1`)
@@ -553,7 +554,7 @@ Safety: refuses if both prompt inputs are provided, if neither is provided, or i
 
 Example:
 ```bash
-botctl submit-prompt --session demo --pane %7 --text "Continue"
+botctl submit-prompt --session demo --pane 0:2.3 --text "Continue"
 ```
 
 ## Permission babysitting
@@ -564,8 +565,8 @@ Purpose: start or stop the permission babysit loop.
 
 Syntax:
 ```bash
-botctl yolo [start] (--pane %ID | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]
-botctl yolo stop (--pane %ID | --all) [--state-dir PATH]
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH]
 botctl permission-babysit [same as yolo]
 botctl babysit [same as yolo]
 ```
@@ -578,14 +579,14 @@ Subcommands:
 - `stop`
 
 Start flags:
-- `--pane %ID` or `--all` (exactly one required)
+- `--pane %ID|session:window.pane` or `--all` (exactly one required)
 - `--poll-ms N` (default: `1000`, must be at least `1`)
 - `--format human|jsonl` (default: `human`)
 - `--live-preview` (default: off)
 - `--state-dir PATH` (optional)
 
 Stop flags:
-- `--pane %ID` or `--all` (exactly one required)
+- `--pane %ID|session:window.pane` or `--all` (exactly one required)
 - `--state-dir PATH` (optional)
 
 Targeting:
@@ -597,7 +598,7 @@ Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed target
 
 Example:
 ```bash
-botctl yolo start --pane %7 --live-preview
+botctl yolo start --pane 0:2.3 --live-preview
 ```
 
 ## Help

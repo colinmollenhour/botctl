@@ -112,7 +112,18 @@ pub fn collect_observation(
     }
 
     let target_pane = match &request.target_pane {
-        Some(pane_id) => pane_id.clone(),
+        Some(target) => {
+            let pane = client
+                .pane_by_target(target)?
+                .ok_or_else(|| AppError::new(format!("could not resolve target pane {target}")))?;
+            if pane.session_name != request.session_name {
+                return Err(AppError::new(format!(
+                    "pane {} belongs to session {} but observe is attached to {}",
+                    pane.pane_id, pane.session_name, request.session_name
+                )));
+            }
+            pane.pane_id
+        }
         None => client
             .active_pane_for_session(&request.session_name)?
             .map(|pane| pane.pane_id)

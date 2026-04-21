@@ -45,6 +45,8 @@ cargo test resolves_custom_binding_keys_for_actions
 
 ## Basic Commands
 
+Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
+
 Show the CLI help:
 
 ```bash
@@ -81,6 +83,12 @@ Check the live classified state for a pane:
 cargo run -- status --pane %19
 ```
 
+The same command using tmux pane syntax:
+
+```bash
+cargo run -- status --pane 0:2.3
+```
+
 Run the long-lived observer for one tmux session:
 
 ```bash
@@ -104,6 +112,12 @@ If the session is blocked on a known confirmation flow, target the pane directly
 cargo run -- approve-permission --pane %19
 cargo run -- reject-permission --pane %19
 cargo run -- dismiss-survey --pane %19
+```
+
+Or with an explicit tmux pane target:
+
+```bash
+cargo run -- approve-permission --pane 0:2.3
 ```
 
 Prepare and submit a prompt:

@@ -231,15 +231,17 @@ fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
 }
 
 fn run_capture(args: CaptureArgs) -> AppResult<String> {
-    TmuxClient::default().capture_pane(&args.pane_id, args.history_lines)
+    let client = TmuxClient::default();
+    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    client.capture_pane(&pane.pane_id, args.history_lines)
 }
 
 fn run_status(args: StatusArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    let frame = client.capture_pane(&args.pane_id, args.history_lines)?;
+    let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
-    let classification = Classifier.classify(&args.pane_id, &focused);
+    let classification = Classifier.classify(&pane.pane_id, &focused);
     let bindings = inspect_keybindings(None).map_err(AppError::new)?;
 
     Ok(render_status_report(
@@ -538,10 +540,8 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
     let pane = resolve_target_pane(&client, &args.target)?;
     ensure_pane_owned_by_claude(&pane)?;
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
-    let prompt = resolve_keep_going_prompt(
-        args.prompt_source.as_deref(),
-        args.prompt_text.as_deref(),
-    )?;
+    let prompt =
+        resolve_keep_going_prompt(args.prompt_source.as_deref(), args.prompt_text.as_deref())?;
     let bindings = load_automation_keybindings(None)?;
     let mut awaiting_reply = false;
     let mut last_state: Option<SessionState> = None;
@@ -960,9 +960,7 @@ fn resolve_keep_going_prompt(
         _ => {
             let text = read_prompt_input(source, text)?;
             if text.trim().is_empty() {
-                return Err(AppError::new(
-                    "keep-going custom prompt must not be empty",
-                ));
+                return Err(AppError::new("keep-going custom prompt must not be empty"));
             }
             Ok(KeepGoingPromptConfig {
                 anchor: Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR.to_string()),
@@ -1120,12 +1118,16 @@ fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<Str
         }
         Ok(out.join("\n"))
     } else {
-        let pane_id = args.pane_id.as_deref().unwrap();
-        let pane_label = babysit_pane_label(&state_dir, pane_id);
-        let disabled = disable_babysit_record(&state_dir, pane_id)?;
+        let raw_target = args.pane_id.as_deref().unwrap();
+        let pane_id = match TmuxClient::default().pane_by_target(raw_target)? {
+            Some(pane) => pane.pane_id,
+            None => raw_target.to_string(),
+        };
+        let pane_label = babysit_pane_label(&state_dir, &pane_id);
+        let disabled = disable_babysit_record(&state_dir, &pane_id)?;
         Ok(render_babysit_stop_event(
             &pane_label,
-            pane_id,
+            &pane_id,
             if disabled {
                 "disabled"
             } else {
@@ -1146,12 +1148,13 @@ fn run_yolo_single(
     format: BabysitFormat,
     interrupted: Arc<AtomicBool>,
 ) -> AppResult<String> {
-    if matches!(read_babysit_record(state_dir, pane_id)?, Some(record) if record.enabled) {
+    let pane = resolve_pane_by_id(client, pane_id)?;
+    if matches!(read_babysit_record(state_dir, &pane.pane_id)?, Some(record) if record.enabled) {
         return Err(AppError::new(format!(
-            "yolo is already active for pane {pane_id}"
+            "yolo is already active for pane {}",
+            pane.pane_id
         )));
     }
-    let pane = resolve_pane_by_id(client, pane_id)?;
     ensure_pane_owned_by_claude(&pane)?;
     let bindings = load_automation_keybindings(None)?;
     let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
@@ -2003,7 +2006,10 @@ fn permission_prompt_lines(inspected: &InspectedPane) -> Option<Vec<String>> {
 }
 
 fn permission_prompt_region_lines(source: &str) -> Option<Vec<String>> {
-    let lines = source.lines().map(|line| line.to_string()).collect::<Vec<_>>();
+    let lines = source
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
     let line_refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
     let (title_idx, _) = extract_permission_prompt_region(&line_refs)?;
     Some(lines.into_iter().skip(title_idx).collect())
@@ -2586,7 +2592,7 @@ fn keys_for_action<'a>(
 
 fn resolve_pane_by_id(client: &TmuxClient, pane_id: &str) -> AppResult<TmuxPane> {
     client
-        .pane_by_id(pane_id)?
+        .pane_by_target(pane_id)?
         .ok_or_else(|| AppError::new(format!("pane not found: {pane_id}")))
 }
 
@@ -2849,17 +2855,15 @@ fn parse_expected_state_arg(
 mod tests {
     use super::{
         AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
-        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
-        PermissionBabysitAction, RecoveryAction, cleanup_babysit_record,
-        ensure_pane_owned_by_claude, ensure_state_transition, extract_keep_going_response,
-        extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
-        keep_going_no_yolo_blocker, permission_babysit_action_for_state,
+        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, PermissionBabysitAction, RecoveryAction,
+        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
+        extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_babysit_action_for_state,
         permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
         recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output,
-        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_screen_excerpt, render_status_report, resolve_keep_going_prompt,
-        submit_prompt_preflight_workflow,
+        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
+        render_list_panes, render_next_safe_action, render_screen_excerpt, render_status_report,
+        resolve_keep_going_prompt, submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -3355,9 +3359,16 @@ mod tests {
         let prompt = resolve_keep_going_prompt(None, Some("Custom loop header\nContinue"))
             .expect("custom keep-going prompt should resolve");
 
-        assert_eq!(prompt.anchor.as_deref(), Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR));
+        assert_eq!(
+            prompt.anchor.as_deref(),
+            Some(KEEP_GOING_CUSTOM_PROMPT_ANCHOR)
+        );
         assert!(prompt.text.starts_with("Custom loop header\nContinue"));
-        assert!(prompt.text.contains("Do not repeat the marker line below in your reply."));
+        assert!(
+            prompt
+                .text
+                .contains("Do not repeat the marker line below in your reply.")
+        );
         assert!(prompt.text.contains("Custom loop header\nContinue"));
         assert!(prompt.text.ends_with(KEEP_GOING_CUSTOM_PROMPT_ANCHOR));
     }
@@ -3367,7 +3378,10 @@ mod tests {
         let error = resolve_keep_going_prompt(None, Some("   \n\t  "))
             .expect_err("blank keep-going prompt should fail");
 
-        assert_eq!(error.to_string(), "keep-going custom prompt must not be empty");
+        assert_eq!(
+            error.to_string(),
+            "keep-going custom prompt must not be empty"
+        );
     }
 
     #[test]
@@ -3668,7 +3682,8 @@ mod tests {
             focused_source: String::from(
                 "✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\n✔ Write tests for Phase 2 changes\n✔ Regenerate manifests + RBAC mirror + docs\n◼ Run pre-PR gate\n────────────────────────────────────────────────────────────────────────\nBash command\n  export PATH=\"$(go env GOPATH)/bin:$PATH\" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 |\n  tail-40\n  Run golangci-lint\nContains simple_expansion\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
-            raw_source: String::from(r#"✔ Add PITR verification spec + binlog replay
+            raw_source: String::from(
+                r#"✔ Add PITR verification spec + binlog replay
 ✔ Add SanityCheck spec + Checking phase
 ✔ Write tests for Phase 2 changes
 ✔ Regenerate manifests + RBAC mirror + docs
@@ -3682,7 +3697,8 @@ Contains simple_expansion
 Do you want to proceed?
 ❯ 1. Yes
   2. No
-Esc to cancel · Tab to amend · ctrl+e to explain"#),
+Esc to cancel · Tab to amend · ctrl+e to explain"#,
+            ),
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
@@ -3712,7 +3728,8 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#),
             focused_source: String::from(
                 "✔ Add PITR verification spec + binlog replay\n✔ Add SanityCheck spec + Checking phase\n✔ Write tests for Phase 2 changes\n✔ Regenerate manifests + RBAC mirror + docs\n◼ Run pre-PR gate\nDo you want to proceed?\n❯ 1. Yes\n  2. No",
             ),
-            raw_source: String::from(r#"❯ commit and push
+            raw_source: String::from(
+                r#"❯ commit and push
 ✔ Add PITR verification spec + binlog replay
 ✔ Add SanityCheck spec + Checking phase
 ✔ Write tests for Phase 2 changes
@@ -3727,12 +3744,21 @@ Contains simple_expansion
 Do you want to proceed?
 ❯ 1. Yes
   2. No
-Esc to cancel · Tab to amend · ctrl+e to explain"#),
+Esc to cancel · Tab to amend · ctrl+e to explain"#,
+            ),
         };
 
         let details = extract_permission_prompt_details(&inspected).expect("details should parse");
-        assert_eq!(details.prompt_type, "Bash command (Contains simple_expansion)");
-        assert_eq!(details.command.as_deref(), Some(r#"export PATH="$(go env GOPATH)/bin:$PATH" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail-40"#));
+        assert_eq!(
+            details.prompt_type,
+            "Bash command (Contains simple_expansion)"
+        );
+        assert_eq!(
+            details.command.as_deref(),
+            Some(
+                r#"export PATH="$(go env GOPATH)/bin:$PATH" && GOCACHE=$TMPDIR/go-cache GOLANGCI_LINT_CACHE=$TMPDIR/golangci-cache make lint 2>&1 | tail-40"#
+            )
+        );
         assert_eq!(details.reason.as_deref(), Some("Run golangci-lint"));
         assert!(is_yolo_safe_to_approve(&inspected));
     }

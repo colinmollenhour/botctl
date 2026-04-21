@@ -241,7 +241,7 @@ fn seed_tracked_panes(
 
 fn list_requested_panes(client: &TmuxClient, request: &ServeRequest) -> AppResult<Vec<TmuxPane>> {
     match &request.target_pane {
-        Some(pane_id) => match client.pane_by_id(pane_id)? {
+        Some(pane_id) => match client.pane_by_target(pane_id)? {
             Some(pane) if pane.session_name == request.session_name => Ok(vec![pane]),
             Some(pane) => Err(AppError::new(format!(
                 "pane {} belongs to session {} but serve is attached to {}",

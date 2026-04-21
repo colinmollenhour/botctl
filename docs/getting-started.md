@@ -32,6 +32,12 @@ cargo run -- doctor --session demo
 cargo run -- status --pane %19
 ```
 
+Pane-targeted commands also accept tmux's explicit pane syntax:
+
+```bash
+cargo run -- status --pane 0:2.3
+```
+
 Attach with tmux when you want the full terminal UI:
 
 ```bash
@@ -45,6 +51,12 @@ If Claude was already started inside tmux, resolve and verify the pane explicitl
 ```bash
 cargo run -- list-panes --all
 cargo run -- attach --pane %19
+```
+
+If you already know the tmux pane target, you can use it directly:
+
+```bash
+cargo run -- attach --pane 0:2.3
 ```
 
 ## Observe versus serve
@@ -74,6 +86,7 @@ cargo run -- serve --session demo --format jsonl
 ## Safety rules
 
 - Prefer explicit pane IDs for automation.
+- `session:window.pane` is also accepted when it identifies one pane exactly.
 - Never automate an ambiguous target.
 - Claude ownership is validated before automation runs.
 - `Unknown` is a refusal state, not a guess.

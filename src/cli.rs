@@ -255,30 +255,30 @@ pub fn usage() -> String {
           \n\
           Commands:\n\
             start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
-            attach (--pane %ID | --session NAME [--window NAME])\n\
+            attach (--pane %ID|session:window.pane | --session NAME [--window NAME])\n\
             list-panes|list [--all]\n\
-            capture --pane %ID [--history-lines N]\n\
-            status --pane %ID [--history-lines N]\n\
-            doctor [--session NAME] [--pane %ID] [--history-lines N] [--bindings-path PATH]\n\
-            observe --session NAME [--pane %ID] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
-            serve --session NAME [--pane %ID] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]\n\
-            record-fixture --session NAME --case NAME [--pane %ID] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
+            capture --pane %ID|session:window.pane [--history-lines N]\n\
+            status --pane %ID|session:window.pane [--history-lines N]\n\
+            doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
+            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
+            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]\n\
+            record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
             classify --path PATH\n\
             replay --path PATH\n\
             bindings\n\
             install-bindings [--path PATH]\n\
-            send-action --pane %ID --action NAME\n\
-            approve --pane %ID [--format human|jsonl]\n\
-            reject --pane %ID [--format human|jsonl]\n\
-            dismiss-survey --pane %ID\n\
-            continue-session (--pane %ID | --session NAME --window NAME)\n\
-            auto-unstick (--pane %ID | --session NAME --window NAME) [--max-steps N]\n\
-            keep-going (--pane %ID | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
+            send-action --pane %ID|session:window.pane --action NAME\n\
+            approve --pane %ID|session:window.pane [--format human|jsonl]\n\
+            reject --pane %ID|session:window.pane [--format human|jsonl]\n\
+            dismiss-survey --pane %ID|session:window.pane\n\
+            continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)\n\
+            auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]\n\
+            keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
-            submit-prompt --session NAME --pane %ID [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
-            yolo [start] (--pane %ID | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]\n\
-            yolo stop (--pane %ID | --all) [--state-dir PATH]\n",
+            submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
+            yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]\n\
+            yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH]\n",
     )
 }
 
@@ -467,7 +467,7 @@ fn parse_doctor(args: Vec<String>) -> AppResult<Command> {
 
     if pane_id.is_none() && session_name.is_none() {
         return Err(AppError::new(
-            "doctor requires either --pane %ID or --session NAME",
+            "doctor requires either --pane %ID|session:window.pane or --session NAME",
         ));
     }
 
@@ -878,13 +878,13 @@ fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<Pa
             window_name,
         }),
         (Some(_), Some(_), _) | (Some(_), None, Some(_)) => Err(AppError::new(format!(
-            "{command_name} target must use either --pane %ID or --session NAME [--window NAME]"
+            "{command_name} target must use either --pane %ID|session:window.pane or --session NAME [--window NAME]"
         ))),
         (None, None, Some(_)) => Err(AppError::new(format!(
             "{command_name} requires --session NAME when --window NAME is provided"
         ))),
         (None, None, None) => Err(AppError::new(format!(
-            "{command_name} requires either --pane %ID or --session NAME"
+            "{command_name} requires either --pane %ID|session:window.pane or --session NAME"
         ))),
     }
 }
@@ -897,7 +897,7 @@ fn validate_send_target(target: &PaneTargetArgs, command_name: &str) -> AppResul
     ) {
         (Some(_), None, None) | (None, Some(_), Some(_)) => Ok(()),
         _ => Err(AppError::new(format!(
-            "{command_name} requires --pane %ID or --session NAME --window NAME"
+            "{command_name} requires --pane %ID|session:window.pane or --session NAME --window NAME"
         ))),
     }
 }
@@ -1302,6 +1302,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_attach_command_with_tmux_pane_target() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("attach"),
+            String::from("--pane"),
+            String::from("0:2.3"),
+        ])
+        .expect("attach pane target should parse");
+
+        match command {
+            Command::Attach(args) => {
+                assert_eq!(args.target.pane_id.as_deref(), Some("0:2.3"));
+                assert!(args.target.session_name.is_none());
+                assert!(args.target.window_name.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_attach_window_without_session() {
         let error = parse_args(vec![
             String::from("botctl"),
@@ -1399,6 +1419,25 @@ mod tests {
         match command {
             Command::Status(args) => {
                 assert_eq!(args.pane_id, "%7");
+                assert_eq!(args.history_lines, 120);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_status_command_with_tmux_pane_target() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("status"),
+            String::from("--pane"),
+            String::from("0:2.3"),
+        ])
+        .expect("status command should parse tmux pane target");
+
+        match command {
+            Command::Status(args) => {
+                assert_eq!(args.pane_id, "0:2.3");
                 assert_eq!(args.history_lines, 120);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1555,7 +1594,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("continue-session requires --pane %ID or --session NAME --window NAME")
+                .contains("continue-session requires --pane %ID|session:window.pane or --session NAME --window NAME")
         );
     }
 
@@ -1753,11 +1792,9 @@ mod tests {
         ])
         .expect_err("keep-going should reject ambiguous session-only targets");
 
-        assert!(
-            error
-                .to_string()
-                .contains("keep-going requires --pane %ID or --session NAME --window NAME")
-        );
+        assert!(error.to_string().contains(
+            "keep-going requires --pane %ID|session:window.pane or --session NAME --window NAME"
+        ));
     }
 
     #[test]

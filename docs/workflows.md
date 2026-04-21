@@ -44,6 +44,12 @@ Use this when Claude is already running inside tmux and you want to verify the p
    cargo run -- attach --pane %19
    ```
 
+   Or, if tmux already gave you the pane target:
+
+   ```bash
+   cargo run -- attach --pane 0:2.3
+   ```
+
 3. Verify the pane before acting:
 
    ```bash
@@ -111,6 +117,7 @@ Use `observe` when you want a bounded diagnostic sample; use `serve` when you wa
 ## Safety rules
 
 - Explicit pane IDs are preferred.
+- `session:window.pane` is also supported for explicit pane targeting.
 - Never automate an ambiguous target.
 - Claude ownership must be established before automation.
 - Guarded workflows validate the classified state before sending keys.

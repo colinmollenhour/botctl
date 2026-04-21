@@ -147,8 +147,21 @@ impl TmuxClient {
         Ok(panes.into_iter().find(|pane| pane.pane_active))
     }
 
+    pub fn pane_by_target(&self, target: &str) -> AppResult<Option<TmuxPane>> {
+        if let Some(pane) = self.pane_by_id(target)? {
+            return Ok(Some(pane));
+        }
+
+        let pane_id =
+            select_explicit_pane_target(target, self.match_explicit_pane_targets(target)?)?;
+        match pane_id {
+            Some(pane_id) => self.pane_by_id(&pane_id),
+            None => Ok(None),
+        }
+    }
+
     pub fn pane_by_id(&self, pane_id: &str) -> AppResult<Option<TmuxPane>> {
-        let panes = self.list_panes_for_target(Some(pane_id))?;
+        let panes = self.list_panes()?;
         Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
     }
 
@@ -287,6 +300,26 @@ impl TmuxClient {
         String::from_utf8(output.stdout)
             .map_err(|_| AppError::new("tmux output was not valid UTF-8"))
     }
+
+    fn match_explicit_pane_targets(&self, target: &str) -> AppResult<Vec<String>> {
+        let output = self.run_output(vec![
+            String::from("list-panes"),
+            String::from("-a"),
+            String::from("-F"),
+            String::from(
+                "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}:#{window_name}.#{pane_index}",
+            ),
+        ])?;
+
+        Ok(output
+            .lines()
+            .filter_map(parse_explicit_pane_target_line)
+            .filter(|(_, indexed_target, named_target)| {
+                indexed_target == target || named_target == target
+            })
+            .map(|(pane_id, _, _)| pane_id)
+            .collect())
+    }
 }
 
 enum ControlStreamItem {
@@ -372,6 +405,32 @@ fn parse_cursor(value: &str) -> Option<u16> {
     }
 }
 
+fn parse_explicit_pane_target_line(line: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    Some((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].to_string(),
+    ))
+}
+
+fn select_explicit_pane_target(
+    target: &str,
+    mut pane_ids: Vec<String>,
+) -> AppResult<Option<String>> {
+    match pane_ids.len() {
+        0 => Ok(None),
+        1 => Ok(pane_ids.pop()),
+        _ => Err(AppError::new(format!(
+            "pane target is ambiguous: {target}; use a unique %ID or session:window.pane target"
+        ))),
+    }
+}
+
 fn shell_escape(value: &str) -> String {
     if value
         .chars()
@@ -395,7 +454,10 @@ fn drain_channel(rx: &mpsc::Receiver<String>) -> Vec<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{StartSessionRequest, TmuxClient, parse_pane_line};
+    use super::{
+        StartSessionRequest, TmuxClient, parse_explicit_pane_target_line, parse_pane_line,
+        select_explicit_pane_target,
+    };
 
     #[test]
     fn renders_start_plan() {
@@ -423,5 +485,35 @@ mod tests {
         assert!(pane.pane_active);
         assert_eq!(pane.cursor_x, Some(12));
         assert_eq!(pane.cursor_y, Some(4));
+    }
+
+    #[test]
+    fn explicit_pane_target_accepts_unique_tmux_target() {
+        let pane_id = select_explicit_pane_target("0:2.3", vec![String::from("%21")])
+            .expect("target should resolve")
+            .expect("pane should exist");
+
+        assert_eq!(pane_id, "%21");
+    }
+
+    #[test]
+    fn explicit_pane_target_rejects_ambiguous_tmux_target() {
+        let error = select_explicit_pane_target(
+            "demo:claude.1",
+            vec![String::from("%21"), String::from("%22")],
+        )
+        .expect_err("pane target should fail when it resolves to multiple panes");
+
+        assert!(error.to_string().contains("pane target is ambiguous"));
+    }
+
+    #[test]
+    fn parses_explicit_pane_target_mapping_line() {
+        let parsed = parse_explicit_pane_target_line("%21\t0:2.3\t0:botctl.3")
+            .expect("target mapping line should parse");
+
+        assert_eq!(parsed.0, "%21");
+        assert_eq!(parsed.1, "0:2.3");
+        assert_eq!(parsed.2, "0:botctl.3");
     }
 }

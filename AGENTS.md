@@ -82,3 +82,5 @@ Responsible for deciding what action is allowed in the current state. Example po
 - If you change action routing, verify both the resolved keybinding behavior and any special-case raw keys like folder-trust `Enter`.
 - If you change diagnostics, keep `status` and `doctor` useful for a human operator first.
 - If you add fixture scenarios, make sure they explain why the classifier made its decision, not just what state it returned.
+- If you make a material user-facing change, update the relevant docs in `docs/` in the same change.
+- For CLI behavior, targeting, workflows, or examples, update `docs/command-reference.md` and any affected quickstart or workflow docs such as `README.md`, `docs/getting-started.md`, and `docs/workflows.md`.

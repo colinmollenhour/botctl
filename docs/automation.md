@@ -16,7 +16,7 @@ This is why raw `send-keys` success is not enough: a keypress can land in the wr
 
 ## Explicit targeting and ownership
 
-Prefer `--pane %ID` for all automation. Session-based targeting is only a convenience for resolving the active pane.
+Prefer `--pane %ID` for all automation. `--pane session:window.pane` is also accepted when you already have tmux's explicit pane target. Session-based targeting is only a convenience for resolving the active pane.
 
 Before any guarded workflow runs, `botctl` checks that the pane is owned by Claude. If the pane is running anything else, automation refuses.
 
