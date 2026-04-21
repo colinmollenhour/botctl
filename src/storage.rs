@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -121,8 +121,21 @@ pub fn migrate_state_db(connection: &Connection) -> AppResult<()> {
         write_schema_version(&tx, version)?;
     }
 
+    ensure_schema_layout_for_version(&tx, version)?;
+
     tx.commit()?;
     Ok(())
+}
+
+fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> AppResult<()> {
+    match version {
+        0 => Ok(()),
+        1 => migrate_to_v1(connection),
+        other => Err(AppError::new(format!(
+            "no state.db migration path from version {} to {}",
+            other, CURRENT_SCHEMA_VERSION
+        ))),
+    }
 }
 
 fn migrate_to_v1(connection: &Connection) -> AppResult<()> {
@@ -180,10 +193,29 @@ fn artifact_path(
     artifact_id: &str,
     file_name: &str,
 ) -> AppResult<PathBuf> {
+    validate_artifact_path_token("artifact id", artifact_id)?;
+    validate_artifact_path_token("artifact file name", file_name)?;
     let root = runtime_artifacts_root(state_dir).join(subdir);
     let artifact_dir = root.join(artifact_id);
     fs::create_dir_all(&artifact_dir)?;
     Ok(artifact_dir.join(file_name))
+}
+
+fn validate_artifact_path_token(label: &str, value: &str) -> AppResult<()> {
+    let path = Path::new(value);
+    if path.as_os_str().is_empty() {
+        return Err(AppError::new(format!("{label} must not be empty")));
+    }
+
+    for component in path.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(AppError::new(format!(
+                "{label} must stay within the state artifacts directory: {value}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn store_pending_prompt(state_dir: &Path, session_name: &str, content: &str) -> AppResult<()> {
@@ -548,6 +580,63 @@ mod tests {
         );
 
         drop(connection);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn migrate_state_db_repairs_missing_runtime_tables_for_current_schema() {
+        let state_dir = unique_temp_dir("storage-migrate-repair-v1");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let connection = open_state_db(&state_dir).expect("db should open");
+        ensure_schema_version_table(&connection).expect("schema_version should exist");
+        connection
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_ROW_ID, CURRENT_SCHEMA_VERSION],
+            )
+            .expect("version row should insert");
+
+        migrate_state_db(&connection).expect("migration should repair current schema");
+
+        let prompt_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_prompts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending_prompts table should exist");
+        let babysit_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'babysit_registrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("babysit_registrations table should exist");
+
+        assert_eq!(prompt_table_count, 1);
+        assert_eq!(babysit_table_count, 1);
+
+        drop(connection);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn runtime_artifact_paths_reject_escaping_tokens() {
+        let state_dir = unique_temp_dir("storage-artifact-escape");
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let bad_id = capture_artifact_path(&state_dir, "../escape", "capture.txt")
+            .expect_err("parent path artifact id should fail");
+        let bad_file = export_artifact_path(&state_dir, "observe-demo", "../report.json")
+            .expect_err("parent path file name should fail");
+        let abs_id = tape_artifact_path(&state_dir, "/tmp/out", "events.jsonl")
+            .expect_err("absolute artifact id should fail");
+
+        assert!(bad_id.to_string().contains("state artifacts directory"));
+        assert!(bad_file.to_string().contains("state artifacts directory"));
+        assert!(abs_id.to_string().contains("state artifacts directory"));
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
