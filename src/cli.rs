@@ -113,6 +113,7 @@ pub struct ObserveArgs {
     pub events: usize,
     pub idle_timeout_ms: u64,
     pub history_lines: usize,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +123,7 @@ pub struct ServeArgs {
     pub reconcile_ms: u64,
     pub history_lines: usize,
     pub format: BabysitFormat,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,8 +262,8 @@ pub fn usage() -> String {
             capture --pane %ID|session:window.pane [--history-lines N]\n\
             status --pane %ID|session:window.pane [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
-            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
-            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]\n\
+            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]\\n\
+            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]\\n\
             record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
             classify --path PATH\n\
             replay --path PATH\n\
@@ -485,6 +487,7 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
     let mut events = 25usize;
     let mut idle_timeout_ms = 1500u64;
     let mut history_lines = 120usize;
+    let mut state_dir = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -513,6 +516,9 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
                     AppError::new(format!("invalid value for --history-lines: {raw}"))
                 })?;
             }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
             flag => {
                 return Err(AppError::new(format!("unknown observe flag: {flag}")));
             }
@@ -529,6 +535,7 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
         events,
         idle_timeout_ms,
         history_lines,
+        state_dir,
     }))
 }
 
@@ -538,6 +545,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
     let mut reconcile_ms = 1500u64;
     let mut history_lines = 120usize;
     let mut format = BabysitFormat::Human;
+    let mut state_dir = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -559,6 +567,9 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
                 history_lines = raw.parse::<usize>().map_err(|_| {
                     AppError::new(format!("invalid value for --history-lines: {raw}"))
                 })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
             }
             "--format" => {
                 let raw = read_value(&args, &mut i, "--format")?;
@@ -585,6 +596,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
         reconcile_ms,
         history_lines,
         format,
+        state_dir,
     }))
 }
 
@@ -1347,6 +1359,8 @@ mod tests {
             String::from("demo"),
             String::from("--events"),
             String::from("10"),
+            String::from("--state-dir"),
+            String::from("/tmp/botctl-observe"),
         ])
         .expect("observe command should parse");
 
@@ -1355,6 +1369,7 @@ mod tests {
                 assert_eq!(args.session_name, "demo");
                 assert_eq!(args.events, 10);
                 assert_eq!(args.idle_timeout_ms, 1500);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-observe")));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1373,6 +1388,8 @@ mod tests {
             String::from("750"),
             String::from("--format"),
             String::from("jsonl"),
+            String::from("--state-dir"),
+            String::from("/tmp/botctl-serve"),
         ])
         .expect("serve command should parse");
 
@@ -1382,6 +1399,7 @@ mod tests {
                 assert_eq!(args.pane_id.as_deref(), Some("%7"));
                 assert_eq!(args.reconcile_ms, 750);
                 assert_eq!(args.format, super::BabysitFormat::Jsonl);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-serve")));
             }
             other => panic!("unexpected command: {other:?}"),
         }

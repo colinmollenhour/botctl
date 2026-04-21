@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::io::{self, IsTerminal, Write};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -29,7 +30,7 @@ use crate::cli::{
     ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
-use crate::observe::{ObserveRequest, collect_observation, observe_session};
+use crate::observe::{CollectedObservation, ObserveRequest, collect_observation};
 use crate::permission_babysit::{
     BabysitRecord, disable_babysit_record, list_babysit_pane_ids, read_babysit_record,
     write_babysit_record,
@@ -39,7 +40,10 @@ use crate::prompt::{
     write_editor_target_from_pending,
 };
 use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
-use crate::storage::{bootstrap_state_db, state_db_path};
+use crate::storage::{
+    bootstrap_state_db, capture_artifact_path, export_artifact_path, state_db_path,
+    tape_artifact_path,
+};
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
@@ -319,6 +323,7 @@ fn run_install_bindings(args: InstallBindingsArgs) -> AppResult<String> {
 
 fn run_observe(args: ObserveArgs) -> AppResult<String> {
     let client = TmuxClient::default();
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let request = ObserveRequest {
         session_name: args.session_name,
         target_pane: args.pane_id,
@@ -326,14 +331,145 @@ fn run_observe(args: ObserveArgs) -> AppResult<String> {
         idle_timeout_ms: args.idle_timeout_ms,
         history_lines: args.history_lines,
     };
-    let report = observe_session(&client, &request)?;
-    Ok(report.render())
+    let collected = collect_observation(&client, &request)?;
+    let artifact_paths = write_observe_artifacts(&state_dir, &collected)?;
+
+    Ok(format!(
+        "{}\nartifacts:\n  capture_file={}\n  control_log={}\n  export={}\n",
+        collected.report.render(),
+        artifact_paths.capture_file.display(),
+        artifact_paths.tape_file.display(),
+        artifact_paths.export_file.display()
+    ))
+}
+
+#[derive(Debug)]
+struct ObserveArtifactPaths {
+    capture_file: PathBuf,
+    tape_file: PathBuf,
+    export_file: PathBuf,
+}
+
+#[derive(Debug)]
+struct ServeExportSummary {
+    session_name: String,
+    target_pane: Option<String>,
+    reconcile_ms: u64,
+    history_lines: usize,
+    tape_path: PathBuf,
+    started_at: String,
+    ended_at: Option<String>,
+    stopped_reason: Option<String>,
+    total_events: usize,
+    event_counts: BTreeMap<String, usize>,
+    tracked_panes: BTreeSet<String>,
+}
+
+impl ServeExportSummary {
+    fn new(
+        session_name: &str,
+        target_pane: Option<&str>,
+        reconcile_ms: u64,
+        history_lines: usize,
+        tape_path: PathBuf,
+    ) -> Self {
+        Self {
+            session_name: session_name.to_string(),
+            target_pane: target_pane.map(ToString::to_string),
+            reconcile_ms,
+            history_lines,
+            tape_path,
+            started_at: current_babysit_timestamp(),
+            ended_at: None,
+            stopped_reason: None,
+            total_events: 0,
+            event_counts: BTreeMap::new(),
+            tracked_panes: BTreeSet::new(),
+        }
+    }
+
+    fn record_event(&mut self, event: &ServeEvent) {
+        self.total_events += 1;
+
+        match event {
+            ServeEvent::Started { tracked_panes, .. } => {
+                *self
+                    .event_counts
+                    .entry(String::from("serve-start"))
+                    .or_insert(0) += 1;
+                self.tracked_panes.extend(tracked_panes.iter().cloned());
+            }
+            ServeEvent::Snapshot(snapshot) => {
+                *self
+                    .event_counts
+                    .entry(String::from("snapshot"))
+                    .or_insert(0) += 1;
+                self.tracked_panes.insert(snapshot.pane.pane_id.clone());
+            }
+            ServeEvent::Notification(_) => {
+                *self.event_counts.entry(String::from("notify")).or_insert(0) += 1;
+            }
+            ServeEvent::PaneRemoved { pane_id } => {
+                *self
+                    .event_counts
+                    .entry(String::from("pane-removed"))
+                    .or_insert(0) += 1;
+                self.tracked_panes.remove(pane_id);
+            }
+            ServeEvent::Stopped { reason } => {
+                *self
+                    .event_counts
+                    .entry(String::from("serve-stop"))
+                    .or_insert(0) += 1;
+                self.stopped_reason = Some(reason.clone());
+            }
+        }
+    }
+
+    fn finalize(&mut self) {
+        self.ended_at = Some(current_babysit_timestamp());
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        let event_counts = self.event_counts.clone();
+        let tracked_panes = self.tracked_panes.iter().cloned().collect::<Vec<_>>();
+        serde_json::json!({
+            "command": "serve",
+            "generated_at": self.started_at,
+            "session_name": self.session_name,
+            "target_pane": self.target_pane,
+            "reconcile_ms": self.reconcile_ms,
+            "history_lines": self.history_lines,
+            "tape_path": self.tape_path.display().to_string(),
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "stopped_reason": self.stopped_reason,
+            "total_events": self.total_events,
+            "event_counts": event_counts,
+            "tracked_panes": tracked_panes,
+        })
+    }
 }
 
 fn run_serve(args: ServeArgs) -> AppResult<String> {
     let client = TmuxClient::default();
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let artifact_id = new_artifact_id("serve", &args.session_name, args.pane_id.as_deref())?;
+    let tape_path = tape_artifact_path(&state_dir, &artifact_id, "events.jsonl")?;
+    let export_path = export_artifact_path(&state_dir, &artifact_id, "summary.json")?;
+    let tape_file = File::create(&tape_path)?;
+    let mut tape_writer = BufWriter::new(tape_file);
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
+
+    let mut summary = ServeExportSummary::new(
+        &args.session_name,
+        args.pane_id.as_deref(),
+        args.reconcile_ms,
+        args.history_lines,
+        tape_path.clone(),
+    );
+
     let request = ServeRequest {
         session_name: args.session_name,
         target_pane: args.pane_id,
@@ -344,10 +480,223 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
     let use_color = supports_babysit_color();
 
     run_serve_loop(&client, &request, interrupted, |event| {
-        emit_babysit_output(render_serve_event(&request, &event, format, use_color))
+        let payload = render_serve_event_payload(&request, &event);
+        summary.record_event(&event);
+        append_jsonl_event(&mut tape_writer, &payload)?;
+        emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
     })?;
 
+    summary.finalize();
+    write_serve_summary_export(&export_path, &summary)?;
+
     Ok(String::new())
+}
+
+fn write_observe_artifacts(
+    state_dir: &Path,
+    collected: &CollectedObservation,
+) -> AppResult<ObserveArtifactPaths> {
+    let artifact_id = new_artifact_id(
+        "observe",
+        &collected.report.session_name,
+        Some(&collected.report.target_pane),
+    )?;
+
+    let capture_path = capture_artifact_path(state_dir, &artifact_id, "capture.txt")?;
+    let tape_path = tape_artifact_path(state_dir, &artifact_id, "control-mode.log")?;
+    let export_path = export_artifact_path(state_dir, &artifact_id, "report.json")?;
+
+    fs::write(&capture_path, &collected.report.captured_frame)?;
+    fs::write(
+        &tape_path,
+        render_control_log_lines(&collected.raw_control_lines),
+    )?;
+    let export = serde_json::json!({
+        "command": "observe",
+        "generated_at": current_babysit_timestamp(),
+        "state_dir": state_dir,
+        "session_name": collected.report.session_name,
+        "target_pane": collected.report.target_pane,
+        "output_events": collected.report.output_events,
+        "notifications": collected.report.notifications,
+        "seen_panes": collected.report.seen_panes,
+        "live_excerpt": collected.report.live_excerpt,
+        "capture_file": capture_path.display().to_string(),
+        "tape_file": tape_path.display().to_string(),
+        "classification": {
+            "source": collected.report.classification.source,
+            "state": collected.report.classification.state.as_str(),
+            "recap_present": collected.report.classification.recap_present,
+            "recap_excerpt": collected.report.classification.recap_excerpt,
+            "signals": collected.report.classification.signals,
+        },
+    });
+    let export_content = serde_json::to_string_pretty(&export)
+        .map_err(|error| AppError::new(format!("failed to encode observe export JSON: {error}")))?;
+    fs::write(&export_path, export_content)?;
+
+    Ok(ObserveArtifactPaths {
+        capture_file: capture_path,
+        tape_file: tape_path,
+        export_file: export_path,
+    })
+}
+
+fn new_artifact_id(command: &str, session_name: &str, pane_id: Option<&str>) -> AppResult<String> {
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&format_description!(
+            "[year][month][day]-[hour][minute][second]-[subsecond digits:3]"
+        ))
+        .map_err(|error| AppError::new(format!("failed to format artifact timestamp: {error}")))?;
+    let sanitized_command = sanitize_artifact_token(command);
+    let sanitized_session = sanitize_artifact_token(session_name);
+    let sanitized_pane = pane_id
+        .map(sanitize_artifact_token)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("all"));
+    let pid = std::process::id();
+
+    Ok(format!(
+        "{sanitized_command}-{sanitized_session}-{sanitized_pane}-{timestamp}-{pid}"
+    ))
+}
+
+fn sanitize_artifact_token(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        String::from("item")
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn append_jsonl_event(writer: &mut BufWriter<File>, payload: &serde_json::Value) -> AppResult<()> {
+    writeln!(writer, "{}", payload)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_serve_summary_export(path: &Path, summary: &ServeExportSummary) -> AppResult<()> {
+    let content = serde_json::to_string_pretty(&summary.as_json())
+        .map_err(|error| AppError::new(format!("failed to encode serve summary JSON: {error}")))?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn render_control_log_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::from("# no control-mode lines captured\n");
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn render_serve_event_payload(request: &ServeRequest, event: &ServeEvent) -> serde_json::Value {
+    match event {
+        ServeEvent::Started {
+            session_name,
+            target_pane,
+            tracked_panes,
+        } => serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "serve-start",
+            "session": session_name,
+            "target_pane": target_pane,
+            "tracked_panes": tracked_panes,
+            "summary": format!("Serve mode attached to session {session_name}"),
+            "details": [
+                format!("Target: {}", target_pane.as_deref().unwrap_or("all panes")),
+                format!("Reconcile interval: {}ms", request.reconcile_ms),
+                format!("History lines: {}", request.history_lines),
+                format!(
+                    "Tracked panes: {}",
+                    if tracked_panes.is_empty() {
+                        String::from("none yet")
+                    } else {
+                        tracked_panes.join(", ")
+                    }
+                )
+            ]
+        }),
+        ServeEvent::Snapshot(snapshot) => render_serve_snapshot_event_payload(snapshot),
+        ServeEvent::Notification(message) => serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "notify",
+            "summary": format!("tmux notification: {message}"),
+            "details": [format!("Session: {}", request.session_name)],
+            "body_title": "Notification",
+            "body_lines": [message]
+        }),
+        ServeEvent::PaneRemoved { pane_id } => serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "notify",
+            "pane_id": pane_id,
+            "summary": format!("Observed pane {pane_id} disappeared"),
+            "details": [format!("Session: {}", request.session_name)]
+        }),
+        ServeEvent::Stopped { reason } => serde_json::json!({
+            "timestamp": current_babysit_timestamp(),
+            "kind": "serve-stop",
+            "summary": format!("Serve mode stopped for session {}", request.session_name),
+            "details": [format!("Reason: {reason}")]
+        }),
+    }
+}
+
+fn render_serve_snapshot_event_payload(snapshot: &ServePaneSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "timestamp": current_babysit_timestamp(),
+        "kind": "snapshot",
+        "pane_id": snapshot.pane.pane_id,
+        "session": snapshot.pane.session_name,
+        "window": snapshot.pane.window_name,
+        "command": snapshot.pane.current_command,
+        "cwd": snapshot.pane.current_path,
+        "state": snapshot.classification.state.as_str(),
+        "signals": snapshot.classification.signals.clone(),
+        "changed": snapshot.changed,
+        "reason": snapshot.reason.as_str(),
+        "summary": if snapshot.changed {
+            serde_json::json!(format!(
+                "Pane {} changed to {} ({})",
+                snapshot.pane.pane_id,
+                snapshot.classification.state.as_str(),
+                snapshot.reason.as_str()
+            ))
+        } else {
+            serde_json::json!(format!(
+                "Pane {} reconciled at {} ({})",
+                snapshot.pane.pane_id,
+                snapshot.classification.state.as_str(),
+                snapshot.reason.as_str()
+            ))
+        },
+        "details": [
+            format!("Window: {}", snapshot.pane.window_name),
+            format!("Command: {}", snapshot.pane.current_command),
+            format!("Cwd: {}", snapshot.pane.current_path),
+            format!("Signals: {}", render_signals(&snapshot.classification)),
+            format!("Recap: {}", snapshot.classification.recap_excerpt.as_deref().unwrap_or("none")),
+            format!("Changed: {}", snapshot.changed),
+        ],
+        "body_title": if snapshot.live_excerpt.is_empty() { serde_json::Value::Null } else { serde_json::json!("Recent output") },
+        "body_lines": if snapshot.live_excerpt.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(serve_body_lines(&snapshot.live_excerpt))
+        }
+    })
 }
 
 fn run_record_fixture(args: RecordFixtureArgs) -> AppResult<String> {
@@ -1778,71 +2127,11 @@ fn render_serve_event(
     format: BabysitFormat,
     use_color: bool,
 ) -> String {
-    match event {
-        ServeEvent::Started {
-            session_name,
-            target_pane,
-            tracked_panes,
-        } => render_babysit_output(
-            format.into(),
-            serde_json::json!({
-                "timestamp": current_babysit_timestamp(),
-                "kind": "serve-start",
-                "session": session_name,
-                "target_pane": target_pane,
-                "tracked_panes": tracked_panes,
-                "summary": format!("Serve mode attached to session {session_name}"),
-                "details": [
-                    format!("Target: {}", target_pane.as_deref().unwrap_or("all panes")),
-                    format!("Reconcile interval: {}ms", request.reconcile_ms),
-                    format!("History lines: {}", request.history_lines),
-                    format!(
-                        "Tracked panes: {}",
-                        if tracked_panes.is_empty() {
-                            String::from("none yet")
-                        } else {
-                            tracked_panes.join(", ")
-                        }
-                    )
-                ]
-            }),
-            use_color,
-        ),
-        ServeEvent::Snapshot(snapshot) => render_serve_snapshot_event(snapshot, format, use_color),
-        ServeEvent::Notification(message) => render_babysit_output(
-            format.into(),
-            serde_json::json!({
-                "timestamp": current_babysit_timestamp(),
-                "kind": "notify",
-                "summary": format!("tmux notification: {message}"),
-                "details": [format!("Session: {}", request.session_name)],
-                "body_title": "Notification",
-                "body_lines": [message]
-            }),
-            use_color,
-        ),
-        ServeEvent::PaneRemoved { pane_id } => render_babysit_output(
-            format.into(),
-            serde_json::json!({
-                "timestamp": current_babysit_timestamp(),
-                "kind": "notify",
-                "pane_id": pane_id,
-                "summary": format!("Observed pane {pane_id} disappeared"),
-                "details": [format!("Session: {}", request.session_name)]
-            }),
-            use_color,
-        ),
-        ServeEvent::Stopped { reason } => render_babysit_output(
-            format.into(),
-            serde_json::json!({
-                "timestamp": current_babysit_timestamp(),
-                "kind": "serve-stop",
-                "summary": format!("Serve mode stopped for session {}", request.session_name),
-                "details": [format!("Reason: {reason}")]
-            }),
-            use_color,
-        ),
-    }
+    render_babysit_output(
+        format.into(),
+        render_serve_event_payload(request, event),
+        use_color,
+    )
 }
 
 fn render_serve_snapshot_event(

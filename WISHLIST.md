@@ -28,6 +28,7 @@
 24. [ ] P3-8 Add interactive target selection for single-pane commands.
 25. [ ] P3-9 Move runtime state to XDG and split SQLite control-plane state from file artifacts.
 26. [x] P3-10 Let `keep-going` run user-supplied prompt loops.
+27. [ ] P3-11 Add support for OpenCode.
 
 ## P0
 
@@ -117,6 +118,8 @@ See `PLANS-Sqlite.md` for the storage split and migration boundary.
 
 10. Let `keep-going` run user-supplied prompt loops.
 `keep-going` should optionally accept a user-supplied prompt file instead of the built-in audit prompt, then keep feeding that prompt to an idle Claude pane until the session returns one of the existing loop stop tokens like `ALL_DONE` or `PANIC`. This would let operators define their own supervised loops without changing botctl code for each workflow.
+
+11. Add support for OpenCode as it would also be useful in some ways. OpenCode has a client-server model and an SQLite database so it should be a lot easier but still, I'd like to be able to use keep-going and some other features with OpenCode as well.
 
 ## Questions For Review
 

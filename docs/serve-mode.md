@@ -6,7 +6,10 @@ It holds a persistent tmux control-mode connection open for one session, then re
 
 ## What it does today
 
-`serve` runs in the foreground and emits structured events to stdout.
+`serve` runs in the foreground and emits structured events to stdout, while persisting raw event and summary artifacts under state artifacts:
+
+- `tapes/<id>/events.jsonl`
+- `exports/<id>/summary.json`
 
 Current behavior:
 
@@ -20,6 +23,7 @@ Current behavior:
 - may classify stream-driven reconciliations from merged stream state when capture is ambiguous
 - falls back conservatively to captured pane state when merged state is not trustworthy
 - emits human-readable or JSONL events
+- writes event and summary artifacts to `<state-root>/artifacts`
 
 ## Basic usage
 
@@ -39,6 +43,12 @@ Use JSONL output for tooling:
 
 ```bash
 cargo run -- serve --session demo --format jsonl
+```
+
+You can also write artifacts to an explicit state root:
+
+```bash
+cargo run -- serve --session demo --state-dir /tmp/botctl-state
 ```
 
 Slow down periodic reconciliation:
