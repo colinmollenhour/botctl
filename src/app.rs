@@ -2116,6 +2116,7 @@ fn render_babysit_human(event: serde_json::Value, use_color: bool) -> String {
         "wait" => ("👀", "WAIT", "1;33"),
         "snapshot" => ("👀", "STATE", "1;33"),
         "notify" => ("🔔", "NOTE", "1;36"),
+        "pane-removed" => ("🔔", "NOTE", "1;36"),
         "approve" => ("🔐", "APPROVE", "1;36"),
         "approved" => ("✅", "APPROVED", "1;32"),
         "reject" => ("⛔", "REJECT", "1;31"),
@@ -3192,18 +3193,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
-        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, ObserveArtifactPaths,
-        PermissionBabysitAction, RecoveryAction, artifact_state_dir_result, cleanup_babysit_record,
-        ensure_pane_owned_by_claude, ensure_state_transition, extract_keep_going_response,
-        extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
-        keep_going_no_yolo_blocker, permission_babysit_action_for_state,
+        AppError, BabysitFormat, BabysitOutputFormat, InspectedPane,
+        KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
+        ObserveArtifactPaths, PermissionBabysitAction, RecoveryAction, artifact_state_dir_result,
+        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
+        extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_babysit_action_for_state,
         permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
-        recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_observe_command_output,
-        render_screen_excerpt, render_serve_event_payload, render_status_report,
-        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
+        recovery_action_for_state, render_babysit_action_event, render_babysit_output,
+        render_babysit_start_event, render_babysit_wait_event, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
+        render_status_report, resolve_keep_going_prompt, run_prepare_prompt,
+        submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -3373,6 +3375,22 @@ mod tests {
         );
 
         assert_eq!(payload["kind"], "pane-removed");
+    }
+
+    #[test]
+    fn pane_removed_human_output_uses_note_label() {
+        let rendered = render_babysit_output(
+            BabysitOutputFormat::Human,
+            serde_json::json!({
+                "kind": "pane-removed",
+                "summary": "Observed pane %7 disappeared",
+                "details": ["Session: demo"]
+            }),
+            false,
+        );
+
+        assert!(rendered.contains("NOTE"));
+        assert!(!rendered.contains("STOP"));
     }
 
     #[test]

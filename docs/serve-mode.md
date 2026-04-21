@@ -64,6 +64,7 @@ The current stream includes:
 - `serve-start`
 - `snapshot`
 - `notify`
+- `pane-removed`
 - `serve-stop`
 
 Snapshot events include:

@@ -98,6 +98,7 @@ fn write_schema_version(connection: &Connection, version: i64) -> AppResult<()> 
 pub fn migrate_state_db(connection: &Connection) -> AppResult<()> {
     let tx = connection.unchecked_transaction()?;
     let mut version = read_schema_version(&tx)?.unwrap_or(0);
+    let starting_version = version;
 
     if version > CURRENT_SCHEMA_VERSION {
         return Err(AppError::new(format!(
@@ -121,7 +122,9 @@ pub fn migrate_state_db(connection: &Connection) -> AppResult<()> {
         write_schema_version(&tx, version)?;
     }
 
-    ensure_schema_layout_for_version(&tx, version)?;
+    if starting_version == version {
+        ensure_schema_layout_for_version(&tx, version)?;
+    }
 
     tx.commit()?;
     Ok(())
