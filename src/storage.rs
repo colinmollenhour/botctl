@@ -59,9 +59,9 @@ pub fn open_state_db(state_dir: &Path) -> AppResult<Connection> {
 }
 
 fn configure_connection(connection: &Connection) -> AppResult<()> {
+    connection.busy_timeout(Duration::from_millis(STATE_DB_BUSY_TIMEOUT_MS))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "foreign_keys", 1)?;
-    connection.busy_timeout(Duration::from_millis(STATE_DB_BUSY_TIMEOUT_MS))?;
     Ok(())
 }
 
