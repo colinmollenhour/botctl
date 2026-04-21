@@ -1,5 +1,22 @@
 # botctl Serve Mode Vision
 
+## Remaining Work Checklist
+
+- [ ] Turn `botctl serve` from a foreground observer into a real long-lived local daemon/server process.
+- [ ] Make `botctl` client commands talk to the daemon when it is available.
+- [ ] Add a localhost-only HTTP API for structured commands and queries.
+- [ ] Add SSE endpoints for fleet-wide and per-instance live event streams.
+- [ ] Add a tracked-instance registry with stable API-facing instance IDs.
+- [ ] Persist managed/adopted instance metadata, last-known state, recent history, and action history.
+- [ ] Support the intended managed fleet layout as a first-class serve-mode product surface.
+- [ ] Make managed and adopted instances first-class tracked instances inside serve mode.
+- [ ] Preserve ownership across pane swaps, session renames, window changes, and other tmux topology changes.
+- [ ] Add bounded per-pane event buffers / structured event tapes for observation and debugging.
+- [ ] Add guarded HTTP action endpoints owned by the server-side policy layer.
+- [ ] Add server-distributed state/action event contracts instead of stdout-only foreground output.
+- [ ] Add higher-level served workflows like `continue-session` and `auto-unstick` through the daemon/API.
+- [ ] Add policy-driven continuous automation once observer stability is good enough.
+
 ## Goal
 
 Add a long-lived local `botctl serve` process that can observe, classify, and safely drive many Claude Code instances running inside `tmux`.

@@ -287,7 +287,6 @@ pub fn install_recommended_keybindings(
     path: Option<&Path>,
 ) -> Result<KeybindingsInstallReport, String> {
     let path = resolve_keybindings_path(path)?;
-    let desired = render_keybindings_json();
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -300,18 +299,29 @@ pub fn install_recommended_keybindings(
     }
 
     match fs::read_to_string(&path) {
-        Ok(existing) if existing == desired => {
+        Ok(existing) => {
+            let merged = merge_required_bindings(&path, &existing)?;
+            if merged == existing {
+                return Ok(KeybindingsInstallReport {
+                    path,
+                    backup_path: None,
+                    wrote_file: false,
+                });
+            }
+
+            fs::write(&path, merged).map_err(|error| {
+                format!(
+                    "failed to update Claude keybindings at {}: {}",
+                    path.display(),
+                    error
+                )
+            })?;
+
             return Ok(KeybindingsInstallReport {
                 path,
                 backup_path: None,
-                wrote_file: false,
+                wrote_file: true,
             });
-        }
-        Ok(_) => {
-            return Err(format!(
-                "refusing to overwrite existing Claude keybindings at {}; pass --path to write the recommended map somewhere else if you want to inspect or apply it manually",
-                path.display()
-            ));
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
@@ -323,7 +333,7 @@ pub fn install_recommended_keybindings(
         }
     }
 
-    fs::write(&path, desired).map_err(|error| {
+    fs::write(&path, render_keybindings_json()).map_err(|error| {
         format!(
             "failed to write Claude keybindings at {}: {}",
             path.display(),
@@ -335,6 +345,88 @@ pub fn install_recommended_keybindings(
         path,
         backup_path: None,
         wrote_file: true,
+    })
+}
+
+fn merge_required_bindings(path: &Path, existing: &str) -> Result<String, String> {
+    let mut parsed: Value = serde_json::from_str(existing).map_err(|error| {
+        format!(
+            "invalid Claude keybindings JSON at {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+
+    let binding_entries = parsed
+        .get_mut("bindings")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            format!(
+                "Claude keybindings at {} are missing a top-level bindings array",
+                path.display()
+            )
+        })?;
+
+    let desired: Value = serde_json::from_str(&render_keybindings_json()).map_err(|error| {
+        format!(
+            "internal keybindings template is invalid at {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let desired_entries = desired
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| String::from("internal keybindings template is missing bindings"))?;
+
+    for desired_entry in desired_entries {
+        let Some(context) = desired_entry.get("context").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(desired_map) = desired_entry.get("bindings").and_then(Value::as_object) else {
+            continue;
+        };
+
+        let existing_entry = binding_entries.iter_mut().find(|entry| {
+            entry.get("context").and_then(Value::as_str) == Some(context)
+        });
+
+        let entry = if let Some(entry) = existing_entry {
+            entry
+        } else {
+            binding_entries.push(desired_entry.clone());
+            continue;
+        };
+
+        let Some(existing_map) = entry.get_mut("bindings").and_then(Value::as_object_mut) else {
+            continue;
+        };
+
+        for (key, command) in desired_map {
+            if existing_map.values().any(|existing_command| existing_command == command) {
+                continue;
+            }
+
+            if existing_map.contains_key(key) {
+                return Err(format!(
+                    "cannot add missing Claude binding {}={} at {} because that key is already used in {} context",
+                    key,
+                    command.as_str().unwrap_or("<non-string>"),
+                    path.display(),
+                    context
+                ));
+            }
+
+            existing_map.insert(key.clone(), command.clone());
+        }
+    }
+
+    serde_json::to_string_pretty(&parsed).map_err(|error| {
+        format!(
+            "failed to render merged Claude keybindings at {}: {}",
+            path.display(),
+            error
+        )
     })
 }
 
@@ -670,16 +762,93 @@ mod tests {
         assert!(!inspection.missing_bindings.is_empty());
     }
 
+    const PARTIAL_BINDINGS: &str = r#"{
+  "bindings": [
+    {
+      "context": "Global",
+      "bindings": {
+        "ctrl+c": "app:interrupt"
+      }
+    },
+    {
+      "context": "Chat",
+      "bindings": {
+        "ctrl+l": "chat:clearInput"
+      }
+    }
+  ]
+}"#;
+
+    const CONFLICTING_BINDINGS: &str = r#"{
+  "bindings": [
+    {
+      "context": "Chat",
+      "bindings": {
+        "f7": "chat:openHistory"
+      }
+    }
+  ]
+}"#;
+
     #[test]
-    fn install_keybindings_refuses_to_overwrite_existing_file() {
+    fn install_keybindings_preserves_existing_bindings_and_adds_missing_ones() {
         let root = unique_temp_dir("bindings-install");
         fs::create_dir_all(&root).expect("temp dir should exist");
         let path = root.join("keybindings.json");
-        fs::write(&path, USER_BINDINGS).expect("existing keybindings should write");
+        fs::write(&path, PARTIAL_BINDINGS).expect("existing keybindings should write");
+
+        let report = install_recommended_keybindings(Some(&path))
+            .expect("install should preserve user bindings and add missing ones");
+        assert!(report.wrote_file);
+        let installed = fs::read_to_string(&path).expect("installed keybindings should read");
+        assert!(installed.contains("\"ctrl+c\": \"app:interrupt\""));
+        assert!(installed.contains("\"ctrl+l\": \"chat:clearInput\""));
+        assert!(installed.contains("\"f7\": \"chat:externalEditor\""));
+        assert!(installed.contains("\"f8\": \"chat:submit\""));
+        assert!(installed.contains("\"f6\": \"confirm:previous\""));
+        assert!(installed.contains("\"f7\": \"confirm:next\""));
+        assert!(installed.contains("\"f8\": \"confirm:yes\""));
+        assert!(installed.contains("\"f9\": \"confirm:no\""));
+    }
+
+    #[test]
+    fn merged_install_keeps_user_keys_for_action_routing() {
+        let root = unique_temp_dir("bindings-install-routing");
+        fs::create_dir_all(&root).expect("temp dir should exist");
+        let path = root.join("keybindings.json");
+        fs::write(&path, PARTIAL_BINDINGS).expect("existing keybindings should write");
+
+        install_recommended_keybindings(Some(&path)).expect("install should succeed");
+        let bindings = load_resolved_keybindings(Some(&path)).expect("bindings should load");
+
+        assert_eq!(
+            bindings.keys_for(AutomationAction::Interrupt),
+            Some([String::from("C-c")].as_slice())
+        );
+        assert_eq!(
+            bindings.keys_for(AutomationAction::ClearInput),
+            Some([String::from("C-l")].as_slice())
+        );
+        assert_eq!(
+            bindings.keys_for(AutomationAction::ExternalEditor),
+            Some([String::from("F7")].as_slice())
+        );
+        assert_eq!(
+            bindings.keys_for(AutomationAction::ConfirmYes),
+            Some([String::from("F8")].as_slice())
+        );
+    }
+
+    #[test]
+    fn install_keybindings_refuses_to_overwrite_conflicting_keys() {
+        let root = unique_temp_dir("bindings-install-conflict");
+        fs::create_dir_all(&root).expect("temp dir should exist");
+        let path = root.join("keybindings.json");
+        fs::write(&path, CONFLICTING_BINDINGS).expect("existing keybindings should write");
 
         let error = install_recommended_keybindings(Some(&path))
-            .expect_err("install should refuse to overwrite");
-        assert!(error.contains("refusing to overwrite existing Claude keybindings"));
+            .expect_err("conflicting keybinding should fail");
+        assert!(error.contains("cannot add missing Claude binding f7=chat:externalEditor"));
     }
 
     #[test]

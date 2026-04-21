@@ -39,6 +39,17 @@ impl SessionState {
     }
 }
 
+pub const SIGNAL_PERMISSION_KEYWORDS: &str = "permission-keywords";
+pub const SIGNAL_CHAT_KEYWORDS: &str = "chat-keywords";
+pub const SIGNAL_AMBIGUOUS_PERMISSION_CHAT: &str = "ambiguous-permission-chat";
+pub const SIGNAL_FOLDER_TRUST_KEYWORDS: &str = "folder-trust-keywords";
+pub const SIGNAL_SURVEY_KEYWORDS: &str = "survey-keywords";
+pub const SIGNAL_EXTERNAL_EDITOR_KEYWORDS: &str = "external-editor-keywords";
+pub const SIGNAL_DIFF_KEYWORDS: &str = "diff-keywords";
+pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
+pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
+pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub source: String,
@@ -91,6 +102,14 @@ impl Classifier {
                     "approve",
                 ],
             ) && contains_any(&normalized, &["yes", "no", "enter", "escape"]);
+        let mentions_self_settings_language = contains_any(
+            &normalized,
+            &[
+                "edit its own settings",
+                "allow claude to edit its own settings",
+            ],
+        );
+        let mentions_sensitive_claude_path = contains_sensitive_claude_path(&normalized);
 
         let state = if contains_any(
             &normalized,
@@ -105,15 +124,27 @@ impl Classifier {
             ],
         ) && contains_any(&normalized, &["enter to confirm", "esc to cancel"])
         {
-            signals.push(String::from("folder-trust-keywords"));
+            signals.push(String::from(SIGNAL_FOLDER_TRUST_KEYWORDS));
             SessionState::FolderTrustPrompt
         } else if has_permission_keywords && has_chat_input {
-            signals.push(String::from("permission-keywords"));
-            signals.push(String::from("chat-keywords"));
-            signals.push(String::from("ambiguous-permission-chat"));
+            signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
+            if mentions_self_settings_language {
+                signals.push(String::from(SIGNAL_SELF_SETTINGS_LANGUAGE));
+            }
+            if mentions_sensitive_claude_path {
+                signals.push(String::from(SIGNAL_SENSITIVE_CLAUDE_PATH));
+            }
+            signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
+            signals.push(String::from(SIGNAL_AMBIGUOUS_PERMISSION_CHAT));
             SessionState::Unknown
         } else if has_permission_keywords {
-            signals.push(String::from("permission-keywords"));
+            signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
+            if mentions_self_settings_language {
+                signals.push(String::from(SIGNAL_SELF_SETTINGS_LANGUAGE));
+            }
+            if mentions_sensitive_claude_path {
+                signals.push(String::from(SIGNAL_SENSITIVE_CLAUDE_PATH));
+            }
             SessionState::PermissionDialog
         } else if contains_any(
             &normalized,
@@ -125,7 +156,7 @@ impl Classifier {
                 "rate this conversation",
             ],
         ) {
-            signals.push(String::from("survey-keywords"));
+            signals.push(String::from(SIGNAL_SURVEY_KEYWORDS));
             SessionState::SurveyPrompt
         } else if contains_any(
             &normalized,
@@ -137,7 +168,7 @@ impl Classifier {
                 "editor to continue",
             ],
         ) {
-            signals.push(String::from("external-editor-keywords"));
+            signals.push(String::from(SIGNAL_EXTERNAL_EDITOR_KEYWORDS));
             SessionState::ExternalEditorActive
         } else if contains_any(
             &normalized,
@@ -151,7 +182,7 @@ impl Classifier {
                 "discard changes",
             ],
         ) {
-            signals.push(String::from("diff-keywords"));
+            signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
         } else if contains_any(
             &normalized,
@@ -165,10 +196,10 @@ impl Classifier {
                 "working",
             ],
         ) {
-            signals.push(String::from("busy-keywords"));
+            signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
             SessionState::BusyResponding
         } else if has_chat_input || contains_any(&normalized, &["claude"]) {
-            signals.push(String::from("chat-keywords"));
+            signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             SessionState::ChatReady
         } else {
             SessionState::Unknown
@@ -292,6 +323,20 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn contains_sensitive_claude_path(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "/.claude/commands/",
+            "/.claude/settings",
+            "~/.claude/commands/",
+            "~/.claude/settings",
+            ".claude/commands/",
+            ".claude/settings",
+        ],
+    )
+}
+
 fn is_chat_input_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed == ">" || trimmed == "❯" {
@@ -312,7 +357,9 @@ fn starts_with_numbered_option(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Classifier, SessionState};
+    use super::{
+        Classifier, SessionState, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
+    };
 
     #[test]
     fn classifies_permission_dialog() {
@@ -337,6 +384,32 @@ mod tests {
             result
                 .signals
                 .contains(&String::from("ambiguous-permission-chat"))
+        );
+    }
+
+    #[test]
+    fn adds_self_settings_signal_for_permission_dialog() {
+        let frame = "Do you want to make this edit to commit-and-push.md?\n❯ 1. Yes\n2. Yes, and allow Claude to edit its own settings for this session\n3. No\nEsc to cancel · Tab to amend";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_SELF_SETTINGS_LANGUAGE))
+        );
+    }
+
+    #[test]
+    fn adds_sensitive_claude_path_signal_for_project_slash_command_paths() {
+        let frame = "Do you want to make this edit to /repo/.claude/commands/commit-and-push.md?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_SENSITIVE_CLAUDE_PATH))
         );
     }
 

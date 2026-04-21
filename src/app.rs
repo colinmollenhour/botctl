@@ -17,7 +17,10 @@ use crate::automation::{
     load_resolved_keybindings, prompt_submission_sequence, render_keybindings_json,
     validate_workflow_state,
 };
-use crate::classifier::{Classification, Classifier, SessionState};
+use crate::classifier::{
+    Classification, Classifier, SessionState, SIGNAL_SELF_SETTINGS_LANGUAGE,
+    SIGNAL_SENSITIVE_CLAUDE_PATH,
+};
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, ListPanesArgs,
@@ -1504,6 +1507,10 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
         return false;
     }
 
+    if permission_manual_review_reason(&inspected.classification).is_some() {
+        return false;
+    }
+
     let Some(details) = extract_permission_prompt_details(inspected) else {
         return false;
     };
@@ -1515,6 +1522,28 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
             .lines()
             .map(str::trim)
             .any(is_chat_input_line_for_yolo)
+}
+
+fn permission_manual_review_reason(classification: &Classification) -> Option<&'static str> {
+    if classification.state != SessionState::PermissionDialog {
+        return None;
+    }
+
+    if classification
+        .signals
+        .iter()
+        .any(|signal| signal == SIGNAL_SELF_SETTINGS_LANGUAGE)
+    {
+        Some("Claude wants to edit its own settings")
+    } else if classification
+        .signals
+        .iter()
+        .any(|signal| signal == SIGNAL_SENSITIVE_CLAUDE_PATH)
+    {
+        Some("prompt targets Claude settings or slash-command paths")
+    } else {
+        None
+    }
 }
 
 fn is_chat_input_line_for_yolo(line: &str) -> bool {
@@ -1730,6 +1759,12 @@ fn continue_from_classification(
     pane: &TmuxPane,
     classification: &Classification,
 ) -> AppResult<ContinueOutcome> {
+    if let Some(reason) = permission_manual_review_reason(classification) {
+        return Err(AppError::new(format!(
+            "no safe automatic recovery is defined for PermissionDialog; {reason}"
+        )));
+    }
+
     match recovery_action_for_state(classification.state)? {
         Some(RecoveryAction::ApprovePermission) => {
             let bindings = load_automation_keybindings(None)?;
@@ -1976,7 +2011,13 @@ fn render_next_safe_action(
     match classification.state {
         SessionState::ChatReady => String::from("safe-action: submit-prompt"),
         SessionState::BusyResponding => String::from("safe-action: wait"),
-        SessionState::PermissionDialog => String::from("safe-action: approve"),
+        SessionState::PermissionDialog => {
+            if let Some(reason) = permission_manual_review_reason(classification) {
+                format!("manual-review: {reason}")
+            } else {
+                String::from("safe-action: approve")
+            }
+        }
         SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey"),
         SessionState::FolderTrustPrompt => String::from("safe-action: approve (Enter)"),
         SessionState::DiffDialog => {
@@ -2085,7 +2126,7 @@ fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspecti
 
     if bindings.status != KeybindingsStatus::Valid {
         lines.push(String::from(
-            "recommendation=add the missing automation actions to your Claude keybindings; use the bindings command to inspect the recommended mapping without overwriting your existing file",
+            "recommendation=add the missing automation actions to your Claude keybindings; use install-bindings to merge missing botctl bindings into your existing file or bindings to inspect the recommended mapping",
         ));
     }
 
@@ -2135,14 +2176,17 @@ mod tests {
         BabysitFormat, InspectedPane, PermissionBabysitAction, RecoveryAction,
         cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
         extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
+        permission_manual_review_reason,
         permission_babysit_action_for_state, recovery_action_for_state,
         render_babysit_approval_event, render_babysit_start_event, render_babysit_wait_event,
         render_guarded_workflow_output, render_list_panes, render_next_safe_action,
         render_screen_excerpt, render_status_report,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
-    use crate::classifier::Classification;
-    use crate::classifier::SessionState;
+    use crate::classifier::{
+        Classification, SessionState, SIGNAL_SELF_SETTINGS_LANGUAGE,
+        SIGNAL_SENSITIVE_CLAUDE_PATH,
+    };
     use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
     use crate::tmux::TmuxPane;
 
@@ -2272,6 +2316,62 @@ mod tests {
                 &sample_bindings(KeybindingsStatus::Valid)
             )
             .starts_with("manual-review:")
+        );
+    }
+
+    #[test]
+    fn marks_self_settings_permission_prompt_for_manual_review() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
+        };
+
+        assert_eq!(
+            render_next_safe_action(
+                &classification,
+                &sample_pane("claude"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "manual-review: Claude wants to edit its own settings"
+        );
+    }
+
+    #[test]
+    fn marks_sensitive_claude_path_permission_prompt_for_manual_review() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from(SIGNAL_SENSITIVE_CLAUDE_PATH)],
+        };
+
+        assert_eq!(
+            render_next_safe_action(
+                &classification,
+                &sample_pane("claude"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "manual-review: prompt targets Claude settings or slash-command paths"
+        );
+    }
+
+    #[test]
+    fn reports_sensitive_permission_reason_for_auto_recovery_guard() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
+        };
+
+        assert_eq!(
+            permission_manual_review_reason(&classification),
+            Some("Claude wants to edit its own settings")
         );
     }
 
@@ -2624,6 +2724,48 @@ mod tests {
             },
             focused_source: String::from(
                 "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ Here's some of the output:",
+            ),
+        };
+
+        assert!(!is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_refuses_to_approve_self_settings_prompt_even_when_parseable() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_SELF_SETTINGS_LANGUAGE),
+                ],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\npython tools/update.py .claude/commands/commit-and-push.md\nUpdate project slash command\nDo you want to proceed?\n❯ 1. Yes\n2. Yes, and allow Claude to edit its own settings for this session\n3. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        assert!(!is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_refuses_to_approve_sensitive_claude_path_prompt_even_when_parseable() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_SENSITIVE_CLAUDE_PATH),
+                ],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\npython tools/update.py /repo/.claude/commands/commit-and-push.md\nUpdate project slash command\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
         };
 
