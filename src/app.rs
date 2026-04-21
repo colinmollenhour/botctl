@@ -492,7 +492,7 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
     let format = args.format;
     let use_color = supports_babysit_color();
 
-    run_serve_loop(&client, &request, interrupted, |event| {
+    let serve_result = run_serve_loop(&client, &request, interrupted, |event| {
         let payload = render_serve_event_payload(&request, &event);
         if artifacts.is_none() {
             if let Some(state_dir) = artifact_root.as_deref() {
@@ -526,17 +526,24 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
             }
         }
         emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
-    })?;
+    });
 
     if let Some(mut artifacts) = artifacts {
+        if let Err(error) = &serve_result {
+            if artifacts.summary.stopped_reason.is_none() {
+                artifacts.summary.stopped_reason = Some(error.to_string());
+            }
+        }
         artifacts.summary.finalize();
         if let Err(error) = write_serve_summary_export(&artifacts.export_path, &artifacts.summary) {
-            if artifacts_required {
+            if artifacts_required && serve_result.is_ok() {
                 return Err(error);
             }
             eprintln!("warning: serve summary export failed: {error}");
         }
     }
+
+    serve_result?;
 
     Ok(String::new())
 }
