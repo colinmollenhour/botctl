@@ -150,6 +150,7 @@ impl Classifier {
             &normalized,
             &[
                 "how likely are you to recommend claude code",
+                "how is claude doing this session",
                 "rate your experience",
                 "take our survey",
                 "survey",
@@ -430,6 +431,13 @@ mod tests {
     #[test]
     fn classifies_survey_prompt() {
         let frame = "How likely are you to recommend Claude Code to a friend?";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::SurveyPrompt);
+    }
+
+    #[test]
+    fn classifies_session_feedback_prompt_as_survey() {
+        let frame = "How is Claude doing this session? (optional)\n1: Bad    2: Fine   3: Good   0: Dismiss";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::SurveyPrompt);
     }

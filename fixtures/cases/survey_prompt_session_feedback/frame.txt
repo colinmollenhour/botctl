@@ -1,0 +1,2 @@
+How is Claude doing this session? (optional)
+1: Bad    2: Fine   3: Good   0: Dismiss

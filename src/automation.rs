@@ -69,7 +69,7 @@ const SUBMIT_PROMPT_ACTIONS: [AutomationAction; 3] = [
 
 const APPROVE_PERMISSION_ACTIONS: [AutomationAction; 1] = [AutomationAction::ConfirmYes];
 const REJECT_PERMISSION_ACTIONS: [AutomationAction; 1] = [AutomationAction::ConfirmNo];
-const DISMISS_SURVEY_ACTIONS: [AutomationAction; 1] = [AutomationAction::ConfirmNo];
+const DISMISS_SURVEY_ACTIONS: [AutomationAction; 0] = [];
 
 impl KeybindingsStatus {
     pub fn as_str(self) -> &'static str {
@@ -681,10 +681,7 @@ mod tests {
             GuardedWorkflow::ApprovePermission.actions(),
             &[AutomationAction::ConfirmYes]
         );
-        assert_eq!(
-            GuardedWorkflow::DismissSurvey.actions(),
-            &[AutomationAction::ConfirmNo]
-        );
+        assert_eq!(GuardedWorkflow::DismissSurvey.actions(), &[]);
     }
 
     #[test]

@@ -386,16 +386,10 @@ fn run_guarded_pane_workflow(
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
     ensure_pane_owned_by_claude(&pane)?;
-    let bindings = load_automation_keybindings(None)?;
     let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     ensure_workflow_state(workflow, &classification)?;
-    let executed_actions = if should_confirm_folder_trust_with_enter(workflow, &classification) {
-        client.send_keys(&pane.pane_id, &["Enter"])?;
-        String::from("enter")
-    } else {
-        send_actions(&client, &pane.pane_id, workflow.actions(), &bindings, 0)?;
-        render_action_names(workflow.actions())
-    };
+    let executed_actions =
+        execute_classified_workflow(&client, &pane.pane_id, workflow, &classification)?;
 
     let pane_label = pane_label_from_path(&pane.current_path, &pane.pane_id);
     Ok(render_guarded_workflow_output(
@@ -537,13 +531,21 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
     ensure_pane_owned_by_claude(&pane)?;
-    let bindings = load_automation_keybindings(None)?;
-    let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let mut classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    if let Some(workflow) = submit_prompt_preflight_workflow(&classification) {
+        execute_classified_workflow(&client, &pane.pane_id, workflow, &classification)?;
+        thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
+        let after = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        ensure_state_transition(&classification, &after, workflow.as_str())?;
+        classification = after;
+    }
     ensure_workflow_state(GuardedWorkflow::SubmitPrompt, &classification)?;
 
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
     let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
+
+    let bindings = load_automation_keybindings(None)?;
 
     send_actions(
         &client,
@@ -670,7 +672,6 @@ fn run_yolo_single(
         live_preview,
         format,
         interrupted,
-        bindings,
     )
 }
 
@@ -684,7 +685,6 @@ fn loop_yolo_pane(
     live_preview: bool,
     format: BabysitFormat,
     interrupted: Arc<AtomicBool>,
-    bindings: crate::automation::ResolvedKeybindings,
 ) -> AppResult<String> {
     let mut last_state: Option<SessionState> = None;
     let mut poll_count: usize = 0;
@@ -748,34 +748,66 @@ fn loop_yolo_pane(
             last_state = Some(classification.state);
         }
         match permission_babysit_action_for_state(classification.state) {
-            PermissionBabysitAction::Approve => {
+            PermissionBabysitAction::ApprovePermission => {
                 if !is_yolo_safe_to_approve(&current_view) {
                     thread::sleep(Duration::from_millis(poll_ms));
                     continue;
                 }
-                emit_babysit_output(render_babysit_approval_event(
+                emit_babysit_output(render_babysit_action_event(
                     &pane_label,
                     &pane.pane_id,
                     poll_count,
                     &current_view,
+                    GuardedWorkflow::ApprovePermission,
                     live_preview,
                     format,
                     supports_babysit_color(),
                 ))?;
-                send_actions(
+                execute_classified_workflow(
                     client,
                     &pane.pane_id,
-                    GuardedWorkflow::ApprovePermission.actions(),
-                    &bindings,
-                    0,
+                    GuardedWorkflow::ApprovePermission,
+                    classification,
                 )?;
                 thread::sleep(Duration::from_millis(poll_ms));
                 let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                emit_babysit_output(render_babysit_approved_event(
+                emit_babysit_output(render_babysit_action_completed_event(
                     &pane_label,
                     &pane.pane_id,
                     poll_count,
                     &after,
+                    GuardedWorkflow::ApprovePermission,
+                    live_preview,
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                last_state = Some(after.classification.state);
+            }
+            PermissionBabysitAction::DismissSurvey => {
+                emit_babysit_output(render_babysit_action_event(
+                    &pane_label,
+                    &pane.pane_id,
+                    poll_count,
+                    &current_view,
+                    GuardedWorkflow::DismissSurvey,
+                    live_preview,
+                    format,
+                    supports_babysit_color(),
+                ))?;
+                execute_classified_workflow(
+                    client,
+                    &pane.pane_id,
+                    GuardedWorkflow::DismissSurvey,
+                    classification,
+                )?;
+                thread::sleep(Duration::from_millis(poll_ms));
+                let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+                emit_babysit_output(render_babysit_action_completed_event(
+                    &pane_label,
+                    &pane.pane_id,
+                    poll_count,
+                    &after,
+                    GuardedWorkflow::DismissSurvey,
                     live_preview,
                     format,
                     supports_babysit_color(),
@@ -795,7 +827,6 @@ fn run_yolo_all(
     format: BabysitFormat,
     interrupted: Arc<AtomicBool>,
 ) -> AppResult<String> {
-    let bindings = load_automation_keybindings(None)?;
     let mut tracked: HashMap<String, TrackedYoloPane> = HashMap::new();
     loop {
         if interrupted.load(Ordering::SeqCst) {
@@ -885,33 +916,65 @@ fn run_yolo_all(
                 tracked_pane.last_state = Some(classification);
             }
             match permission_babysit_action_for_state(classification) {
-                PermissionBabysitAction::Approve => {
+                PermissionBabysitAction::ApprovePermission => {
                     if !is_yolo_safe_to_approve(&current_view) {
                         continue;
                     }
-                    emit_babysit_output(render_babysit_approval_event(
+                    emit_babysit_output(render_babysit_action_event(
                         &tracked_pane.pane_label,
                         &pane_id,
                         tracked_pane.poll_count,
                         &current_view,
+                        GuardedWorkflow::ApprovePermission,
                         live_preview,
                         format,
                         supports_babysit_color(),
                     ))?;
-                    send_actions(
+                    execute_classified_workflow(
                         client,
                         &pane_id,
-                        GuardedWorkflow::ApprovePermission.actions(),
-                        &bindings,
-                        0,
+                        GuardedWorkflow::ApprovePermission,
+                        &current_view.classification,
                     )?;
                     thread::sleep(Duration::from_millis(poll_ms));
                     let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                    emit_babysit_output(render_babysit_approved_event(
+                    emit_babysit_output(render_babysit_action_completed_event(
                         &tracked_pane.pane_label,
                         &pane_id,
                         tracked_pane.poll_count,
                         &after,
+                        GuardedWorkflow::ApprovePermission,
+                        live_preview,
+                        format,
+                        supports_babysit_color(),
+                    ))?;
+                    tracked_pane.last_state = Some(after.classification.state);
+                }
+                PermissionBabysitAction::DismissSurvey => {
+                    emit_babysit_output(render_babysit_action_event(
+                        &tracked_pane.pane_label,
+                        &pane_id,
+                        tracked_pane.poll_count,
+                        &current_view,
+                        GuardedWorkflow::DismissSurvey,
+                        live_preview,
+                        format,
+                        supports_babysit_color(),
+                    ))?;
+                    execute_classified_workflow(
+                        client,
+                        &pane_id,
+                        GuardedWorkflow::DismissSurvey,
+                        &current_view.classification,
+                    )?;
+                    thread::sleep(Duration::from_millis(poll_ms));
+                    let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
+                    emit_babysit_output(render_babysit_action_completed_event(
+                        &tracked_pane.pane_label,
+                        &pane_id,
+                        tracked_pane.poll_count,
+                        &after,
+                        GuardedWorkflow::DismissSurvey,
                         live_preview,
                         format,
                         supports_babysit_color(),
@@ -974,7 +1037,8 @@ fn install_babysit_sigint_handler(flag: Arc<AtomicBool>) -> AppResult<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionBabysitAction {
     Wait,
-    Approve,
+    ApprovePermission,
+    DismissSurvey,
 }
 
 fn permission_babysit_action_for_state(state: SessionState) -> PermissionBabysitAction {
@@ -982,11 +1046,11 @@ fn permission_babysit_action_for_state(state: SessionState) -> PermissionBabysit
         SessionState::ChatReady
         | SessionState::BusyResponding
         | SessionState::FolderTrustPrompt
-        | SessionState::SurveyPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
         | SessionState::Unknown => PermissionBabysitAction::Wait,
-        SessionState::PermissionDialog => PermissionBabysitAction::Approve,
+        SessionState::PermissionDialog => PermissionBabysitAction::ApprovePermission,
+        SessionState::SurveyPrompt => PermissionBabysitAction::DismissSurvey,
     }
 }
 
@@ -1607,11 +1671,12 @@ fn render_babysit_wait_event(
     )
 }
 
-fn render_babysit_approval_event(
+fn render_babysit_action_event(
     pane_label: &str,
     pane_id: &str,
     poll_count: usize,
     inspected: &InspectedPane,
+    workflow: GuardedWorkflow,
     live_preview: bool,
     format: BabysitFormat,
     use_color: bool,
@@ -1621,7 +1686,11 @@ fn render_babysit_approval_event(
     let json_details = serde_json::json!([format!("Signals: {}", render_signals(classification))]);
     let human_details: Vec<String> = Vec::new();
     let body_title = if live_preview {
-        Some("Permission prompt")
+        Some(match workflow {
+            GuardedWorkflow::ApprovePermission => "Permission prompt",
+            GuardedWorkflow::DismissSurvey => "Survey prompt",
+            GuardedWorkflow::RejectPermission | GuardedWorkflow::SubmitPrompt => "Prompt",
+        })
     } else {
         None
     };
@@ -1638,14 +1707,22 @@ fn render_babysit_approval_event(
         format.into(),
         serde_json::json!({
             "timestamp": current_babysit_timestamp(),
-            "kind": "approve",
+            "kind": workflow.as_str(),
             "pane_label": pane_label,
             "pane_id": pane_id,
             "poll": poll_count,
             "state": classification.state.as_str(),
             "signals": classification.signals.clone(),
             "prompt": babysit_prompt_json(prompt_details.as_ref()),
-            "summary": format!("Auto-approving {pane_label} (id:{pane_id}) (poll #{poll_count})"),
+            "summary": format!(
+                "{} {pane_label} (id:{pane_id}) (poll #{poll_count})",
+                match workflow {
+                    GuardedWorkflow::ApprovePermission => "Auto-approving",
+                    GuardedWorkflow::DismissSurvey => "Auto-dismissing",
+                    GuardedWorkflow::RejectPermission => "Auto-rejecting",
+                    GuardedWorkflow::SubmitPrompt => "Auto-submitting",
+                }
+            ),
             "details": if format == BabysitFormat::Human { serde_json::json!(human_details) } else { json_details },
             "body_title": body_title,
             "body_lines": body_lines
@@ -1654,11 +1731,12 @@ fn render_babysit_approval_event(
     )
 }
 
-fn render_babysit_approved_event(
+fn render_babysit_action_completed_event(
     pane_label: &str,
     pane_id: &str,
     poll_count: usize,
     inspected: &InspectedPane,
+    workflow: GuardedWorkflow,
     live_preview: bool,
     format: BabysitFormat,
     use_color: bool,
@@ -1672,13 +1750,21 @@ fn render_babysit_approved_event(
         format.into(),
         serde_json::json!({
             "timestamp": current_babysit_timestamp(),
-            "kind": "approved",
+            "kind": format!("{}d", workflow.as_str()),
             "pane_label": pane_label,
             "pane_id": pane_id,
             "poll": poll_count,
             "state": classification.state.as_str(),
             "signals": classification.signals.clone(),
-            "summary": format!("Approval sent for {pane_label} (id:{pane_id}) (poll #{poll_count})"),
+            "summary": format!(
+                "{} for {pane_label} (id:{pane_id}) (poll #{poll_count})",
+                match workflow {
+                    GuardedWorkflow::ApprovePermission => "Approval sent",
+                    GuardedWorkflow::DismissSurvey => "Survey dismissed",
+                    GuardedWorkflow::RejectPermission => "Rejection sent",
+                    GuardedWorkflow::SubmitPrompt => "Prompt submitted",
+                }
+            ),
             "details": if format == BabysitFormat::Human { serde_json::json!([]) } else { json_details },
             "body_title": body_title,
             "body_lines": body_lines
@@ -1767,13 +1853,11 @@ fn continue_from_classification(
 
     match recovery_action_for_state(classification.state)? {
         Some(RecoveryAction::ApprovePermission) => {
-            let bindings = load_automation_keybindings(None)?;
-            send_actions(
+            execute_classified_workflow(
                 client,
                 &pane.pane_id,
-                GuardedWorkflow::ApprovePermission.actions(),
-                &bindings,
-                0,
+                GuardedWorkflow::ApprovePermission,
+                classification,
             )?;
             thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
             let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
@@ -1786,13 +1870,11 @@ fn continue_from_classification(
             })
         }
         Some(RecoveryAction::DismissSurvey) => {
-            let bindings = load_automation_keybindings(None)?;
-            send_actions(
+            execute_classified_workflow(
                 client,
                 &pane.pane_id,
-                GuardedWorkflow::DismissSurvey.actions(),
-                &bindings,
-                0,
+                GuardedWorkflow::DismissSurvey,
+                classification,
             )?;
             thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
             let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
@@ -1858,6 +1940,13 @@ fn render_continue_outcome(state: SessionState) -> String {
     }
 }
 
+fn submit_prompt_preflight_workflow(classification: &Classification) -> Option<GuardedWorkflow> {
+    match classification.state {
+        SessionState::SurveyPrompt => Some(GuardedWorkflow::DismissSurvey),
+        _ => None,
+    }
+}
+
 fn ensure_state_transition(
     before: &Classification,
     after: &Classification,
@@ -1884,12 +1973,33 @@ fn focus_live_frame(frame: &str, max_non_empty_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
-fn should_confirm_folder_trust_with_enter(
+fn raw_key_for_workflow(
     workflow: GuardedWorkflow,
     classification: &Classification,
-) -> bool {
-    workflow == GuardedWorkflow::ApprovePermission
-        && classification.state == SessionState::FolderTrustPrompt
+) -> Option<(&'static str, &'static str)> {
+    match (workflow, classification.state) {
+        (GuardedWorkflow::ApprovePermission, SessionState::FolderTrustPrompt) => {
+            Some(("Enter", "enter"))
+        }
+        (GuardedWorkflow::DismissSurvey, SessionState::SurveyPrompt) => Some(("0", "0")),
+        _ => None,
+    }
+}
+
+fn execute_classified_workflow(
+    client: &TmuxClient,
+    pane_id: &str,
+    workflow: GuardedWorkflow,
+    classification: &Classification,
+) -> AppResult<String> {
+    if let Some((raw_key, rendered)) = raw_key_for_workflow(workflow, classification) {
+        client.send_keys(pane_id, &[raw_key])?;
+        Ok(String::from(rendered))
+    } else {
+        let bindings = load_automation_keybindings(None)?;
+        send_actions(client, pane_id, workflow.actions(), &bindings, 0)?;
+        Ok(render_action_names(workflow.actions()))
+    }
 }
 
 fn load_automation_keybindings(path: Option<&Path>) -> AppResult<ResolvedKeybindings> {
@@ -2018,7 +2128,7 @@ fn render_next_safe_action(
                 String::from("safe-action: approve")
             }
         }
-        SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey"),
+        SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey (0)"),
         SessionState::FolderTrustPrompt => String::from("safe-action: approve (Enter)"),
         SessionState::DiffDialog => {
             String::from("manual-review: diff dialog needs operator confirmation")
@@ -2178,7 +2288,8 @@ mod tests {
         extract_permission_prompt_details, is_usable_state, is_yolo_safe_to_approve,
         permission_manual_review_reason,
         permission_babysit_action_for_state, recovery_action_for_state,
-        render_babysit_approval_event, render_babysit_start_event, render_babysit_wait_event,
+        raw_key_for_workflow, render_babysit_action_event, render_babysit_start_event,
+        render_babysit_wait_event, submit_prompt_preflight_workflow,
         render_guarded_workflow_output, render_list_panes, render_next_safe_action,
         render_screen_excerpt, render_status_report,
     };
@@ -2316,6 +2427,46 @@ mod tests {
                 &sample_bindings(KeybindingsStatus::Valid)
             )
             .starts_with("manual-review:")
+        );
+        assert_eq!(
+            render_next_safe_action(
+                &Classification {
+                    state: SessionState::SurveyPrompt,
+                    recap_present: false,
+                    recap_excerpt: None,
+                    ..classification.clone()
+                },
+                &sample_pane("claude"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "safe-action: dismiss-survey (0)"
+        );
+    }
+
+    #[test]
+    fn uses_raw_keys_for_special_case_workflows() {
+        let folder_trust = Classification {
+            source: String::from("pane"),
+            state: SessionState::FolderTrustPrompt,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("folder-trust-keywords")],
+        };
+        let survey = Classification {
+            source: String::from("pane"),
+            state: SessionState::SurveyPrompt,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("survey-keywords")],
+        };
+
+        assert_eq!(
+            raw_key_for_workflow(GuardedWorkflow::ApprovePermission, &folder_trust),
+            Some(("Enter", "enter"))
+        );
+        assert_eq!(
+            raw_key_for_workflow(GuardedWorkflow::DismissSurvey, &survey),
+            Some(("0", "0"))
         );
     }
 
@@ -2473,7 +2624,11 @@ mod tests {
     fn permission_babysit_only_approves_permission_dialogs() {
         assert_eq!(
             permission_babysit_action_for_state(SessionState::PermissionDialog),
-            PermissionBabysitAction::Approve
+            PermissionBabysitAction::ApprovePermission
+        );
+        assert_eq!(
+            permission_babysit_action_for_state(SessionState::SurveyPrompt),
+            PermissionBabysitAction::DismissSurvey
         );
         assert_eq!(
             permission_babysit_action_for_state(SessionState::ChatReady),
@@ -2497,7 +2652,6 @@ mod tests {
     fn permission_babysit_keeps_waiting_on_non_permission_blockers() {
         for state in [
             SessionState::FolderTrustPrompt,
-            SessionState::SurveyPrompt,
             SessionState::ExternalEditorActive,
             SessionState::DiffDialog,
             SessionState::Unknown,
@@ -2507,6 +2661,30 @@ mod tests {
                 PermissionBabysitAction::Wait
             );
         }
+    }
+
+    #[test]
+    fn submit_prompt_preflight_dismisses_surveys_only() {
+        let survey = Classification {
+            source: String::from("pane"),
+            state: SessionState::SurveyPrompt,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("survey-keywords")],
+        };
+        let ready = Classification {
+            source: String::from("pane"),
+            state: SessionState::ChatReady,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("chat-keywords")],
+        };
+
+        assert_eq!(
+            submit_prompt_preflight_workflow(&survey),
+            Some(GuardedWorkflow::DismissSurvey)
+        );
+        assert_eq!(submit_prompt_preflight_workflow(&ready), None);
     }
 
     #[test]
@@ -2813,11 +2991,12 @@ mod tests {
             ),
         };
 
-        let log = render_babysit_approval_event(
+        let log = render_babysit_action_event(
             "bloodraven",
             "%20",
             3,
             &inspected,
+            GuardedWorkflow::ApprovePermission,
             true,
             BabysitFormat::Human,
             false,
@@ -2828,6 +3007,36 @@ mod tests {
         assert!(!log.contains("Type:"));
         assert!(log.contains("Permission prompt"));
         assert!(log.contains("Do you want to proceed?"));
+    }
+
+    #[test]
+    fn yolo_survey_log_uses_dismiss_language() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::SurveyPrompt,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("survey-keywords")],
+            },
+            focused_source: String::from(
+                "How is Claude doing this session? (optional)\n1: Bad    2: Fine   3: Good   0: Dismiss",
+            ),
+        };
+
+        let log = render_babysit_action_event(
+            "seamus",
+            "%20",
+            7,
+            &inspected,
+            GuardedWorkflow::DismissSurvey,
+            true,
+            BabysitFormat::Human,
+            false,
+        );
+
+        assert!(log.contains("Auto-dismissing seamus (id:%20) (poll #7)"));
+        assert!(log.contains("Survey prompt"));
     }
 
     #[test]
