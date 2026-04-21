@@ -31,11 +31,10 @@ use crate::cli::{
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
 use crate::permission_babysit::{
-    BabysitRecord, disable_babysit_record, read_babysit_record,
-    resolve_state_dir as resolve_babysit_state_dir, write_babysit_record,
+    BabysitRecord, disable_babysit_record, read_babysit_record, write_babysit_record,
 };
 use crate::prompt::{
-    PromptSource, default_state_dir, prepare_prompt, resolve_prompt_text, write_editor_target,
+    PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
 };
 use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
@@ -539,7 +538,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_target_pane(&client, &args.target)?;
     ensure_pane_owned_by_claude(&pane)?;
-    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let prompt =
         resolve_keep_going_prompt(args.prompt_source.as_deref(), args.prompt_text.as_deref())?;
     let bindings = load_automation_keybindings(None)?;
@@ -991,7 +990,7 @@ fn keep_going_starts_with_numbered_option(line: &str) -> bool {
 }
 
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
     let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
     Ok(format!(
@@ -1002,7 +1001,7 @@ fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
 }
 
 fn run_editor_helper(args: EditorHelperArgs) -> AppResult<String> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let content = match args.source.as_deref() {
         Some(source_path) => {
             let prompt_text = resolve_prompt_text(PromptSource::File(source_path))?;
@@ -1038,7 +1037,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     }
     ensure_workflow_state(GuardedWorkflow::SubmitPrompt, &classification)?;
 
-    let state_dir = resolve_state_dir(args.state_dir.as_deref());
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
     let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
 
@@ -1071,7 +1070,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
 
 fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let state_dir = resolve_babysit_state_dir(args.state_dir.as_deref());
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
     if args.all {
@@ -1098,7 +1097,7 @@ fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<S
 }
 
 fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<String> {
-    let state_dir = resolve_babysit_state_dir(args.state_dir.as_deref());
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     if args.all {
         let mut out = Vec::new();
         for pane_id in tracked_pane_ids(&state_dir)? {
@@ -2820,11 +2819,6 @@ fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspecti
 
 fn load_frame_text(path: &PathBuf) -> AppResult<String> {
     std::fs::read_to_string(path).map_err(AppError::from)
-}
-
-fn resolve_state_dir(path: Option<&Path>) -> PathBuf {
-    path.map(Path::to_path_buf)
-        .unwrap_or_else(default_state_dir)
 }
 
 fn read_prompt_input(source: Option<&Path>, text: Option<&str>) -> AppResult<String> {

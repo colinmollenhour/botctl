@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::app::{AppError, AppResult};
-use crate::prompt::default_state_dir;
 use crate::tmux::TmuxPane;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +42,6 @@ impl BabysitRecord {
             && self.window_id == pane.window_id
             && self.current_command == pane.current_command
     }
-}
-
-pub fn resolve_state_dir(path: Option<&Path>) -> PathBuf {
-    path.map(Path::to_path_buf)
-        .unwrap_or_else(default_state_dir)
 }
 
 pub fn babysit_record_path(state_dir: &Path, pane_id: &str) -> PathBuf {

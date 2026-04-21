@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,8 +10,50 @@ pub enum PromptSource<'a> {
     File(&'a Path),
 }
 
-pub fn default_state_dir() -> PathBuf {
-    PathBuf::from(".botctl/state")
+pub fn default_state_dir() -> AppResult<PathBuf> {
+    default_state_dir_from_env(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+pub fn resolve_state_dir(path: Option<&Path>) -> AppResult<PathBuf> {
+    resolve_state_dir_from_env(
+        path,
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn resolve_state_dir_from_env(
+    path: Option<&Path>,
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> AppResult<PathBuf> {
+    match path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => default_state_dir_from_env(xdg_state_home, home),
+    }
+}
+
+fn default_state_dir_from_env(
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> AppResult<PathBuf> {
+    if let Some(xdg_state_home) = xdg_state_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(xdg_state_home).join("botctl"));
+    }
+
+    let home = home.filter(|value| !value.is_empty()).ok_or_else(|| {
+        AppError::new(
+            "failed to resolve default state directory: XDG_STATE_HOME is unset or empty and HOME is unset or empty",
+        )
+    })?;
+
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("botctl"))
 }
 
 pub fn resolve_prompt_text(source: PromptSource<'_>) -> AppResult<String> {
@@ -85,18 +128,63 @@ fn sanitize_session_name(session_name: &str) -> String {
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        PromptSource, default_state_dir, pending_prompt_path, prepare_prompt, resolve_prompt_text,
-        write_editor_target_from_pending,
+        PromptSource, default_state_dir_from_env, pending_prompt_path, prepare_prompt,
+        resolve_prompt_text, resolve_state_dir_from_env, write_editor_target_from_pending,
     };
 
     #[test]
-    fn default_state_dir_is_repo_local() {
-        assert_eq!(default_state_dir(), PathBuf::from(".botctl/state"));
+    fn default_state_dir_prefers_non_empty_xdg_state_home() {
+        assert_eq!(
+            default_state_dir_from_env(
+                Some(OsStr::new("/tmp/xdg-state")),
+                Some(OsStr::new("/tmp/home")),
+            )
+            .expect("xdg state home should win"),
+            PathBuf::from("/tmp/xdg-state/botctl")
+        );
+    }
+
+    #[test]
+    fn default_state_dir_falls_back_to_home_local_state() {
+        let expected = PathBuf::from("/tmp/home/.local/state/botctl");
+
+        assert_eq!(
+            default_state_dir_from_env(None, Some(OsStr::new("/tmp/home")))
+                .expect("home fallback should work"),
+            expected
+        );
+        assert_eq!(
+            default_state_dir_from_env(Some(OsStr::new("")), Some(OsStr::new("/tmp/home")))
+                .expect("empty xdg state home should fall back to home"),
+            expected
+        );
+    }
+
+    #[test]
+    fn state_dir_override_wins_without_env_defaults() {
+        assert_eq!(
+            resolve_state_dir_from_env(
+                Some(std::path::Path::new("/tmp/override-state")),
+                None,
+                None,
+            )
+            .expect("explicit state dir should bypass env resolution"),
+            PathBuf::from("/tmp/override-state")
+        );
+    }
+
+    #[test]
+    fn default_state_dir_errors_without_xdg_state_home_or_home() {
+        let error = default_state_dir_from_env(Some(OsStr::new("")), None)
+            .expect_err("missing env should fail");
+
+        assert!(error.to_string().contains("HOME"));
     }
 
     #[test]

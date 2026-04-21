@@ -19,13 +19,15 @@ There are three supported paths:
 
 ## State directory
 
-The default state root is `.botctl/state`.
+The default state root is `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty. Otherwise, `botctl` uses `~/.local/state/botctl`.
+
+`--state-dir PATH` overrides that root for commands that support it.
 
 Prompt staging uses:
 
 `<state-dir>/prompts/<session>/pending-prompt.txt`
 
-The session name is sanitized for filesystem use, so prompt staging stays local to the repo by default.
+The session name is sanitized for filesystem use, so prompt staging stays machine-local under that state root.
 
 ## `prepare-prompt`
 

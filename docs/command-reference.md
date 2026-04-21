@@ -10,6 +10,8 @@ This page is the current CLI reference for shipped commands and aliases.
 - Several workflow commands refuse ambiguous targets.
 - Automation commands generally require the target pane to be a Claude pane and will refuse to act otherwise.
 - `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
+- Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
+- `--state-dir PATH` overrides that default state root for commands that support it.
 
 ## Session and pane management
 
@@ -451,7 +453,7 @@ Flags:
 - `--pane %ID|session:window.pane` or `--session NAME --window NAME` (required)
 - `--poll-ms N` (default: `1000`, must be at least `1`)
 - `--submit-delay-ms N` (default: `250`, must be at least `1`)
-- `--state-dir PATH` (optional)
+- `--state-dir PATH` (optional; overrides the default state root)
 - `--source PATH` or `--text TEXT` (optional; defaults to the built-in audit loop prompt)
 - `--no-yolo` (default: off)
 
@@ -495,7 +497,7 @@ botctl prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text 
 
 Flags:
 - `--session NAME` (required)
-- `--state-dir PATH` (optional)
+- `--state-dir PATH` (optional; overrides the default state root)
 - `--source PATH` or `--text TEXT` (exactly one required)
 
 Targeting: session only.
@@ -518,7 +520,7 @@ botctl editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-p
 
 Flags:
 - `--session NAME` (required)
-- `--state-dir PATH` (optional)
+- `--state-dir PATH` (optional; overrides the default state root)
 - `--source PATH` (optional)
 - `--keep-pending` (optional)
 - `TARGET` (required positional path)
@@ -544,7 +546,7 @@ botctl submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir 
 Flags:
 - `--session NAME` (required)
 - `--pane %ID|session:window.pane` (required)
-- `--state-dir PATH` (optional)
+- `--state-dir PATH` (optional; overrides the default state root)
 - `--source PATH` or `--text TEXT` (exactly one required)
 - `--submit-delay-ms N` (default: `250`, must be at least `1`)
 
@@ -583,11 +585,11 @@ Start flags:
 - `--poll-ms N` (default: `1000`, must be at least `1`)
 - `--format human|jsonl` (default: `human`)
 - `--live-preview` (default: off)
-- `--state-dir PATH` (optional)
+- `--state-dir PATH` (optional; overrides the default state root)
 
 Stop flags:
 - `--pane %ID|session:window.pane` or `--all` (exactly one required)
-- `--state-dir PATH` (optional)
+- `--state-dir PATH` (optional; overrides the default state root)
 
 Targeting:
 - `start` can target one pane or scan all Claude panes with `--all`
