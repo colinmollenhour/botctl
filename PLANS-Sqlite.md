@@ -5,7 +5,7 @@
 - [x] Move the default runtime state root to `$XDG_STATE_HOME/botctl`.
 - [x] Keep `--state-dir` as an explicit override for the state root.
 - [x] Add `state.db` under the state root and initialize a schema-version table.
-- [ ] Move prompt handoff state from ad hoc files into SQLite.
+- [x] Move prompt handoff state from ad hoc files into SQLite.
 - [ ] Move babysit / continuous-automation registrations from ad hoc files into SQLite.
 - [ ] Add stable workspace/worktree scoping so multiple repos do not bleed into each other.
 - [ ] Add durable tracked-instance tables that can support serve mode.

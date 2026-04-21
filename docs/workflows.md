@@ -90,6 +90,8 @@ There are two prompt paths today:
 1. **One-shot submission** — pass `--text` or `--source` directly to `submit-prompt`.
 2. **Manual staging** — use `prepare-prompt`, then `editor-helper` when Claude requests an external editor target.
 
+Manual staging now keeps the session's pending prompt in `<state-root>/state.db` rather than a separate prompt file.
+
 One-shot example:
 
 ```bash

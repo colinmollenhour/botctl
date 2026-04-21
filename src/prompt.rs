@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::app::{AppError, AppResult};
+use crate::storage::{
+    delete_pending_prompt, load_pending_prompt, state_db_path, store_pending_prompt,
+};
 
 #[derive(Debug, Clone)]
 pub enum PromptSource<'a> {
@@ -63,13 +66,12 @@ pub fn resolve_prompt_text(source: PromptSource<'_>) -> AppResult<String> {
     }
 }
 
-pub fn prepare_prompt(state_dir: &Path, session_name: &str, content: &str) -> AppResult<PathBuf> {
-    let path = pending_prompt_path(state_dir, session_name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, content)?;
-    Ok(path)
+pub fn prepare_prompt(state_dir: &Path, session_name: &str, content: &str) -> AppResult<()> {
+    store_pending_prompt(state_dir, session_name, content)
+}
+
+pub fn pending_prompt_text(state_dir: &Path, session_name: &str) -> AppResult<Option<String>> {
+    load_pending_prompt(state_dir, session_name)
 }
 
 pub fn write_editor_target_from_pending(
@@ -78,18 +80,21 @@ pub fn write_editor_target_from_pending(
     target_path: &Path,
     consume: bool,
 ) -> AppResult<String> {
-    let pending_path = pending_prompt_path(state_dir, session_name);
-    let content = fs::read_to_string(&pending_path).map_err(|error| {
+    let state_db = state_db_path(state_dir);
+    let content = pending_prompt_text(state_dir, session_name)?.ok_or_else(|| {
         AppError::new(format!(
-            "failed to read pending prompt for session {} at {}: {}",
+            "no pending prompt prepared for session {} in {}",
             session_name,
-            pending_path.display(),
-            error
+            state_db.display()
         ))
     })?;
     write_editor_target(target_path, &content)?;
-    if consume {
-        fs::remove_file(&pending_path)?;
+    if consume && !delete_pending_prompt(state_dir, session_name)? {
+        return Err(AppError::new(format!(
+            "pending prompt disappeared before it could be consumed for session {} in {}",
+            session_name,
+            state_db.display()
+        )));
     }
     Ok(content)
 }
@@ -102,30 +107,6 @@ pub fn write_editor_target(target_path: &Path, content: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub fn pending_prompt_path(state_dir: &Path, session_name: &str) -> PathBuf {
-    state_dir
-        .join("prompts")
-        .join(sanitize_session_name(session_name))
-        .join("pending-prompt.txt")
-}
-
-fn sanitize_session_name(session_name: &str) -> String {
-    let mut out = String::with_capacity(session_name.len());
-    for ch in session_name.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-
-    if out.is_empty() {
-        String::from("default")
-    } else {
-        out
-    }
-}
-
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::ffi::OsStr;
@@ -134,7 +115,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        PromptSource, default_state_dir_from_env, pending_prompt_path, prepare_prompt,
+        PromptSource, default_state_dir_from_env, pending_prompt_text, prepare_prompt,
         resolve_prompt_text, resolve_state_dir_from_env, write_editor_target_from_pending,
     };
 
@@ -193,9 +174,12 @@ mod tests {
         let state_dir = root.join("state");
         let target = root.join("editor.txt");
 
-        let pending = prepare_prompt(&state_dir, "demo/session", "hello world")
+        prepare_prompt(&state_dir, "demo/session", "hello world")
             .expect("prompt should be prepared");
-        assert_eq!(pending, pending_prompt_path(&state_dir, "demo/session"));
+        assert_eq!(
+            pending_prompt_text(&state_dir, "demo/session").expect("pending prompt should load"),
+            Some(String::from("hello world"))
+        );
 
         let content = write_editor_target_from_pending(&state_dir, "demo/session", &target, true)
             .expect("editor helper should write target");
@@ -204,7 +188,52 @@ mod tests {
             fs::read_to_string(&target).expect("target should exist"),
             "hello world"
         );
-        assert!(!pending.exists());
+        assert_eq!(
+            pending_prompt_text(&state_dir, "demo/session")
+                .expect("consumed prompt lookup should succeed"),
+            None
+        );
+    }
+
+    #[test]
+    fn editor_helper_keep_pending_leaves_staged_prompt() {
+        let root = unique_temp_dir("prompt-keep-pending");
+        let state_dir = root.join("state");
+        let target = root.join("editor.txt");
+
+        prepare_prompt(&state_dir, "demo/session", "hello world")
+            .expect("prompt should be prepared");
+
+        let content = write_editor_target_from_pending(&state_dir, "demo/session", &target, false)
+            .expect("editor helper should write target without consuming");
+
+        assert_eq!(content, "hello world");
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should exist"),
+            "hello world"
+        );
+        assert_eq!(
+            pending_prompt_text(&state_dir, "demo/session")
+                .expect("pending prompt should still exist"),
+            Some(String::from("hello world"))
+        );
+    }
+
+    #[test]
+    fn write_editor_target_from_pending_errors_when_prompt_is_missing() {
+        let root = unique_temp_dir("prompt-missing");
+        let state_dir = root.join("state");
+        let target = root.join("editor.txt");
+
+        let error = write_editor_target_from_pending(&state_dir, "demo/session", &target, true)
+            .expect_err("missing pending prompt should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no pending prompt prepared for session demo/session")
+        );
+        assert!(!target.exists());
     }
 
     #[test]

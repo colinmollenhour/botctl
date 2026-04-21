@@ -38,7 +38,7 @@ use crate::prompt::{
     write_editor_target_from_pending,
 };
 use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
-use crate::storage::bootstrap_state_db;
+use crate::storage::{bootstrap_state_db, state_db_path};
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
@@ -999,11 +999,11 @@ fn keep_going_starts_with_numbered_option(line: &str) -> bool {
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
-    let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
+    prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
     Ok(format!(
-        "prepared prompt session={} path={}",
+        "prepared prompt session={} state_db={}",
         args.session_name,
-        pending_path.display()
+        state_db_path(&state_dir).display()
     ))
 }
 
@@ -1048,7 +1048,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
 
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
-    let pending_path = prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
+    prepare_prompt(&state_dir, &args.session_name, &prompt_text)?;
 
     let bindings = load_automation_keybindings(None)?;
     let before_submit = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
@@ -1068,11 +1068,11 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     })?;
 
     Ok(format!(
-        "submitted prepared prompt session={} pane={} state={} pending_path={} delay_ms={}",
+        "submitted prepared prompt session={} pane={} state={} state_db={} delay_ms={}",
         args.session_name,
         pane.pane_id,
         classification.state.as_str(),
-        pending_path.display(),
+        state_db_path(&state_dir).display(),
         args.submit_delay_ms
     ))
 }
@@ -2883,7 +2883,7 @@ mod tests {
     };
     use crate::cli::PreparePromptArgs;
     use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
-    use crate::prompt::pending_prompt_path;
+    use crate::prompt::pending_prompt_text;
     use crate::storage::{CURRENT_SCHEMA_VERSION, state_db_path};
     use crate::tmux::TmuxPane;
 
@@ -3494,10 +3494,9 @@ mod tests {
         })
         .expect("prepare-prompt should succeed");
 
-        let pending_path = pending_prompt_path(&state_dir, "demo/session");
         assert_eq!(
-            fs::read_to_string(&pending_path).expect("pending prompt should exist"),
-            "hello world"
+            pending_prompt_text(&state_dir, "demo/session").expect("pending prompt should load"),
+            Some(String::from("hello world"))
         );
 
         let connection = rusqlite::Connection::open(state_db_path(&state_dir))
@@ -3509,7 +3508,15 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("schema version row should exist");
+        let stored_prompt = connection
+            .query_row(
+                "SELECT content FROM pending_prompts WHERE session_name = ?1",
+                rusqlite::params!["demo/session"],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("pending prompt row should exist");
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(stored_prompt, "hello world");
 
         let _ = fs::remove_dir_all(&state_dir);
     }

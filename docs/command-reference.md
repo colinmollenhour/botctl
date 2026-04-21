@@ -12,7 +12,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
-- Relevant stateful commands bootstrap `<state-root>/state.db` with a minimal `schema_version` table; prompt handoff files and babysit records remain regular files for now.
+- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff now uses SQLite-backed pending prompt records, while babysit records remain regular files for now.
 
 ## Session and pane management
 
@@ -489,7 +489,7 @@ botctl keep-going --pane 0:2.3 --source ./prompts/review-loop.txt
 
 ### `prepare-prompt`
 
-Purpose: prepare a prompt payload for a session.
+Purpose: prepare a prompt payload for a session in the state database.
 
 Syntax:
 ```bash
@@ -537,7 +537,7 @@ botctl editor-helper --session demo /tmp/botctl-prompt.txt
 
 ### `submit-prompt`
 
-Purpose: resolve prompt text from `--text` or `--source`, stage it, and submit it into a pane.
+Purpose: resolve prompt text from `--text` or `--source`, stage it in the state database, and submit it into a pane.
 
 Syntax:
 ```bash
