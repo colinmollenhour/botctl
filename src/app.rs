@@ -478,23 +478,10 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
     if let Some(warning) = artifact_warning.as_deref() {
         eprintln!("warning: serve artifacts unavailable: {warning}");
     }
-    let mut artifacts = match state_dir {
-        Some(state_dir) => match open_serve_artifacts(
-            &state_dir,
-            &args.session_name,
-            args.pane_id.as_deref(),
-            args.reconcile_ms,
-            args.history_lines,
-        ) {
-            Ok(artifacts) => Some(artifacts),
-            Err(error) if artifacts_required => return Err(error),
-            Err(error) => {
-                eprintln!("warning: serve artifacts unavailable: {error}");
-                None
-            }
-        },
-        None => None,
-    };
+    let mut artifact_root = state_dir;
+    let mut artifacts: Option<ServeArtifacts> = None;
+    let artifact_session_name = args.session_name.clone();
+    let artifact_pane_id = args.pane_id.clone();
 
     let request = ServeRequest {
         session_name: args.session_name,
@@ -507,6 +494,26 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
 
     run_serve_loop(&client, &request, interrupted, |event| {
         let payload = render_serve_event_payload(&request, &event);
+        if artifacts.is_none() {
+            if let Some(state_dir) = artifact_root.as_deref() {
+                match open_serve_artifacts(
+                    state_dir,
+                    &artifact_session_name,
+                    artifact_pane_id.as_deref(),
+                    args.reconcile_ms,
+                    args.history_lines,
+                ) {
+                    Ok(opened_artifacts) => {
+                        artifacts = Some(opened_artifacts);
+                    }
+                    Err(error) if artifacts_required => return Err(error),
+                    Err(error) => {
+                        eprintln!("warning: serve artifacts unavailable: {error}");
+                        artifact_root = None;
+                    }
+                }
+            }
+        }
         if let Some(active_artifacts) = artifacts.as_mut() {
             active_artifacts.summary.record_event(&event);
             if let Err(error) = append_jsonl_event(&mut active_artifacts.tape_writer, &payload) {
@@ -681,7 +688,7 @@ fn render_observe_command_output(
 }
 
 fn resolve_artifact_state_dir(path: Option<&Path>) -> AppResult<(Option<PathBuf>, Option<String>)> {
-    artifact_state_dir_result(resolve_bootstrapped_state_dir(path), path.is_some())
+    artifact_state_dir_result(resolve_state_dir(path), path.is_some())
 }
 
 fn artifact_state_dir_result(
