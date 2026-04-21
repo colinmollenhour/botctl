@@ -262,8 +262,8 @@ pub fn usage() -> String {
             capture --pane %ID|session:window.pane [--history-lines N]\n\
             status --pane %ID|session:window.pane [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
-            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]\\n\
-            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]\\n\
+            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]\n\
+            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]\n\
             record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
             classify --path PATH\n\
             replay --path PATH\n\
@@ -1422,6 +1422,15 @@ mod tests {
                 .to_string()
                 .contains("serve requires --reconcile-ms to be at least 1")
         );
+    }
+
+    #[test]
+    fn usage_renders_real_newlines_for_observe_and_serve() {
+        let usage = super::usage();
+
+        assert!(!usage.contains("\\n"));
+        assert!(usage.contains("observe --session NAME"));
+        assert!(usage.contains("serve --session NAME"));
     }
 
     #[test]

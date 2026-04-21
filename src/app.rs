@@ -323,7 +323,6 @@ fn run_install_bindings(args: InstallBindingsArgs) -> AppResult<String> {
 
 fn run_observe(args: ObserveArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let request = ObserveRequest {
         session_name: args.session_name,
         target_pane: args.pane_id,
@@ -332,14 +331,24 @@ fn run_observe(args: ObserveArgs) -> AppResult<String> {
         history_lines: args.history_lines,
     };
     let collected = collect_observation(&client, &request)?;
-    let artifact_paths = write_observe_artifacts(&state_dir, &collected)?;
+    let report = collected.report.render();
+    let (state_dir, mut artifact_warning) =
+        resolve_best_effort_artifact_state_dir(args.state_dir.as_deref());
+    let artifact_paths = match state_dir {
+        Some(state_dir) => match write_observe_artifacts(&state_dir, &collected) {
+            Ok(paths) => Some(paths),
+            Err(error) => {
+                artifact_warning = Some(error.to_string());
+                None
+            }
+        },
+        None => None,
+    };
 
-    Ok(format!(
-        "{}\nartifacts:\n  capture_file={}\n  control_log={}\n  export={}\n",
-        collected.report.render(),
-        artifact_paths.capture_file.display(),
-        artifact_paths.tape_file.display(),
-        artifact_paths.export_file.display()
+    Ok(render_observe_command_output(
+        &report,
+        artifact_paths.as_ref(),
+        artifact_warning.as_deref(),
     ))
 }
 
@@ -363,6 +372,12 @@ struct ServeExportSummary {
     total_events: usize,
     event_counts: BTreeMap<String, usize>,
     tracked_panes: BTreeSet<String>,
+}
+
+struct ServeArtifacts {
+    tape_writer: BufWriter<File>,
+    export_path: PathBuf,
+    summary: ServeExportSummary,
 }
 
 impl ServeExportSummary {
@@ -453,22 +468,29 @@ impl ServeExportSummary {
 
 fn run_serve(args: ServeArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let artifact_id = new_artifact_id("serve", &args.session_name, args.pane_id.as_deref())?;
-    let tape_path = tape_artifact_path(&state_dir, &artifact_id, "events.jsonl")?;
-    let export_path = export_artifact_path(&state_dir, &artifact_id, "summary.json")?;
-    let tape_file = File::create(&tape_path)?;
-    let mut tape_writer = BufWriter::new(tape_file);
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-
-    let mut summary = ServeExportSummary::new(
-        &args.session_name,
-        args.pane_id.as_deref(),
-        args.reconcile_ms,
-        args.history_lines,
-        tape_path.clone(),
-    );
+    let (state_dir, artifact_warning) =
+        resolve_best_effort_artifact_state_dir(args.state_dir.as_deref());
+    if let Some(warning) = artifact_warning.as_deref() {
+        eprintln!("warning: serve artifacts unavailable: {warning}");
+    }
+    let mut artifacts = match state_dir {
+        Some(state_dir) => match open_serve_artifacts(
+            &state_dir,
+            &args.session_name,
+            args.pane_id.as_deref(),
+            args.reconcile_ms,
+            args.history_lines,
+        ) {
+            Ok(artifacts) => Some(artifacts),
+            Err(error) => {
+                eprintln!("warning: serve artifacts unavailable: {error}");
+                None
+            }
+        },
+        None => None,
+    };
 
     let request = ServeRequest {
         session_name: args.session_name,
@@ -481,15 +503,49 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
 
     run_serve_loop(&client, &request, interrupted, |event| {
         let payload = render_serve_event_payload(&request, &event);
-        summary.record_event(&event);
-        append_jsonl_event(&mut tape_writer, &payload)?;
+        if let Some(active_artifacts) = artifacts.as_mut() {
+            active_artifacts.summary.record_event(&event);
+            if let Err(error) = append_jsonl_event(&mut active_artifacts.tape_writer, &payload) {
+                eprintln!("warning: serve artifacts disabled after write failure: {error}");
+                artifacts = None;
+            }
+        }
         emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
     })?;
 
-    summary.finalize();
-    write_serve_summary_export(&export_path, &summary)?;
+    if let Some(mut artifacts) = artifacts {
+        artifacts.summary.finalize();
+        if let Err(error) = write_serve_summary_export(&artifacts.export_path, &artifacts.summary) {
+            eprintln!("warning: serve summary export failed: {error}");
+        }
+    }
 
     Ok(String::new())
+}
+
+fn open_serve_artifacts(
+    state_dir: &Path,
+    session_name: &str,
+    pane_id: Option<&str>,
+    reconcile_ms: u64,
+    history_lines: usize,
+) -> AppResult<ServeArtifacts> {
+    let artifact_id = new_artifact_id("serve", session_name, pane_id)?;
+    let tape_path = tape_artifact_path(state_dir, &artifact_id, "events.jsonl")?;
+    let export_path = export_artifact_path(state_dir, &artifact_id, "summary.json")?;
+    let tape_file = File::create(&tape_path)?;
+
+    Ok(ServeArtifacts {
+        tape_writer: BufWriter::new(tape_file),
+        export_path,
+        summary: ServeExportSummary::new(
+            session_name,
+            pane_id,
+            reconcile_ms,
+            history_lines,
+            tape_path,
+        ),
+    })
 }
 
 fn write_observe_artifacts(
@@ -590,6 +646,43 @@ fn write_serve_summary_export(path: &Path, summary: &ServeExportSummary) -> AppR
         .map_err(|error| AppError::new(format!("failed to encode serve summary JSON: {error}")))?;
     fs::write(path, content)?;
     Ok(())
+}
+
+fn render_observe_command_output(
+    report: &str,
+    artifact_paths: Option<&ObserveArtifactPaths>,
+    artifact_warning: Option<&str>,
+) -> String {
+    let mut out = report.to_string();
+    if let Some(artifact_paths) = artifact_paths {
+        out.push_str(&format!(
+            "\nartifacts:\n  capture_file={}\n  control_log={}\n  export={}\n",
+            artifact_paths.capture_file.display(),
+            artifact_paths.tape_file.display(),
+            artifact_paths.export_file.display()
+        ));
+    } else if let Some(artifact_warning) = artifact_warning {
+        out.push_str(&format!(
+            "\nartifacts:\n  unavailable={}\n",
+            artifact_warning
+        ));
+    }
+    out
+}
+
+fn resolve_best_effort_artifact_state_dir(
+    path: Option<&Path>,
+) -> (Option<PathBuf>, Option<String>) {
+    best_effort_artifact_state_dir_result(resolve_bootstrapped_state_dir(path))
+}
+
+fn best_effort_artifact_state_dir_result(
+    result: AppResult<PathBuf>,
+) -> (Option<PathBuf>, Option<String>) {
+    match result {
+        Ok(state_dir) => (Some(state_dir), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
 }
 
 fn render_control_log_lines(lines: &[String]) -> String {
@@ -2121,72 +2214,6 @@ fn render_babysit_stop_event(
     )
 }
 
-fn render_serve_event(
-    request: &ServeRequest,
-    event: &ServeEvent,
-    format: BabysitFormat,
-    use_color: bool,
-) -> String {
-    render_babysit_output(
-        format.into(),
-        render_serve_event_payload(request, event),
-        use_color,
-    )
-}
-
-fn render_serve_snapshot_event(
-    snapshot: &ServePaneSnapshot,
-    format: BabysitFormat,
-    use_color: bool,
-) -> String {
-    render_babysit_output(
-        format.into(),
-        serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "snapshot",
-            "pane_id": snapshot.pane.pane_id,
-            "session": snapshot.pane.session_name,
-            "window": snapshot.pane.window_name,
-            "command": snapshot.pane.current_command,
-            "cwd": snapshot.pane.current_path,
-            "state": snapshot.classification.state.as_str(),
-            "signals": snapshot.classification.signals.clone(),
-            "changed": snapshot.changed,
-            "reason": snapshot.reason.as_str(),
-            "summary": if snapshot.changed {
-                serde_json::json!(format!(
-                    "Pane {} changed to {} ({})",
-                    snapshot.pane.pane_id,
-                    snapshot.classification.state.as_str(),
-                    snapshot.reason.as_str()
-                ))
-            } else {
-                serde_json::json!(format!(
-                    "Pane {} reconciled at {} ({})",
-                    snapshot.pane.pane_id,
-                    snapshot.classification.state.as_str(),
-                    snapshot.reason.as_str()
-                ))
-            },
-            "details": [
-                format!("Window: {}", snapshot.pane.window_name),
-                format!("Command: {}", snapshot.pane.current_command),
-                format!("Cwd: {}", snapshot.pane.current_path),
-                format!("Signals: {}", render_signals(&snapshot.classification)),
-                format!("Recap: {}", snapshot.classification.recap_excerpt.as_deref().unwrap_or("none")),
-                format!("Changed: {}", snapshot.changed),
-            ],
-            "body_title": if snapshot.live_excerpt.is_empty() { serde_json::Value::Null } else { serde_json::json!("Recent output") },
-            "body_lines": if snapshot.live_excerpt.is_empty() {
-                serde_json::json!([])
-            } else {
-                serde_json::json!(serve_body_lines(&snapshot.live_excerpt))
-            }
-        }),
-        use_color,
-    )
-}
-
 fn serve_body_lines(input: &str) -> Vec<String> {
     input
         .lines()
@@ -3148,15 +3175,17 @@ mod tests {
 
     use super::{
         AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
-        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, PermissionBabysitAction, RecoveryAction,
+        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, ObserveArtifactPaths,
+        PermissionBabysitAction, RecoveryAction, best_effort_artifact_state_dir_result,
         cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
         extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
         is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_babysit_action_for_state,
         permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
         recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
         render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_screen_excerpt, render_status_report,
-        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
+        render_list_panes, render_next_safe_action, render_observe_command_output,
+        render_screen_excerpt, render_status_report, resolve_keep_going_prompt, run_prepare_prompt,
+        submit_prompt_preflight_workflow,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -3263,6 +3292,42 @@ mod tests {
     fn renders_a_focused_screen_excerpt() {
         let excerpt = render_screen_excerpt("\n\nfirst\n\nsecond\nthird\n");
         assert_eq!(excerpt, "first | second | third");
+    }
+
+    #[test]
+    fn best_effort_artifact_state_dir_turns_errors_into_warnings() {
+        let (state_dir, warning) =
+            best_effort_artifact_state_dir_result(Err(AppError::new("disk full")));
+
+        assert_eq!(state_dir, None);
+        assert_eq!(warning.as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn observe_output_reports_artifact_warning_without_paths() {
+        let rendered = render_observe_command_output("report body", None, Some("disk full"));
+        assert_eq!(
+            rendered,
+            "report body\nartifacts:\n  unavailable=disk full\n"
+        );
+    }
+
+    #[test]
+    fn observe_output_reports_artifact_paths_when_available() {
+        let rendered = render_observe_command_output(
+            "report body",
+            Some(&ObserveArtifactPaths {
+                capture_file: std::path::PathBuf::from("/tmp/capture.txt"),
+                tape_file: std::path::PathBuf::from("/tmp/control-mode.log"),
+                export_file: std::path::PathBuf::from("/tmp/report.json"),
+            }),
+            Some("ignored warning"),
+        );
+
+        assert!(rendered.contains("capture_file=/tmp/capture.txt"));
+        assert!(rendered.contains("control_log=/tmp/control-mode.log"));
+        assert!(rendered.contains("export=/tmp/report.json"));
+        assert!(!rendered.contains("unavailable="));
     }
 
     #[test]
