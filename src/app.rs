@@ -2148,7 +2148,18 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
     }
 
     let Some(details) = extract_permission_prompt_details(inspected) else {
-        return false;
+        return has_project_scoped_permission_option(inspected)
+            && !permission_prompt_lines(inspected)
+                .unwrap_or_else(|| {
+                    inspected
+                        .focused_source
+                        .lines()
+                        .map(|line| line.to_string())
+                        .collect()
+                })
+                .iter()
+                .map(|line| line.trim())
+                .any(is_chat_input_line_for_yolo);
     };
 
     details.question.is_some()
@@ -2164,6 +2175,43 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
             .iter()
             .map(|line| line.trim())
             .any(is_chat_input_line_for_yolo)
+}
+
+fn has_project_scoped_permission_option(inspected: &InspectedPane) -> bool {
+    permission_prompt_lines(inspected)
+        .unwrap_or_else(|| {
+            inspected
+                .focused_source
+                .lines()
+                .map(|line| line.to_string())
+                .collect()
+        })
+        .iter()
+        .map(|line| line.trim())
+        .any(is_project_scoped_permission_option_line)
+}
+
+fn is_project_scoped_permission_option_line(line: &str) -> bool {
+    let Some((_, rest)) = split_numbered_option_line(line) else {
+        return false;
+    };
+    let lower = rest.to_ascii_lowercase();
+    lower.starts_with("yes, and always allow access to ") && lower.ends_with(" from this project")
+}
+
+fn split_numbered_option_line(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start_matches('❯').trim();
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 || !trimmed[digits..].starts_with('.') {
+        return None;
+    }
+
+    let rest = trimmed[digits + 1..].trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some((&trimmed[..digits], rest))
+    }
 }
 
 fn permission_manual_review_reason(classification: &Classification) -> Option<&'static str> {
@@ -3948,6 +3996,27 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
             raw_source: String::from(
                 "Bash command (unsandboxed)\nfor f in /repo/.claude/commands/colin/*.md /repo/.claude/commands/coolify.md; do head -20 \"$f\"; done\nRead command headers\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_allows_truncated_project_scoped_permission_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Save Opus craft findings\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and always allow access to results/ from this project\n  3. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+            raw_source: String::from(
+                "Save Opus craft findings\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and always allow access to results/ from this project\n  3. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
         };
 
