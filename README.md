@@ -129,6 +129,13 @@ cargo run -- prepare-prompt --session demo --text "Summarize the current repo"
 cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the current repo"
 ```
 
+Scope prompt prep or babysit work to one workspace:
+
+```bash
+cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the current repo"
+cargo run -- yolo start --all --workspace .
+```
+
 ## Keybinding Policy
 
 `botctl` respects the user's existing Claude keybindings. It resolves actions like submit, external editor, and confirmation flows from `~/.claude/keybindings.json` instead of assuming that a hard-coded automation keymap is installed.

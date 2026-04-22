@@ -66,22 +66,32 @@ pub fn resolve_prompt_text(source: PromptSource<'_>) -> AppResult<String> {
     }
 }
 
-pub fn prepare_prompt(state_dir: &Path, session_name: &str, content: &str) -> AppResult<()> {
-    store_pending_prompt(state_dir, session_name, content)
+pub fn prepare_prompt(
+    state_dir: &Path,
+    workspace_id: &str,
+    session_name: &str,
+    content: &str,
+) -> AppResult<()> {
+    store_pending_prompt(state_dir, workspace_id, session_name, content)
 }
 
-pub fn pending_prompt_text(state_dir: &Path, session_name: &str) -> AppResult<Option<String>> {
-    load_pending_prompt(state_dir, session_name)
+pub fn pending_prompt_text(
+    state_dir: &Path,
+    workspace_id: &str,
+    session_name: &str,
+) -> AppResult<Option<String>> {
+    load_pending_prompt(state_dir, workspace_id, session_name)
 }
 
 pub fn write_editor_target_from_pending(
     state_dir: &Path,
+    workspace_id: &str,
     session_name: &str,
     target_path: &Path,
     consume: bool,
 ) -> AppResult<String> {
     let state_db = state_db_path(state_dir);
-    let content = pending_prompt_text(state_dir, session_name)?.ok_or_else(|| {
+    let content = pending_prompt_text(state_dir, workspace_id, session_name)?.ok_or_else(|| {
         AppError::new(format!(
             "no pending prompt prepared for session {} in {}",
             session_name,
@@ -89,7 +99,7 @@ pub fn write_editor_target_from_pending(
         ))
     })?;
     write_editor_target(target_path, &content)?;
-    if consume && !delete_pending_prompt(state_dir, session_name)? {
+    if consume && !delete_pending_prompt(state_dir, workspace_id, session_name)? {
         return Err(AppError::new(format!(
             "pending prompt disappeared before it could be consumed for session {} in {}",
             session_name,
@@ -113,6 +123,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::storage::resolve_workspace_for_path;
 
     use super::{
         PromptSource, default_state_dir_from_env, pending_prompt_text, prepare_prompt,
@@ -172,24 +184,35 @@ mod tests {
     fn prepare_and_consume_prompt_round_trip() {
         let root = unique_temp_dir("prompt-roundtrip");
         let state_dir = root.join("state");
+        let workspace_root = root.join("workspace");
         let target = root.join("editor.txt");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
 
-        prepare_prompt(&state_dir, "demo/session", "hello world")
+        prepare_prompt(&state_dir, &workspace.id, "demo/session", "hello world")
             .expect("prompt should be prepared");
         assert_eq!(
-            pending_prompt_text(&state_dir, "demo/session").expect("pending prompt should load"),
+            pending_prompt_text(&state_dir, &workspace.id, "demo/session")
+                .expect("pending prompt should load"),
             Some(String::from("hello world"))
         );
 
-        let content = write_editor_target_from_pending(&state_dir, "demo/session", &target, true)
-            .expect("editor helper should write target");
+        let content = write_editor_target_from_pending(
+            &state_dir,
+            &workspace.id,
+            "demo/session",
+            &target,
+            true,
+        )
+        .expect("editor helper should write target");
         assert_eq!(content, "hello world");
         assert_eq!(
             fs::read_to_string(&target).expect("target should exist"),
             "hello world"
         );
         assert_eq!(
-            pending_prompt_text(&state_dir, "demo/session")
+            pending_prompt_text(&state_dir, &workspace.id, "demo/session")
                 .expect("consumed prompt lookup should succeed"),
             None
         );
@@ -199,13 +222,23 @@ mod tests {
     fn editor_helper_keep_pending_leaves_staged_prompt() {
         let root = unique_temp_dir("prompt-keep-pending");
         let state_dir = root.join("state");
+        let workspace_root = root.join("workspace");
         let target = root.join("editor.txt");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
 
-        prepare_prompt(&state_dir, "demo/session", "hello world")
+        prepare_prompt(&state_dir, &workspace.id, "demo/session", "hello world")
             .expect("prompt should be prepared");
 
-        let content = write_editor_target_from_pending(&state_dir, "demo/session", &target, false)
-            .expect("editor helper should write target without consuming");
+        let content = write_editor_target_from_pending(
+            &state_dir,
+            &workspace.id,
+            "demo/session",
+            &target,
+            false,
+        )
+        .expect("editor helper should write target without consuming");
 
         assert_eq!(content, "hello world");
         assert_eq!(
@@ -213,7 +246,7 @@ mod tests {
             "hello world"
         );
         assert_eq!(
-            pending_prompt_text(&state_dir, "demo/session")
+            pending_prompt_text(&state_dir, &workspace.id, "demo/session")
                 .expect("pending prompt should still exist"),
             Some(String::from("hello world"))
         );
@@ -223,10 +256,20 @@ mod tests {
     fn write_editor_target_from_pending_errors_when_prompt_is_missing() {
         let root = unique_temp_dir("prompt-missing");
         let state_dir = root.join("state");
+        let workspace_root = root.join("workspace");
         let target = root.join("editor.txt");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
 
-        let error = write_editor_target_from_pending(&state_dir, "demo/session", &target, true)
-            .expect_err("missing pending prompt should fail");
+        let error = write_editor_target_from_pending(
+            &state_dir,
+            &workspace.id,
+            "demo/session",
+            &target,
+            true,
+        )
+        .expect_err("missing pending prompt should fail");
 
         assert!(
             error

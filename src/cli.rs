@@ -113,6 +113,7 @@ pub struct ObserveArgs {
     pub events: usize,
     pub idle_timeout_ms: u64,
     pub history_lines: usize,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +123,7 @@ pub struct ServeArgs {
     pub reconcile_ms: u64,
     pub history_lines: usize,
     pub format: BabysitFormat,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +169,7 @@ pub struct InstallBindingsArgs {
 pub struct PreparePromptArgs {
     pub session_name: String,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
     pub source: Option<PathBuf>,
     pub text: Option<String>,
 }
@@ -175,6 +178,7 @@ pub struct PreparePromptArgs {
 pub struct EditorHelperArgs {
     pub session_name: String,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
     pub source: Option<PathBuf>,
     pub target: PathBuf,
     pub keep_pending: bool,
@@ -185,6 +189,7 @@ pub struct SubmitPromptArgs {
     pub session_name: String,
     pub pane_id: String,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
     pub source: Option<PathBuf>,
     pub text: Option<String>,
     pub submit_delay_ms: u64,
@@ -198,6 +203,7 @@ pub struct YoloStartArgs {
     pub live_preview: bool,
     pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +211,7 @@ pub struct YoloStopArgs {
     pub pane_id: Option<String>,
     pub all: bool,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
 }
 
 pub fn parse_args<I>(args: I) -> AppResult<Command>
@@ -260,8 +267,8 @@ pub fn usage() -> String {
             capture --pane %ID|session:window.pane [--history-lines N]\n\
             status --pane %ID|session:window.pane [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
-            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
-            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl]\n\
+            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]\n\
+            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]\n\
             record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
             classify --path PATH\n\
             replay --path PATH\n\
@@ -274,11 +281,11 @@ pub fn usage() -> String {
             continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)\n\
             auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]\n\
             keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
-            prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
-            editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
-            submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
-            yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]\n\
-            yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH]\n",
+            prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]\n\
+            editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET\n\
+            submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
+            yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]\n\
+            yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]\n",
     )
 }
 
@@ -485,6 +492,7 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
     let mut events = 25usize;
     let mut idle_timeout_ms = 1500u64;
     let mut history_lines = 120usize;
+    let mut state_dir = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -513,6 +521,9 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
                     AppError::new(format!("invalid value for --history-lines: {raw}"))
                 })?;
             }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
             flag => {
                 return Err(AppError::new(format!("unknown observe flag: {flag}")));
             }
@@ -529,6 +540,7 @@ fn parse_observe(args: Vec<String>) -> AppResult<Command> {
         events,
         idle_timeout_ms,
         history_lines,
+        state_dir,
     }))
 }
 
@@ -538,6 +550,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
     let mut reconcile_ms = 1500u64;
     let mut history_lines = 120usize;
     let mut format = BabysitFormat::Human;
+    let mut state_dir = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -559,6 +572,9 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
                 history_lines = raw.parse::<usize>().map_err(|_| {
                     AppError::new(format!("invalid value for --history-lines: {raw}"))
                 })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
             }
             "--format" => {
                 let raw = read_value(&args, &mut i, "--format")?;
@@ -585,6 +601,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
         reconcile_ms,
         history_lines,
         format,
+        state_dir,
     }))
 }
 
@@ -917,6 +934,7 @@ fn validate_optional_prompt_input(
 fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut state_dir = None;
+    let mut workspace = None;
     let mut source = None;
     let mut text = None;
 
@@ -928,6 +946,9 @@ fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
             }
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--workspace" => {
+                workspace = Some(read_value(&args, &mut i, "--workspace")?);
             }
             "--source" => {
                 source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
@@ -951,6 +972,7 @@ fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::PreparePrompt(PreparePromptArgs {
         session_name,
         state_dir,
+        workspace,
         source,
         text,
     }))
@@ -959,6 +981,7 @@ fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
 fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut state_dir = None;
+    let mut workspace = None;
     let mut source = None;
     let mut keep_pending = false;
     let mut target = None;
@@ -971,6 +994,9 @@ fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
             }
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--workspace" => {
+                workspace = Some(read_value(&args, &mut i, "--workspace")?);
             }
             "--source" => {
                 source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
@@ -1002,6 +1028,7 @@ fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::EditorHelper(EditorHelperArgs {
         session_name,
         state_dir,
+        workspace,
         source,
         target,
         keep_pending,
@@ -1012,6 +1039,7 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut pane_id = None;
     let mut state_dir = None;
+    let mut workspace = None;
     let mut source = None;
     let mut text = None;
     let mut submit_delay_ms = 250u64;
@@ -1027,6 +1055,9 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
             }
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--workspace" => {
+                workspace = Some(read_value(&args, &mut i, "--workspace")?);
             }
             "--source" => {
                 source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
@@ -1061,6 +1092,7 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
         session_name,
         pane_id,
         state_dir,
+        workspace,
         source,
         text,
         submit_delay_ms,
@@ -1082,6 +1114,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
             let mut live_preview = false;
             let mut format = BabysitFormat::Human;
             let mut state_dir = None;
+            let mut workspace = None;
             let mut i = start_index;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1102,6 +1135,9 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     }
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+                    }
+                    "--workspace" => {
+                        workspace = Some(read_value(&args, &mut i, "--workspace")?);
                     }
                     flag => {
                         return Err(AppError::new(format!("unknown yolo flag: {flag}")));
@@ -1127,6 +1163,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     live_preview,
                     format,
                     state_dir,
+                    workspace,
                 },
             ))
         }
@@ -1134,6 +1171,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
             let mut pane_id = None;
             let mut all = false;
             let mut state_dir = None;
+            let mut workspace = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1141,6 +1179,9 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     "--all" => all = true,
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+                    }
+                    "--workspace" => {
+                        workspace = Some(read_value(&args, &mut i, "--workspace")?);
                     }
                     flag => {
                         return Err(AppError::new(format!("unknown yolo flag: {flag}")));
@@ -1157,6 +1198,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                 pane_id,
                 all,
                 state_dir,
+                workspace,
             }))
         }
         _ => Err(AppError::new("yolo requires start or stop subcommand")),
@@ -1336,6 +1378,8 @@ mod tests {
             String::from("demo"),
             String::from("--events"),
             String::from("10"),
+            String::from("--state-dir"),
+            String::from("/tmp/botctl-observe"),
         ])
         .expect("observe command should parse");
 
@@ -1344,6 +1388,7 @@ mod tests {
                 assert_eq!(args.session_name, "demo");
                 assert_eq!(args.events, 10);
                 assert_eq!(args.idle_timeout_ms, 1500);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-observe")));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1362,6 +1407,8 @@ mod tests {
             String::from("750"),
             String::from("--format"),
             String::from("jsonl"),
+            String::from("--state-dir"),
+            String::from("/tmp/botctl-serve"),
         ])
         .expect("serve command should parse");
 
@@ -1371,6 +1418,7 @@ mod tests {
                 assert_eq!(args.pane_id.as_deref(), Some("%7"));
                 assert_eq!(args.reconcile_ms, 750);
                 assert_eq!(args.format, super::BabysitFormat::Jsonl);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-serve")));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1393,6 +1441,15 @@ mod tests {
                 .to_string()
                 .contains("serve requires --reconcile-ms to be at least 1")
         );
+    }
+
+    #[test]
+    fn usage_renders_real_newlines_for_observe_and_serve() {
+        let usage = super::usage();
+
+        assert!(!usage.contains("\\n"));
+        assert!(usage.contains("observe --session NAME"));
+        assert!(usage.contains("serve --session NAME"));
     }
 
     #[test]

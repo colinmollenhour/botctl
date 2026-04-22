@@ -7,12 +7,12 @@
 - [x] Add `state.db` under the state root and initialize a schema-version table.
 - [x] Move prompt handoff state from ad hoc files into SQLite.
 - [x] Move babysit / continuous-automation registrations from ad hoc files into SQLite.
-- [?] Add stable workspace/worktree scoping so multiple repos do not bleed into each other.
-- [ ] Add durable tracked-instance tables that can support serve mode.
+- [x] Add stable workspace/worktree scoping so multiple repos do not bleed into each other.
+- [x] Add durable tracked-instance tables that can support serve mode.
 - [ ] Add durable action-history tables for restart-safe automation and operator auditability.
-- [ ] Keep bulky artifacts, event tapes, and exported diagnostics as regular files.
-- [ ] Use SQLite in WAL mode with foreign keys and a busy timeout.
-- [ ] Add startup schema migration logic for future versions of `state.db`.
+- [x] Keep bulky artifacts, event tapes, and exported diagnostics as regular files.
+- [x] Use SQLite in WAL mode with foreign keys and a busy timeout.
+- [x] Add startup schema migration logic for future versions of `state.db`.
 - [ ] Do **not** migrate existing `.botctl` state; start fresh when the new state root is introduced.
 
 ## Goal
