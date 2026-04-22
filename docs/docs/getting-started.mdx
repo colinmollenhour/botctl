@@ -2,7 +2,7 @@
 
 `botctl` is a Rust CLI for launching, observing, and safely driving Claude Code sessions inside `tmux`.
 
-For end-to-end operator flows, see [workflows](workflows.md). For command details, see [command reference](command-reference.md).
+For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
 ## Requirements
 
@@ -27,7 +27,7 @@ cargo run -- start --session demo --cwd /path/to/project
 Then inspect the session from `botctl`:
 
 ```bash
-cargo run -- list-panes
+cargo run -- list
 cargo run -- doctor --session demo
 cargo run -- status --pane %19
 ```
@@ -49,7 +49,7 @@ tmux attach -t demo
 If Claude was already started inside tmux, resolve and verify the pane explicitly before acting:
 
 ```bash
-cargo run -- list-panes --all
+cargo run -- list --all
 cargo run -- attach --pane %19
 ```
 
@@ -92,7 +92,7 @@ cargo run -- serve --session demo --format jsonl
 - `Unknown` is a refusal state, not a guess.
 - Folder trust approval is special and uses raw `Enter`.
 
-For blocker recovery, prompt handoff, and recovery examples, see [workflows](workflows.md) and [prompt handoff](prompt-handoff.md).
+For blocker recovery, prompt handoff, and recovery examples, see [workflows](./workflows.mdx) and [prompt handoff](./prompt-handoff.mdx).
 
 ## Current limits
 

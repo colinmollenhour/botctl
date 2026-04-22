@@ -12,7 +12,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
-- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and babysit registrations now both use SQLite-backed records there.
+- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and yolo registrations now both use SQLite-backed records there.
 
 ## Session and pane management
 
@@ -60,13 +60,12 @@ Example:
 botctl attach --session demo --window claude
 ```
 
-### `list-panes` / `list`
+### `list`
 
 Purpose: list tmux panes.
 
 Syntax:
 ```bash
-botctl list-panes [--all]
 botctl list [--all]
 ```
 
@@ -171,7 +170,7 @@ botctl observe --session demo --events 10
 
 ### `serve`
 
-Purpose: run the babysit/serve loop for a session.
+Purpose: run the live observation loop for a session.
 
 Syntax:
 ```bash
@@ -443,7 +442,7 @@ botctl auto-unstick --pane 0:2.3 --max-steps 4
 
 ### `keep-going`
 
-Purpose: continuously babysit a pane, submit the loop prompt when Claude is ready, and return only when the loop yields `ALL_DONE`, `PANIC`, or an error.
+Purpose: continuously watch a pane, submit the loop prompt when Claude is ready, and return only when the loop yields `ALL_DONE`, `PANIC`, or an error.
 
 Syntax:
 ```bash
@@ -560,22 +559,17 @@ Example:
 botctl submit-prompt --session demo --pane 0:2.3 --text "Continue"
 ```
 
-## Permission babysitting
+## Yolo
 
-### `yolo` / `permission-babysit` / `babysit`
+### `yolo`
 
-Purpose: start or stop the permission babysit loop.
+Purpose: start or stop the long-running permission loop.
 
 Syntax:
 ```bash
 botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]
 botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH]
-botctl permission-babysit [same as yolo]
-botctl babysit [same as yolo]
 ```
-
-Aliases:
-- `yolo`, `permission-babysit`, and `babysit` are the same command family.
 
 Subcommands:
 - `start` (optional; omitted by default)
@@ -594,7 +588,7 @@ Stop flags:
 
 Targeting:
 - `start` can target one pane or scan all Claude panes with `--all`
-- `stop --all` disables all tracked babysit registrations stored in `<state-root>/state.db`
+- `stop --all` disables all tracked yolo registrations stored in `<state-root>/state.db`
 - neither mode allows mixing `--pane` and `--all`
 
 Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed targets.

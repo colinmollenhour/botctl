@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="logoTitle logoDesc">
+  <title id="logoTitle">botctl logo</title>
+  <desc id="logoDesc">Stylized terminal frame with a command cursor and control orbit.</desc>
+  <defs>
+    <linearGradient id="botctlGlow" x1="18%" y1="18%" x2="86%" y2="88%">
+      <stop offset="0%" stop-color="#67f5df"/>
+      <stop offset="100%" stop-color="#2bb9d6"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="#08111a"/>
+  <rect x="34" y="46" width="188" height="136" rx="22" fill="#10202d" stroke="url(#botctlGlow)" stroke-width="10"/>
+  <circle cx="62" cy="72" r="7" fill="#ffaf57"/>
+  <circle cx="86" cy="72" r="7" fill="#67f5df"/>
+  <circle cx="110" cy="72" r="7" fill="#2bb9d6"/>
+  <path d="M76 119l25 21-25 21" fill="none" stroke="#67f5df" stroke-linecap="round" stroke-linejoin="round" stroke-width="12"/>
+  <path d="M122 161h50" stroke="#eef7ff" stroke-linecap="round" stroke-width="12"/>
+  <path d="M193 182c0 21.539-17.461 39-39 39s-39-17.461-39-39" fill="none" stroke="#ffaf57" stroke-linecap="round" stroke-width="10"/>
+  <circle cx="115" cy="182" r="8" fill="#ffaf57"/>
+  <circle cx="193" cy="182" r="8" fill="#ffaf57"/>
+</svg>
