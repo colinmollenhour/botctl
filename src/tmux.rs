@@ -29,7 +29,9 @@ pub struct TmuxPane {
     pub session_id: String,
     pub session_name: String,
     pub window_id: String,
+    pub window_index: u16,
     pub window_name: String,
+    pub pane_index: u16,
     pub current_command: String,
     pub current_path: String,
     pub pane_active: bool,
@@ -121,7 +123,7 @@ impl TmuxClient {
         }
         args.push(String::from("-F"));
         args.push(String::from(
-            "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
+            "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
         ));
 
         let output = self.run_output(args)?;
@@ -274,6 +276,47 @@ impl TmuxClient {
         self.run_status(args)
     }
 
+    pub fn select_window(&self, target: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("select-window"),
+            String::from("-t"),
+            target.to_string(),
+        ])
+    }
+
+    pub fn select_pane(&self, target: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("select-pane"),
+            String::from("-t"),
+            target.to_string(),
+        ])
+    }
+
+    pub fn switch_client(&self, target_session: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("switch-client"),
+            String::from("-t"),
+            target_session.to_string(),
+        ])
+    }
+
+    pub fn rename_window(&self, target: &str, name: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("rename-window"),
+            String::from("-t"),
+            target.to_string(),
+            name.to_string(),
+        ])
+    }
+
+    pub fn attach_session(&self, target_session: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("attach-session"),
+            String::from("-t"),
+            target_session.to_string(),
+        ])
+    }
+
     fn run_status(&self, args: Vec<String>) -> AppResult<()> {
         let status = Command::new(&self.program).args(&args).status()?;
         if status.success() {
@@ -377,7 +420,7 @@ impl Drop for ControlModeSession {
 
 fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 12 {
+    if parts.len() != 14 {
         return None;
     }
 
@@ -388,12 +431,14 @@ fn parse_pane_line(line: &str) -> Option<TmuxPane> {
         session_id: parts[3].to_string(),
         session_name: parts[4].to_string(),
         window_id: parts[5].to_string(),
-        window_name: parts[6].to_string(),
-        current_command: parts[7].to_string(),
-        current_path: parts[8].to_string(),
-        pane_active: parts[9] == "1",
-        cursor_x: parse_cursor(parts[10]),
-        cursor_y: parse_cursor(parts[11]),
+        window_index: parts[6].parse::<u16>().ok()?,
+        window_name: parts[7].to_string(),
+        pane_index: parts[8].parse::<u16>().ok()?,
+        current_command: parts[9].to_string(),
+        current_path: parts[10].to_string(),
+        pane_active: parts[11] == "1",
+        cursor_x: parse_cursor(parts[12]),
+        cursor_y: parse_cursor(parts[13]),
     })
 }
 
@@ -478,10 +523,12 @@ mod tests {
     #[test]
     fn parses_pane_listing() {
         let pane = parse_pane_line(
-            "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\tclaude\tclaude\t/tmp/demo\t1\t12\t4",
+            "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\t1\t12\t4",
         )
         .expect("pane should parse");
         assert_eq!(pane.pane_id, "%1");
+        assert_eq!(pane.window_index, 3);
+        assert_eq!(pane.pane_index, 1);
         assert!(pane.pane_active);
         assert_eq!(pane.cursor_x, Some(12));
         assert_eq!(pane.cursor_y, Some(4));

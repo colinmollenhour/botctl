@@ -11,6 +11,7 @@ The project is built around a simple rule: terminal automation is only safe when
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude pane
 - run `serve` as a foreground long-lived observer for one tmux session
+- run `dashboard` as a popup-sized TUI across Claude panes, grouped by workspace with per-pane YOLO controls
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
@@ -96,6 +97,14 @@ Run the long-lived observer for one tmux session:
 ```bash
 cargo run -- serve --session demo
 ```
+
+Run the cross-workspace dashboard TUI:
+
+```bash
+cargo run -- dashboard
+```
+
+The dashboard groups Claude panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 ## Real Session Workflow
 

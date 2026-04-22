@@ -12,6 +12,7 @@ pub enum Command {
     Doctor(DoctorArgs),
     Observe(ObserveArgs),
     Serve(ServeArgs),
+    Dashboard(DashboardArgs),
     RecordFixture(RecordFixtureArgs),
     Classify(ClassifyArgs),
     Replay(ReplayArgs),
@@ -127,6 +128,14 @@ pub struct ServeArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct DashboardArgs {
+    pub poll_ms: u64,
+    pub history_lines: usize,
+    pub state_dir: Option<PathBuf>,
+    pub exit_on_navigate: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RecordFixtureArgs {
     pub session_name: String,
     pub pane_id: Option<String>,
@@ -235,6 +244,7 @@ where
         "doctor" => parse_doctor(rest),
         "observe" => parse_observe(rest),
         "serve" => parse_serve(rest),
+        "dashboard" => parse_dashboard(rest),
         "record-fixture" => parse_record_fixture(rest),
         "classify" => parse_classify(rest),
         "replay" => parse_replay(rest),
@@ -269,6 +279,7 @@ pub fn usage() -> String {
             doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
             observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]\n\
             serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]\n\
+            dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate]\n\
             record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
             classify --path PATH\n\
             replay --path PATH\n\
@@ -602,6 +613,54 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
         history_lines,
         format,
         state_dir,
+    }))
+}
+
+fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
+    let mut poll_ms = 1000u64;
+    let mut history_lines = 120usize;
+    let mut state_dir = None;
+    let mut exit_on_navigate = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--poll-ms" => {
+                let raw = read_value(&args, &mut i, "--poll-ms")?;
+                poll_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| AppError::new(format!("invalid value for --poll-ms: {raw}")))?;
+            }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--exit-on-navigate" => {
+                exit_on_navigate = true;
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown dashboard flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+
+    if poll_ms == 0 {
+        return Err(AppError::new(
+            "dashboard requires --poll-ms to be at least 1",
+        ));
+    }
+
+    Ok(Command::Dashboard(DashboardArgs {
+        poll_ms,
+        history_lines,
+        state_dir,
+        exit_on_navigate,
     }))
 }
 
@@ -1155,17 +1214,15 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     "yolo start requires exactly one of --pane or --all",
                 ));
             }
-            Ok(Command::YoloStart(
-                YoloStartArgs {
-                    pane_id,
-                    all,
-                    poll_ms,
-                    live_preview,
-                    format,
-                    state_dir,
-                    workspace,
-                },
-            ))
+            Ok(Command::YoloStart(YoloStartArgs {
+                pane_id,
+                all,
+                poll_ms,
+                live_preview,
+                format,
+                state_dir,
+                workspace,
+            }))
         }
         "stop" => {
             let mut pane_id = None;
@@ -1444,12 +1501,73 @@ mod tests {
     }
 
     #[test]
+    fn parses_dashboard_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("dashboard"),
+            String::from("--poll-ms"),
+            String::from("750"),
+            String::from("--history-lines"),
+            String::from("200"),
+            String::from("--state-dir"),
+            String::from("/tmp/botctl-dashboard"),
+        ])
+        .expect("dashboard command should parse");
+
+        match command {
+            Command::Dashboard(args) => {
+                assert_eq!(args.poll_ms, 750);
+                assert_eq!(args.history_lines, 200);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-dashboard")));
+                assert!(!args.exit_on_navigate);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dashboard_exit_on_navigate_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("dashboard"),
+            String::from("--exit-on-navigate"),
+        ])
+        .expect("dashboard command should parse exit flag");
+
+        match command {
+            Command::Dashboard(args) => {
+                assert!(args.exit_on_navigate);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_dashboard_zero_poll_interval() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("dashboard"),
+            String::from("--poll-ms"),
+            String::from("0"),
+        ])
+        .expect_err("dashboard should reject zero poll interval");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dashboard requires --poll-ms to be at least 1")
+        );
+    }
+
+    #[test]
     fn usage_renders_real_newlines_for_observe_and_serve() {
         let usage = super::usage();
 
         assert!(!usage.contains("\\n"));
         assert!(usage.contains("observe --session NAME"));
         assert!(usage.contains("serve --session NAME"));
+        assert!(usage.contains("dashboard [--poll-ms N]"));
+        assert!(usage.contains("[--exit-on-navigate]"));
     }
 
     #[test]

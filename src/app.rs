@@ -24,16 +24,14 @@ use crate::classifier::{
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
-    ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, KeepGoingArgs,
-    ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
+    ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
+    KeepGoingArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
     RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
     SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
+use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{CollectedObservation, ObserveRequest, collect_observation};
-use crate::yolo::{
-    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
-};
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
@@ -45,6 +43,9 @@ use crate::storage::{
     store_pending_prompt_for_tmux_instance, tape_artifact_path,
 };
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
+use crate::yolo::{
+    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
+};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
@@ -133,6 +134,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Doctor(args) => run_doctor(args),
         Command::Observe(args) => run_observe(args),
         Command::Serve(args) => run_serve(args),
+        Command::Dashboard(args) => run_dashboard(args),
         Command::RecordFixture(args) => run_record_fixture(args),
         Command::Classify(args) => run_classify(args),
         Command::Replay(args) => run_replay(args),
@@ -158,6 +160,10 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::YoloStop(args) => run_yolo_stop(args),
         Command::Help => Ok(crate::cli::usage()),
     }
+}
+
+fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
+    dashboard::run(args)
 }
 
 fn run_start(args: StartArgs) -> AppResult<String> {
@@ -2330,10 +2336,10 @@ fn serve_body_lines(input: &str) -> Vec<String> {
 }
 
 #[derive(Debug, Clone)]
-struct InspectedPane {
-    classification: Classification,
-    focused_source: String,
-    raw_source: String,
+pub(crate) struct InspectedPane {
+    pub(crate) classification: Classification,
+    pub(crate) focused_source: String,
+    pub(crate) raw_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2345,7 +2351,7 @@ struct PermissionPromptDetails {
     question: Option<String>,
 }
 
-fn inspect_pane(
+pub(crate) fn inspect_pane(
     client: &TmuxClient,
     pane_id: &str,
     history_lines: usize,
@@ -2558,7 +2564,7 @@ fn render_permission_prompt_details(details: &PermissionPromptDetails) -> Vec<St
     lines
 }
 
-fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
+pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
     if inspected.classification.state != SessionState::PermissionDialog {
         return false;
     }
@@ -2886,6 +2892,15 @@ struct ContinueOutcome {
     used_permission_approval: bool,
 }
 
+pub(crate) fn try_unstick_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<String> {
+    let classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let outcome = continue_from_classification(client, pane, &classification)?;
+    Ok(format!(
+        "unstick {}: {} -> {}",
+        pane.pane_id, outcome.action, outcome.outcome
+    ))
+}
+
 fn continue_from_classification(
     client: &TmuxClient,
     pane: &TmuxPane,
@@ -3035,7 +3050,7 @@ fn raw_key_for_workflow(
     }
 }
 
-fn execute_classified_workflow(
+pub(crate) fn execute_classified_workflow(
     client: &TmuxClient,
     pane_id: &str,
     workflow: GuardedWorkflow,
@@ -3265,7 +3280,7 @@ fn is_pane_command_claude(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("claude")
 }
 
-fn ensure_pane_owned_by_claude(pane: &TmuxPane) -> AppResult<()> {
+pub(crate) fn ensure_pane_owned_by_claude(pane: &TmuxPane) -> AppResult<()> {
     if is_pane_command_claude(pane) {
         Ok(())
     } else {
@@ -3338,25 +3353,25 @@ mod tests {
         ObserveArtifactPaths, RecoveryAction, YoloAction, artifact_state_dir_result,
         cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
         extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, yolo_action_for_state,
-        permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
-        recovery_action_for_state, render_babysit_action_event, render_babysit_output,
-        render_babysit_start_event, render_babysit_wait_event, render_guarded_workflow_output,
-        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
-        render_status_report, resolve_keep_going_prompt, run_prepare_prompt,
-        submit_prompt_preflight_workflow,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_manual_review_reason,
+        prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
+        render_babysit_action_event, render_babysit_output, render_babysit_start_event,
+        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
+        render_list_panes, render_next_safe_action, render_observe_command_output,
+        render_screen_excerpt, render_serve_event_payload, render_status_report,
+        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
+        yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
         Classification, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
     use crate::cli::PreparePromptArgs;
-    use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
     use crate::prompt::pending_prompt_text;
     use crate::serve::{ServeEvent, ServeRequest};
     use crate::storage::{CURRENT_SCHEMA_VERSION, resolve_workspace_for_path, state_db_path};
     use crate::tmux::TmuxPane;
+    use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
 
     fn sample_pane(current_command: &str) -> TmuxPane {
         TmuxPane {
@@ -3366,7 +3381,9 @@ mod tests {
             session_id: String::from("$1"),
             session_name: String::from("demo"),
             window_id: String::from("@2"),
+            window_index: 1,
             window_name: String::from("claude"),
+            pane_index: 0,
             current_command: current_command.to_string(),
             current_path: String::from("/tmp/demo"),
             pane_active: true,
@@ -3813,10 +3830,7 @@ mod tests {
             SessionState::DiffDialog,
             SessionState::Unknown,
         ] {
-            assert_eq!(
-                yolo_action_for_state(state),
-                YoloAction::Wait
-            );
+            assert_eq!(yolo_action_for_state(state), YoloAction::Wait);
         }
     }
 
@@ -4735,7 +4749,9 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             session_id: String::from("$9"),
             session_name: String::from("demo"),
             window_id: String::from("@9"),
+            window_index: 9,
             window_name: String::from("claude"),
+            pane_index: 0,
             current_command: String::from("claude"),
             current_path: workspace_root.display().to_string(),
             pane_active: true,

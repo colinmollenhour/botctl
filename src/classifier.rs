@@ -105,6 +105,8 @@ impl Classifier {
                     "approve",
                 ],
             ) && contains_any(&normalized, &["yes", "no", "enter", "escape"]);
+        let has_plain_chat_prompt_after_permission =
+            has_permission_keywords && has_plain_chat_prompt_after_permission(&lines);
         let has_conflicting_chat_after_permission =
             has_permission_keywords && has_chat_indicators_after_permission(&lines);
         let has_plan_approval_keywords = contains_any(
@@ -131,6 +133,25 @@ impl Classifier {
         );
         let mentions_sensitive_claude_path = contains_sensitive_claude_path(&normalized);
 
+        let has_busy_interrupt_hint = contains_any(
+            &normalized,
+            &[
+                "press esc to interrupt",
+                "esc to interrupt",
+                "ctrl+c to interrupt",
+            ],
+        );
+        let has_busy_keywords = contains_any(
+            &normalized,
+            &[
+                "thinking",
+                "running",
+                "background task",
+                "still thinking",
+                "working",
+            ],
+        );
+
         let state = if contains_any(
             &normalized,
             &[
@@ -149,6 +170,9 @@ impl Classifier {
         } else if has_plan_approval_keywords {
             signals.push(String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS));
             SessionState::PlanApprovalPrompt
+        } else if has_permission_keywords && has_plain_chat_prompt_after_permission {
+            signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
+            SessionState::ChatReady
         } else if has_permission_keywords && has_conflicting_chat_after_permission {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
             if mentions_self_settings_language {
@@ -208,18 +232,7 @@ impl Classifier {
         ) {
             signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
-        } else if contains_any(
-            &normalized,
-            &[
-                "esc to interrupt",
-                "ctrl+c to interrupt",
-                "thinking",
-                "running",
-                "background task",
-                "still thinking",
-                "working",
-            ],
-        ) {
+        } else if has_busy_interrupt_hint && has_busy_keywords {
             signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
             SessionState::BusyResponding
         } else if has_chat_input || contains_any(&normalized, &["claude"]) {
@@ -374,6 +387,21 @@ fn has_chat_indicators_after_permission(lines: &[&str]) -> bool {
         .any(|line| is_chat_keyword_line(line) || is_chat_input_line(line))
 }
 
+fn has_plain_chat_prompt_after_permission(lines: &[&str]) -> bool {
+    let Some(last_permission_anchor) = lines
+        .iter()
+        .rposition(|line| is_permission_anchor_line(line.trim()))
+    else {
+        return false;
+    };
+
+    lines
+        .iter()
+        .skip(last_permission_anchor + 1)
+        .copied()
+        .any(is_plain_chat_input_line)
+}
+
 fn is_chat_keyword_line(line: &str) -> bool {
     contains_any(
         &line.to_ascii_lowercase(),
@@ -414,7 +442,7 @@ fn is_permission_choice_line(line: &str) -> bool {
 
 fn is_chat_input_line(line: &str) -> bool {
     let trimmed = line.trim();
-    if trimmed == ">" || trimmed == "❯" {
+    if is_plain_chat_input_line(trimmed) {
         return true;
     }
 
@@ -425,6 +453,10 @@ fn is_chat_input_line(line: &str) -> bool {
     !rest.is_empty() && !starts_with_numbered_option(rest)
 }
 
+fn is_plain_chat_input_line(line: &str) -> bool {
+    matches!(line.trim(), ">" | "❯")
+}
+
 fn starts_with_numbered_option(line: &str) -> bool {
     let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digits > 0 && line[digits..].starts_with('.')
@@ -433,7 +465,8 @@ fn starts_with_numbered_option(line: &str) -> bool {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
-        Classifier, SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
+        Classifier, SIGNAL_CHAT_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
+        SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
         SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
 
@@ -469,9 +502,11 @@ mod tests {
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::PlanApprovalPrompt);
-        assert!(result
-            .signals
-            .contains(&String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS))
+        );
     }
 
     #[test]
@@ -484,6 +519,17 @@ mod tests {
                 .signals
                 .contains(&String::from("ambiguous-permission-chat"))
         );
+    }
+
+    #[test]
+    fn treats_stale_permission_prompt_above_plain_chat_prompt_as_chat_ready() {
+        let frame = "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain\n● Build confirmed the pre-existing broken links in multi-site.mdx\n※ recap: Shipping WISHLIST #24\n❯\n~/Projects/shipstream/bloodraven/docs (wishlist/upgrade-policy)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(!result.signals.contains(&String::from(SIGNAL_PERMISSION_KEYWORDS)));
+        assert!(result.recap_present);
     }
 
     #[test]
@@ -558,6 +604,14 @@ mod tests {
         let frame = "Still thinking\nPress Esc to interrupt";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::BusyResponding);
+    }
+
+    #[test]
+    fn recap_working_line_does_not_trigger_busy_without_interrupt_hint() {
+        let frame = "※ recap: Working DEV-2812 Cypress parallelization MR !2505; just pushed a fix and posted an MR note.\n❯";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.recap_present);
     }
 
     #[test]

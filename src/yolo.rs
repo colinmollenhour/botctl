@@ -64,7 +64,10 @@ pub fn write_yolo_record(
 }
 
 pub fn read_yolo_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<YoloRecord>> {
-    Ok(load_babysit_registration_by_pane_id(state_dir, pane_id)?.map(YoloRecord::from_registration))
+    Ok(
+        load_babysit_registration_by_pane_id(state_dir, pane_id)?
+            .map(YoloRecord::from_registration),
+    )
 }
 
 pub fn disable_yolo_record(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
@@ -91,7 +94,9 @@ mod tests {
             session_id: String::from("$1"),
             session_name: String::from("demo"),
             window_id: String::from("@2"),
+            window_index: 0,
             window_name: String::from("claude"),
+            pane_index: 0,
             current_command: String::from("claude"),
             current_path: String::from("/tmp/demo"),
             pane_active: true,
@@ -165,8 +170,7 @@ mod tests {
         second.current_path = workspace_root.display().to_string();
 
         write_yolo_record(&state_dir, &workspace.id, &first).expect("first record should store");
-        write_yolo_record(&state_dir, &workspace.id, &second)
-            .expect("second record should store");
+        write_yolo_record(&state_dir, &workspace.id, &second).expect("second record should store");
 
         assert!(
             disable_yolo_record(&state_dir, &first.pane_id)
@@ -177,8 +181,7 @@ mod tests {
                 .expect("existing disabled record should still report tracked")
         );
         assert!(
-            !disable_yolo_record(&state_dir, "%404")
-                .expect("missing record should report false")
+            !disable_yolo_record(&state_dir, "%404").expect("missing record should report false")
         );
 
         assert_eq!(

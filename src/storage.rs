@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -49,6 +49,13 @@ pub struct InstanceRecord {
 pub struct BabysitRegistrationRecord {
     pub instance: InstanceRecord,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceRuntimeState {
+    pub instance_id: String,
+    pub last_state: Option<String>,
+    pub wait_started_at_unix_ms: Option<i64>,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -194,7 +201,8 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
         2 => Ok(table_exists(connection, "workspaces")?
             && table_exists(connection, "instances")?
             && table_exists(connection, "pending_prompts")?
-            && table_exists(connection, "babysit_registrations")?),
+            && table_exists(connection, "babysit_registrations")?
+            && table_exists(connection, "instance_runtime_state")?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -436,7 +444,62 @@ fn ensure_v2_prompt_and_babysit_tables(connection: &Connection) -> AppResult<()>
         )",
         [],
     )?;
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS instance_runtime_state (\
+            instance_id TEXT PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE, \
+            last_state TEXT, \
+            wait_started_at_unix_ms INTEGER\
+        )",
+        [],
+    )?;
     Ok(())
+}
+
+pub fn sync_tmux_wait_state(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+    state: &str,
+    waiting: bool,
+) -> AppResult<Option<Duration>> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let instance = find_or_create_tmux_instance_with_connection(&connection, workspace_id, pane)?;
+    let existing = load_instance_runtime_state_with_connection(&connection, &instance.id)?;
+    let now_ms = current_unix_ms()?;
+
+    let wait_started_at_unix_ms = if waiting {
+        existing
+            .as_ref()
+            .and_then(|row| row.wait_started_at_unix_ms)
+            .unwrap_or(now_ms)
+    } else {
+        0
+    };
+
+    connection.execute(
+        "INSERT INTO instance_runtime_state (instance_id, last_state, wait_started_at_unix_ms) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(instance_id) DO UPDATE SET \
+             last_state = excluded.last_state, \
+             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms",
+        params![
+            instance.id,
+            state,
+            if waiting {
+                Some(wait_started_at_unix_ms)
+            } else {
+                None::<i64>
+            }
+        ],
+    )?;
+
+    if waiting {
+        Ok(Some(Duration::from_millis(
+            now_ms.saturating_sub(wait_started_at_unix_ms) as u64,
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 fn table_has_column(
@@ -919,6 +982,26 @@ fn load_instance_by_id(
         .optional()?)
 }
 
+fn load_instance_runtime_state_with_connection(
+    connection: &Connection,
+    instance_id: &str,
+) -> AppResult<Option<InstanceRuntimeState>> {
+    Ok(connection
+        .query_row(
+            "SELECT instance_id, last_state, wait_started_at_unix_ms \
+             FROM instance_runtime_state WHERE instance_id = ?1",
+            params![instance_id],
+            |row| {
+                Ok(InstanceRuntimeState {
+                    instance_id: row.get(0)?,
+                    last_state: row.get(1)?,
+                    wait_started_at_unix_ms: row.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRecord> {
     Ok(InstanceRecord {
         id: row.get(0)?,
@@ -964,6 +1047,15 @@ fn new_uuid() -> String {
     Uuid::now_v7().to_string()
 }
 
+fn current_unix_ms() -> AppResult<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AppError::new(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AppError::new("system clock timestamp overflowed i64"))?)
+}
+
 fn artifact_path(
     state_dir: &Path,
     subdir: &str,
@@ -999,7 +1091,7 @@ fn validate_artifact_path_token(label: &str, value: &str) -> AppResult<()> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;
 
@@ -1010,7 +1102,7 @@ mod tests {
         load_babysit_registration_by_pane_id, load_pending_prompt, migrate_state_db, open_state_db,
         resolve_workspace, resolve_workspace_for_path, runtime_artifacts_root, state_db_path,
         store_babysit_registration, store_pending_prompt, store_pending_prompt_for_tmux_instance,
-        table_exists, tape_artifact_path,
+        sync_tmux_wait_state, table_exists, tape_artifact_path,
     };
     use crate::tmux::TmuxPane;
 
@@ -1048,6 +1140,10 @@ mod tests {
         assert!(
             table_exists(&connection, "babysit_registrations")
                 .expect("babysit registrations should exist")
+        );
+        assert!(
+            table_exists(&connection, "instance_runtime_state")
+                .expect("instance runtime state should exist")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -1193,6 +1289,33 @@ mod tests {
     }
 
     #[test]
+    fn sync_tmux_wait_state_persists_wait_start_across_calls() {
+        let state_dir = unique_temp_dir("storage-runtime-state");
+        let workspace_root = unique_temp_dir("workspace-runtime-state");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+
+        let pane = sample_pane();
+        let first = sync_tmux_wait_state(&state_dir, &workspace.id, &pane, "ChatReady", true)
+            .expect("first sync should succeed")
+            .expect("first sync should return duration");
+        std::thread::sleep(Duration::from_millis(20));
+        let second = sync_tmux_wait_state(&state_dir, &workspace.id, &pane, "ChatReady", true)
+            .expect("second sync should succeed")
+            .expect("second sync should return duration");
+        let cleared =
+            sync_tmux_wait_state(&state_dir, &workspace.id, &pane, "BusyResponding", false)
+                .expect("clear sync should succeed");
+
+        assert!(second >= first);
+        assert!(cleared.is_none());
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
     fn migrate_state_db_upgrades_v1_rows_into_legacy_workspace() {
         let state_dir = unique_temp_dir("storage-migrate-v1");
         let _ = fs::remove_dir_all(&state_dir);
@@ -1278,7 +1401,9 @@ mod tests {
             session_id: String::from("$1"),
             session_name: String::from("demo"),
             window_id: String::from("@1"),
+            window_index: 0,
             window_name: String::from("claude"),
+            pane_index: 0,
             current_command: String::from("claude"),
             current_path: String::from("/tmp/demo"),
             pane_active: true,
