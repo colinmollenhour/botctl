@@ -3,6 +3,7 @@ pub enum SessionState {
     ChatReady,
     BusyResponding,
     PermissionDialog,
+    PlanApprovalPrompt,
     FolderTrustPrompt,
     SurveyPrompt,
     ExternalEditorActive,
@@ -16,6 +17,7 @@ impl SessionState {
             Self::ChatReady => "ChatReady",
             Self::BusyResponding => "BusyResponding",
             Self::PermissionDialog => "PermissionDialog",
+            Self::PlanApprovalPrompt => "PlanApprovalPrompt",
             Self::FolderTrustPrompt => "FolderTrustPrompt",
             Self::SurveyPrompt => "SurveyPrompt",
             Self::ExternalEditorActive => "ExternalEditorActive",
@@ -29,6 +31,7 @@ impl SessionState {
             "ChatReady" => Some(Self::ChatReady),
             "BusyResponding" => Some(Self::BusyResponding),
             "PermissionDialog" => Some(Self::PermissionDialog),
+            "PlanApprovalPrompt" => Some(Self::PlanApprovalPrompt),
             "FolderTrustPrompt" => Some(Self::FolderTrustPrompt),
             "SurveyPrompt" => Some(Self::SurveyPrompt),
             "ExternalEditorActive" => Some(Self::ExternalEditorActive),
@@ -40,6 +43,7 @@ impl SessionState {
 }
 
 pub const SIGNAL_PERMISSION_KEYWORDS: &str = "permission-keywords";
+pub const SIGNAL_PLAN_APPROVAL_KEYWORDS: &str = "plan-approval-keywords";
 pub const SIGNAL_CHAT_KEYWORDS: &str = "chat-keywords";
 pub const SIGNAL_AMBIGUOUS_PERMISSION_CHAT: &str = "ambiguous-permission-chat";
 pub const SIGNAL_FOLDER_TRUST_KEYWORDS: &str = "folder-trust-keywords";
@@ -103,6 +107,21 @@ impl Classifier {
             ) && contains_any(&normalized, &["yes", "no", "enter", "escape"]);
         let has_conflicting_chat_after_permission =
             has_permission_keywords && has_chat_indicators_after_permission(&lines);
+        let has_plan_approval_keywords = contains_any(
+            &normalized,
+            &[
+                "claude has written up a plan and is ready to execute",
+                "would you like to proceed?",
+            ],
+        ) && contains_any(
+            &normalized,
+            &[
+                "yes, and use auto mode",
+                "yes, manually approve edits",
+                "refine with ultraplan",
+                "shift+tab to approve with this feedback",
+            ],
+        );
         let mentions_self_settings_language = contains_any(
             &normalized,
             &[
@@ -127,6 +146,9 @@ impl Classifier {
         {
             signals.push(String::from(SIGNAL_FOLDER_TRUST_KEYWORDS));
             SessionState::FolderTrustPrompt
+        } else if has_plan_approval_keywords {
+            signals.push(String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS));
+            SessionState::PlanApprovalPrompt
         } else if has_permission_keywords && has_conflicting_chat_after_permission {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
             if mentions_self_settings_language {
@@ -411,7 +433,8 @@ fn starts_with_numbered_option(line: &str) -> bool {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
-        Classifier, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
+        Classifier, SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
+        SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
 
     #[test]
@@ -438,6 +461,17 @@ mod tests {
                 .signals
                 .contains(&String::from("ambiguous-permission-chat"))
         );
+    }
+
+    #[test]
+    fn classifies_plan_approval_prompt() {
+        let frame = "Claude has written up a plan and is ready to execute. Would you like to proceed?\n❯ 1. Yes, and use auto mode\n2. Yes, manually approve edits\n3. No, refine with Ultraplan on Claude Code on the web\n4. Tell Claude what to change\nshift+tab to approve with this feedback\nctrl-g to edit in Vim";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PlanApprovalPrompt);
+        assert!(result
+            .signals
+            .contains(&String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS)));
     }
 
     #[test]
