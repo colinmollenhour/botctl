@@ -54,6 +54,23 @@ pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
 pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
 pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
 
+const PERMISSION_KEYWORDS: &[&str] = &[
+    "allow once",
+    "allow for session",
+    "permission",
+    "do you want to proceed",
+    "do you want to allow claude to",
+    "claude wants to",
+    "don't ask again",
+    "unsandboxed",
+    "tab to amend",
+    "ctrl+e to explain",
+    "confirm action",
+    "approve",
+];
+
+const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "esc"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub source: String,
@@ -90,21 +107,8 @@ impl Classifier {
         let mut signals = Vec::new();
         let has_chat_input = lines.iter().copied().any(is_chat_keyword_line)
             || lines.iter().copied().any(is_chat_input_line);
-        let has_permission_keywords =
-            contains_any(
-                &normalized,
-                &[
-                    "allow once",
-                    "allow for session",
-                    "permission",
-                    "do you want to proceed",
-                    "unsandboxed",
-                    "tab to amend",
-                    "ctrl+e to explain",
-                    "confirm action",
-                    "approve",
-                ],
-            ) && contains_any(&normalized, &["yes", "no", "enter", "escape"]);
+        let has_permission_keywords = contains_any(&normalized, PERMISSION_KEYWORDS)
+            && contains_any(&normalized, PERMISSION_CONFIRM_KEYWORDS);
         let has_plain_chat_prompt_after_permission =
             has_permission_keywords && has_plain_chat_prompt_after_permission(&lines);
         let has_conflicting_chat_after_permission =
@@ -219,18 +223,7 @@ impl Classifier {
         ) {
             signals.push(String::from(SIGNAL_EXTERNAL_EDITOR_KEYWORDS));
             SessionState::ExternalEditorActive
-        } else if contains_any(
-            &normalized,
-            &[
-                "diff",
-                "review changes",
-                "accept",
-                "reject",
-                "view details",
-                "keep changes",
-                "discard changes",
-            ],
-        ) {
+        } else if has_diff_dialog_keywords(&normalized) {
             signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
         } else if has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords) {
@@ -372,6 +365,18 @@ fn contains_sensitive_claude_path(normalized: &str) -> bool {
     )
 }
 
+fn has_diff_dialog_keywords(normalized: &str) -> bool {
+    let has_diff_context = contains_any(normalized, &["review changes", "view details", "diff"]);
+    let has_diff_choice = contains_any(
+        normalized,
+        &["keep changes", "discard changes", "accept", "reject"],
+    );
+
+    // Require both the review context and a concrete choice so stale words like
+    // "reject" in scrollback do not masquerade as an active diff dialog.
+    has_diff_context && has_diff_choice
+}
+
 fn has_chat_indicators_after_permission(lines: &[&str]) -> bool {
     let Some(last_permission_anchor) = lines
         .iter()
@@ -414,22 +419,17 @@ fn is_permission_anchor_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     contains_any(
         &lower,
-        &[
-            "allow once",
-            "allow for session",
-            "permission",
-            "do you want to proceed",
-            "unsandboxed",
-            "tab to amend",
-            "ctrl+e to explain",
-            "confirm action",
-            "approve",
-            "enter confirms",
-            "enter to confirm",
-            "esc to cancel",
-            "escape to cancel",
-        ],
+        PERMISSION_KEYWORDS,
     ) || is_permission_choice_line(line)
+        || contains_any(
+            &lower,
+            &[
+                "enter confirms",
+                "enter to confirm",
+                "esc to cancel",
+                "escape to cancel",
+            ],
+        )
 }
 
 fn is_permission_choice_line(line: &str) -> bool {
@@ -473,8 +473,8 @@ fn starts_with_numbered_option(line: &str) -> bool {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
-        Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
-        SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
+        Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_DIFF_KEYWORDS,
+        SIGNAL_PERMISSION_KEYWORDS, SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
         SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
 
@@ -501,6 +501,19 @@ mod tests {
             !result
                 .signals
                 .contains(&String::from("ambiguous-permission-chat"))
+        );
+    }
+
+    #[test]
+    fn classifies_fetch_allow_dialog_as_permission() {
+        let frame = "Fetch\n\nhttps://docus.dev/raw/en/getting-started/studio.md\nClaude wants to fetch content from docus.dev\n\nDo you want to allow Claude to fetch this content?\n❯ 1. Yes\n2. Yes, and don't ask again for docus.dev\n3. No, and tell Claude what to do differently (esc)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
         );
     }
 
@@ -584,6 +597,17 @@ mod tests {
         let frame = "Review changes\nKeep changes\nDiscard changes\nView details";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::DiffDialog);
+    }
+
+    #[test]
+    fn ignores_stale_reject_word_in_chat_scrollback() {
+        let frame = "Want me to commit it? Once committed, run ./shell/scripts/sync-docs.sh push and it should take a handful of seconds and succeed.\nfix: sync-docs.sh push rewrite to avoid non-fast-forward reject\n● Committed as 37800bb8bd.\n※ recap: Goal was to sync DEV-2958 docs to the knowledge-base repo.\n❯\n~/Projects/shipstream/wms (master)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(!result.signals.contains(&String::from(SIGNAL_DIFF_KEYWORDS)));
+        assert!(result.recap_present);
     }
 
     #[test]

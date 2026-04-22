@@ -2472,6 +2472,7 @@ fn is_plausible_permission_prompt_title(title: &str) -> bool {
         return matches!(
             title,
             "Bash command"
+                | "Fetch"
                 | "Monitor"
                 | "JavaScript code"
                 | "TypeScript code"
@@ -4316,6 +4317,42 @@ mod tests {
         );
         assert_eq!(details.reason.as_deref(), Some("FG ready state"));
         assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn extracts_permission_prompt_details_from_fetch_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Fetch\n  https://docus.dev/raw/en/getting-started/studio.md\n  Claude wants to fetch content from docus.dev\nDo you want to allow Claude to fetch this content?\n❯ 1. Yes\n  2. Yes, and don't ask again for docus.dev\n  3. No, and tell Claude what to do differently (esc)",
+            ),
+            raw_source: String::from(
+                "Fetch\n  https://docus.dev/raw/en/getting-started/studio.md\n  Claude wants to fetch content from docus.dev\nDo you want to allow Claude to fetch this content?\n❯ 1. Yes\n  2. Yes, and don't ask again for docus.dev\n  3. No, and tell Claude what to do differently (esc)",
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Fetch");
+        assert_eq!(details.sandbox_mode, None);
+        assert_eq!(
+            details.command.as_deref(),
+            Some("https://docus.dev/raw/en/getting-started/studio.md")
+        );
+        assert_eq!(
+            details.reason.as_deref(),
+            Some("Claude wants to fetch content from docus.dev")
+        );
+        assert_eq!(
+            details.question.as_deref(),
+            Some("Do you want to allow Claude to fetch this content?")
+        );
         assert!(is_yolo_safe_to_approve(&inspected));
     }
 
