@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::{AppError, AppResult};
-use crate::permission_babysit::BabysitRecord;
+use crate::yolo::YoloRecord;
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
@@ -129,7 +129,7 @@ pub fn delete_pending_prompt(state_dir: &Path, session_name: &str) -> AppResult<
     )? > 0)
 }
 
-pub fn store_babysit_record(state_dir: &Path, record: &BabysitRecord) -> AppResult<()> {
+pub fn store_babysit_record(state_dir: &Path, record: &YoloRecord) -> AppResult<()> {
     let connection = open_bootstrapped_state_db(state_dir)?;
     connection.execute(
         "INSERT INTO babysit_registrations (\
@@ -162,7 +162,7 @@ pub fn store_babysit_record(state_dir: &Path, record: &BabysitRecord) -> AppResu
     Ok(())
 }
 
-pub fn load_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<BabysitRecord>> {
+pub fn load_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<YoloRecord>> {
     let connection = open_bootstrapped_state_db(state_dir)?;
     Ok(connection
         .query_row(
@@ -171,7 +171,7 @@ pub fn load_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<
              FROM babysit_registrations WHERE pane_id = ?1",
             params![pane_id],
             |row| {
-                Ok(BabysitRecord {
+                Ok(YoloRecord {
                     enabled: row.get(0)?,
                     pane_id: row.get(1)?,
                     pane_tty: row.get(2)?,

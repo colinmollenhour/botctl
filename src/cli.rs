@@ -27,8 +27,8 @@ pub enum Command {
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
-    PermissionBabysitStart(PermissionBabysitStartArgs),
-    PermissionBabysitStop(PermissionBabysitStopArgs),
+    YoloStart(YoloStartArgs),
+    YoloStop(YoloStopArgs),
     Help,
 }
 
@@ -191,7 +191,7 @@ pub struct SubmitPromptArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct PermissionBabysitStartArgs {
+pub struct YoloStartArgs {
     pub pane_id: Option<String>,
     pub all: bool,
     pub poll_ms: u64,
@@ -201,7 +201,7 @@ pub struct PermissionBabysitStartArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct PermissionBabysitStopArgs {
+pub struct YoloStopArgs {
     pub pane_id: Option<String>,
     pub all: bool,
     pub state_dir: Option<PathBuf>,
@@ -222,7 +222,7 @@ where
     match subcommand.as_str() {
         "start" => parse_start(rest),
         "attach" => parse_attach(rest),
-        "list-panes" | "list" => parse_list_panes(rest),
+        "list" => parse_list_panes(rest),
         "capture" => parse_capture(rest),
         "status" => parse_status(rest),
         "doctor" => parse_doctor(rest),
@@ -243,7 +243,7 @@ where
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
-        "yolo" | "permission-babysit" | "babysit" => parse_permission_babysit(rest),
+        "yolo" => parse_yolo(rest),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(AppError::new(format!("unknown subcommand: {other}"))),
     }
@@ -256,7 +256,7 @@ pub fn usage() -> String {
           Commands:\n\
             start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
             attach (--pane %ID|session:window.pane | --session NAME [--window NAME])\n\
-            list-panes|list [--all]\n\
+            list [--all]\n\
             capture --pane %ID|session:window.pane [--history-lines N]\n\
             status --pane %ID|session:window.pane [--history-lines N]\n\
             doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
@@ -365,7 +365,7 @@ fn parse_list_panes(args: Vec<String>) -> AppResult<Command> {
     while i < args.len() {
         match args[i].as_str() {
             "--all" => all = true,
-            flag => return Err(AppError::new(format!("unknown list-panes flag: {flag}"))),
+            flag => return Err(AppError::new(format!("unknown list flag: {flag}"))),
         }
         i += 1;
     }
@@ -1067,7 +1067,7 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     }))
 }
 
-fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
+fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
     let (mode, start_index) = match args.first().map(String::as_str) {
         Some("start") => ("start", 1),
         Some("stop") => ("stop", 1),
@@ -1119,8 +1119,8 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                     "yolo start requires exactly one of --pane or --all",
                 ));
             }
-            Ok(Command::PermissionBabysitStart(
-                PermissionBabysitStartArgs {
+            Ok(Command::YoloStart(
+                YoloStartArgs {
                     pane_id,
                     all,
                     poll_ms,
@@ -1153,7 +1153,7 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                     "yolo stop requires exactly one of --pane or --all",
                 ));
             }
-            Ok(Command::PermissionBabysitStop(PermissionBabysitStopArgs {
+            Ok(Command::YoloStop(YoloStopArgs {
                 pane_id,
                 all,
                 state_dir,
@@ -1243,20 +1243,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_panes_default_as_claude_only() {
-        let command = parse_args(vec![String::from("botctl"), String::from("list-panes")])
-            .expect("list-panes command should parse");
-
-        match command {
-            Command::ListPanes(args) => assert!(!args.all),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
     fn parses_list_alias() {
         let command = parse_args(vec![String::from("botctl"), String::from("list")])
-            .expect("list alias should parse");
+            .expect("list command should parse");
 
         match command {
             Command::ListPanes(args) => assert!(!args.all),
@@ -1265,13 +1254,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_panes_all_flag() {
+    fn parses_list_all_flag() {
         let command = parse_args(vec![
             String::from("botctl"),
-            String::from("list-panes"),
+            String::from("list"),
             String::from("--all"),
         ])
-        .expect("list-panes --all command should parse");
+        .expect("list --all command should parse");
 
         match command {
             Command::ListPanes(args) => assert!(args.all),
@@ -1853,7 +1842,7 @@ mod tests {
         .expect("yolo start should parse");
 
         match command {
-            Command::PermissionBabysitStart(args) => {
+            Command::YoloStart(args) => {
                 assert_eq!(args.pane_id.as_deref(), Some("%9"));
                 assert!(!args.all);
                 assert_eq!(args.poll_ms, 250);
@@ -1876,7 +1865,7 @@ mod tests {
         .expect("yolo all should parse");
 
         match command {
-            Command::PermissionBabysitStart(args) => {
+            Command::YoloStart(args) => {
                 assert!(args.all);
                 assert!(args.pane_id.is_none());
                 assert_eq!(args.format, super::BabysitFormat::Jsonl);
@@ -1896,7 +1885,7 @@ mod tests {
         .expect("yolo foreground mode should parse");
 
         match command {
-            Command::PermissionBabysitStart(args) => {
+            Command::YoloStart(args) => {
                 assert_eq!(args.pane_id.as_deref(), Some("%9"));
                 assert!(!args.all);
                 assert_eq!(args.poll_ms, 1000);
@@ -1918,7 +1907,7 @@ mod tests {
         .expect("yolo live preview should parse");
 
         match command {
-            Command::PermissionBabysitStart(args) => {
+            Command::YoloStart(args) => {
                 assert_eq!(args.pane_id.as_deref(), Some("%9"));
                 assert!(args.live_preview);
             }
@@ -1991,7 +1980,7 @@ mod tests {
         .expect("yolo stop should parse");
 
         match command {
-            Command::PermissionBabysitStop(args) => assert!(args.all),
+            Command::YoloStop(args) => assert!(args.all),
             other => panic!("unexpected command: {other:?}"),
         }
     }

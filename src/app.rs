@@ -24,15 +24,14 @@ use crate::classifier::{
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, KeepGoingArgs,
-    ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PermissionBabysitStartArgs,
-    PermissionBabysitStopArgs, PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs,
-    ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs,
+    ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
+    RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
+    SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
-use crate::permission_babysit::{
-    BabysitRecord, disable_babysit_record, list_babysit_pane_ids, read_babysit_record,
-    write_babysit_record,
+use crate::yolo::{
+    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
 };
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
@@ -150,8 +149,8 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
-        Command::PermissionBabysitStart(args) => run_permission_babysit_start(args),
-        Command::PermissionBabysitStop(args) => run_permission_babysit_stop(args),
+        Command::YoloStart(args) => run_yolo_start(args),
+        Command::YoloStop(args) => run_yolo_stop(args),
         Command::Help => Ok(crate::cli::usage()),
     }
 }
@@ -591,8 +590,8 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                 continue;
             }
 
-            match permission_babysit_action_for_state(classification.state) {
-                PermissionBabysitAction::ApprovePermission => {
+            match yolo_action_for_state(classification.state) {
+                YoloAction::ApprovePermission => {
                     if is_yolo_safe_to_approve(&inspected) {
                         emit_babysit_output(format!(
                             "keep-going pane={} action=approve",
@@ -608,7 +607,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                         continue;
                     }
                 }
-                PermissionBabysitAction::DismissSurvey => {
+                YoloAction::DismissSurvey => {
                     emit_babysit_output(format!(
                         "keep-going pane={} action=dismiss-survey",
                         pane.pane_id
@@ -622,7 +621,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                     thread::sleep(Duration::from_millis(args.poll_ms));
                     continue;
                 }
-                PermissionBabysitAction::Wait => {}
+                YoloAction::Wait => {}
             }
         } else if let Some(error) = keep_going_no_yolo_blocker(classification, &pane.pane_id) {
             return Err(error);
@@ -1078,7 +1077,7 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     ))
 }
 
-fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<String> {
+fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -1106,13 +1105,13 @@ fn run_permission_babysit_start(args: PermissionBabysitStartArgs) -> AppResult<S
     }
 }
 
-fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<String> {
+fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     if args.all {
         let mut out = Vec::new();
         for pane_id in tracked_pane_ids(&state_dir)? {
             let pane_label = babysit_pane_label(&state_dir, &pane_id);
-            let disabled = disable_babysit_record(&state_dir, &pane_id)?;
+            let disabled = disable_yolo_record(&state_dir, &pane_id)?;
             out.push(render_babysit_stop_event(
                 &pane_label,
                 &pane_id,
@@ -1133,7 +1132,7 @@ fn run_permission_babysit_stop(args: PermissionBabysitStopArgs) -> AppResult<Str
             None => raw_target.to_string(),
         };
         let pane_label = babysit_pane_label(&state_dir, &pane_id);
-        let disabled = disable_babysit_record(&state_dir, &pane_id)?;
+        let disabled = disable_yolo_record(&state_dir, &pane_id)?;
         Ok(render_babysit_stop_event(
             &pane_label,
             &pane_id,
@@ -1164,7 +1163,7 @@ fn run_yolo_single(
     interrupted: Arc<AtomicBool>,
 ) -> AppResult<String> {
     let pane = resolve_pane_by_id(client, pane_id)?;
-    if matches!(read_babysit_record(state_dir, &pane.pane_id)?, Some(record) if record.enabled) {
+    if matches!(read_yolo_record(state_dir, &pane.pane_id)?, Some(record) if record.enabled) {
         return Err(AppError::new(format!(
             "yolo is already active for pane {}",
             pane.pane_id
@@ -1173,9 +1172,9 @@ fn run_yolo_single(
     ensure_pane_owned_by_claude(&pane)?;
     let bindings = load_automation_keybindings(None)?;
     let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
-    let record = BabysitRecord::from_pane(&pane);
+    let record = YoloRecord::from_pane(&pane);
     let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
-    let record_path = write_babysit_record(state_dir, &record)?;
+    let record_path = write_yolo_record(state_dir, &record)?;
     emit_babysit_output(render_babysit_start_event(
         &pane_label,
         &pane.pane_id,
@@ -1203,7 +1202,7 @@ fn loop_yolo_pane(
     client: &TmuxClient,
     state_dir: &Path,
     pane: TmuxPane,
-    record: BabysitRecord,
+    record: YoloRecord,
     pane_label: String,
     poll_ms: u64,
     live_preview: bool,
@@ -1271,8 +1270,8 @@ fn loop_yolo_pane(
             ))?;
             last_state = Some(classification.state);
         }
-        match permission_babysit_action_for_state(classification.state) {
-            PermissionBabysitAction::ApprovePermission => {
+        match yolo_action_for_state(classification.state) {
+            YoloAction::ApprovePermission => {
                 if !is_yolo_safe_to_approve(&current_view) {
                     thread::sleep(Duration::from_millis(poll_ms));
                     continue;
@@ -1307,7 +1306,7 @@ fn loop_yolo_pane(
                 ))?;
                 last_state = Some(after.classification.state);
             }
-            PermissionBabysitAction::DismissSurvey => {
+            YoloAction::DismissSurvey => {
                 emit_babysit_output(render_babysit_action_event(
                     &pane_label,
                     &pane.pane_id,
@@ -1338,7 +1337,7 @@ fn loop_yolo_pane(
                 ))?;
                 last_state = Some(after.classification.state);
             }
-            PermissionBabysitAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
+            YoloAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
         }
     }
 }
@@ -1365,9 +1364,9 @@ fn run_yolo_all(
             if tracked.contains_key(&pane.pane_id) {
                 continue;
             }
-            let record = BabysitRecord::from_pane(&pane);
+            let record = YoloRecord::from_pane(&pane);
             let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
-            let record_path = write_babysit_record(state_dir, &record)?;
+            let record_path = write_yolo_record(state_dir, &record)?;
             emit_babysit_output(render_babysit_start_event(
                 &pane_label,
                 &pane.pane_id,
@@ -1439,8 +1438,8 @@ fn run_yolo_all(
                 ))?;
                 tracked_pane.last_state = Some(classification);
             }
-            match permission_babysit_action_for_state(classification) {
-                PermissionBabysitAction::ApprovePermission => {
+            match yolo_action_for_state(classification) {
+                YoloAction::ApprovePermission => {
                     if !is_yolo_safe_to_approve(&current_view) {
                         continue;
                     }
@@ -1474,7 +1473,7 @@ fn run_yolo_all(
                     ))?;
                     tracked_pane.last_state = Some(after.classification.state);
                 }
-                PermissionBabysitAction::DismissSurvey => {
+                YoloAction::DismissSurvey => {
                     emit_babysit_output(render_babysit_action_event(
                         &tracked_pane.pane_label,
                         &pane_id,
@@ -1505,7 +1504,7 @@ fn run_yolo_all(
                     ))?;
                     tracked_pane.last_state = Some(after.classification.state);
                 }
-                PermissionBabysitAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
+                YoloAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
             }
         }
         thread::sleep(Duration::from_millis(poll_ms));
@@ -1513,18 +1512,18 @@ fn run_yolo_all(
 }
 
 struct TrackedYoloPane {
-    record: BabysitRecord,
+    record: YoloRecord,
     pane_label: String,
     last_state: Option<SessionState>,
     poll_count: usize,
 }
 
 fn yolo_record_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
-    Ok(matches!(read_babysit_record(state_dir, pane_id)?, Some(record) if record.enabled))
+    Ok(matches!(read_yolo_record(state_dir, pane_id)?, Some(record) if record.enabled))
 }
 
 fn tracked_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
-    list_babysit_pane_ids(state_dir)
+    list_yolo_pane_ids(state_dir)
 }
 
 fn cleanup_all_babysit_records<'a, I: IntoIterator<Item = &'a String>>(
@@ -1538,7 +1537,7 @@ fn cleanup_all_babysit_records<'a, I: IntoIterator<Item = &'a String>>(
 }
 
 fn cleanup_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<()> {
-    let _ = disable_babysit_record(state_dir, pane_id)?;
+    let _ = disable_yolo_record(state_dir, pane_id)?;
     Ok(())
 }
 
@@ -1550,22 +1549,22 @@ fn install_babysit_sigint_handler(flag: Arc<AtomicBool>) -> AppResult<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PermissionBabysitAction {
+enum YoloAction {
     Wait,
     ApprovePermission,
     DismissSurvey,
 }
 
-fn permission_babysit_action_for_state(state: SessionState) -> PermissionBabysitAction {
+fn yolo_action_for_state(state: SessionState) -> YoloAction {
     match state {
         SessionState::ChatReady
         | SessionState::BusyResponding
         | SessionState::FolderTrustPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
-        | SessionState::Unknown => PermissionBabysitAction::Wait,
-        SessionState::PermissionDialog => PermissionBabysitAction::ApprovePermission,
-        SessionState::SurveyPrompt => PermissionBabysitAction::DismissSurvey,
+        | SessionState::Unknown => YoloAction::Wait,
+        SessionState::PermissionDialog => YoloAction::ApprovePermission,
+        SessionState::SurveyPrompt => YoloAction::DismissSurvey,
     }
 }
 
@@ -1598,7 +1597,7 @@ fn pane_label_from_path(current_path: &str, fallback: &str) -> String {
 }
 
 fn babysit_pane_label(state_dir: &std::path::Path, pane_id: &str) -> String {
-    read_babysit_record(state_dir, pane_id)
+    read_yolo_record(state_dir, pane_id)
         .ok()
         .flatten()
         .map(|record| pane_label_from_path(&record.current_path, pane_id))
@@ -1716,7 +1715,7 @@ fn render_babysit_start_event(
     pane_id: &str,
     poll_ms: u64,
     live_preview: bool,
-    record: &BabysitRecord,
+    record: &YoloRecord,
     record_path: &Path,
     format: BabysitFormat,
     use_color: bool,
@@ -2861,10 +2860,10 @@ mod tests {
 
     use super::{
         AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
-        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, PermissionBabysitAction, RecoveryAction,
+        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, RecoveryAction, YoloAction,
         cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
         extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_babysit_action_for_state,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, yolo_action_for_state,
         permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
         recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
         render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
@@ -2876,7 +2875,7 @@ mod tests {
         Classification, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
     use crate::cli::PreparePromptArgs;
-    use crate::permission_babysit::{BabysitRecord, read_babysit_record, write_babysit_record};
+    use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
     use crate::prompt::pending_prompt_text;
     use crate::storage::{CURRENT_SCHEMA_VERSION, state_db_path};
     use crate::tmux::TmuxPane;
@@ -3203,28 +3202,28 @@ mod tests {
     #[test]
     fn permission_babysit_only_approves_permission_dialogs() {
         assert_eq!(
-            permission_babysit_action_for_state(SessionState::PermissionDialog),
-            PermissionBabysitAction::ApprovePermission
+            yolo_action_for_state(SessionState::PermissionDialog),
+            YoloAction::ApprovePermission
         );
         assert_eq!(
-            permission_babysit_action_for_state(SessionState::SurveyPrompt),
-            PermissionBabysitAction::DismissSurvey
+            yolo_action_for_state(SessionState::SurveyPrompt),
+            YoloAction::DismissSurvey
         );
         assert_eq!(
-            permission_babysit_action_for_state(SessionState::ChatReady),
-            PermissionBabysitAction::Wait
+            yolo_action_for_state(SessionState::ChatReady),
+            YoloAction::Wait
         );
         assert_eq!(
-            permission_babysit_action_for_state(SessionState::BusyResponding),
-            PermissionBabysitAction::Wait
+            yolo_action_for_state(SessionState::BusyResponding),
+            YoloAction::Wait
         );
         assert_eq!(
-            permission_babysit_action_for_state(SessionState::FolderTrustPrompt),
-            PermissionBabysitAction::Wait
+            yolo_action_for_state(SessionState::FolderTrustPrompt),
+            YoloAction::Wait
         );
         assert_eq!(
-            permission_babysit_action_for_state(SessionState::Unknown),
-            PermissionBabysitAction::Wait
+            yolo_action_for_state(SessionState::Unknown),
+            YoloAction::Wait
         );
     }
 
@@ -3237,8 +3236,8 @@ mod tests {
             SessionState::Unknown,
         ] {
             assert_eq!(
-                permission_babysit_action_for_state(state),
-                PermissionBabysitAction::Wait
+                yolo_action_for_state(state),
+                YoloAction::Wait
             );
         }
     }
@@ -4058,7 +4057,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             "%20",
             500,
             false,
-            &BabysitRecord {
+            &YoloRecord {
                 enabled: true,
                 pane_id: String::from("%20"),
                 pane_tty: String::from("/dev/pts/1"),
@@ -4100,7 +4099,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
         let dir = std::env::temp_dir().join(unique);
         let _ = std::fs::remove_dir_all(&dir);
         let pane_id = "%99";
-        let record = BabysitRecord {
+        let record = YoloRecord {
             enabled: true,
             pane_id: pane_id.to_string(),
             pane_tty: String::from("/dev/pts/9"),
@@ -4112,9 +4111,9 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             current_command: String::from("claude"),
             current_path: String::from("/tmp"),
         };
-        write_babysit_record(&dir, &record).expect("write record");
+        write_yolo_record(&dir, &record).expect("write record");
         cleanup_babysit_record(&dir, pane_id).expect("cleanup record");
-        let reread = read_babysit_record(&dir, pane_id)
+        let reread = read_yolo_record(&dir, pane_id)
             .expect("read record")
             .expect("record exists");
         assert!(!reread.enabled);

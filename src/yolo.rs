@@ -8,7 +8,7 @@ use crate::storage::{
 use crate::tmux::TmuxPane;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BabysitRecord {
+pub struct YoloRecord {
     pub enabled: bool,
     pub pane_id: String,
     pub pane_tty: String,
@@ -21,7 +21,7 @@ pub struct BabysitRecord {
     pub current_path: String,
 }
 
-impl BabysitRecord {
+impl YoloRecord {
     pub fn from_pane(pane: &TmuxPane) -> Self {
         Self {
             enabled: true,
@@ -47,20 +47,20 @@ impl BabysitRecord {
     }
 }
 
-pub fn write_babysit_record(state_dir: &Path, record: &BabysitRecord) -> AppResult<PathBuf> {
+pub fn write_yolo_record(state_dir: &Path, record: &YoloRecord) -> AppResult<PathBuf> {
     store_babysit_record(state_dir, record)?;
     Ok(state_db_path(state_dir))
 }
 
-pub fn read_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<BabysitRecord>> {
+pub fn read_yolo_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<YoloRecord>> {
     load_babysit_record(state_dir, pane_id)
 }
 
-pub fn disable_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
+pub fn disable_yolo_record(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
     storage_disable_babysit_record(state_dir, pane_id)
 }
 
-pub fn list_babysit_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
+pub fn list_yolo_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
     list_babysit_record_pane_ids(state_dir)
 }
 
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn record_round_trips_and_matches() {
         let pane = sample_pane();
-        let record = BabysitRecord::from_pane(&pane);
+        let record = YoloRecord::from_pane(&pane);
         assert!(record.matches_pane(&pane));
     }
 
@@ -102,12 +102,12 @@ mod tests {
         let state_dir = unique_temp_dir("permission-babysit-round-trip");
         let _ = fs::remove_dir_all(&state_dir);
 
-        let record = BabysitRecord::from_pane(&sample_pane());
-        let stored_path = write_babysit_record(&state_dir, &record).expect("record should store");
+        let record = YoloRecord::from_pane(&sample_pane());
+        let stored_path = write_yolo_record(&state_dir, &record).expect("record should store");
 
         assert_eq!(stored_path, state_db_path(&state_dir));
         assert_eq!(
-            read_babysit_record(&state_dir, &record.pane_id).expect("record should load"),
+            read_yolo_record(&state_dir, &record.pane_id).expect("record should load"),
             Some(record)
         );
 
@@ -119,7 +119,7 @@ mod tests {
         let state_dir = unique_temp_dir("permission-babysit-disable-list");
         let _ = fs::remove_dir_all(&state_dir);
 
-        let first = BabysitRecord::from_pane(&sample_pane());
+        let first = YoloRecord::from_pane(&sample_pane());
         let mut second_pane = sample_pane();
         second_pane.pane_id = String::from("%22");
         second_pane.pane_tty = String::from("/dev/pts/22");
@@ -129,38 +129,38 @@ mod tests {
         second_pane.window_id = String::from("@22");
         second_pane.window_name = String::from("claude-22");
         second_pane.current_path = String::from("/tmp/demo-22");
-        let second = BabysitRecord::from_pane(&second_pane);
+        let second = YoloRecord::from_pane(&second_pane);
 
-        write_babysit_record(&state_dir, &first).expect("first record should store");
-        write_babysit_record(&state_dir, &second).expect("second record should store");
+        write_yolo_record(&state_dir, &first).expect("first record should store");
+        write_yolo_record(&state_dir, &second).expect("second record should store");
 
         assert!(
-            disable_babysit_record(&state_dir, &first.pane_id)
+            disable_yolo_record(&state_dir, &first.pane_id)
                 .expect("existing record should disable")
         );
         assert!(
-            disable_babysit_record(&state_dir, &first.pane_id)
+            disable_yolo_record(&state_dir, &first.pane_id)
                 .expect("existing disabled record should still report tracked")
         );
         assert!(
-            !disable_babysit_record(&state_dir, "%404")
+            !disable_yolo_record(&state_dir, "%404")
                 .expect("missing record should report false")
         );
 
         assert_eq!(
-            list_babysit_pane_ids(&state_dir).expect("pane ids should list"),
+            list_yolo_pane_ids(&state_dir).expect("pane ids should list"),
             vec![String::from("%1"), String::from("%22")]
         );
 
         assert_eq!(
-            read_babysit_record(&state_dir, &first.pane_id)
+            read_yolo_record(&state_dir, &first.pane_id)
                 .expect("disabled record should load")
                 .expect("disabled record should still exist")
                 .enabled,
             false
         );
         assert_eq!(
-            read_babysit_record(&state_dir, &second.pane_id)
+            read_yolo_record(&state_dir, &second.pane_id)
                 .expect("second record should load")
                 .expect("second record should still exist")
                 .enabled,
