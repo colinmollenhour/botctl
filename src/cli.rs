@@ -169,6 +169,7 @@ pub struct InstallBindingsArgs {
 pub struct PreparePromptArgs {
     pub session_name: String,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
     pub source: Option<PathBuf>,
     pub text: Option<String>,
 }
@@ -177,6 +178,7 @@ pub struct PreparePromptArgs {
 pub struct EditorHelperArgs {
     pub session_name: String,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
     pub source: Option<PathBuf>,
     pub target: PathBuf,
     pub keep_pending: bool,
@@ -187,6 +189,7 @@ pub struct SubmitPromptArgs {
     pub session_name: String,
     pub pane_id: String,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
     pub source: Option<PathBuf>,
     pub text: Option<String>,
     pub submit_delay_ms: u64,
@@ -200,6 +203,7 @@ pub struct PermissionBabysitStartArgs {
     pub live_preview: bool,
     pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +211,7 @@ pub struct PermissionBabysitStopArgs {
     pub pane_id: Option<String>,
     pub all: bool,
     pub state_dir: Option<PathBuf>,
+    pub workspace: Option<String>,
 }
 
 pub fn parse_args<I>(args: I) -> AppResult<Command>
@@ -276,11 +281,11 @@ pub fn usage() -> String {
             continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)\n\
             auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]\n\
             keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
-            prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
-            editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
-            submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
-            yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]\n\
-            yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH]\n",
+            prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]\n\
+            editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET\n\
+            submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
+            yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]\n\
+            yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]\n",
     )
 }
 
@@ -929,6 +934,7 @@ fn validate_optional_prompt_input(
 fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut state_dir = None;
+    let mut workspace = None;
     let mut source = None;
     let mut text = None;
 
@@ -940,6 +946,9 @@ fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
             }
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--workspace" => {
+                workspace = Some(read_value(&args, &mut i, "--workspace")?);
             }
             "--source" => {
                 source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
@@ -963,6 +972,7 @@ fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::PreparePrompt(PreparePromptArgs {
         session_name,
         state_dir,
+        workspace,
         source,
         text,
     }))
@@ -971,6 +981,7 @@ fn parse_prepare_prompt(args: Vec<String>) -> AppResult<Command> {
 fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut state_dir = None;
+    let mut workspace = None;
     let mut source = None;
     let mut keep_pending = false;
     let mut target = None;
@@ -983,6 +994,9 @@ fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
             }
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--workspace" => {
+                workspace = Some(read_value(&args, &mut i, "--workspace")?);
             }
             "--source" => {
                 source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
@@ -1014,6 +1028,7 @@ fn parse_editor_helper(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::EditorHelper(EditorHelperArgs {
         session_name,
         state_dir,
+        workspace,
         source,
         target,
         keep_pending,
@@ -1024,6 +1039,7 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     let mut session_name = None;
     let mut pane_id = None;
     let mut state_dir = None;
+    let mut workspace = None;
     let mut source = None;
     let mut text = None;
     let mut submit_delay_ms = 250u64;
@@ -1039,6 +1055,9 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
             }
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            "--workspace" => {
+                workspace = Some(read_value(&args, &mut i, "--workspace")?);
             }
             "--source" => {
                 source = Some(PathBuf::from(read_value(&args, &mut i, "--source")?));
@@ -1073,6 +1092,7 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
         session_name,
         pane_id,
         state_dir,
+        workspace,
         source,
         text,
         submit_delay_ms,
@@ -1094,6 +1114,7 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
             let mut live_preview = false;
             let mut format = BabysitFormat::Human;
             let mut state_dir = None;
+            let mut workspace = None;
             let mut i = start_index;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1114,6 +1135,9 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                     }
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+                    }
+                    "--workspace" => {
+                        workspace = Some(read_value(&args, &mut i, "--workspace")?);
                     }
                     flag => {
                         return Err(AppError::new(format!("unknown yolo flag: {flag}")));
@@ -1139,6 +1163,7 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                     live_preview,
                     format,
                     state_dir,
+                    workspace,
                 },
             ))
         }
@@ -1146,6 +1171,7 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
             let mut pane_id = None;
             let mut all = false;
             let mut state_dir = None;
+            let mut workspace = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1153,6 +1179,9 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                     "--all" => all = true,
                     "--state-dir" => {
                         state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+                    }
+                    "--workspace" => {
+                        workspace = Some(read_value(&args, &mut i, "--workspace")?);
                     }
                     flag => {
                         return Err(AppError::new(format!("unknown yolo flag: {flag}")));
@@ -1169,6 +1198,7 @@ fn parse_permission_babysit(args: Vec<String>) -> AppResult<Command> {
                 pane_id,
                 all,
                 state_dir,
+                workspace,
             }))
         }
         _ => Err(AppError::new("yolo requires start or stop subcommand")),

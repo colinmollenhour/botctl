@@ -10,3 +10,4 @@ pub mod screen_model;
 pub mod serve;
 pub mod storage;
 pub mod tmux;
+pub mod workspace;

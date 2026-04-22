@@ -516,17 +516,24 @@ Purpose: prepare a prompt payload for a session in the state database.
 
 Syntax:
 ```bash
-botctl prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]
+botctl prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]
 ```
 
 Flags:
 - `--session NAME` (required)
 - `--state-dir PATH` (optional; overrides the default state root)
+- `--workspace PATH|UUID` (optional; defaults to the cwd workspace)
 - `--source PATH` or `--text TEXT` (exactly one required)
 
-Targeting: session only.
+Targeting: session plus a resolved workspace.
 
 Safety: refuses if both prompt inputs are provided or if neither is provided.
+
+Workspace resolution:
+- UUID values resolve a previously known botctl workspace
+- path values may be absolute or relative to the current working directory
+- Git-backed paths collapse to the canonical worktree root
+- non-Git paths use the resolved path itself as the workspace root
 
 Example:
 ```bash
@@ -539,17 +546,18 @@ Purpose: generate an editor target file for the prompt workflow.
 
 Syntax:
 ```bash
-botctl editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET
+botctl editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET
 ```
 
 Flags:
 - `--session NAME` (required)
 - `--state-dir PATH` (optional; overrides the default state root)
+- `--workspace PATH|UUID` (optional; defaults to the cwd workspace)
 - `--source PATH` (optional)
 - `--keep-pending` (optional)
 - `TARGET` (required positional path)
 
-Targeting: session plus a single positional target path.
+Targeting: session, workspace, and a single positional target path.
 
 Safety: refuses unknown flags and multiple positional targets.
 
@@ -564,17 +572,18 @@ Purpose: resolve prompt text from `--text` or `--source`, stage it in the state 
 
 Syntax:
 ```bash
-botctl submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]
+botctl submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]
 ```
 
 Flags:
 - `--session NAME` (required)
 - `--pane %ID|session:window.pane` (required)
 - `--state-dir PATH` (optional; overrides the default state root)
+- `--workspace PATH|UUID` (optional; must match the target pane workspace when provided)
 - `--source PATH` or `--text TEXT` (exactly one required)
 - `--submit-delay-ms N` (default: `250`, must be at least `1`)
 
-Targeting: session plus explicit pane.
+Targeting: session plus explicit pane; workspace defaults from the pane path.
 
 Safety: refuses if both prompt inputs are provided, if neither is provided, or if `--submit-delay-ms 0` is used.
 
@@ -591,8 +600,8 @@ Purpose: start or stop the permission babysit loop.
 
 Syntax:
 ```bash
-botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH]
-botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH]
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
 botctl permission-babysit [same as yolo]
 botctl babysit [same as yolo]
 ```
@@ -610,14 +619,18 @@ Start flags:
 - `--format human|jsonl` (default: `human`)
 - `--live-preview` (default: off)
 - `--state-dir PATH` (optional; overrides the default state root)
+- `--workspace PATH|UUID` (optional; filters `--all` or validates the target pane workspace)
 
 Stop flags:
 - `--pane %ID|session:window.pane` or `--all` (exactly one required)
 - `--state-dir PATH` (optional; overrides the default state root)
+- `--workspace PATH|UUID` (optional; filters `stop --all`)
 
 Targeting:
 - `start` can target one pane or scan all Claude panes with `--all`
-- `stop --all` disables all tracked babysit registrations stored in `<state-root>/state.db`
+- `start --all` and `stop --all` remain global by default
+- `--workspace` limits `--all` operations to one workspace
+- `stop --all` disables tracked babysit registrations stored in `<state-root>/state.db`
 - neither mode allows mixing `--pane` and `--all`
 
 Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed targets.

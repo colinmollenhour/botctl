@@ -2,13 +2,17 @@ use std::path::{Path, PathBuf};
 
 use crate::app::AppResult;
 use crate::storage::{
-    disable_babysit_record as storage_disable_babysit_record, list_babysit_record_pane_ids,
-    load_babysit_record, state_db_path, store_babysit_record,
+    BabysitRegistrationRecord,
+    disable_babysit_registration_by_pane_id as storage_disable_babysit_record,
+    list_babysit_registration_pane_ids, load_babysit_registration_by_pane_id, state_db_path,
+    store_babysit_registration,
 };
 use crate::tmux::TmuxPane;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BabysitRecord {
+    pub instance_id: String,
+    pub workspace_id: String,
     pub enabled: bool,
     pub pane_id: String,
     pub pane_tty: String,
@@ -22,18 +26,21 @@ pub struct BabysitRecord {
 }
 
 impl BabysitRecord {
-    pub fn from_pane(pane: &TmuxPane) -> Self {
+    pub fn from_registration(registration: BabysitRegistrationRecord) -> Self {
+        let instance = registration.instance;
         Self {
-            enabled: true,
-            pane_id: pane.pane_id.clone(),
-            pane_tty: pane.pane_tty.clone(),
-            pane_pid: pane.pane_pid,
-            session_id: pane.session_id.clone(),
-            session_name: pane.session_name.clone(),
-            window_id: pane.window_id.clone(),
-            window_name: pane.window_name.clone(),
-            current_command: pane.current_command.clone(),
-            current_path: pane.current_path.clone(),
+            instance_id: instance.id,
+            workspace_id: instance.workspace_id,
+            enabled: registration.enabled,
+            pane_id: instance.pane_id.unwrap_or_default(),
+            pane_tty: instance.pane_tty.unwrap_or_default(),
+            pane_pid: instance.pane_pid,
+            session_id: instance.session_id.unwrap_or_default(),
+            session_name: instance.session_name,
+            window_id: instance.window_id.unwrap_or_default(),
+            window_name: instance.window_name.unwrap_or_default(),
+            current_command: instance.current_command.unwrap_or_default(),
+            current_path: instance.current_path.unwrap_or_default(),
         }
     }
 
@@ -47,21 +54,29 @@ impl BabysitRecord {
     }
 }
 
-pub fn write_babysit_record(state_dir: &Path, record: &BabysitRecord) -> AppResult<PathBuf> {
-    store_babysit_record(state_dir, record)?;
+pub fn write_babysit_record(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+) -> AppResult<PathBuf> {
+    store_babysit_registration(state_dir, workspace_id, pane, true)?;
     Ok(state_db_path(state_dir))
 }
 
 pub fn read_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<Option<BabysitRecord>> {
-    load_babysit_record(state_dir, pane_id)
+    Ok(load_babysit_registration_by_pane_id(state_dir, pane_id)?
+        .map(BabysitRecord::from_registration))
 }
 
 pub fn disable_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
     storage_disable_babysit_record(state_dir, pane_id)
 }
 
-pub fn list_babysit_pane_ids(state_dir: &Path) -> AppResult<Vec<String>> {
-    list_babysit_record_pane_ids(state_dir)
+pub fn list_babysit_pane_ids(
+    state_dir: &Path,
+    workspace_id: Option<&str>,
+) -> AppResult<Vec<String>> {
+    list_babysit_registration_pane_ids(state_dir, workspace_id)
 }
 
 #[cfg(any(test, rust_analyzer))]
@@ -93,22 +108,42 @@ mod tests {
     #[test]
     fn record_round_trips_and_matches() {
         let pane = sample_pane();
-        let record = BabysitRecord::from_pane(&pane);
+        let record = BabysitRecord {
+            instance_id: String::from("instance-1"),
+            workspace_id: String::from("workspace-1"),
+            enabled: true,
+            pane_id: pane.pane_id.clone(),
+            pane_tty: pane.pane_tty.clone(),
+            pane_pid: pane.pane_pid,
+            session_id: pane.session_id.clone(),
+            session_name: pane.session_name.clone(),
+            window_id: pane.window_id.clone(),
+            window_name: pane.window_name.clone(),
+            current_command: pane.current_command.clone(),
+            current_path: pane.current_path.clone(),
+        };
         assert!(record.matches_pane(&pane));
     }
 
     #[test]
     fn sqlite_backed_babysit_record_round_trips_by_pane_id() {
         let state_dir = unique_temp_dir("permission-babysit-round-trip");
+        let workspace_root = unique_temp_dir("permission-babysit-workspace");
         let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = crate::storage::resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
 
-        let record = BabysitRecord::from_pane(&sample_pane());
-        let stored_path = write_babysit_record(&state_dir, &record).expect("record should store");
+        let pane = sample_pane();
+        let stored_path =
+            write_babysit_record(&state_dir, &workspace.id, &pane).expect("record should store");
 
         assert_eq!(stored_path, state_db_path(&state_dir));
         assert_eq!(
-            read_babysit_record(&state_dir, &record.pane_id).expect("record should load"),
-            Some(record)
+            read_babysit_record(&state_dir, &pane.pane_id)
+                .expect("record should load")
+                .map(|record| record.matches_pane(&pane)),
+            Some(true)
         );
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -117,9 +152,13 @@ mod tests {
     #[test]
     fn sqlite_backed_babysit_disable_and_list_preserve_records() {
         let state_dir = unique_temp_dir("permission-babysit-disable-list");
+        let workspace_root = unique_temp_dir("permission-babysit-list-workspace");
         let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = crate::storage::resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
 
-        let first = BabysitRecord::from_pane(&sample_pane());
+        let first = sample_pane();
         let mut second_pane = sample_pane();
         second_pane.pane_id = String::from("%22");
         second_pane.pane_tty = String::from("/dev/pts/22");
@@ -128,11 +167,11 @@ mod tests {
         second_pane.session_name = String::from("demo-22");
         second_pane.window_id = String::from("@22");
         second_pane.window_name = String::from("claude-22");
-        second_pane.current_path = String::from("/tmp/demo-22");
-        let second = BabysitRecord::from_pane(&second_pane);
+        second_pane.current_path = workspace_root.display().to_string();
 
-        write_babysit_record(&state_dir, &first).expect("first record should store");
-        write_babysit_record(&state_dir, &second).expect("second record should store");
+        write_babysit_record(&state_dir, &workspace.id, &first).expect("first record should store");
+        write_babysit_record(&state_dir, &workspace.id, &second_pane)
+            .expect("second record should store");
 
         assert!(
             disable_babysit_record(&state_dir, &first.pane_id)
@@ -148,7 +187,7 @@ mod tests {
         );
 
         assert_eq!(
-            list_babysit_pane_ids(&state_dir).expect("pane ids should list"),
+            list_babysit_pane_ids(&state_dir, Some(&workspace.id)).expect("pane ids should list"),
             vec![String::from("%1"), String::from("%22")]
         );
 
@@ -160,7 +199,7 @@ mod tests {
             false
         );
         assert_eq!(
-            read_babysit_record(&state_dir, &second.pane_id)
+            read_babysit_record(&state_dir, &second_pane.pane_id)
                 .expect("second record should load")
                 .expect("second record should still exist")
                 .enabled,

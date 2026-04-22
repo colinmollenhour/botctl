@@ -90,7 +90,7 @@ There are two prompt paths today:
 1. **One-shot submission** — pass `--text` or `--source` directly to `submit-prompt`.
 2. **Manual staging** — use `prepare-prompt`, then `editor-helper` when Claude requests an external editor target.
 
-Manual staging now keeps the session's pending prompt in `<state-root>/state.db` rather than a separate prompt file.
+Manual staging now keeps the session's pending prompt in `<state-root>/state.db` under a workspace-scoped placeholder instance rather than a separate prompt file.
 
 One-shot example:
 
@@ -103,6 +103,13 @@ Manual staging example:
 ```bash
 cargo run -- prepare-prompt --session demo --text "Summarize the current repo"
 cargo run -- editor-helper --session demo /tmp/claude-editor.txt
+```
+
+Workspace example:
+
+```bash
+cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the current repo"
+cargo run -- yolo start --all --workspace .
 ```
 
 For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](prompt-handoff.md).
