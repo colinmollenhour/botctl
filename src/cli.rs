@@ -24,6 +24,7 @@ pub enum Command {
     ContinueSession(ContinueSessionArgs),
     AutoUnstick(AutoUnstickArgs),
     KeepGoing(KeepGoingArgs),
+    DynamicDuo(DynamicDuoArgs),
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
@@ -79,6 +80,16 @@ pub struct KeepGoingArgs {
     pub state_dir: Option<PathBuf>,
     pub prompt_source: Option<PathBuf>,
     pub prompt_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicDuoArgs {
+    pub file: PathBuf,
+    pub pane_id: Option<String>,
+    pub no_yolo: bool,
+    pub poll_ms: u64,
+    pub submit_delay_ms: u64,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +251,7 @@ where
         "continue-session" => parse_continue_session(rest),
         "auto-unstick" => parse_auto_unstick(rest),
         "keep-going" => parse_keep_going(rest),
+        "dynamic-duo" => parse_dynamic_duo(rest),
         "prepare-prompt" => parse_prepare_prompt(rest),
         "editor-helper" => parse_editor_helper(rest),
         "submit-prompt" => parse_submit_prompt(rest),
@@ -274,6 +286,7 @@ pub fn usage() -> String {
             continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)\n\
             auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]\n\
             keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
+            dynamic-duo FILE [--pane %ID|session:window.pane] [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--no-yolo]\n\
             prepare-prompt --session NAME [--state-dir PATH] [--source PATH | --text TEXT]\n\
             editor-helper --session NAME [--state-dir PATH] [--source PATH] [--keep-pending] TARGET\n\
             submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
@@ -840,6 +853,71 @@ fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
     }))
 }
 
+fn parse_dynamic_duo(args: Vec<String>) -> AppResult<Command> {
+    let mut file = None;
+    let mut pane_id = None;
+    let mut no_yolo = false;
+    let mut poll_ms = 1000u64;
+    let mut submit_delay_ms = 250u64;
+    let mut state_dir = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+            "--no-yolo" => no_yolo = true,
+            "--poll-ms" => {
+                let raw = read_value(&args, &mut i, "--poll-ms")?;
+                poll_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| AppError::new(format!("invalid value for --poll-ms: {raw}")))?;
+            }
+            "--submit-delay-ms" => {
+                let raw = read_value(&args, &mut i, "--submit-delay-ms")?;
+                submit_delay_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --submit-delay-ms: {raw}"))
+                })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            value if value.starts_with("--") => {
+                return Err(AppError::new(format!("unknown dynamic-duo flag: {value}")));
+            }
+            value => {
+                if file.is_some() {
+                    return Err(AppError::new(format!(
+                        "unexpected extra dynamic-duo argument: {value}"
+                    )));
+                }
+                file = Some(PathBuf::from(value));
+            }
+        }
+        i += 1;
+    }
+
+    let file = file.ok_or_else(|| AppError::new("missing required dynamic-duo planning file"))?;
+    if poll_ms == 0 {
+        return Err(AppError::new(
+            "dynamic-duo requires --poll-ms to be at least 1",
+        ));
+    }
+    if submit_delay_ms == 0 {
+        return Err(AppError::new(
+            "dynamic-duo requires --submit-delay-ms to be at least 1",
+        ));
+    }
+
+    Ok(Command::DynamicDuo(DynamicDuoArgs {
+        file,
+        pane_id,
+        no_yolo,
+        poll_ms,
+        submit_delay_ms,
+        state_dir,
+    }))
+}
+
 fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<PaneTargetArgs> {
     let mut pane_id = None;
     let mut session_name = None;
@@ -1119,16 +1197,14 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     "yolo start requires exactly one of --pane or --all",
                 ));
             }
-            Ok(Command::YoloStart(
-                YoloStartArgs {
-                    pane_id,
-                    all,
-                    poll_ms,
-                    live_preview,
-                    format,
-                    state_dir,
-                },
-            ))
+            Ok(Command::YoloStart(YoloStartArgs {
+                pane_id,
+                all,
+                poll_ms,
+                live_preview,
+                format,
+                state_dir,
+            }))
         }
         "stop" => {
             let mut pane_id = None;
@@ -1784,6 +1860,103 @@ mod tests {
         assert!(error.to_string().contains(
             "keep-going requires --pane %ID|session:window.pane or --session NAME --window NAME"
         ));
+    }
+
+    #[test]
+    fn parses_dynamic_duo_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("dynamic-duo"),
+            String::from("PLANS.md"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--poll-ms"),
+            String::from("400"),
+            String::from("--submit-delay-ms"),
+            String::from("600"),
+            String::from("--state-dir"),
+            String::from("/tmp/state"),
+            String::from("--no-yolo"),
+        ])
+        .expect("dynamic-duo command should parse");
+
+        match command {
+            Command::DynamicDuo(args) => {
+                assert_eq!(args.file, PathBuf::from("PLANS.md"));
+                assert_eq!(args.pane_id.as_deref(), Some("%9"));
+                assert_eq!(args.poll_ms, 400);
+                assert_eq!(args.submit_delay_ms, 600);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/state")));
+                assert!(args.no_yolo);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dynamic_duo_without_explicit_pane() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("dynamic-duo"),
+            String::from("PLANS.md"),
+        ])
+        .expect("dynamic-duo without --pane should parse");
+
+        match command {
+            Command::DynamicDuo(args) => {
+                assert_eq!(args.file, PathBuf::from("PLANS.md"));
+                assert!(args.pane_id.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_dynamic_duo_without_file() {
+        let error = parse_args(vec![String::from("botctl"), String::from("dynamic-duo")])
+            .expect_err("dynamic-duo should require a file");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required dynamic-duo planning file")
+        );
+    }
+
+    #[test]
+    fn rejects_dynamic_duo_zero_poll_interval() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("dynamic-duo"),
+            String::from("PLANS.md"),
+            String::from("--poll-ms"),
+            String::from("0"),
+        ])
+        .expect_err("dynamic-duo should reject zero poll interval");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic-duo requires --poll-ms to be at least 1")
+        );
+    }
+
+    #[test]
+    fn rejects_dynamic_duo_zero_submit_delay() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("dynamic-duo"),
+            String::from("PLANS.md"),
+            String::from("--submit-delay-ms"),
+            String::from("0"),
+        ])
+        .expect_err("dynamic-duo should reject zero submit delay");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic-duo requires --submit-delay-ms to be at least 1")
+        );
     }
 
     #[test]

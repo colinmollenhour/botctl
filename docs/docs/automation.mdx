@@ -61,7 +61,7 @@ Refusal states are part of the safety model:
 
 That refusal is deliberate: it is safer to stop than to guess.
 
-## keep-going, auto-unstick, and yolo
+## keep-going, dynamic-duo, auto-unstick, and yolo
 
 These commands are recovery loops, not magic fixers.
 
@@ -69,7 +69,10 @@ These commands are recovery loops, not magic fixers.
 - `keep-going` watches a pane, submits the built-in audit prompt by default or a custom loop prompt via `--source` / `--text`, and can optionally respond to supported blockers.
 - `keep-going` expects each loop reply to end with exactly one terminal token: `OKIE_DOKIE`, `ALL_DONE`, or `PANIC`.
 - the built-in `keep-going` prompt tells Claude to verify completion, commit before `ALL_DONE`, push on branches other than `main`, `master`, `develop`, `dev`, `trunk`, or `release/*`, and open a PR only when the user explicitly asked for one
-- `--no-yolo` turns `PermissionDialog` and `FolderTrustPrompt` into manual-review exits.
+- `dynamic-duo` supervises one already-running Claude pane with a planning-file-driven grunt/boss loop and exact directives: `DUO_PREVAILED`, `DUO_FAILED`, `GRUNT_FINISHED`, and `BOSS_FINISHED`
+- `dynamic-duo` can resolve the current tmux window automatically only when it is launched from inside tmux and exactly one Claude pane exists in that window
+- `dynamic-duo` clears the Claude chat between grunt and boss phases and waits for `ChatReady` before submitting the next prompt
+- `--no-yolo` turns permission and trust prompts into manual-review exits, and `dynamic-duo` also treats `PlanApprovalPrompt` as manual review in both modes.
 - `yolo` is the long-running loop for supported permission dialogs and survey dismissal.
 
 Limits:
@@ -79,6 +82,7 @@ Limits:
 - they do not bypass classifier or keybinding checks
 - `yolo` does not auto-handle `FolderTrustPrompt`
 - `keep-going` will stop on manual-review blockers when `--no-yolo` is set
+- `dynamic-duo` is intentionally build-mode only and will always stop on `PlanApprovalPrompt`
 
 ## Related docs
 

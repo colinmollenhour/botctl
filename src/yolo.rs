@@ -143,8 +143,7 @@ mod tests {
                 .expect("existing disabled record should still report tracked")
         );
         assert!(
-            !disable_yolo_record(&state_dir, "%404")
-                .expect("missing record should report false")
+            !disable_yolo_record(&state_dir, "%404").expect("missing record should report false")
         );
 
         assert_eq!(

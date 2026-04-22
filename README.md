@@ -14,6 +14,7 @@ The project is built around a simple rule: terminal automation is only safe when
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
+- run long-lived supervised loops such as `keep-going`, `dynamic-duo`, and `yolo`
 
 ## Docs
 
@@ -127,6 +128,12 @@ Prepare and submit a prompt:
 ```bash
 cargo run -- prepare-prompt --session demo --text "Summarize the current repo"
 cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the current repo"
+```
+
+Run the planning-file grunt/boss loop against one existing Claude pane:
+
+```bash
+cargo run -- dynamic-duo ./PLANS-Dynamic-Duo.md --pane %19
 ```
 
 ## Keybinding Policy

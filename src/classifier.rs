@@ -469,9 +469,11 @@ mod tests {
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::PlanApprovalPrompt);
-        assert!(result
-            .signals
-            .contains(&String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS))
+        );
     }
 
     #[test]

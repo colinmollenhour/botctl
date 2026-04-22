@@ -23,16 +23,13 @@ use crate::classifier::{
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
-    ContinueSessionArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs, KeepGoingArgs,
-    ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
+    ContinueSessionArgs, DoctorArgs, DynamicDuoArgs, EditorHelperArgs, InstallBindingsArgs,
+    KeepGoingArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
     RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
     SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::observe::{ObserveRequest, collect_observation, observe_session};
-use crate::yolo::{
-    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
-};
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
@@ -40,12 +37,19 @@ use crate::prompt::{
 use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
 use crate::storage::{bootstrap_state_db, state_db_path};
 use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
+use crate::yolo::{
+    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
+};
 
 const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
 const KEEP_GOING_HISTORY_LINES: usize = 2000;
 const KEEP_GOING_PROMPT_ANCHOR: &str = "Audit the task currently in scope";
 const KEEP_GOING_CUSTOM_PROMPT_ANCHOR: &str = "[[BOTCTL_KEEP_GOING_END_PROMPT]]";
+const DYNAMIC_DUO_HISTORY_LINES: usize = 2000;
+const DYNAMIC_DUO_INVALID_REPLY_LIMIT: usize = 3;
+const DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR: &str = "[[BOTCTL_DYNAMIC_DUO_GRUNT_END_PROMPT]]";
+const DYNAMIC_DUO_BOSS_PROMPT_ANCHOR: &str = "[[BOTCTL_DYNAMIC_DUO_BOSS_END_PROMPT]]";
 const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
 const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
 const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
@@ -146,6 +150,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::ContinueSession(args) => run_continue_session(args),
         Command::AutoUnstick(args) => run_auto_unstick(args),
         Command::KeepGoing(args) => run_keep_going(args),
+        Command::DynamicDuo(args) => run_dynamic_duo(args),
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
@@ -691,6 +696,636 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
 
         thread::sleep(Duration::from_millis(args.poll_ms));
     }
+}
+
+fn run_dynamic_duo(args: DynamicDuoArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = resolve_dynamic_duo_pane(&client, args.pane_id.as_deref())?;
+    ensure_pane_owned_by_claude(&pane)?;
+    let planning_file = resolve_dynamic_duo_file(&args.file)?;
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let bindings = load_automation_keybindings(None)?;
+    let mut awaiting_reply = false;
+    let mut invalid_replies = 0usize;
+    let mut phase = DynamicDuoPhase::Grunt;
+    let mut last_state: Option<SessionState> = None;
+
+    emit_babysit_output(format!(
+        "dynamic-duo watching pane={} file={} yolo={}",
+        pane.pane_id,
+        planning_file.display(),
+        if args.no_yolo { "off" } else { "on" }
+    ))?;
+
+    loop {
+        let current_pane = resolve_pane_by_id(&client, &pane.pane_id)?;
+        ensure_pane_owned_by_claude(&current_pane)?;
+        let inspected = inspect_pane(&client, &pane.pane_id, DYNAMIC_DUO_HISTORY_LINES)?;
+        let classification = &inspected.classification;
+
+        if last_state != Some(classification.state) {
+            emit_babysit_output(render_dynamic_duo_wait_message(
+                &pane.pane_id,
+                phase,
+                classification,
+                awaiting_reply,
+                args.no_yolo,
+            ))?;
+            last_state = Some(classification.state);
+        }
+
+        if classification.state == SessionState::PlanApprovalPrompt {
+            return Err(AppError::with_exit_code(
+                format!(
+                    "dynamic-duo stopped for pane {} in state PlanApprovalPrompt: plan-mode approval requires manual review",
+                    pane.pane_id
+                ),
+                2,
+            ));
+        }
+
+        if !args.no_yolo {
+            if classification.state == SessionState::FolderTrustPrompt {
+                emit_babysit_output(format!(
+                    "dynamic-duo pane={} phase={} action=confirm-folder-trust",
+                    pane.pane_id,
+                    phase.as_str()
+                ))?;
+                execute_keep_going_yolo_action(
+                    &client,
+                    &pane.pane_id,
+                    GuardedWorkflow::ApprovePermission,
+                    classification,
+                )?;
+                thread::sleep(Duration::from_millis(args.poll_ms));
+                continue;
+            }
+
+            match yolo_action_for_state(classification.state) {
+                YoloAction::ApprovePermission => {
+                    if is_yolo_safe_to_approve(&inspected) {
+                        emit_babysit_output(format!(
+                            "dynamic-duo pane={} phase={} action=approve",
+                            pane.pane_id,
+                            phase.as_str()
+                        ))?;
+                        execute_keep_going_yolo_action(
+                            &client,
+                            &pane.pane_id,
+                            GuardedWorkflow::ApprovePermission,
+                            classification,
+                        )?;
+                        thread::sleep(Duration::from_millis(args.poll_ms));
+                        continue;
+                    }
+                }
+                YoloAction::DismissSurvey => {
+                    emit_babysit_output(format!(
+                        "dynamic-duo pane={} phase={} action=dismiss-survey",
+                        pane.pane_id,
+                        phase.as_str()
+                    ))?;
+                    execute_keep_going_yolo_action(
+                        &client,
+                        &pane.pane_id,
+                        GuardedWorkflow::DismissSurvey,
+                        classification,
+                    )?;
+                    thread::sleep(Duration::from_millis(args.poll_ms));
+                    continue;
+                }
+                YoloAction::Wait => {}
+            }
+        } else if let Some(error) = dynamic_duo_no_yolo_blocker(classification, &pane.pane_id) {
+            return Err(error);
+        }
+
+        if awaiting_reply {
+            let frame = client.capture_pane(&pane.pane_id, DYNAMIC_DUO_HISTORY_LINES)?;
+            let terminal_reply_ready = classification.state == SessionState::ChatReady
+                || frame_has_keep_going_chat_input(&frame);
+
+            if let Some(reply) = extract_dynamic_duo_reply(&frame, phase.prompt_anchor()) {
+                match reply {
+                    DynamicDuoReply::Valid(response)
+                        if dynamic_duo_phase_accepts_directive(phase, response.directive) =>
+                    {
+                        if terminal_reply_ready {
+                            emit_babysit_output(format!(
+                                "dynamic-duo pane={} phase={} token={}",
+                                pane.pane_id,
+                                phase.as_str(),
+                                response.directive.as_str()
+                            ))?;
+                            invalid_replies = 0;
+                            match response.directive {
+                                DynamicDuoDirective::DuoPrevailed => return Ok(response.render()),
+                                DynamicDuoDirective::DuoFailed => {
+                                    return Err(AppError::with_exit_code(response.render(), 2));
+                                }
+                                DynamicDuoDirective::GruntFinished
+                                | DynamicDuoDirective::BossFinished => {
+                                    phase = phase.next();
+                                    submit_dynamic_duo_phase_prompt(
+                                        &client,
+                                        &pane.pane_id,
+                                        &current_pane.session_name,
+                                        &state_dir,
+                                        &bindings,
+                                        &planning_file,
+                                        phase,
+                                        args.submit_delay_ms,
+                                        args.poll_ms,
+                                    )?;
+                                    awaiting_reply = true;
+                                    last_state = None;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    DynamicDuoReply::Valid(_) | DynamicDuoReply::Invalid(_)
+                        if terminal_reply_ready =>
+                    {
+                        invalid_replies += 1;
+                        if let Some(next_phase) =
+                            dynamic_duo_phase_after_invalid_reply(phase, invalid_replies)
+                        {
+                            emit_babysit_output(format!(
+                                "dynamic-duo pane={} phase={} action=phase-reset invalid-replies={}",
+                                pane.pane_id,
+                                phase.as_str(),
+                                invalid_replies
+                            ))?;
+                            invalid_replies = 0;
+                            phase = next_phase;
+                            submit_dynamic_duo_phase_prompt(
+                                &client,
+                                &pane.pane_id,
+                                &current_pane.session_name,
+                                &state_dir,
+                                &bindings,
+                                &planning_file,
+                                phase,
+                                args.submit_delay_ms,
+                                args.poll_ms,
+                            )?;
+                        } else if classification.state == SessionState::ChatReady {
+                            submit_dynamic_duo_reminder_prompt(
+                                &client,
+                                &pane.pane_id,
+                                &current_pane.session_name,
+                                &state_dir,
+                                &bindings,
+                                &planning_file,
+                                phase,
+                                args.submit_delay_ms,
+                            )?;
+                            emit_babysit_output(format!(
+                                "dynamic-duo pane={} phase={} action=remind invalid-replies={}",
+                                pane.pane_id,
+                                phase.as_str(),
+                                invalid_replies
+                            ))?;
+                        }
+                        awaiting_reply = true;
+                        last_state = None;
+                        continue;
+                    }
+                    DynamicDuoReply::Valid(_) | DynamicDuoReply::Invalid(_) => {}
+                }
+            }
+        } else if classification.state == SessionState::ChatReady {
+            let prompt = build_dynamic_duo_phase_prompt(phase, &planning_file);
+            let before_submit = client.capture_pane(&pane.pane_id, DYNAMIC_DUO_HISTORY_LINES)?;
+            submit_keep_going_prompt(
+                &client,
+                &pane.pane_id,
+                &current_pane.session_name,
+                &state_dir,
+                &prompt.text,
+                &bindings,
+                args.submit_delay_ms,
+            )?;
+            emit_babysit_output(format!(
+                "dynamic-duo pane={} phase={} action=submit-prompt",
+                pane.pane_id,
+                phase.as_str()
+            ))?;
+            wait_for_prompt_submission_start(
+                &client,
+                &pane.pane_id,
+                &before_submit,
+                prompt.anchor.as_deref(),
+            )
+            .map_err(|_| {
+                AppError::new(format!(
+                    "dynamic-duo submitted the {} prompt but pane {} did not show a prompt-submission transition",
+                    phase.as_str(),
+                    pane.pane_id
+                ))
+            })?;
+            awaiting_reply = true;
+        }
+
+        thread::sleep(Duration::from_millis(args.poll_ms));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicDuoPhase {
+    Grunt,
+    Boss,
+}
+
+impl DynamicDuoPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Grunt => "grunt",
+            Self::Boss => "boss",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Grunt => Self::Boss,
+            Self::Boss => Self::Grunt,
+        }
+    }
+
+    fn prompt_anchor(self) -> &'static str {
+        match self {
+            Self::Grunt => DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR,
+            Self::Boss => DYNAMIC_DUO_BOSS_PROMPT_ANCHOR,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicDuoDirective {
+    DuoPrevailed,
+    DuoFailed,
+    GruntFinished,
+    BossFinished,
+}
+
+impl DynamicDuoDirective {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DuoPrevailed => "DUO_PREVAILED",
+            Self::DuoFailed => "DUO_FAILED",
+            Self::GruntFinished => "GRUNT_FINISHED",
+            Self::BossFinished => "BOSS_FINISHED",
+        }
+    }
+
+    fn from_line(line: &str) -> Option<Self> {
+        match line.trim() {
+            "DUO_PREVAILED" => Some(Self::DuoPrevailed),
+            "DUO_FAILED" => Some(Self::DuoFailed),
+            "GRUNT_FINISHED" => Some(Self::GruntFinished),
+            "BOSS_FINISHED" => Some(Self::BossFinished),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynamicDuoResponse {
+    directive: DynamicDuoDirective,
+    body: String,
+}
+
+impl DynamicDuoResponse {
+    fn render(&self) -> String {
+        if self.body.is_empty() {
+            self.directive.as_str().to_string()
+        } else {
+            format!("{}\n{}", self.body, self.directive.as_str())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DynamicDuoReply {
+    Valid(DynamicDuoResponse),
+    Invalid(String),
+}
+
+fn resolve_dynamic_duo_pane(client: &TmuxClient, pane_id: Option<&str>) -> AppResult<TmuxPane> {
+    match pane_id {
+        Some(pane_id) => resolve_pane_by_id(client, pane_id),
+        None => resolve_current_tmux_window_claude_pane(
+            client,
+            std::env::var("TMUX_PANE").ok().as_deref(),
+        ),
+    }
+}
+
+fn resolve_current_tmux_window_claude_pane(
+    client: &TmuxClient,
+    current_tmux_pane_id: Option<&str>,
+) -> AppResult<TmuxPane> {
+    let current_tmux_pane_id = current_tmux_pane_id.ok_or_else(|| {
+        AppError::new(
+            "dynamic-duo without --pane requires running inside tmux so the current window can be resolved",
+        )
+    })?;
+    let current_pane = resolve_pane_by_id(client, current_tmux_pane_id)?;
+    let window_panes = client.list_panes_for_target(Some(&current_pane.window_id))?;
+    select_single_claude_pane_for_dynamic_duo(&window_panes)
+}
+
+fn select_single_claude_pane_for_dynamic_duo(panes: &[TmuxPane]) -> AppResult<TmuxPane> {
+    let claude_panes = panes
+        .iter()
+        .filter(|pane| is_pane_command_claude(pane))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    match claude_panes.len() {
+        0 => Err(AppError::new(
+            "dynamic-duo found no Claude panes in the current tmux window; pass --pane %ID|session:window.pane",
+        )),
+        1 => Ok(claude_panes[0].clone()),
+        _ => Err(AppError::new(
+            "dynamic-duo found multiple Claude panes in the current tmux window; pass --pane %ID|session:window.pane",
+        )),
+    }
+}
+
+fn resolve_dynamic_duo_file(path: &Path) -> AppResult<PathBuf> {
+    std::fs::canonicalize(path).map_err(|error| {
+        AppError::new(format!(
+            "failed to resolve dynamic-duo planning file {}: {}",
+            path.display(),
+            error
+        ))
+    })
+}
+
+fn dynamic_duo_phase_accepts_directive(
+    phase: DynamicDuoPhase,
+    directive: DynamicDuoDirective,
+) -> bool {
+    matches!(
+        directive,
+        DynamicDuoDirective::DuoPrevailed | DynamicDuoDirective::DuoFailed
+    ) || matches!(
+        (phase, directive),
+        (DynamicDuoPhase::Grunt, DynamicDuoDirective::GruntFinished)
+            | (DynamicDuoPhase::Boss, DynamicDuoDirective::BossFinished)
+    )
+}
+
+fn dynamic_duo_phase_after_invalid_reply(
+    phase: DynamicDuoPhase,
+    invalid_replies: usize,
+) -> Option<DynamicDuoPhase> {
+    if invalid_replies >= DYNAMIC_DUO_INVALID_REPLY_LIMIT {
+        Some(phase.next())
+    } else {
+        None
+    }
+}
+
+fn build_dynamic_duo_phase_prompt(
+    phase: DynamicDuoPhase,
+    planning_file: &Path,
+) -> KeepGoingPromptConfig {
+    let shared_rules = dynamic_duo_shared_rules();
+    let planning_file = planning_file.display();
+    let (text, anchor) = match phase {
+        DynamicDuoPhase::Grunt => (
+            format!(
+                "You are the grunt in botctl dynamic-duo build mode. Planning file: {planning_file}\n\nWork exactly one bounded implementation slice from that planning file. Inspect recent branch-local git history for context before changing code. Choose the highest-priority feasible unchecked `[ ]` item. Prefer shipping code, tests, docs, and validation over writing analysis. When your implementation pass for that slice is complete, update the planning file to mark that slice `[~]`. If you cannot safely proceed without clarification, add a `Questions and Problems` entry in the planning file and still mark the slice `[~]` for boss review.\n\nIf the planning file is already fully complete before you start this pass, finish with `DUO_PREVAILED`. Otherwise finish with `GRUNT_FINISHED`. Do not stop with ordinary natural language. The literal last non-empty line must be exactly one of those directives.\n\n{shared_rules}\n\n(Do not repeat the marker line below in your reply.)\n{DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR}"
+            ),
+            DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR.to_string(),
+        ),
+        DynamicDuoPhase::Boss => (
+            format!(
+                "You are the boss in botctl dynamic-duo build mode. Planning file: {planning_file}\n\nReview the current `[~]` slice and the most recent relevant commit(s). Look for linked `Questions and Problems` entries. Either fix or complete the slice, or mark it `[?]` or `[!]` if it truly must be deferred. Mark a checklist item `[x]` only when its wording is fully satisfied. This is a review and unsticking pass, not a planning pass.\n\nFinish with `DUO_FAILED` only when the workflow cannot safely continue without a human. Otherwise finish with `BOSS_FINISHED`. Do not stop with ordinary natural language. The literal last non-empty line must be exactly one of those directives.\n\n{shared_rules}\n\n(Do not repeat the marker line below in your reply.)\n{DYNAMIC_DUO_BOSS_PROMPT_ANCHOR}"
+            ),
+            DYNAMIC_DUO_BOSS_PROMPT_ANCHOR.to_string(),
+        ),
+    };
+
+    KeepGoingPromptConfig {
+        text,
+        anchor: Some(anchor),
+    }
+}
+
+fn build_dynamic_duo_reminder_prompt(
+    phase: DynamicDuoPhase,
+    planning_file: &Path,
+) -> KeepGoingPromptConfig {
+    let phase_prompt = build_dynamic_duo_phase_prompt(phase, planning_file);
+    KeepGoingPromptConfig {
+        anchor: phase_prompt.anchor.clone(),
+        text: format!(
+            "You should not have stopped yet. If the next action is clear, keep working now. If there is a major blocker, terminate the phase properly with its required directive instead of stopping in ordinary prose. Re-read the exact phase contract below and continue.\n\n{}",
+            phase_prompt.text
+        ),
+    }
+}
+
+fn dynamic_duo_shared_rules() -> &'static str {
+    "Shared rules:\n- Commit before final success reporting for the phase.\n- Push only when the current branch already has an upstream.\n- Stage only files relevant to the current slice.\n- Keep the worktree clean before ending the phase.\n- If the phase ends with a blocker, include the blocking context in both the commit message and the planning file.\n- Do not approve plan-mode prompts."
+}
+
+fn submit_dynamic_duo_phase_prompt(
+    client: &TmuxClient,
+    pane_id: &str,
+    session_name: &str,
+    state_dir: &Path,
+    bindings: &ResolvedKeybindings,
+    planning_file: &Path,
+    phase: DynamicDuoPhase,
+    submit_delay_ms: u64,
+    poll_ms: u64,
+) -> AppResult<()> {
+    clear_dynamic_duo_chat(client, pane_id, poll_ms)?;
+    let prompt = build_dynamic_duo_phase_prompt(phase, planning_file);
+    let before_submit = client.capture_pane(pane_id, DYNAMIC_DUO_HISTORY_LINES)?;
+    submit_keep_going_prompt(
+        client,
+        pane_id,
+        session_name,
+        state_dir,
+        &prompt.text,
+        bindings,
+        submit_delay_ms,
+    )?;
+    wait_for_prompt_submission_start(client, pane_id, &before_submit, prompt.anchor.as_deref())
+        .map_err(|_| {
+            AppError::new(format!(
+                "dynamic-duo submitted the {} prompt but pane {} did not show a prompt-submission transition",
+                phase.as_str(),
+                pane_id
+            ))
+        })
+}
+
+fn submit_dynamic_duo_reminder_prompt(
+    client: &TmuxClient,
+    pane_id: &str,
+    session_name: &str,
+    state_dir: &Path,
+    bindings: &ResolvedKeybindings,
+    planning_file: &Path,
+    phase: DynamicDuoPhase,
+    submit_delay_ms: u64,
+) -> AppResult<()> {
+    let prompt = build_dynamic_duo_reminder_prompt(phase, planning_file);
+    let before_submit = client.capture_pane(pane_id, DYNAMIC_DUO_HISTORY_LINES)?;
+    submit_keep_going_prompt(
+        client,
+        pane_id,
+        session_name,
+        state_dir,
+        &prompt.text,
+        bindings,
+        submit_delay_ms,
+    )?;
+    wait_for_prompt_submission_start(client, pane_id, &before_submit, prompt.anchor.as_deref())
+        .map_err(|_| {
+            AppError::new(format!(
+                "dynamic-duo submitted the {} reminder but pane {} did not show a prompt-submission transition",
+                phase.as_str(),
+                pane_id
+            ))
+        })
+}
+
+fn clear_dynamic_duo_chat(client: &TmuxClient, pane_id: &str, poll_ms: u64) -> AppResult<()> {
+    let before_clear = client.capture_pane(pane_id, DYNAMIC_DUO_HISTORY_LINES)?;
+    client.send_keys(pane_id, &["/clear", "Enter"])?;
+    wait_for_prompt_submission_start(client, pane_id, &before_clear, None).map_err(|_| {
+        AppError::new(format!(
+            "dynamic-duo submitted /clear but pane {} did not show a prompt-submission transition",
+            pane_id
+        ))
+    })?;
+    wait_for_chat_ready(client, pane_id, poll_ms, "dynamic-duo /clear")
+}
+
+fn wait_for_chat_ready(
+    client: &TmuxClient,
+    pane_id: &str,
+    poll_ms: u64,
+    action: &str,
+) -> AppResult<()> {
+    let attempts = std::cmp::max(1, 15000u64 / std::cmp::max(1, poll_ms));
+    for _ in 0..attempts {
+        let classification = classify_pane(client, pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        if classification.state == SessionState::ChatReady {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(poll_ms));
+    }
+
+    Err(AppError::new(format!(
+        "pane {pane_id} did not return to ChatReady after {action}"
+    )))
+}
+
+fn extract_dynamic_duo_reply(frame: &str, prompt_anchor: &str) -> Option<DynamicDuoReply> {
+    let lines = frame.lines().collect::<Vec<_>>();
+    let mut search_end = lines.len();
+    while search_end > 0
+        && (is_keep_going_chat_input_line(lines[search_end - 1])
+            || lines[search_end - 1].trim().is_empty())
+    {
+        search_end -= 1;
+    }
+    if search_end == 0 {
+        return None;
+    }
+
+    let anchor_idx = lines[..search_end]
+        .iter()
+        .rposition(|line| line.contains(prompt_anchor))?;
+    let mut body_lines = lines[anchor_idx + 1..search_end]
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>();
+    while matches!(body_lines.first(), Some(line) if line.trim().is_empty()) {
+        body_lines.remove(0);
+    }
+    while matches!(body_lines.last(), Some(line) if line.trim().is_empty()) {
+        body_lines.pop();
+    }
+    if body_lines.is_empty() {
+        return None;
+    }
+
+    let last_line = *body_lines.last()?;
+    if let Some(directive) = DynamicDuoDirective::from_line(last_line) {
+        body_lines.pop();
+        while matches!(body_lines.last(), Some(line) if line.trim().is_empty()) {
+            body_lines.pop();
+        }
+        return Some(DynamicDuoReply::Valid(DynamicDuoResponse {
+            directive,
+            body: body_lines.join("\n"),
+        }));
+    }
+
+    Some(DynamicDuoReply::Invalid(body_lines.join("\n")))
+}
+
+fn dynamic_duo_no_yolo_blocker(classification: &Classification, pane_id: &str) -> Option<AppError> {
+    if !matches!(
+        classification.state,
+        SessionState::PermissionDialog
+            | SessionState::FolderTrustPrompt
+            | SessionState::PlanApprovalPrompt
+    ) {
+        return None;
+    }
+
+    let detail = permission_manual_review_reason(classification)
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+
+    Some(AppError::with_exit_code(
+        format!(
+            "dynamic-duo stopped for pane {} in state {}{}",
+            pane_id,
+            classification.state.as_str(),
+            detail,
+        ),
+        2,
+    ))
+}
+
+fn render_dynamic_duo_wait_message(
+    pane_id: &str,
+    phase: DynamicDuoPhase,
+    classification: &Classification,
+    awaiting_reply: bool,
+    no_yolo: bool,
+) -> String {
+    let waiting_for = if awaiting_reply {
+        "phase-response"
+    } else {
+        "chat-input"
+    };
+    let yolo = if no_yolo { "off" } else { "on" };
+    let detail = permission_manual_review_reason(classification)
+        .map(|reason| format!(" detail={reason}"))
+        .unwrap_or_default();
+
+    format!(
+        "dynamic-duo pane={} phase={} state={} waiting-for={} yolo={}{}",
+        pane_id,
+        phase.as_str(),
+        classification.state.as_str(),
+        waiting_for,
+        yolo,
+        detail,
+    )
 }
 
 fn submit_keep_going_prompt(
@@ -2917,26 +3552,32 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AppError, BabysitFormat, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
-        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, RecoveryAction, YoloAction,
-        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
+        AppError, BabysitFormat, DYNAMIC_DUO_BOSS_PROMPT_ANCHOR, DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR,
+        DynamicDuoDirective, DynamicDuoPhase, DynamicDuoReply, InspectedPane,
+        KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
+        RecoveryAction, YoloAction, build_dynamic_duo_phase_prompt,
+        build_dynamic_duo_reminder_prompt, cleanup_babysit_record,
+        dynamic_duo_phase_accepts_directive, dynamic_duo_phase_after_invalid_reply,
+        ensure_pane_owned_by_claude, ensure_state_transition, extract_dynamic_duo_reply,
         extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, yolo_action_for_state,
-        permission_manual_review_reason, prompt_submission_started, raw_key_for_workflow,
-        recovery_action_for_state, render_babysit_action_event, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_screen_excerpt, render_status_report,
-        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_manual_review_reason,
+        prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
+        render_babysit_action_event, render_babysit_start_event, render_babysit_wait_event,
+        render_dynamic_duo_wait_message, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_screen_excerpt, render_status_report, resolve_current_tmux_window_claude_pane,
+        resolve_keep_going_prompt, run_prepare_prompt, select_single_claude_pane_for_dynamic_duo,
+        submit_prompt_preflight_workflow, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
         Classification, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
     use crate::cli::PreparePromptArgs;
-    use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
     use crate::prompt::pending_prompt_text;
     use crate::storage::{CURRENT_SCHEMA_VERSION, state_db_path};
-    use crate::tmux::TmuxPane;
+    use crate::tmux::{TmuxClient, TmuxPane};
+    use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
 
     fn sample_pane(current_command: &str) -> TmuxPane {
         TmuxPane {
@@ -3315,10 +3956,7 @@ mod tests {
             SessionState::DiffDialog,
             SessionState::Unknown,
         ] {
-            assert_eq!(
-                yolo_action_for_state(state),
-                YoloAction::Wait
-            );
+            assert_eq!(yolo_action_for_state(state), YoloAction::Wait);
         }
     }
 
@@ -3344,6 +3982,179 @@ mod tests {
             Some(GuardedWorkflow::DismissSurvey)
         );
         assert_eq!(submit_prompt_preflight_workflow(&ready), None);
+    }
+
+    #[test]
+    fn selects_single_dynamic_duo_claude_pane_in_current_window() {
+        let mut bash_pane = sample_pane("bash");
+        bash_pane.pane_id = String::from("%2");
+
+        let selected =
+            select_single_claude_pane_for_dynamic_duo(&[sample_pane("claude"), bash_pane])
+                .expect("exactly one Claude pane should resolve");
+
+        assert_eq!(selected.pane_id, "%1");
+    }
+
+    #[test]
+    fn dynamic_duo_current_window_refuses_when_no_claude_panes_exist() {
+        let error = select_single_claude_pane_for_dynamic_duo(&[sample_pane("bash")])
+            .expect_err("zero Claude panes should fail");
+
+        assert!(error.to_string().contains("found no Claude panes"));
+    }
+
+    #[test]
+    fn dynamic_duo_current_window_refuses_when_multiple_claude_panes_exist() {
+        let mut second = sample_pane("claude");
+        second.pane_id = String::from("%2");
+
+        let error = select_single_claude_pane_for_dynamic_duo(&[sample_pane("claude"), second])
+            .expect_err("multiple Claude panes should fail");
+
+        assert!(error.to_string().contains("found multiple Claude panes"));
+    }
+
+    #[test]
+    fn dynamic_duo_current_window_requires_tmux_context_without_explicit_pane() {
+        let client = TmuxClient::default();
+        let error = resolve_current_tmux_window_claude_pane(&client, None)
+            .expect_err("missing tmux context should fail before tmux access");
+
+        assert!(error.to_string().contains("requires running inside tmux"));
+    }
+
+    #[test]
+    fn dynamic_duo_phase_accepts_expected_directives() {
+        assert!(dynamic_duo_phase_accepts_directive(
+            DynamicDuoPhase::Grunt,
+            DynamicDuoDirective::GruntFinished
+        ));
+        assert!(dynamic_duo_phase_accepts_directive(
+            DynamicDuoPhase::Boss,
+            DynamicDuoDirective::BossFinished
+        ));
+        assert!(dynamic_duo_phase_accepts_directive(
+            DynamicDuoPhase::Boss,
+            DynamicDuoDirective::DuoFailed
+        ));
+        assert!(!dynamic_duo_phase_accepts_directive(
+            DynamicDuoPhase::Grunt,
+            DynamicDuoDirective::BossFinished
+        ));
+    }
+
+    #[test]
+    fn dynamic_duo_phase_switches_after_invalid_reply_limit() {
+        assert_eq!(
+            dynamic_duo_phase_after_invalid_reply(DynamicDuoPhase::Grunt, 2),
+            None
+        );
+        assert_eq!(
+            dynamic_duo_phase_after_invalid_reply(DynamicDuoPhase::Grunt, 3),
+            Some(DynamicDuoPhase::Boss)
+        );
+        assert_eq!(
+            dynamic_duo_phase_after_invalid_reply(DynamicDuoPhase::Boss, 3),
+            Some(DynamicDuoPhase::Grunt)
+        );
+    }
+
+    #[test]
+    fn dynamic_duo_prompt_builders_include_file_and_anchor() {
+        let grunt = build_dynamic_duo_phase_prompt(
+            DynamicDuoPhase::Grunt,
+            std::path::Path::new("/tmp/PLANS.md"),
+        );
+        let boss = build_dynamic_duo_phase_prompt(
+            DynamicDuoPhase::Boss,
+            std::path::Path::new("/tmp/PLANS.md"),
+        );
+        let reminder = build_dynamic_duo_reminder_prompt(
+            DynamicDuoPhase::Grunt,
+            std::path::Path::new("/tmp/PLANS.md"),
+        );
+
+        assert_eq!(
+            grunt.anchor.as_deref(),
+            Some(DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR)
+        );
+        assert!(grunt.text.contains("/tmp/PLANS.md"));
+        assert!(grunt.text.contains("GRUNT_FINISHED"));
+        assert_eq!(boss.anchor.as_deref(), Some(DYNAMIC_DUO_BOSS_PROMPT_ANCHOR));
+        assert!(boss.text.contains("BOSS_FINISHED"));
+        assert!(reminder.text.contains("You should not have stopped yet."));
+        assert!(reminder.text.contains(DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR));
+    }
+
+    #[test]
+    fn extracts_dynamic_duo_finished_reply_before_visible_input() {
+        let reply = extract_dynamic_duo_reply(
+            "You are the grunt in botctl dynamic-duo build mode.\n[[BOTCTL_DYNAMIC_DUO_GRUNT_END_PROMPT]]\nImplemented the current slice and updated the plan marker.\nGRUNT_FINISHED\nEnter to submit message\n❯",
+            DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR,
+        )
+        .expect("reply should parse");
+
+        match reply {
+            DynamicDuoReply::Valid(response) => {
+                assert_eq!(response.directive, DynamicDuoDirective::GruntFinished);
+                assert_eq!(
+                    response.body,
+                    "Implemented the current slice and updated the plan marker."
+                );
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_stale_dynamic_duo_token_before_latest_prompt() {
+        let reply = extract_dynamic_duo_reply(
+            "old grunt prompt\n[[BOTCTL_DYNAMIC_DUO_GRUNT_END_PROMPT]]\nDone\nGRUNT_FINISHED\nnew grunt prompt\n[[BOTCTL_DYNAMIC_DUO_GRUNT_END_PROMPT]]\nStill working\nEnter to submit message\n❯",
+            DYNAMIC_DUO_GRUNT_PROMPT_ANCHOR,
+        );
+
+        match reply {
+            Some(DynamicDuoReply::Invalid(body)) => assert_eq!(body, "Still working"),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn treats_non_directive_dynamic_duo_output_as_invalid_reply() {
+        let reply = extract_dynamic_duo_reply(
+            "boss prompt\n[[BOTCTL_DYNAMIC_DUO_BOSS_END_PROMPT]]\nI reviewed the slice and need one more pass.\nEnter to submit message\n❯",
+            DYNAMIC_DUO_BOSS_PROMPT_ANCHOR,
+        )
+        .expect("invalid reply should still be detected");
+
+        match reply {
+            DynamicDuoReply::Invalid(body) => {
+                assert_eq!(body, "I reviewed the slice and need one more pass.");
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_duo_wait_message_includes_phase_and_manual_reason() {
+        let log = render_dynamic_duo_wait_message(
+            "%9",
+            DynamicDuoPhase::Boss,
+            &Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
+            },
+            true,
+            true,
+        );
+
+        assert!(log.contains("phase=boss"));
+        assert!(log.contains("waiting-for=phase-response"));
+        assert!(log.contains("Claude wants to edit its own settings"));
     }
 
     #[test]

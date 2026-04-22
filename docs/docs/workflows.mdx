@@ -107,6 +107,43 @@ cargo run -- editor-helper --session demo /tmp/claude-editor.txt
 
 For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](./prompt-handoff.mdx).
 
+## Dynamic duo workflow
+
+Use this when Claude is already running in tmux and you want one pane to work through a planning file in alternating build and review passes.
+
+1. Make sure exactly one Claude pane is in the current tmux window, or decide the explicit target pane first:
+
+   ```bash
+   cargo run -- list --all
+   cargo run -- doctor --pane %19
+   ```
+
+2. Start the loop against the planning file:
+
+   ```bash
+   cargo run -- dynamic-duo ./PLANS-Dynamic-Duo.md --pane %19
+   ```
+
+   Or, from inside tmux, let `dynamic-duo` resolve the current window automatically when there is exactly one Claude pane there:
+
+   ```bash
+   cargo run -- dynamic-duo ./PLANS-Dynamic-Duo.md
+   ```
+
+3. Expect one-pane role handoff rather than multi-pane orchestration:
+
+   - grunt works one bounded slice and should end with `GRUNT_FINISHED`
+   - boss reviews or unsticks that slice and should end with `BOSS_FINISHED`
+   - `DUO_PREVAILED` exits success
+   - `DUO_FAILED` exits for manual intervention
+
+Notes:
+
+- `dynamic-duo` is build-mode automation only; it will stop on `PlanApprovalPrompt`.
+- Between grunt and boss phases, `botctl` sends `/clear` and waits for `ChatReady` before submitting the next prompt.
+- After three invalid replies in one phase, `dynamic-duo` clears the chat and switches to the other phase.
+- `--no-yolo` turns permission dialogs, folder trust, and plan prompts into manual-review exits.
+
 ## Observe versus serve
 
 - `observe` is bounded: it returns a fixed sample of events and pane state.

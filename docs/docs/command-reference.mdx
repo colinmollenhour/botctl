@@ -12,7 +12,7 @@ This page is the current CLI reference for shipped commands and aliases.
 - `approve` / `reject` / `dismiss-survey` and `yolo` are guarded workflows: they validate the classified pane state before sending keys.
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
-- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and yolo registrations now both use SQLite-backed records there.
+- Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff, `keep-going`, `dynamic-duo`, and yolo registrations all use that state root.
 
 ## Session and pane management
 
@@ -482,6 +482,53 @@ botctl keep-going --pane 0:2.3 --no-yolo
 Custom loop example:
 ```bash
 botctl keep-going --pane 0:2.3 --source ./prompts/review-loop.txt
+```
+
+### `dynamic-duo`
+
+Purpose: supervise one already-running Claude pane against a planning file by alternating a grunt implementation pass with a boss review/unstick pass.
+
+Syntax:
+```bash
+botctl dynamic-duo FILE [--pane %ID|session:window.pane] [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--no-yolo]
+```
+
+Flags:
+- `FILE` (required positional planning-file path)
+- `--pane %ID|session:window.pane` (optional)
+- `--poll-ms N` (default: `1000`, must be at least `1`)
+- `--submit-delay-ms N` (default: `250`, must be at least `1`)
+- `--state-dir PATH` (optional; overrides the default state root)
+- `--no-yolo` (default: off)
+
+Targeting:
+- with `--pane`, target that explicit Claude pane directly
+- without `--pane`, `dynamic-duo` must be started from inside tmux and will only proceed if exactly one Claude pane exists in the current tmux window
+
+Safety:
+- refuses zero polling/submission intervals
+- refuses missing or ambiguous current-window Claude targets
+- refuses non-Claude panes
+- never auto-approves `PlanApprovalPrompt`; that is always a manual-review stop with exit code `2`
+
+Phase contract:
+- grunt accepts `GRUNT_FINISHED`, `DUO_PREVAILED`, or `DUO_FAILED`
+- boss accepts `BOSS_FINISHED`, `DUO_PREVAILED`, or `DUO_FAILED`
+- `GRUNT_FINISHED` and `BOSS_FINISHED` trigger `/clear`, wait for `ChatReady`, then start the next phase
+- after three invalid replies in one phase, `dynamic-duo` clears the chat and switches to the other phase instead of trusting the reply
+
+Yolo behavior:
+- normal mode can auto-approve supported permission prompts, confirm folder trust with raw `Enter`, and dismiss surveys
+- `--no-yolo` turns `PermissionDialog`, `FolderTrustPrompt`, and `PlanApprovalPrompt` into manual-review exits
+
+Example with explicit pane:
+```bash
+botctl dynamic-duo ./PLANS-Dynamic-Duo.md --pane 0:2.3
+```
+
+Example from inside tmux without `--pane`:
+```bash
+botctl dynamic-duo ./PLANS-Dynamic-Duo.md --no-yolo
 ```
 
 ## Prompt preparation and submission
