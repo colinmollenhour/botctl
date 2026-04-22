@@ -3,13 +3,14 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::app::{AppError, AppResult};
 use crate::tmux::TmuxPane;
 use crate::workspace::resolve_workspace_locator;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -20,6 +21,8 @@ const STATE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
 const PLACEHOLDER_INSTANCE_KIND: &str = "prompt-placeholder";
 const TMUX_INSTANCE_KIND: &str = "tmux-pane";
 const LEGACY_WORKSPACE_ROOT: &str = "/__botctl_legacy_global_workspace__";
+const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
+const CLAUDE_SESSION_REVALIDATE_MS: i64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRecord {
@@ -56,6 +59,8 @@ pub struct InstanceRuntimeState {
     pub instance_id: String,
     pub last_state: Option<String>,
     pub wait_started_at_unix_ms: Option<i64>,
+    pub claude_session_id: Option<String>,
+    pub claude_session_checked_at_unix_ms: Option<i64>,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -156,10 +161,11 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
         )));
     }
 
-    while version < CURRENT_SCHEMA_VERSION {
+        while version < CURRENT_SCHEMA_VERSION {
         match version {
             0 => migrate_to_v1(&tx)?,
             1 => migrate_to_v2(&tx)?,
+            2 => migrate_to_v3(&tx)?,
             other => {
                 return Err(AppError::new(format!(
                     "no state.db migration path from version {} to {}",
@@ -185,6 +191,7 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
         0 => Ok(()),
         1 => migrate_to_v1(connection),
         2 => ensure_v2_tables(connection),
+        3 => ensure_v3_tables(connection),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -203,6 +210,17 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
             && table_exists(connection, "pending_prompts")?
             && table_exists(connection, "babysit_registrations")?
             && table_exists(connection, "instance_runtime_state")?),
+        3 => Ok(table_exists(connection, "workspaces")?
+            && table_exists(connection, "instances")?
+            && table_exists(connection, "pending_prompts")?
+            && table_exists(connection, "babysit_registrations")?
+            && table_exists(connection, "instance_runtime_state")?
+            && table_has_column(connection, "instance_runtime_state", "claude_session_id")?
+            && table_has_column(
+                connection,
+                "instance_runtime_state",
+                "claude_session_checked_at_unix_ms",
+            )?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -429,6 +447,11 @@ fn ensure_v2_tables(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn migrate_to_v3(connection: &Connection) -> AppResult<()> {
+    ensure_v2_tables(connection)?;
+    ensure_v3_tables(connection)
+}
+
 fn ensure_v2_prompt_and_babysit_tables(connection: &Connection) -> AppResult<()> {
     connection.execute(
         "CREATE TABLE IF NOT EXISTS pending_prompts (\
@@ -455,6 +478,27 @@ fn ensure_v2_prompt_and_babysit_tables(connection: &Connection) -> AppResult<()>
     Ok(())
 }
 
+fn ensure_v3_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v2_tables(connection)?;
+    if !table_has_column(connection, "instance_runtime_state", "claude_session_id")? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN claude_session_id TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(
+        connection,
+        "instance_runtime_state",
+        "claude_session_checked_at_unix_ms",
+    )? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN claude_session_checked_at_unix_ms INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn sync_tmux_wait_state(
     state_dir: &Path,
     workspace_id: &str,
@@ -477,11 +521,15 @@ pub fn sync_tmux_wait_state(
     };
 
     connection.execute(
-        "INSERT INTO instance_runtime_state (instance_id, last_state, wait_started_at_unix_ms) \
-         VALUES (?1, ?2, ?3) \
+        "INSERT INTO instance_runtime_state (\
+            instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
+            claude_session_checked_at_unix_ms\
+         ) VALUES (?1, ?2, ?3, ?4, ?5) \
          ON CONFLICT(instance_id) DO UPDATE SET \
              last_state = excluded.last_state, \
-             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms",
+             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
+             claude_session_id = excluded.claude_session_id, \
+             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms",
         params![
             instance.id,
             state,
@@ -489,7 +537,11 @@ pub fn sync_tmux_wait_state(
                 Some(wait_started_at_unix_ms)
             } else {
                 None::<i64>
-            }
+            },
+            existing.as_ref().and_then(|row| row.claude_session_id.clone()),
+            existing
+                .as_ref()
+                .and_then(|row| row.claude_session_checked_at_unix_ms),
         ],
     )?;
 
@@ -500,6 +552,46 @@ pub fn sync_tmux_wait_state(
     } else {
         Ok(None)
     }
+}
+
+pub fn sync_tmux_claude_session_id(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+) -> AppResult<Option<String>> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let instance = find_or_create_tmux_instance_with_connection(&connection, workspace_id, pane)?;
+    let existing = load_instance_runtime_state_with_connection(&connection, &instance.id)?;
+    let now_ms = current_unix_ms()?;
+
+    if let Some(existing) = existing.as_ref().filter(|row| {
+        row.claude_session_checked_at_unix_ms
+            .map(|checked_at| now_ms.saturating_sub(checked_at) < CLAUDE_SESSION_REVALIDATE_MS)
+            .unwrap_or(false)
+    }) {
+        return Ok(existing.claude_session_id.clone());
+    }
+
+    let claude_session_id = resolve_claude_session_id_for_pane(pane)?;
+    connection.execute(
+        "INSERT INTO instance_runtime_state (\
+            instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
+            claude_session_checked_at_unix_ms\
+         ) VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(instance_id) DO UPDATE SET \
+             last_state = excluded.last_state, \
+             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
+             claude_session_id = excluded.claude_session_id, \
+             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms",
+        params![
+            instance.id,
+            existing.as_ref().and_then(|row| row.last_state.clone()),
+            existing.as_ref().and_then(|row| row.wait_started_at_unix_ms),
+            claude_session_id,
+            Some(now_ms),
+        ],
+    )?;
+    Ok(claude_session_id)
 }
 
 fn table_has_column(
@@ -988,7 +1080,8 @@ fn load_instance_runtime_state_with_connection(
 ) -> AppResult<Option<InstanceRuntimeState>> {
     Ok(connection
         .query_row(
-            "SELECT instance_id, last_state, wait_started_at_unix_ms \
+            "SELECT instance_id, last_state, wait_started_at_unix_ms, \
+                claude_session_id, claude_session_checked_at_unix_ms \
              FROM instance_runtime_state WHERE instance_id = ?1",
             params![instance_id],
             |row| {
@@ -996,10 +1089,127 @@ fn load_instance_runtime_state_with_connection(
                     instance_id: row.get(0)?,
                     last_state: row.get(1)?,
                     wait_started_at_unix_ms: row.get(2)?,
+                    claude_session_id: row.get(3)?,
+                    claude_session_checked_at_unix_ms: row.get(4)?,
                 })
             },
         )
         .optional()?)
+}
+
+fn resolve_claude_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<String>> {
+    let Some(projects_root) = claude_projects_root() else {
+        return Ok(None);
+    };
+
+    for project_dir in candidate_claude_project_dirs(&projects_root, &pane.current_path) {
+        if let Some(pid) = pane.pane_pid
+            && let Some(session_id) = claude_session_id_from_pid(pid, &project_dir)?
+        {
+            return Ok(Some(session_id));
+        }
+        if let Some(session_id) = latest_claude_session_id(&project_dir)? {
+            return Ok(Some(session_id));
+        }
+    }
+
+    Ok(None)
+}
+
+fn claude_projects_root() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(CLAUDE_PROJECTS_DIR))
+}
+
+fn candidate_claude_project_dirs(projects_root: &Path, current_path: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for ancestor in Path::new(current_path).ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = projects_root.join(encode_claude_project_path(ancestor));
+        if candidate.is_dir() {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn encode_claude_project_path(path: &Path) -> String {
+    path.display().to_string().replace('/', "-")
+}
+
+fn claude_session_id_from_pid(pid: u32, project_dir: &Path) -> AppResult<Option<String>> {
+    claude_session_id_from_fd_dir(&PathBuf::from(format!("/proc/{pid}/fd")), project_dir)
+}
+
+fn claude_session_id_from_fd_dir(fd_dir: &Path, project_dir: &Path) -> AppResult<Option<String>> {
+    let entries = match fs::read_dir(fd_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        if let Some(session_id) = claude_session_id_from_transcript_path(&target, project_dir) {
+            return Ok(Some(session_id));
+        }
+    }
+    Ok(None)
+}
+
+fn latest_claude_session_id(project_dir: &Path) -> AppResult<Option<String>> {
+    let mut latest = None::<(SystemTime, String)>;
+    for entry in fs::read_dir(project_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(session_id) = claude_session_id_from_transcript_path(&path, project_dir) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .map(|(latest_modified, _)| modified > *latest_modified)
+            .unwrap_or(true)
+        {
+            latest = Some((modified, session_id));
+        }
+    }
+    Ok(latest.map(|(_, session_id)| session_id))
+}
+
+fn claude_session_id_from_transcript_path(path: &Path, project_dir: &Path) -> Option<String> {
+    if path.parent()? != project_dir {
+        return None;
+    }
+    if path.extension()? != "jsonl" {
+        return None;
+    }
+    read_session_id_from_transcript(path).ok().flatten()
+}
+
+fn read_session_id_from_transcript(path: &Path) -> AppResult<Option<String>> {
+    let content = fs::read_to_string(path)?;
+    for line in content.lines().take(8) {
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
+            return Ok(Some(session_id.to_string()));
+        }
+    }
+    Ok(path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string))
 }
 
 fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRecord> {
@@ -1091,18 +1301,21 @@ fn validate_artifact_path_token(label: &str, value: &str) -> AppResult<()> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::os::unix::fs::symlink;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;
 
     use super::{
         CURRENT_SCHEMA_VERSION, LEGACY_WORKSPACE_ROOT, SCHEMA_VERSION_ROW_ID, bootstrap_state_db,
-        capture_artifact_path, disable_babysit_registration_by_pane_id,
-        ensure_schema_version_table, export_artifact_path, list_babysit_registration_pane_ids,
-        load_babysit_registration_by_pane_id, load_pending_prompt, migrate_state_db, open_state_db,
+        capture_artifact_path, claude_session_id_from_fd_dir, current_unix_ms,
+        disable_babysit_registration_by_pane_id, encode_claude_project_path,
+        ensure_schema_version_table, export_artifact_path, latest_claude_session_id,
+        list_babysit_registration_pane_ids, load_babysit_registration_by_pane_id,
+        load_pending_prompt, migrate_state_db, open_state_db, read_session_id_from_transcript,
         resolve_workspace, resolve_workspace_for_path, runtime_artifacts_root, state_db_path,
         store_babysit_registration, store_pending_prompt, store_pending_prompt_for_tmux_instance,
-        sync_tmux_wait_state, table_exists, tape_artifact_path,
+        sync_tmux_claude_session_id, sync_tmux_wait_state, table_exists, tape_artifact_path,
     };
     use crate::tmux::TmuxPane;
 
@@ -1313,6 +1526,124 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_dir);
         let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn encode_claude_project_path_rewrites_slashes() {
+        assert_eq!(
+            encode_claude_project_path(std::path::Path::new("/home/colin/Projects/botctl")),
+            "-home-colin-Projects-botctl"
+        );
+    }
+
+    #[test]
+    fn transcript_reader_prefers_embedded_session_id() {
+        let root = unique_temp_dir("storage-claude-transcript");
+        fs::create_dir_all(&root).expect("root should exist");
+        let transcript = root.join("fallback.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"permission-mode\",\"sessionId\":\"session-123\"}\n",
+        )
+        .expect("transcript should write");
+
+        assert_eq!(
+            read_session_id_from_transcript(&transcript).expect("session id should read"),
+            Some(String::from("session-123"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_claude_session_id_uses_newest_top_level_transcript() {
+        let root = unique_temp_dir("storage-claude-project-dir");
+        fs::create_dir_all(&root).expect("project dir should exist");
+        let older = root.join("older.jsonl");
+        let newer = root.join("newer.jsonl");
+        fs::write(&older, "{\"sessionId\":\"older\"}\n").expect("older should write");
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(&newer, "{\"sessionId\":\"newer\"}\n").expect("newer should write");
+        fs::create_dir_all(root.join("subagents")).expect("subagents dir should exist");
+        fs::write(
+            root.join("subagents/ignored.jsonl"),
+            "{\"sessionId\":\"ignored\"}\n",
+        )
+        .expect("subagent transcript should write");
+
+        assert_eq!(
+            latest_claude_session_id(&root).expect("latest session should resolve"),
+            Some(String::from("newer"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_session_id_from_fd_dir_prefers_open_transcript() {
+        let root = unique_temp_dir("storage-claude-fd");
+        let project_dir = root.join("project");
+        let fd_dir = root.join("fd");
+        fs::create_dir_all(&project_dir).expect("project dir should exist");
+        fs::create_dir_all(&fd_dir).expect("fd dir should exist");
+        let transcript = project_dir.join("session-from-fd.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"permission-mode\",\"sessionId\":\"session-from-fd\"}\n",
+        )
+        .expect("transcript should write");
+        symlink(&transcript, fd_dir.join("7")).expect("fd symlink should create");
+
+        assert_eq!(
+            claude_session_id_from_fd_dir(&fd_dir, &project_dir).expect("fd lookup should work"),
+            Some(String::from("session-from-fd"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_tmux_claude_session_id_resolves_from_project_transcript() {
+        let state_dir = unique_temp_dir("storage-claude-sync-state");
+        let home_dir = unique_temp_dir("storage-claude-sync-home");
+        let workspace_root = home_dir.join("project");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let project_dir = home_dir
+            .join(".claude/projects")
+            .join(encode_claude_project_path(&workspace_root));
+        fs::create_dir_all(&project_dir).expect("project dir should exist");
+        let transcript = project_dir.join("session-live.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"permission-mode\",\"sessionId\":\"session-live\"}}\n{{\"cwd\":\"{}\",\"sessionId\":\"session-live\"}}\n",
+                workspace_root.display()
+            ),
+        )
+        .expect("transcript should write");
+
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        pane.pane_pid = None;
+
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+        let resolved = sync_tmux_claude_session_id(&state_dir, &workspace.id, &pane)
+            .expect("claude session should sync");
+        match previous_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(resolved, Some(String::from("session-live")));
+
+        let _ = current_unix_ms().expect("clock should work");
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&home_dir);
     }
 
     #[test]

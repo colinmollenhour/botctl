@@ -151,6 +151,7 @@ impl Classifier {
                 "working",
             ],
         );
+        let has_busy_status_banner = lines.iter().copied().any(is_busy_status_line);
 
         let state = if contains_any(
             &normalized,
@@ -232,7 +233,7 @@ impl Classifier {
         ) {
             signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
-        } else if has_busy_interrupt_hint && has_busy_keywords {
+        } else if has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords) {
             signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
             SessionState::BusyResponding
         } else if has_chat_input || contains_any(&normalized, &["claude"]) {
@@ -457,6 +458,13 @@ fn is_plain_chat_input_line(line: &str) -> bool {
     matches!(line.trim(), ">" | "❯")
 }
 
+fn is_busy_status_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let stripped = lower.trim_start_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    stripped.starts_with("thinking...") || stripped.starts_with("thinking…")
+}
+
 fn starts_with_numbered_option(line: &str) -> bool {
     let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digits > 0 && line[digits..].starts_with('.')
@@ -465,7 +473,7 @@ fn starts_with_numbered_option(line: &str) -> bool {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
-        Classifier, SIGNAL_CHAT_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
+        Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
         SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
         SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
@@ -612,6 +620,14 @@ mod tests {
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::ChatReady);
         assert!(result.recap_present);
+    }
+
+    #[test]
+    fn classifies_live_thinking_banner_as_busy_even_with_chat_prompt_visible() {
+        let frame = "✻ Thinking… (57s · ↓ 3.3k tokens)\n❯\n~/Projects/shipstream/bloodraven (wishlist/upgrade-policy) ✅";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
     }
 
     #[test]

@@ -1,18 +1,21 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -28,12 +31,13 @@ use crate::classifier::SessionState;
 use crate::cli::DashboardArgs;
 use crate::prompt::resolve_state_dir;
 use crate::storage::{
-    WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_wait_state,
+    WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
+    sync_tmux_wait_state,
 };
 use crate::tmux::{TmuxClient, TmuxPane};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
-const FOOTER_TEXT: &str = "Arrows/jk move  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q quit";
+const FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q quit";
 const TABLE_GAP: &str = "  ";
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
@@ -42,15 +46,15 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = DashboardApp::new(state_dir, args.poll_ms, args.history_lines);
+    let mut app = DashboardApp::new(state_dir, args.poll_ms, args.history_lines)?;
     let loop_result = run_dashboard_loop(&mut terminal, &mut app, args.exit_on_navigate);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     app.restore_window_names()?;
 
@@ -72,9 +76,11 @@ struct DashboardApp {
     selected_pane_id: Option<String>,
     selection: usize,
     first_seen: HashMap<String, Instant>,
+    previous_frames: HashMap<String, String>,
     window_names: HashMap<String, ManagedWindowName>,
     message: String,
     last_refresh: Instant,
+    restored_selection: SavedSelection,
 }
 
 #[derive(Clone)]
@@ -90,6 +96,7 @@ struct PaneEntry {
     yolo_enabled: bool,
     age: Duration,
     wait_duration: Option<Duration>,
+    claude_session_id: Option<String>,
     focused_source: String,
 }
 
@@ -111,9 +118,16 @@ struct ManagedWindowName {
     applied_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SavedSelection {
+    pane_id: Option<String>,
+    row_index: Option<usize>,
+}
+
 impl DashboardApp {
-    fn new(state_dir: std::path::PathBuf, poll_ms: u64, history_lines: usize) -> Self {
-        Self {
+    fn new(state_dir: std::path::PathBuf, poll_ms: u64, history_lines: usize) -> AppResult<Self> {
+        let restored_selection = load_saved_selection(&state_dir)?;
+        Ok(Self {
             client: TmuxClient::default(),
             state_dir,
             poll_ms,
@@ -123,10 +137,12 @@ impl DashboardApp {
             selected_pane_id: None,
             selection: 0,
             first_seen: HashMap::new(),
+            previous_frames: HashMap::new(),
             window_names: HashMap::new(),
             message: String::new(),
             last_refresh: Instant::now() - Duration::from_millis(poll_ms),
-        }
+            restored_selection,
+        })
     }
 
     fn refresh(&mut self) -> AppResult<()> {
@@ -134,12 +150,19 @@ impl DashboardApp {
         let mut panes = Vec::new();
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
+        let mut next_frames = HashMap::new();
 
         for pane in self.client.list_panes()?.into_iter().filter(is_claude_pane) {
             seen_pane_ids.insert(pane.pane_id.clone());
             self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
 
             let inspected = inspect_pane(&self.client, &pane.pane_id, self.history_lines)?;
+            let previous_frame = self.previous_frames.get(&pane.pane_id);
+            let state = dashboard_display_state(
+                inspected.classification.state,
+                previous_frame,
+                &inspected.raw_source,
+            );
             let workspace =
                 resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
             let workspace_group_key = workspace_group_key(&workspace);
@@ -159,9 +182,12 @@ impl DashboardApp {
                 &self.state_dir,
                 &workspace.id,
                 &pane,
-                inspected.classification.state.as_str(),
-                is_waiting_state(inspected.classification.state),
+                state.as_str(),
+                is_waiting_state(state),
             )?;
+            let claude_session_id =
+                sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
+            next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
 
             panes.push(PaneEntry {
                 pane,
@@ -169,18 +195,20 @@ impl DashboardApp {
                 workspace_group_key,
                 workspace_group_label,
                 branch,
-                state: inspected.classification.state,
+                state,
                 recap_present: inspected.classification.recap_present,
                 recap_excerpt: inspected.classification.recap_excerpt.clone(),
                 yolo_enabled,
                 age,
                 wait_duration,
+                claude_session_id,
                 focused_source: inspected.focused_source,
             });
         }
 
         self.first_seen
             .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
+        self.previous_frames = next_frames;
 
         let first_window_by_workspace = panes.iter().fold(
             HashMap::<String, u32>::new(),
@@ -254,6 +282,24 @@ impl DashboardApp {
             }
         }
 
+        if let Some(pane_id) = self.restored_selection.pane_id.as_ref() {
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == pane_id))
+            {
+                self.set_selection(index);
+                return;
+            }
+        }
+
+        if let Some(index) = self.restored_selection.row_index {
+            if let Some(index) = self.nearest_selectable_row(index) {
+                self.set_selection(index);
+                return;
+            }
+        }
+
         self.selection = self
             .rows
             .iter()
@@ -268,6 +314,33 @@ impl DashboardApp {
                     .position(|row| matches!(row, RowItem::Pane { .. }))
             })
             .unwrap_or(0);
+        self.selected_pane_id = match &self.rows[self.selection] {
+            RowItem::Pane { pane_id } => Some(pane_id.clone()),
+            RowItem::WorkspaceHeader { .. } => None,
+        };
+    }
+
+    fn nearest_selectable_row(&self, index: usize) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+
+        let clamped = index.min(self.rows.len().saturating_sub(1));
+        if matches!(self.rows.get(clamped), Some(RowItem::Pane { .. })) {
+            return Some(clamped);
+        }
+        for forward in clamped + 1..self.rows.len() {
+            if matches!(self.rows.get(forward), Some(RowItem::Pane { .. })) {
+                return Some(forward);
+            }
+        }
+        (0..clamped)
+            .rev()
+            .find(|candidate| matches!(self.rows.get(*candidate), Some(RowItem::Pane { .. })))
+    }
+
+    fn set_selection(&mut self, index: usize) {
+        self.selection = index;
         self.selected_pane_id = match &self.rows[self.selection] {
             RowItem::Pane { pane_id } => Some(pane_id.clone()),
             RowItem::WorkspaceHeader { .. } => None,
@@ -342,18 +415,24 @@ impl DashboardApp {
         for ((session_name, window_id), mut panes) in windows {
             panes.sort_by_key(|pane| pane.pane.pane_index);
             let first = panes[0];
+            let prefix = panes
+                .iter()
+                .map(|pane| state_emoji(pane.state))
+                .collect::<String>();
             let managed = self
                 .window_names
                 .entry(window_id.clone())
                 .or_insert_with(|| ManagedWindowName {
                     target: format!("{session_name}:{}", first.pane.window_index),
-                    base_name: first.pane.window_name.clone(),
+                    base_name: derive_base_window_name(&first.pane.window_name, &prefix),
                     applied_name: None,
                 });
-            let prefix = panes
-                .iter()
-                .map(|pane| state_emoji(pane.state))
-                .collect::<String>();
+            managed.base_name = current_base_window_name(
+                &first.pane.window_name,
+                managed.applied_name.as_deref(),
+                &managed.base_name,
+                &prefix,
+            );
             let target_name = format!("{prefix} {}", managed.base_name);
             if managed.applied_name.as_deref() != Some(target_name.as_str()) {
                 self.client.rename_window(&managed.target, &target_name)?;
@@ -404,17 +483,24 @@ impl DashboardApp {
         self.panes.iter().find(|pane| &pane.pane.pane_id == pane_id)
     }
 
-    fn select_next(&mut self) {
-        self.move_selection(1);
+    fn pane_for_row(&self, index: usize) -> Option<&PaneEntry> {
+        let RowItem::Pane { pane_id } = self.rows.get(index)? else {
+            return None;
+        };
+        self.panes.iter().find(|pane| &pane.pane.pane_id == pane_id)
     }
 
-    fn select_previous(&mut self) {
-        self.move_selection(-1);
+    fn select_next(&mut self) -> AppResult<()> {
+        self.move_selection(1)
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    fn select_previous(&mut self) -> AppResult<()> {
+        self.move_selection(-1)
+    }
+
+    fn move_selection(&mut self, delta: isize) -> AppResult<()> {
         if self.rows.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut index = self.selection as isize;
@@ -423,9 +509,30 @@ impl DashboardApp {
             if let RowItem::Pane { pane_id } = &self.rows[index as usize] {
                 self.selection = index as usize;
                 self.selected_pane_id = Some(pane_id.clone());
-                return;
+                self.persist_selection()?;
+                return Ok(());
             }
         }
+        Ok(())
+    }
+
+    fn select_row(&mut self, index: usize) -> AppResult<bool> {
+        if !matches!(self.rows.get(index), Some(RowItem::Pane { .. })) {
+            return Ok(false);
+        }
+        self.set_selection(index);
+        self.persist_selection()?;
+        Ok(true)
+    }
+
+    fn persist_selection(&self) -> AppResult<()> {
+        save_selection(
+            &self.state_dir,
+            &SavedSelection {
+                pane_id: self.selected_pane_id.clone(),
+                row_index: Some(self.selection),
+            },
+        )
     }
 
     fn toggle_selected_yolo(&mut self) -> AppResult<()> {
@@ -522,32 +629,51 @@ fn run_dashboard_loop(
 
         let timeout = Duration::from_millis(100);
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') => return Ok(None),
-                    KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                    KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
-                    KeyCode::Enter => {
-                        let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
-                            continue;
-                        };
-                        if exit_on_navigate || std::env::var_os("TMUX").is_none() {
-                            return Ok(Some(pane));
-                        }
-                        navigate_to_pane(&app.client, &pane)?;
-                        app.message = format!("navigated to {}", pane_descriptor(&pane));
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::Char('r') => app.refresh()?,
-                    KeyCode::Char('u') => app.unstick_selected_pane()?,
-                    KeyCode::Char('y') => app.toggle_selected_yolo()?,
-                    KeyCode::Char('Y') => app.toggle_workspace_yolo()?,
-                    KeyCode::Char('A') => app.set_all_yolo(true)?,
-                    KeyCode::Char('N') => app.set_all_yolo(false)?,
-                    _ => {}
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            app.persist_selection()?;
+                            return Ok(None);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
+                        KeyCode::Up | KeyCode::Char('k') => app.select_previous()?,
+                        KeyCode::Enter => {
+                            let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
+                                continue;
+                            };
+                            app.persist_selection()?;
+                            if exit_on_navigate || std::env::var_os("TMUX").is_none() {
+                                return Ok(Some(pane));
+                            }
+                            navigate_to_pane(&app.client, &pane)?;
+                            app.message = format!("navigated to {}", pane_descriptor(&pane));
+                        }
+                        KeyCode::Char('r') => app.refresh()?,
+                        KeyCode::Char('u') => app.unstick_selected_pane()?,
+                        KeyCode::Char('y') => app.toggle_selected_yolo()?,
+                        KeyCode::Char('Y') => app.toggle_workspace_yolo()?,
+                        KeyCode::Char('A') => app.set_all_yolo(true)?,
+                        KeyCode::Char('N') => app.set_all_yolo(false)?,
+                        _ => {}
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let area = Rect {
+                        x: 0,
+                        y: 0,
+                        width: size.width,
+                        height: size.height,
+                    };
+                    if let Some(pane) = handle_mouse_event(app, mouse, area, exit_on_navigate)? {
+                        return Ok(Some(pane));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -557,19 +683,62 @@ fn run_dashboard_loop(
     }
 }
 
+fn handle_mouse_event(
+    app: &mut DashboardApp,
+    mouse: MouseEvent,
+    terminal_area: Rect,
+    exit_on_navigate: bool,
+) -> AppResult<Option<TmuxPane>> {
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            app.select_next()?;
+            Ok(None)
+        }
+        MouseEventKind::ScrollUp => {
+            app.select_previous()?;
+            Ok(None)
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let list_area = pane_list_content_area(terminal_area);
+            if !rect_contains(list_area, mouse.column, mouse.row) {
+                return Ok(None);
+            }
+            let index = (mouse.row - list_area.y) as usize;
+            if yolo_column_contains(app, list_area, mouse.column)
+                && let Some(pane) = app.pane_for_row(index).cloned()
+            {
+                app.select_row(index)?;
+                app.toggle_yolo_for_pane(&pane)?;
+                app.refresh()?;
+                return Ok(None);
+            }
+            let was_selected = app.selection == index;
+            if !app.select_row(index)? {
+                return Ok(None);
+            }
+            if was_selected {
+                let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
+                    return Ok(None);
+                };
+                app.persist_selection()?;
+                if exit_on_navigate || std::env::var_os("TMUX").is_none() {
+                    return Ok(Some(pane));
+                }
+                navigate_to_pane(&app.client, &pane)?;
+                app.message = format!("navigated to {}", pane_descriptor(&pane));
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .split(frame.area());
+    let layout = dashboard_layout(frame.area());
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(layout[0]);
+        .split(layout.body);
 
     let panes_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -657,7 +826,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
 
     let details_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(3)])
+        .constraints([Constraint::Length(11), Constraint::Min(3)])
         .split(body[1]);
 
     if let Some(pane) = app.selected_pane() {
@@ -693,6 +862,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 abbreviate_home_path(&pane.workspace.workspace_root)
             )));
         }
+        details.push(Line::from(format!(
+            "Session ID: {}",
+            pane.claude_session_id.as_deref().unwrap_or("-")
+        )));
 
         let details = Paragraph::new(details).block(rounded_block(Some("Details")));
         frame.render_widget(details, details_layout[0]);
@@ -714,9 +887,58 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     let message = Paragraph::new(app.message.as_str())
         .block(rounded_block(Some("Status")))
         .wrap(Wrap { trim: true });
-    frame.render_widget(message, layout[1]);
+    frame.render_widget(message, layout.status);
 
-    frame.render_widget(Paragraph::new(FOOTER_TEXT), layout[2]);
+    frame.render_widget(Paragraph::new(FOOTER_TEXT), layout.footer);
+}
+
+struct DashboardLayout {
+    body: Rect,
+    status: Rect,
+    footer: Rect,
+}
+
+fn dashboard_layout(area: Rect) -> DashboardLayout {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    DashboardLayout {
+        body: layout[0],
+        status: layout[1],
+        footer: layout[2],
+    }
+}
+
+fn pane_list_content_area(area: Rect) -> Rect {
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(dashboard_layout(area).body);
+    let panes_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(5)])
+        .split(body[0]);
+    rounded_block(None).inner(panes_layout[1])
+}
+
+fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> bool {
+    let columns = pane_list_columns(app);
+    let x = column.saturating_sub(list_area.x) as usize;
+    let yolo_start = columns.state_width + UnicodeWidthStr::width(TABLE_GAP);
+    let yolo_end = yolo_start + columns.yolo_width;
+    x >= yolo_start && x < yolo_end
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 struct PaneListColumns {
@@ -932,6 +1154,70 @@ fn tmux_object_id_order(id: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+fn current_base_window_name(
+    current_name: &str,
+    applied_name: Option<&str>,
+    previous_base_name: &str,
+    prefix: &str,
+) -> String {
+    if applied_name == Some(current_name) {
+        previous_base_name.to_string()
+    } else {
+        derive_base_window_name(current_name, prefix)
+    }
+}
+
+fn derive_base_window_name(current_name: &str, prefix: &str) -> String {
+    current_name
+        .strip_prefix(&format!("{prefix} "))
+        .unwrap_or(current_name)
+        .to_string()
+}
+
+fn dashboard_display_state(
+    classified_state: SessionState,
+    previous_frame: Option<&String>,
+    current_frame: &str,
+) -> SessionState {
+    if classified_state == SessionState::ChatReady
+        && previous_frame.is_some_and(|previous_frame| previous_frame != current_frame)
+    {
+        SessionState::BusyResponding
+    } else {
+        classified_state
+    }
+}
+
+fn dashboard_selection_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("dashboard-selection")
+}
+
+fn load_saved_selection(state_dir: &Path) -> AppResult<SavedSelection> {
+    let path = dashboard_selection_path(state_dir);
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(SavedSelection::default());
+    };
+    let mut lines = content.lines();
+    let pane_id = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let row_index = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok());
+    Ok(SavedSelection { pane_id, row_index })
+}
+
+fn save_selection(state_dir: &Path, selection: &SavedSelection) -> AppResult<()> {
+    let pane_id = selection.pane_id.as_deref().unwrap_or_default();
+    let row_index = selection.row_index.map(|value| value.to_string()).unwrap_or_default();
+    fs::write(dashboard_selection_path(state_dir), format!("{pane_id}\n{row_index}\n"))?;
+    Ok(())
+}
+
 fn workspace_name(workspace_root: &str) -> String {
     let workspace_root = abbreviate_home_path(workspace_root);
     let path = Path::new(&workspace_root);
@@ -1114,17 +1400,27 @@ fn navigate_to_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<()> {
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DetailBodyKind, PaneEntry, abbreviate_home_path, context_lines_above_input,
+        DashboardApp, DetailBodyKind, PaneEntry, SavedSelection, TABLE_GAP,
+        abbreviate_home_path,
+        context_lines_above_input, current_base_window_name, dashboard_display_state,
+        dashboard_selection_path, derive_base_window_name,
         detail_body_kind, detail_current_path, detail_workspace_label, format_age, recap_lines,
-        repo_root_from_repo_key, state_emoji, tmux_object_id_order, workspace_group_key,
+        load_saved_selection, pane_list_columns, pane_list_content_area, rect_contains,
+        repo_root_from_repo_key, save_selection, state_emoji, tmux_object_id_order,
+        workspace_group_key, yolo_column_contains,
         workspace_group_label,
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
     use crate::tmux::TmuxPane;
+    use ratatui::layout::Rect;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn formats_short_age() {
@@ -1233,6 +1529,91 @@ mod tests {
         assert_eq!(detail_current_path(&pane), "/tmp/demo/project-feature/src");
     }
 
+    #[test]
+    fn saved_selection_round_trips() {
+        let state_dir = unique_temp_dir("dashboard-selection");
+        fs::create_dir_all(&state_dir).expect("state dir should exist");
+
+        save_selection(
+            &state_dir,
+            &SavedSelection {
+                pane_id: Some(String::from("%9")),
+                row_index: Some(4),
+            },
+        )
+        .expect("selection should save");
+
+        assert_eq!(
+            load_saved_selection(&state_dir).expect("selection should load"),
+            SavedSelection {
+                pane_id: Some(String::from("%9")),
+                row_index: Some(4),
+            }
+        );
+
+        let _ = fs::remove_file(dashboard_selection_path(&state_dir));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn pane_list_content_area_excludes_borders() {
+        let area = pane_list_content_area(Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        });
+        assert!(area.width > 0);
+        assert!(area.height > 0);
+        assert!(rect_contains(area, area.x, area.y));
+    }
+
+    #[test]
+    fn changing_frame_promotes_chat_ready_to_busy_in_dashboard() {
+        assert_eq!(
+            dashboard_display_state(SessionState::ChatReady, Some(&String::from("before")), "after"),
+            SessionState::BusyResponding
+        );
+        assert_eq!(
+            dashboard_display_state(SessionState::ChatReady, Some(&String::from("same")), "same"),
+            SessionState::ChatReady
+        );
+    }
+
+    #[test]
+    fn derive_base_window_name_strips_matching_prefix() {
+        assert_eq!(derive_base_window_name("💤⚙️ project", "💤⚙️"), "project");
+        assert_eq!(derive_base_window_name("project", "💤⚙️"), "project");
+    }
+
+    #[test]
+    fn current_base_window_name_preserves_live_rename() {
+        assert_eq!(
+            current_base_window_name("renamed-project", Some("💤 old-project"), "old-project", "💤"),
+            "renamed-project"
+        );
+        assert_eq!(
+            current_base_window_name("💤 old-project", Some("💤 old-project"), "old-project", "💤"),
+            "old-project"
+        );
+    }
+
+    #[test]
+    fn yolo_column_hitbox_matches_rendered_columns() {
+        let app = DashboardApp::new(unique_temp_dir("dashboard-hitbox"), 1000, 120)
+            .expect("app should initialize");
+        let list_area = Rect {
+            x: 10,
+            y: 5,
+            width: 80,
+            height: 10,
+        };
+        let columns = pane_list_columns(&app);
+        let yolo_x = list_area.x + columns.state_width as u16 + UnicodeWidthStr::width(TABLE_GAP) as u16;
+        assert!(yolo_column_contains(&app, list_area, yolo_x));
+        assert!(!yolo_column_contains(&app, list_area, list_area.x));
+    }
+
     fn sample_pane_entry(
         state: SessionState,
         recap_present: bool,
@@ -1273,6 +1654,7 @@ mod tests {
             yolo_enabled: false,
             age: Duration::from_secs(1),
             wait_duration: None,
+            claude_session_id: None,
             focused_source: focused_source.to_string(),
         }
     }
@@ -1292,5 +1674,13 @@ mod tests {
             workspace_group_label: String::from("project  (/tmp/demo/project)"),
             ..sample_pane_entry(SessionState::ChatReady, false, "")
         }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("botctl-{label}-{}-{nanos}", std::process::id()))
     }
 }
