@@ -1200,7 +1200,9 @@ fn execute_keep_going_yolo_action(
 fn keep_going_no_yolo_blocker(classification: &Classification, pane_id: &str) -> Option<AppError> {
     if !matches!(
         classification.state,
-        SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+        SessionState::PermissionDialog
+            | SessionState::PlanApprovalPrompt
+            | SessionState::FolderTrustPrompt
     ) {
         return None;
     }
@@ -1229,6 +1231,7 @@ fn prompt_submission_started(
     match after_classification.state {
         SessionState::BusyResponding
         | SessionState::PermissionDialog
+        | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
         | SessionState::SurveyPrompt
         | SessionState::DiffDialog => return true,
@@ -2100,6 +2103,7 @@ fn yolo_action_for_state(state: SessionState) -> YoloAction {
     match state {
         SessionState::ChatReady
         | SessionState::BusyResponding
+        | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
@@ -2564,7 +2568,18 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
     }
 
     let Some(details) = extract_permission_prompt_details(inspected) else {
-        return false;
+        return has_project_scoped_permission_option(inspected)
+            && !permission_prompt_lines(inspected)
+                .unwrap_or_else(|| {
+                    inspected
+                        .focused_source
+                        .lines()
+                        .map(|line| line.to_string())
+                        .collect()
+                })
+                .iter()
+                .map(|line| line.trim())
+                .any(is_chat_input_line_for_yolo);
     };
 
     details.question.is_some()
@@ -2580,6 +2595,43 @@ fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
             .iter()
             .map(|line| line.trim())
             .any(is_chat_input_line_for_yolo)
+}
+
+fn has_project_scoped_permission_option(inspected: &InspectedPane) -> bool {
+    permission_prompt_lines(inspected)
+        .unwrap_or_else(|| {
+            inspected
+                .focused_source
+                .lines()
+                .map(|line| line.to_string())
+                .collect()
+        })
+        .iter()
+        .map(|line| line.trim())
+        .any(is_project_scoped_permission_option_line)
+}
+
+fn is_project_scoped_permission_option_line(line: &str) -> bool {
+    let Some((_, rest)) = split_numbered_option_line(line) else {
+        return false;
+    };
+    let lower = rest.to_ascii_lowercase();
+    lower.starts_with("yes, and always allow access to ") && lower.ends_with(" from this project")
+}
+
+fn split_numbered_option_line(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start_matches('❯').trim();
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 || !trimmed[digits..].starts_with('.') {
+        return None;
+    }
+
+    let rest = trimmed[digits + 1..].trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some((&trimmed[..digits], rest))
+    }
 }
 
 fn permission_manual_review_reason(classification: &Classification) -> Option<&'static str> {
@@ -2912,6 +2964,9 @@ fn recovery_action_for_state(state: SessionState) -> AppResult<Option<RecoveryAc
     match state {
         SessionState::ChatReady | SessionState::BusyResponding => Ok(None),
         SessionState::PermissionDialog => Ok(Some(RecoveryAction::ApprovePermission)),
+        SessionState::PlanApprovalPrompt => Err(AppError::new(
+            "no safe automatic recovery is defined for PlanApprovalPrompt; review the pane manually",
+        )),
         SessionState::SurveyPrompt => Ok(Some(RecoveryAction::DismissSurvey)),
         SessionState::FolderTrustPrompt => Ok(Some(RecoveryAction::ConfirmFolderTrust)),
         SessionState::DiffDialog => Err(AppError::new(
@@ -3121,6 +3176,9 @@ fn render_next_safe_action(
             } else {
                 String::from("safe-action: approve")
             }
+        }
+        SessionState::PlanApprovalPrompt => {
+            String::from("manual-review: plan approval prompt needs operator confirmation")
         }
         SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey (0)"),
         SessionState::FolderTrustPrompt => String::from("safe-action: approve (Enter)"),
@@ -3366,6 +3424,10 @@ mod tests {
                 .expect("folder trust should need recovery"),
             RecoveryAction::ConfirmFolderTrust
         );
+
+        let error = recovery_action_for_state(SessionState::PlanApprovalPrompt)
+            .expect_err("plan approval prompt should require manual review");
+        assert!(error.to_string().contains("PlanApprovalPrompt"));
     }
 
     #[test]
@@ -3517,6 +3579,19 @@ mod tests {
                 &sample_bindings(KeybindingsStatus::Valid)
             ),
             "safe-action: dismiss-survey (0)"
+        );
+        assert_eq!(
+            render_next_safe_action(
+                &Classification {
+                    state: SessionState::PlanApprovalPrompt,
+                    recap_present: false,
+                    recap_excerpt: None,
+                    ..classification.clone()
+                },
+                &sample_pane("claude"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "manual-review: plan approval prompt needs operator confirmation"
         );
     }
 
@@ -3712,6 +3787,10 @@ mod tests {
             YoloAction::Wait
         );
         assert_eq!(
+            yolo_action_for_state(SessionState::PlanApprovalPrompt),
+            YoloAction::Wait
+        );
+        assert_eq!(
             yolo_action_for_state(SessionState::BusyResponding),
             YoloAction::Wait
         );
@@ -3728,6 +3807,7 @@ mod tests {
     #[test]
     fn permission_babysit_keeps_waiting_on_non_permission_blockers() {
         for state in [
+            SessionState::PlanApprovalPrompt,
             SessionState::FolderTrustPrompt,
             SessionState::ExternalEditorActive,
             SessionState::DiffDialog,
@@ -4462,6 +4542,27 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
     }
 
     #[test]
+    fn yolo_allows_truncated_project_scoped_permission_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Save Opus craft findings\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and always allow access to results/ from this project\n  3. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+            raw_source: String::from(
+                "Save Opus craft findings\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and always allow access to results/ from this project\n  3. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain",
+            ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
     fn yolo_wait_log_omits_live_preview_even_when_enabled() {
         let inspected = InspectedPane {
             classification: Classification {
@@ -4486,6 +4587,21 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
         );
         assert!(!log.contains("Extracted prompt"));
         assert!(!log.to_lowercase().contains("babysit"));
+    }
+
+    #[test]
+    fn keep_going_no_yolo_blocks_plan_approval_prompt() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::PlanApprovalPrompt,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("plan-approval-keywords")],
+        };
+
+        let error = keep_going_no_yolo_blocker(&classification, "%42")
+            .expect("plan approval prompt should block no-yolo keep-going");
+        assert!(error.to_string().contains("PlanApprovalPrompt"));
     }
 
     #[test]

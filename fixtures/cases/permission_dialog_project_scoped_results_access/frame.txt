@@ -1,0 +1,34 @@
+   line: 21-22
+   severity: low
+   role: craft
+   agent: Opus 4.7
+   title: Speculative TODO comment baked into production code
+   ENDISSUE
+
+   ISSUE
+   file: app/code/community/ShipStream/AmazonShipping/Plugin.php
+   line: 52-55
+   severity: low
+   role: craft
+   agent: Opus 4.7
+   title: connectionDiagnostics parameter unused
+   ENDISSUE
+
+   ISSUE
+   file: app/code/community/ShipStream/AmazonShipping/GroupComment.php
+   line: 7-8
+   severity: low
+   role: craft
+   agent: Opus 4.7
+   title: New Plugin instantiated just to read OAuth URLs — use PLUGIN_CODE const
+   ENDISSUE
+   EOF
+   wc -l .tmp/ultra-review-2489/results/craft-opus.txt
+   Save Opus craft findings
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to results/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain

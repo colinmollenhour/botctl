@@ -1,0 +1,33 @@
+ - /home/colin/.local/colin-dotfiles/.claude/commands/colin/commit-and-push.md (step 6, single line)
+ - /home/colin/.local/colin-dotfiles/.claude/commands/colin/fix-comments.md (steps 2 and 3)
+
+ No other command files need updating - verified by grep and by reading the Explore pass output.
+
+ Verification
+
+ Pure prompt-text edits; there is no code path to exercise. To verify:
+
+ 1. git diff - confirm only the two files above are modified, and only prose/format changes are made (no behavior instructions
+ removed).
+ 2. Read each edited file end-to-end and check that steps still read coherently and that the new header snippets render correctly as
+ markdown (blockquote + bold + separators).
+ 3. Next real invocation of /colin:commit-and-push on an existing PR/MR should produce a comment starting with > **AI Commit Note**.
+ 4. Next real invocation of /colin:fix-comments should produce thread replies and a summary comment each starting with > **AI Review
+ Response**.
+
+ Non-goals
+
+ - Not adding commit-SHA tracking / incremental-run semantics (that is review-specific).
+ - Not changing the free-form body of any comment - only adding the header line + blank line.
+ - Not touching review.md or ultra-review.md - they already self-identify.
+ - Not touching agent-sops/*, coolify.md, or other commands that don't post PR/MR comments.
+
+ Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+ ❯ 1. Yes, and use auto mode
+   2. Yes, manually approve edits
+   3. No, refine with Ultraplan on Claude Code on the web
+   4. Tell Claude what to change
+      shift+tab to approve with this feedback
+
+ ctrl-g to edit in Vim - ~/.claude/plans/update-any-commands-see-quiet-biscuit.md
