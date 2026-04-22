@@ -1,0 +1,40 @@
+Generate a dark cinematic terminal-control background for the `botctl` documentation homepage.
+
+Core visual idea:
+- a human puppetmaster hiding behind a curtain and holding puppet controls for a robot that is typing on a computer
+- the image should suggest supervised automation and guarded control, not chaos or malice
+- keep it tasteful, editorial, and metaphorical rather than cartoonish
+
+Style and composition:
+- premium editorial sci-fi look
+- theatrical composition with the puppetmaster partially obscured in shadow
+- the robot at the terminal should feel capable but clearly controlled
+- abstract tmux pane grid
+- subtle command-line glow
+- deep navy and near-black shadows
+- teal and cyan neon as primary accents
+- restrained amber highlights as secondary accents
+- wide composition for a docs hero section
+- layered depth, atmospheric haze, and crisp geometric panel framing
+- should feel like terminal automation, observability, and control rather than generic cyberpunk
+
+Constraints:
+- no text
+- no logos
+- no browser chrome
+- no fake screenshots
+- no obvious brand marks
+- safe for use as a background image behind headline text
+- keep the center readable with lower contrast behind where text would sit
+- avoid horror aesthetics, gore, or sinister clown energy
+- avoid cheesy marionette props; the control rig should feel elegant and minimal
+
+Suggested nano-banana command:
+
+gemini --allowed-mcp-server-names nanobanana --yolo "/generate 'dark cinematic terminal-control background for the botctl documentation homepage, a human puppetmaster hiding behind a curtain and holding puppet controls for a robot typing on a computer, supervised automation metaphor, tasteful editorial sci-fi look, puppetmaster partially obscured in shadow, robot capable but clearly controlled, abstract tmux pane grid, subtle command-line glow, teal and cyan neon with restrained amber accents, deep navy shadows, layered depth, atmospheric haze, crisp geometric panel framing, wide composition, center kept readable for headline text, no text, no logos, no fake screenshots, no obvious brand marks, no UI chrome, avoid horror aesthetics, avoid cartoonish style, elegant minimal control rig' --aspect=16:9 --count=1"
+
+When you have a final image, save it as:
+
+docs/static/img/hero-background.jpg
+
+Then update `docs/src/css/custom.css` to point back at `/img/hero-background.jpg` if you want the raster version instead of the built-in SVG fallback.

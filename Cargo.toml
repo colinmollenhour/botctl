@@ -1,7 +1,7 @@
 [package]
 name = "botctl"
-version = "0.1.0"
-edition = "2024"
+version = "0.2.0"
+edition = "2026"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rust_analyzer)'] }

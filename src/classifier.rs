@@ -81,12 +81,11 @@ pub struct Classifier;
 impl Classifier {
     pub fn classify(&self, source: &str, frame_text: &str) -> Classification {
         let normalized = normalize(frame_text);
+        let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
         let recap = detect_recap(frame_text, &normalized);
         let mut signals = Vec::new();
-        let has_chat_input = contains_any(
-            &normalized,
-            &["enter submit message", "main chat input area", "chat:"],
-        ) || frame_text.lines().map(str::trim).any(is_chat_input_line);
+        let has_chat_input = lines.iter().copied().any(is_chat_keyword_line)
+            || lines.iter().copied().any(is_chat_input_line);
         let has_permission_keywords =
             contains_any(
                 &normalized,
@@ -102,6 +101,8 @@ impl Classifier {
                     "approve",
                 ],
             ) && contains_any(&normalized, &["yes", "no", "enter", "escape"]);
+        let has_conflicting_chat_after_permission =
+            has_permission_keywords && has_chat_indicators_after_permission(&lines);
         let mentions_self_settings_language = contains_any(
             &normalized,
             &[
@@ -126,7 +127,7 @@ impl Classifier {
         {
             signals.push(String::from(SIGNAL_FOLDER_TRUST_KEYWORDS));
             SessionState::FolderTrustPrompt
-        } else if has_permission_keywords && has_chat_input {
+        } else if has_permission_keywords && has_conflicting_chat_after_permission {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
             if mentions_self_settings_language {
                 signals.push(String::from(SIGNAL_SELF_SETTINGS_LANGUAGE));
@@ -328,14 +329,65 @@ fn contains_sensitive_claude_path(normalized: &str) -> bool {
     contains_any(
         normalized,
         &[
-            "/.claude/commands/",
             "/.claude/settings",
-            "~/.claude/commands/",
             "~/.claude/settings",
-            ".claude/commands/",
             ".claude/settings",
         ],
     )
+}
+
+fn has_chat_indicators_after_permission(lines: &[&str]) -> bool {
+    let Some(last_permission_anchor) = lines
+        .iter()
+        .rposition(|line| is_permission_anchor_line(line.trim()))
+    else {
+        return lines.iter().copied().any(is_chat_keyword_line)
+            || lines.iter().copied().any(is_chat_input_line);
+    };
+
+    lines
+        .iter()
+        .skip(last_permission_anchor + 1)
+        .copied()
+        .any(|line| is_chat_keyword_line(line) || is_chat_input_line(line))
+}
+
+fn is_chat_keyword_line(line: &str) -> bool {
+    contains_any(
+        &line.to_ascii_lowercase(),
+        &["enter submit message", "main chat input area", "chat:"],
+    )
+}
+
+fn is_permission_anchor_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "allow once",
+            "allow for session",
+            "permission",
+            "do you want to proceed",
+            "unsandboxed",
+            "tab to amend",
+            "ctrl+e to explain",
+            "confirm action",
+            "approve",
+            "enter confirms",
+            "enter to confirm",
+            "esc to cancel",
+            "escape to cancel",
+        ],
+    ) || is_permission_choice_line(line)
+}
+
+fn is_permission_choice_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_start_matches('❯').trim();
+    (trimmed.starts_with("1.") || trimmed.starts_with("2.") || trimmed.starts_with("3."))
+        && contains_any(
+            &trimmed.to_ascii_lowercase(),
+            &["yes", "no", "allow once", "allow for session"],
+        )
 }
 
 fn is_chat_input_line(line: &str) -> bool {
@@ -377,6 +429,18 @@ mod tests {
     }
 
     #[test]
+    fn ignores_stale_chat_prompt_before_monitor_permission_dialog() {
+        let frame = "❯\n● Monitor(FG ready state)\nMonitor\n  until out=$(kubectl -n bloodraven-playground get mysqlfailovergroup playground -o jsonpath='{.status.activeSite}={.status.ready}'\n  2>/dev/null); [[ \"$out\" =~ ^[a-z]+=true$ ]]; do sleep 5; done; echo \"FG ready: $out\"\n  FG ready state\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            !result
+                .signals
+                .contains(&String::from("ambiguous-permission-chat"))
+        );
+    }
+
+    #[test]
     fn refuses_permission_dialog_when_chat_input_is_active() {
         let frame = "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain\n❯ Here's some of the output:";
         let result = Classifier.classify("test", frame);
@@ -402,13 +466,26 @@ mod tests {
     }
 
     #[test]
-    fn adds_sensitive_claude_path_signal_for_project_slash_command_paths() {
-        let frame = "Do you want to make this edit to /repo/.claude/commands/commit-and-push.md?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
+    fn adds_sensitive_claude_path_signal_for_claude_settings_paths() {
+        let frame = "Do you want to make this edit to /repo/.claude/settings.json?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::PermissionDialog);
         assert!(
             result
+                .signals
+                .contains(&String::from(SIGNAL_SENSITIVE_CLAUDE_PATH))
+        );
+    }
+
+    #[test]
+    fn does_not_flag_project_claude_command_paths_as_sensitive() {
+        let frame = "Do you want to make this edit to /repo/.claude/commands/commit-and-push.md?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            !result
                 .signals
                 .contains(&String::from(SIGNAL_SENSITIVE_CLAUDE_PATH))
         );

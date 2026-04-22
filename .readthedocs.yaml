@@ -1,0 +1,15 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    nodejs: "22"
+
+  commands:
+    - cd docs/ && npm install
+    - cd docs/ && npm run build
+    - mkdir --parents $READTHEDOCS_OUTPUT/html/
+    - cp --recursive docs/build/* $READTHEDOCS_OUTPUT/html/

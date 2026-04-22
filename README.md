@@ -17,11 +17,13 @@ The project is built around a simple rule: terminal automation is only safe when
 
 ## Docs
 
-- [`docs/README.md`](docs/README.md) - docs index
-- [`docs/getting-started.md`](docs/getting-started.md) - quick setup and operator workflow
-- [`docs/workflows.md`](docs/workflows.md) - end-to-end operator flows
-- [`docs/architecture.md`](docs/architecture.md) - module boundaries and design rules
-- [`docs/serve-mode.md`](docs/serve-mode.md) - current serve-mode behavior and next steps
+- published site: `https://botctl.readthedocs.io/en/latest/`
+- docs app source: [`docs/`](docs/)
+- intro: [`docs/docs/intro.mdx`](docs/docs/intro.mdx)
+- getting started: [`docs/docs/getting-started.mdx`](docs/docs/getting-started.mdx)
+- workflows: [`docs/docs/workflows.mdx`](docs/docs/workflows.mdx)
+- architecture: [`docs/docs/architecture.mdx`](docs/docs/architecture.mdx)
+- serve mode: [`docs/docs/serve-mode.mdx`](docs/docs/serve-mode.mdx)
 
 ## Requirements
 
@@ -62,7 +64,7 @@ cargo run -- start --session demo
 See what pane was created:
 
 ```bash
-cargo run -- list-panes
+cargo run -- list
 ```
 
 Inspect a managed session:
@@ -102,7 +104,7 @@ Typical loop:
 ```bash
 cargo run -- start --session demo --cwd /path/to/project
 cargo run -- doctor --session demo
-cargo run -- list-panes
+cargo run -- list
 tmux attach -t demo
 ```
 

@@ -1,0 +1,10 @@
+recorded_at_unix=0
+session=monitor-example
+pane=%monitor
+output_events=0
+notifications=0
+classified_state=PermissionDialog
+expected_state=PermissionDialog
+recap_present=false
+recap_excerpt=none
+signals=permission-keywords

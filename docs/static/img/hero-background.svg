@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">botctl hero background</title>
+  <desc id="desc">Abstract terminal-grid background with cyan and amber glows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#07111a"/>
+      <stop offset="50%" stop-color="#0b1722"/>
+      <stop offset="100%" stop-color="#102030"/>
+    </linearGradient>
+    <radialGradient id="cyanA" cx="22%" cy="20%" r="42%">
+      <stop offset="0%" stop-color="#67f5df" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#67f5df" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cyanB" cx="72%" cy="38%" r="32%">
+      <stop offset="0%" stop-color="#2bb9d6" stop-opacity="0.42"/>
+      <stop offset="100%" stop-color="#2bb9d6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="amber" cx="84%" cy="72%" r="28%">
+      <stop offset="0%" stop-color="#ffaf57" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#ffaf57" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="beam" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#67f5df" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#67f5df" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#67f5df" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <rect width="1600" height="900" fill="url(#cyanA)"/>
+  <rect width="1600" height="900" fill="url(#cyanB)"/>
+  <rect width="1600" height="900" fill="url(#amber)"/>
+  <g stroke="#67f5df" stroke-opacity="0.14">
+    <path d="M0 90h1600M0 180h1600M0 270h1600M0 360h1600M0 450h1600M0 540h1600M0 630h1600M0 720h1600M0 810h1600"/>
+    <path d="M100 0v900M200 0v900M300 0v900M400 0v900M500 0v900M600 0v900M700 0v900M800 0v900M900 0v900M1000 0v900M1100 0v900M1200 0v900M1300 0v900M1400 0v900M1500 0v900"/>
+  </g>
+  <g fill="none" stroke="#9ffcf0" stroke-opacity="0.18" stroke-width="2">
+    <rect x="142" y="128" width="320" height="186" rx="18"/>
+    <rect x="418" y="224" width="442" height="240" rx="22"/>
+    <rect x="928" y="138" width="488" height="262" rx="24"/>
+    <rect x="716" y="506" width="536" height="212" rx="24"/>
+    <rect x="192" y="516" width="406" height="172" rx="20"/>
+  </g>
+  <g opacity="0.28">
+    <path d="M252 216h146" stroke="#67f5df" stroke-width="8" stroke-linecap="round"/>
+    <path d="M510 306h236" stroke="#67f5df" stroke-width="10" stroke-linecap="round"/>
+    <path d="M988 232h188" stroke="#2bb9d6" stroke-width="9" stroke-linecap="round"/>
+    <path d="M988 278h286" stroke="#eef7ff" stroke-opacity="0.5" stroke-width="7" stroke-linecap="round"/>
+    <path d="M770 612h264" stroke="#67f5df" stroke-width="10" stroke-linecap="round"/>
+    <path d="M274 592h184" stroke="#ffaf57" stroke-width="8" stroke-linecap="round"/>
+  </g>
+  <rect x="486" y="110" width="724" height="4" rx="2" fill="url(#beam)" opacity="0.7"/>
+  <rect x="108" y="758" width="622" height="3" rx="1.5" fill="url(#beam)" opacity="0.42"/>
+</svg>

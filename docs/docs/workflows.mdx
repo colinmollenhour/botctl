@@ -2,7 +2,7 @@
 
 This guide collects the operator flows that are currently shipped.
 
-For command syntax, see [command reference](command-reference.md). For prompt handoff details, see [prompt handoff](prompt-handoff.md).
+For command syntax, see [command reference](./command-reference.mdx). For prompt handoff details, see [prompt handoff](./prompt-handoff.mdx).
 
 ## Managed session flow
 
@@ -17,7 +17,7 @@ Use this when `botctl` launches Claude for you.
 2. Find the pane and inspect the session:
 
    ```bash
-   cargo run -- list-panes
+   cargo run -- list
    cargo run -- doctor --session demo
    cargo run -- status --pane %19
    ```
@@ -35,7 +35,7 @@ Use this when Claude is already running inside tmux and you want to verify the p
 1. List panes, including non-managed ones:
 
    ```bash
-   cargo run -- list-panes --all
+   cargo run -- list --all
    ```
 
 2. Resolve only a specific explicit pane:
@@ -112,7 +112,7 @@ cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the c
 cargo run -- yolo start --all --workspace .
 ```
 
-For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](prompt-handoff.md).
+For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](./prompt-handoff.mdx).
 
 ## Observe versus serve
 
@@ -132,4 +132,4 @@ Use `observe` when you want a bounded diagnostic sample; use `serve` when you wa
 - Guarded workflows validate the classified state before sending keys.
 - `Unknown` means stop and inspect.
 
-For deeper rationale and current limits, see [architecture](architecture.md) and [troubleshooting](troubleshooting.md).
+For deeper rationale and current limits, see [architecture](./architecture.mdx) and [troubleshooting](./troubleshooting.mdx).
