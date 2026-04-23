@@ -4,6 +4,7 @@ pub mod classifier;
 pub mod cli;
 pub mod dashboard;
 pub mod fixtures;
+pub mod http_api;
 pub mod observe;
 pub mod prompt;
 pub mod screen_model;

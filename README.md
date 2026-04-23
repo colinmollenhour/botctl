@@ -100,11 +100,27 @@ Run the long-lived observer for one tmux session:
 cargo run -- serve --session demo
 ```
 
+Run the observer and a localhost HTTP API for a web UI:
+
+```bash
+cargo run -- serve --session demo --http 127.0.0.1:8787
+```
+
 Use machine-readable output for tooling:
 
 ```bash
 cargo run -- serve --session demo --format jsonl
 ```
+
+The HTTP API exposes live pane state plus interactive controls such as visible prompt options. Useful endpoints include:
+
+- `GET /instances`
+- `GET /instances/%251`
+- `POST /instances/%251/prompt`
+- `POST /instances/%251/actions/approve-permission`
+- `POST /instances/%251/actions/continue-session`
+- `POST /instances/%251/actions/auto-unstick`
+- `POST /instances/%251/interactions/2`
 
 ## Session Setup And Inspection
 

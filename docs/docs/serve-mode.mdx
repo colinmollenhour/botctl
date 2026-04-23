@@ -25,6 +25,7 @@ Current behavior:
 - may classify stream-driven reconciliations from merged stream state when capture is ambiguous
 - falls back conservatively to captured pane state when merged state is not trustworthy
 - emits human-readable or JSONL events
+- can also expose a localhost HTTP API for polling clients and web UIs
 - writes event and summary artifacts to `<state-root>/artifacts`
 
 ## Basic usage
@@ -47,6 +48,29 @@ Use JSONL output for tooling:
 
 ```bash
 botctl serve --session demo --format jsonl
+```
+
+Expose the local HTTP API for a browser-based control surface:
+
+```bash
+botctl serve --session demo --http 127.0.0.1:8787
+```
+
+Current HTTP endpoints include:
+
+- `GET /instances`
+- `GET /instances/:id`
+- `POST /instances/:id/prompt`
+- `POST /instances/:id/actions/:action`
+- `POST /instances/:id/interactions/:optionId`
+
+The prompt endpoint accepts JSON like:
+
+```json
+{
+  "text": "Summarize the current repo",
+  "submit_delay_ms": 100
+}
 ```
 
 You can also write artifacts to an explicit state root:
@@ -96,7 +120,6 @@ Implemented now:
 Not implemented yet:
 
 - persistent daemon lifecycle
-- HTTP API
 - SSE endpoints
 - full reconstructed terminal screen model
 - persistent registry of managed/adopted instances
@@ -110,11 +133,13 @@ Serve mode keeps the same safety rules as the rest of `botctl`:
 - observation stays scoped to the requested tmux session or explicit pane
 - `Unknown` remains a refusal state
 - serve mode does not bypass guarded workflow checks
+- the HTTP API only exposes panes inside the served tmux session
+- the HTTP API exposes visible prompt options conservatively; when a dialog cannot be selected safely yet, it falls back to low-level confirmation controls
 
 Current limits:
 
 - it is still a foreground observer
-- it does not expose a daemon, HTTP API, or SSE yet
+- it does not expose a daemon or SSE yet
 - it does not replace guarded workflow execution
 - classification still depends on capture-plus-merge heuristics, not a full terminal model
 

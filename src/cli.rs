@@ -123,6 +123,7 @@ pub struct ServeArgs {
     pub pane_id: Option<String>,
     pub reconcile_ms: u64,
     pub history_lines: usize,
+    pub http_addr: Option<String>,
     pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
 }
@@ -308,7 +309,7 @@ pub fn usage() -> String {
         "    With --persistent, keep the dashboard alive in a dedicated tmux session and reopen it in a popup.\n\n",
     );
     out.push_str(&featured(
-        "serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]",
+        "serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--format human|jsonl] [--state-dir PATH]",
     ));
     out.push_str("\n    Continuously inspect a Claude session and emit babysit output.\n\n");
 
@@ -645,6 +646,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
     let mut reconcile_ms = 1500u64;
     let mut history_lines = 120usize;
     let mut format = BabysitFormat::Human;
+    let mut http_addr: Option<String> = None;
     let mut state_dir = None;
 
     let mut i = 0;
@@ -675,6 +677,9 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
                 let raw = read_value(&args, &mut i, "--format")?;
                 format = parse_human_jsonl_format(&raw)?;
             }
+            "--http" => {
+                http_addr = Some(read_value(&args, &mut i, "--http")?);
+            }
             flag => {
                 return Err(AppError::new(format!("unknown serve flag: {flag}")));
             }
@@ -695,6 +700,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
         pane_id,
         reconcile_ms,
         history_lines,
+        http_addr,
         format,
         state_dir,
     }))
@@ -1557,6 +1563,8 @@ mod tests {
             String::from("%7"),
             String::from("--reconcile-ms"),
             String::from("750"),
+            String::from("--http"),
+            String::from("127.0.0.1:8787"),
             String::from("--format"),
             String::from("jsonl"),
             String::from("--state-dir"),
@@ -1569,6 +1577,7 @@ mod tests {
                 assert_eq!(args.session_name, "demo");
                 assert_eq!(args.pane_id.as_deref(), Some("%7"));
                 assert_eq!(args.reconcile_ms, 750);
+                assert_eq!(args.http_addr.as_deref(), Some("127.0.0.1:8787"));
                 assert_eq!(args.format, super::BabysitFormat::Jsonl);
                 assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-serve")));
             }

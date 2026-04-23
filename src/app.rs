@@ -31,6 +31,7 @@ use crate::cli::{
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
+use crate::http_api::spawn_http_server;
 use crate::observe::{CollectedObservation, ObserveRequest, collect_observation};
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
@@ -47,7 +48,7 @@ use crate::yolo::{
     YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
 };
 
-const ACTION_GUARD_HISTORY_LINES: usize = 120;
+pub(crate) const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
 const KEEP_GOING_HISTORY_LINES: usize = 2000;
 const KEEP_GOING_PROMPT_ANCHOR: &str = "Audit the task currently in scope";
@@ -626,8 +627,19 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
     };
     let format = args.format;
     let use_color = supports_babysit_color();
+    let http_thread = if let Some(http_addr) = args.http_addr.clone() {
+        eprintln!("http api listening on http://{http_addr}");
+        Some(spawn_http_server(
+            client.clone(),
+            request.clone(),
+            http_addr,
+            Arc::clone(&interrupted),
+        ))
+    } else {
+        None
+    };
 
-    let serve_result = run_serve_loop(&client, &request, interrupted, |event| {
+    let serve_result = run_serve_loop(&client, &request, Arc::clone(&interrupted), |event| {
         let payload = render_serve_event_payload(&request, &event);
         if artifacts.is_none() {
             if let Some(state_dir) = artifact_root.as_deref() {
@@ -676,6 +688,13 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
             }
             eprintln!("warning: serve summary export failed: {error}");
         }
+    }
+
+    interrupted.store(true, Ordering::SeqCst);
+    if let Some(http_thread) = http_thread {
+        http_thread
+            .join()
+            .map_err(|_| AppError::new("http api thread panicked"))??;
     }
 
     serve_result?;
@@ -1651,53 +1670,89 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
     ensure_pane_owned_by_claude(&pane)?;
-    let mut classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
+    let submitted = submit_prompt_for_pane(
+        &client,
+        &pane,
+        &args.session_name,
+        args.state_dir.as_deref(),
+        args.workspace.as_deref(),
+        &prompt_text,
+        args.submit_delay_ms,
+    )?;
+
+    Ok(format!(
+        "submitted prepared prompt session={} pane={} workspace={} state={} state_db={} delay_ms={}",
+        args.session_name,
+        submitted.pane_id,
+        submitted.workspace_id,
+        submitted.state,
+        submitted.state_db.display(),
+        submitted.delay_ms
+    ))
+}
+
+pub(crate) struct PromptSubmissionOutcome {
+    pub(crate) pane_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) state: String,
+    pub(crate) state_db: PathBuf,
+    pub(crate) delay_ms: u64,
+}
+
+pub(crate) fn submit_prompt_for_pane(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    session_name: &str,
+    state_dir_override: Option<&Path>,
+    workspace_selector: Option<&str>,
+    prompt_text: &str,
+    submit_delay_ms: u64,
+) -> AppResult<PromptSubmissionOutcome> {
+    let mut classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     if let Some(workflow) = submit_prompt_preflight_workflow(&classification) {
-        execute_classified_workflow(&client, &pane.pane_id, workflow, &classification)?;
+        execute_classified_workflow(client, &pane.pane_id, workflow, &classification)?;
         thread::sleep(Duration::from_millis(AUTO_UNSTICK_STEP_DELAY_MS));
-        let after = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        let after = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
         ensure_state_transition(&classification, &after, workflow.as_str())?;
         classification = after;
     }
     ensure_workflow_state(GuardedWorkflow::SubmitPrompt, &classification)?;
 
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = resolve_workspace_for_pane(&state_dir, &pane, args.workspace.as_deref())?;
-    let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
+    let state_dir = resolve_bootstrapped_state_dir(state_dir_override)?;
+    let workspace = resolve_workspace_for_pane(&state_dir, pane, workspace_selector)?;
     store_pending_prompt_for_tmux_instance(
         &state_dir,
         &workspace.id,
-        &args.session_name,
-        &pane,
-        &prompt_text,
+        session_name,
+        pane,
+        prompt_text,
     )?;
 
     let bindings = load_automation_keybindings(None)?;
     let before_submit = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
 
     send_actions(
-        &client,
+        client,
         &pane.pane_id,
         &prompt_submission_sequence(),
         &bindings,
-        args.submit_delay_ms,
+        submit_delay_ms,
     )?;
-    wait_for_prompt_submission_start(&client, &pane.pane_id, &before_submit, None).map_err(|_| {
+    wait_for_prompt_submission_start(client, &pane.pane_id, &before_submit, None).map_err(|_| {
         AppError::new(format!(
             "submit-prompt sent the prepared prompt but pane {} did not show a prompt-submission transition",
             pane.pane_id
         ))
     })?;
 
-    Ok(format!(
-        "submitted prepared prompt session={} pane={} workspace={} state={} state_db={} delay_ms={}",
-        args.session_name,
-        pane.pane_id,
-        workspace.id,
-        classification.state.as_str(),
-        state_db_path(&state_dir).display(),
-        args.submit_delay_ms
-    ))
+    Ok(PromptSubmissionOutcome {
+        pane_id: pane.pane_id.clone(),
+        workspace_id: workspace.id,
+        state: classification.state.as_str().to_string(),
+        state_db: state_db_path(&state_dir),
+        delay_ms: submit_delay_ms,
+    })
 }
 
 fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
@@ -1782,7 +1837,7 @@ fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
     }
 }
 
-fn resolve_bootstrapped_state_dir(path: Option<&Path>) -> AppResult<PathBuf> {
+pub(crate) fn resolve_bootstrapped_state_dir(path: Option<&Path>) -> AppResult<PathBuf> {
     let state_dir = resolve_state_dir(path)?;
     bootstrap_state_db(&state_dir)?;
     Ok(state_dir)
@@ -1796,7 +1851,7 @@ fn resolve_selected_workspace(
     resolve_workspace(state_dir, selector, &cwd)
 }
 
-fn resolve_workspace_for_pane(
+pub(crate) fn resolve_workspace_for_pane(
     state_dir: &Path,
     pane: &TmuxPane,
     selector: Option<&str>,
@@ -2472,12 +2527,12 @@ pub(crate) struct InspectedPane {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PermissionPromptDetails {
-    prompt_type: String,
-    sandbox_mode: Option<String>,
-    command: Option<String>,
-    reason: Option<String>,
-    question: Option<String>,
+pub(crate) struct PermissionPromptDetails {
+    pub(crate) prompt_type: String,
+    pub(crate) sandbox_mode: Option<String>,
+    pub(crate) command: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) question: Option<String>,
 }
 
 pub(crate) fn inspect_pane(
@@ -2494,7 +2549,9 @@ pub(crate) fn inspect_pane(
     })
 }
 
-fn extract_permission_prompt_details(inspected: &InspectedPane) -> Option<PermissionPromptDetails> {
+pub(crate) fn extract_permission_prompt_details(
+    inspected: &InspectedPane,
+) -> Option<PermissionPromptDetails> {
     if inspected.classification.state != SessionState::PermissionDialog {
         return None;
     }
@@ -2955,7 +3012,7 @@ fn render_babysit_action_completed_event(
     )
 }
 
-fn classify_pane(
+pub(crate) fn classify_pane(
     client: &TmuxClient,
     pane_id: &str,
     history_lines: usize,
@@ -3015,11 +3072,11 @@ fn is_usable_state(state: SessionState) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct ContinueOutcome {
-    action: String,
-    outcome: String,
-    after: Classification,
-    used_permission_approval: bool,
+pub(crate) struct ContinueOutcome {
+    pub(crate) action: String,
+    pub(crate) outcome: String,
+    pub(crate) after: Classification,
+    pub(crate) used_permission_approval: bool,
 }
 
 pub(crate) fn try_unstick_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<String> {
@@ -3031,7 +3088,7 @@ pub(crate) fn try_unstick_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResul
     ))
 }
 
-fn continue_from_classification(
+pub(crate) fn continue_from_classification(
     client: &TmuxClient,
     pane: &TmuxPane,
     classification: &Classification,
@@ -3196,11 +3253,11 @@ pub(crate) fn execute_classified_workflow(
     }
 }
 
-fn load_automation_keybindings(path: Option<&Path>) -> AppResult<ResolvedKeybindings> {
+pub(crate) fn load_automation_keybindings(path: Option<&Path>) -> AppResult<ResolvedKeybindings> {
     load_resolved_keybindings(path).map_err(AppError::new)
 }
 
-fn keys_for_action<'a>(
+pub(crate) fn keys_for_action<'a>(
     bindings: &'a ResolvedKeybindings,
     action: AutomationAction,
 ) -> AppResult<&'a [String]> {
@@ -3292,7 +3349,7 @@ fn render_status_report(
     )
 }
 
-fn render_screen_excerpt(frame: &str) -> String {
+pub(crate) fn render_screen_excerpt(frame: &str) -> String {
     let excerpt = focus_live_frame(frame, 8);
     if excerpt.is_empty() {
         String::from("none")
@@ -3301,7 +3358,7 @@ fn render_screen_excerpt(frame: &str) -> String {
     }
 }
 
-fn render_next_safe_action(
+pub(crate) fn render_next_safe_action(
     classification: &Classification,
     pane: &TmuxPane,
     bindings: &KeybindingsInspection,
@@ -3419,6 +3476,17 @@ pub(crate) fn ensure_pane_owned_by_claude(pane: &TmuxPane) -> AppResult<()> {
             pane.pane_id, pane.current_command
         )))
     }
+}
+
+pub(crate) fn execute_automation_action(
+    client: &TmuxClient,
+    pane_id: &str,
+    action: AutomationAction,
+) -> AppResult<String> {
+    let bindings = load_automation_keybindings(None)?;
+    let keys = keys_for_action(&bindings, action)?;
+    client.send_keys(pane_id, keys)?;
+    Ok(action.as_str().to_string())
 }
 
 fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspection) -> String {

@@ -63,15 +63,18 @@ Notes:
 
 Purpose: run the live observation loop for one tmux session and stream human-readable or JSONL events.
 
+It can also expose a localhost HTTP API for a polling web UI.
+
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--format human|jsonl] [--state-dir PATH]
 ```
 
 Examples:
 ```bash
 botctl serve --session demo
 botctl serve --session demo --format jsonl
+botctl serve --session demo --http 127.0.0.1:8787
 botctl serve --session demo --pane 0:2.3
 ```
 
@@ -79,6 +82,7 @@ Notes:
 
 - this is the main long-lived observation path
 - `--format jsonl` is the useful mode for tooling and automation
+- `--http ADDR` starts a localhost JSON API alongside the observer
 - persists tape and summary artifacts under the state root
 
 ## Common targeting and safety rules
@@ -304,7 +308,7 @@ Purpose: run the live observation loop for a session.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--format human|jsonl] [--state-dir PATH]
 ```
 
 Flags:
@@ -312,6 +316,7 @@ Flags:
 - `--pane %ID|session:window.pane` (optional)
 - `--reconcile-ms N` (default: `1500`, must be at least `1`)
 - `--history-lines N` (default: `120`)
+- `--http ADDR` (optional; example: `127.0.0.1:8787`)
 - `--format human|jsonl` (default: `human`)
 - `--state-dir PATH` (optional; default machine-state root)
 
@@ -322,6 +327,12 @@ Artifacts:
   - `exports/<id>/summary.json` (session summary)
 - events are still streamed to stdout with the same format behavior as before.
 - these runtime artifacts stay as regular files; they are not stored in `state.db`.
+- when `--http` is set, `serve` also listens for JSON requests such as:
+  - `GET /instances`
+  - `GET /instances/:id`
+  - `POST /instances/:id/prompt`
+  - `POST /instances/:id/actions/:action`
+  - `POST /instances/:id/interactions/:optionId`
 
 Targeting: session required; optional explicit pane target.
 
@@ -330,6 +341,7 @@ Safety: rejects `--reconcile-ms 0`.
 Example:
 ```bash
 botctl serve --session demo --format jsonl
+botctl serve --session demo --http 127.0.0.1:8787
 ```
 
 ## Fixtures and replay

@@ -135,7 +135,7 @@ For the editor-helper, survey preflight, and state-dir variants, see [prompt han
 - `observe` is bounded: it returns a fixed sample of events and pane state.
 - `serve` is the current long-lived foreground observer for one session.
 - `serve` still depends on tmux control mode and periodic pane snapshots.
-- `serve` is not yet a full daemon/API/SSE product.
+- `serve` now has a localhost HTTP API, but it is still not the full daemon/SSE product.
 
 Use `observe` when you want a bounded diagnostic sample; use `serve` when you want a live foreground stream.
 
