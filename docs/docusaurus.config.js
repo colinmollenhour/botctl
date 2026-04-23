@@ -113,6 +113,10 @@ const config = {
                 href: 'https://github.com/colinmollenhour/botctl',
               },
               {
+                label: 'Sponsor',
+                href: 'https://github.com/sponsors/colinmollenhour',
+              },
+              {
                 label: 'Read the Docs',
                 href: 'https://botctl.readthedocs.io/en/latest/',
               },

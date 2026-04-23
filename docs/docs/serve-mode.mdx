@@ -2,6 +2,8 @@
 
 `botctl serve` is the current long-lived observation path.
 
+It is one of the three main user-facing commands, alongside `dashboard` and `yolo`.
+
 It holds a persistent tmux control-mode connection open for one session, then rebases that stream with periodic `capture-pane` snapshots.
 
 ## What it does today
@@ -32,6 +34,8 @@ Observe one session:
 ```bash
 cargo run -- serve --session demo
 ```
+
+This is the main live observation path. Use it when you want a foreground stream; use `observe` only when you specifically want a bounded diagnostic sample.
 
 Observe one specific pane inside that session:
 

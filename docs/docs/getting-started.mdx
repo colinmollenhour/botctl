@@ -4,6 +4,16 @@
 
 For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
+## Learn these first
+
+Most users only need three commands:
+
+- `dashboard` for a live control surface across Claude panes
+- `yolo` for automated babysitting and recovery
+- `serve` for a long-lived observation stream
+
+Everything else is support around setup, diagnostics, prompt handoff, and lower-level recovery.
+
 ## Requirements
 
 - Rust and Cargo
@@ -14,6 +24,26 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 ```bash
 cargo test
+```
+
+## Fastest useful path
+
+Open the dashboard:
+
+```bash
+cargo run -- dashboard
+```
+
+Start YOLO on one pane:
+
+```bash
+cargo run -- yolo --pane 0:6.0
+```
+
+Stream live session events:
+
+```bash
+cargo run -- serve --session demo --format jsonl
 ```
 
 ## First success
@@ -59,11 +89,45 @@ If you already know the tmux pane target, you can use it directly:
 cargo run -- attach --pane 0:2.3
 ```
 
+## Dashboard and YOLO
+
+Open the cross-workspace dashboard TUI:
+
+```bash
+cargo run -- dashboard
+```
+
+Keep it alive in a dedicated tmux-backed popup session:
+
+```bash
+cargo run -- dashboard --persistent
+```
+
+If you use tmux popups, this is the quick and easy way to make the dashboard feel built-in:
+
+```tmux
+bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
+```
+
+Enable YOLO for one explicit pane:
+
+```bash
+cargo run -- yolo --pane 0:6.0
+```
+
+Enable YOLO for all panes in one workspace:
+
+```bash
+cargo run -- yolo --all --workspace .
+```
+
 ## Observe versus serve
 
 - `observe` is bounded and returns a fixed snapshot/event sample.
 - `serve` is the current foreground observer for one tmux session.
 - `serve` is not a full daemon/API/SSE product yet.
+
+If you are not sure which one you want, you probably want `serve`, not `observe`.
 
 Run `serve` against one tmux session:
 

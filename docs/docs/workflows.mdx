@@ -4,6 +4,22 @@ This guide collects the operator flows that are currently shipped.
 
 For command syntax, see [command reference](./command-reference.mdx). For prompt handoff details, see [prompt handoff](./prompt-handoff.mdx).
 
+## Main operator loop
+
+For most real use, the loop is:
+
+1. Open `dashboard` to see all panes.
+2. Use `yolo` on the pane or workspace you want babysat.
+3. Use `serve` when you need a live event stream or machine-readable observation.
+
+Typical commands:
+
+```bash
+cargo run -- dashboard
+cargo run -- yolo --pane 0:6.0
+cargo run -- serve --session demo --format jsonl
+```
+
 ## Managed session flow
 
 Use this when `botctl` launches Claude for you.
@@ -122,6 +138,8 @@ For the editor-helper, survey preflight, and state-dir variants, see [prompt han
 - `serve` is not yet a full daemon/API/SSE product.
 
 Use `observe` when you want a bounded diagnostic sample; use `serve` when you want a live foreground stream.
+
+In practice, `observe` is a secondary diagnostic tool. `serve` is the main live observation path.
 
 ## Safety rules
 

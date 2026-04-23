@@ -5,39 +5,80 @@ slug: /
 
 # botctl docs
 
-Operator-facing docs for `botctl`.
+`botctl` helps you keep Claude Code sessions under control inside `tmux`.
+
+The fun part is not the implementation details. The fun part is that you can:
+
+- open a live `dashboard` and immediately see what all your Claude panes are doing
+- turn on `yolo` and let `botctl` babysit the boring confirmation flows
+- run `serve` and get a live event stream when you want to watch or integrate the session externally
+
+Also, yes, it is written in Rust. Legally, I believe, all new CLIs must be.
+
+## The three cool commands
+
+### `dashboard`
+
+The command you open first.
+
+- see Claude panes across workspaces in one place
+- spot blocked or waiting sessions quickly
+- jump straight into a pane
+- toggle YOLO without hunting around in tmux
+
+### `yolo`
+
+The command that removes tedious operator babysitting.
+
+- handle common safe confirmation flows automatically
+- scope automation to one pane or one workspace
+- keep the guardrails on instead of blindly mashing keys
+
+### `serve`
+
+The command for live observation.
+
+- stream what is happening in a session as it happens
+- use human output for watching, or JSONL for tooling
+- keep a long-running foreground observer attached to one tmux session
 
 ## Start here
 
-- [Getting started](./getting-started.mdx) — first successful run
-- [Workflows](./workflows.mdx) — end-to-end operator flows
+- [Getting started](./getting-started.mdx) — fastest path to a useful first run
+- [Workflows](./workflows.mdx) — the main operator loop with `dashboard`, `yolo`, and `serve`
+- [Command reference](./command-reference.mdx) — syntax and flags, with the important commands first
 
-## Understand the modes
+## Quick start
 
-- [Serve mode](./serve-mode.mdx) — current foreground observer behavior
-- [Architecture](./architecture.mdx) — module boundaries and safety rules
+```bash
+botctl dashboard
+botctl yolo --pane 0:6.0
+botctl serve --session demo --format jsonl
+```
 
-## Find command details
+## More detail when you want it
 
-- [Command reference](./command-reference.mdx)
-- [Automation](./automation.mdx)
-- [Prompt handoff](./prompt-handoff.mdx)
-- [Troubleshooting](./troubleshooting.mdx)
+- [Serve mode](./serve-mode.mdx) — what the live observer does today
+- [Prompt handoff](./prompt-handoff.mdx) — prompt staging and editor flow
+- [Automation](./automation.mdx) — guarded workflows and keybinding behavior
+- [Troubleshooting](./troubleshooting.mdx) — when a pane is weird or blocked
 
-## Build, test, and contribute
+## Internals and development
 
+- [Architecture](./architecture.mdx)
 - [Classifier](./classifier.mdx)
 - [Testing and fixtures](./testing-and-fixtures.mdx)
 - [Contributing](./contributing.mdx)
 
-## Planning docs still in the repo root
+## Plans and scope
+
+- Keep docs here aligned with shipped behavior.
+- If a flow is not implemented yet, link to the plan instead of describing it as current behavior.
+
+Planning docs still in the repo root:
 
 These remain the source of longer-term plans:
 
 - [`VISION.md`](https://github.com/colinmollenhour/botctl/blob/main/VISION.md)
 - [`WISHLIST.md`](https://github.com/colinmollenhour/botctl/blob/main/WISHLIST.md)
 - [`PLANS-Serve-Mode.md`](https://github.com/colinmollenhour/botctl/blob/main/PLANS-Serve-Mode.md)
-
-## Scope
-
-Keep docs here aligned with shipped behavior. If a flow is not implemented yet, link to the relevant plan instead of describing it as current behavior.
