@@ -120,6 +120,17 @@ impl TmuxClient {
         }
     }
 
+    pub fn plan_kill_session(&self, target_session: &str) -> TmuxCommandPlan {
+        TmuxCommandPlan {
+            program: self.program.clone(),
+            args: self.with_socket_args(vec![
+                String::from("kill-session"),
+                String::from("-t"),
+                target_session.to_string(),
+            ]),
+        }
+    }
+
     pub fn start_session(&self, request: &StartSessionRequest) -> AppResult<StartedSession> {
         self.run_status(self.plan_start_session(request).args)?;
         Ok(StartedSession {
@@ -339,11 +350,7 @@ impl TmuxClient {
     }
 
     pub fn kill_session(&self, target_session: &str) -> AppResult<()> {
-        self.run_status(vec![
-            String::from("kill-session"),
-            String::from("-t"),
-            target_session.to_string(),
-        ])
+        self.run_status(self.plan_kill_session(target_session).args)
     }
 
     pub fn attach_session(&self, target_session: &str) -> AppResult<()> {

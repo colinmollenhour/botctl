@@ -38,7 +38,9 @@ use crate::tmux::{TmuxClient, TmuxPane};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q quit";
-const PERSISTENT_FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q detach";
+const PERSISTENT_FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q detach  X kill server";
+const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
+const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
@@ -649,6 +651,11 @@ fn host_tmux_client() -> TmuxClient {
     TmuxClient::default()
 }
 
+fn kill_persistent_dashboard_server() -> AppResult<()> {
+    TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET)
+        .kill_session(PERSISTENT_DASHBOARD_SESSION)
+}
+
 fn run_dashboard_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut DashboardApp,
@@ -674,6 +681,12 @@ fn run_dashboard_loop(
                                 continue;
                             }
                             return Ok(None);
+                        }
+                        KeyCode::Char('X') => {
+                            if persistent {
+                                kill_persistent_dashboard_server()?;
+                                return Ok(None);
+                            }
                         }
                         KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
                         KeyCode::Up | KeyCode::Char('k') => app.select_previous()?,
@@ -805,12 +818,13 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         Paragraph::new(Line::from(Span::styled(header_text, header_style()))).style(header_style());
     frame.render_widget(header, panes_layout[0]);
 
+    let pane_list_width = rounded_block(None).inner(panes_layout[1]).width as usize;
     let mut items = Vec::new();
     for row in &app.rows {
         match row {
             RowItem::WorkspaceHeader { label } => {
                 items.push(ListItem::new(Line::from(vec![Span::styled(
-                    label.clone(),
+                    pad_display_right(label, pane_list_width),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -1052,6 +1066,15 @@ fn pad_display(value: &str, width: usize) -> String {
         value.to_string()
     } else {
         format!("{}{}", value, " ".repeat(width - display_width))
+    }
+}
+
+fn pad_display_right(value: &str, width: usize) -> String {
+    let display_width = UnicodeWidthStr::width(value);
+    if display_width >= width {
+        value.to_string()
+    } else {
+        format!("{}{}", " ".repeat(width - display_width), value)
     }
 }
 
@@ -1450,12 +1473,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DashboardApp, DetailBodyKind, PaneEntry, SavedSelection, TABLE_GAP,
+        DashboardApp, DetailBodyKind, PaneEntry, SavedSelection, PERSISTENT_DASHBOARD_SESSION,
+        PERSISTENT_DASHBOARD_SOCKET, PERSISTENT_FOOTER_TEXT, TABLE_GAP,
         abbreviate_home_path,
         context_lines_above_input, current_base_window_name, dashboard_display_state,
         dashboard_selection_path, derive_base_window_name,
         detail_body_kind, detail_current_path, detail_workspace_label, format_age, recap_lines,
-        load_saved_selection, pane_list_columns, pane_list_content_area, rect_contains,
+        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area, rect_contains,
         repo_root_from_repo_key, save_selection, state_emoji, tmux_object_id_order,
         workspace_group_key, yolo_column_contains,
         workspace_group_label,
@@ -1610,6 +1634,25 @@ mod tests {
         assert!(area.width > 0);
         assert!(area.height > 0);
         assert!(rect_contains(area, area.x, area.y));
+    }
+
+    #[test]
+    fn pad_display_right_left_pads_to_width() {
+        assert_eq!(pad_display_right("demo", 8), "    demo");
+        assert_eq!(pad_display_right("demo", 4), "demo");
+    }
+
+    #[test]
+    fn persistent_footer_mentions_kill_server_action() {
+        assert!(PERSISTENT_FOOTER_TEXT.contains("X kill server"));
+    }
+
+    #[test]
+    fn kill_persistent_dashboard_server_uses_dedicated_socket_and_session() {
+        let client = TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET);
+        let plan = client.plan_kill_session(PERSISTENT_DASHBOARD_SESSION);
+
+        assert_eq!(plan.render(), "tmux -L botctl-dashboard kill-session -t botctl-dashboard");
     }
 
     #[test]
