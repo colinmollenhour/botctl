@@ -32,6 +32,7 @@ use crate::tmux::{ControlModeReceive, TmuxClient, TmuxPane};
 use crate::yolo::{YoloRecord, disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const SOCKET_FILENAME: &str = "runtime.sock";
+const TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_RUNTIME_TARGET_TMUX_SOCKET";
 const CONTROL_POLL_MS: u64 = 250;
 const STREAM_DEBOUNCE_MS: u64 = 200;
 const MAX_LIVE_EXCERPT_LINES: usize = 20;
@@ -131,6 +132,7 @@ enum RuntimeRequest {
         prompt_text: String,
         submit_delay_ms: u64,
     },
+    Stop,
     Subscribe,
 }
 
@@ -265,6 +267,13 @@ impl RuntimeClient {
         })
     }
 
+    pub fn stop(&self) -> AppResult<()> {
+        match self.request(RuntimeRequest::Stop)? {
+            RuntimeResponse::Ok => Ok(()),
+            other => Err(unexpected_response("stop", &other)),
+        }
+    }
+
     fn request(&self, request: RuntimeRequest) -> AppResult<RuntimeResponse> {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|error| {
             AppError::new(format!(
@@ -331,8 +340,9 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
             Ok((stream, _)) => {
                 let shared = Arc::clone(&shared);
                 let config = config.clone();
+                let stop = Arc::clone(&stop);
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, shared, config) {
+                    if let Err(error) = handle_client(stream, shared, config, Arc::clone(&stop)) {
                         eprintln!("warning: runtime client failed: {error}");
                     }
                 });
@@ -417,6 +427,7 @@ fn handle_client(
     stream: UnixStream,
     shared: Arc<Mutex<RuntimeShared>>,
     config: RuntimeServerConfig,
+    stop: Arc<AtomicBool>,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
     let request = read_request(&mut reader)?;
@@ -486,6 +497,10 @@ fn handle_client(
             )?;
             write_message(&mut stream, &RuntimeResponse::Action { result })
         }
+        RuntimeRequest::Stop => {
+            stop.store(true, Ordering::SeqCst);
+            write_message(&mut stream, &RuntimeResponse::Ok)
+        }
         RuntimeRequest::Subscribe => handle_subscribe(stream, &shared),
     }
 }
@@ -538,7 +553,7 @@ fn handle_set_yolo(
     all: bool,
     enabled: bool,
 ) -> AppResult<Vec<String>> {
-    let client = TmuxClient::default();
+    let client = runtime_tmux_client();
     let mut updated = Vec::new();
     if let Some(pane_id) = pane_id {
         let pane = client
@@ -626,7 +641,7 @@ fn handle_run_action(
     action: &str,
 ) -> AppResult<RuntimeActionResult> {
     let _guard = ActionGuard::acquire(shared, pane_id)?;
-    let client = TmuxClient::default();
+    let client = runtime_tmux_client();
     let snapshot = get_snapshot(shared, pane_id, session_name)?;
     let current = validate_action_target(&client, &snapshot)?;
     ensure_pane_owned_by_claude(&current)?;
@@ -661,7 +676,7 @@ fn handle_submit_prompt(
     submit_delay_ms: u64,
 ) -> AppResult<RuntimeActionResult> {
     let _guard = ActionGuard::acquire(shared, pane_id)?;
-    let client = TmuxClient::default();
+    let client = runtime_tmux_client();
     let snapshot = get_snapshot(shared, pane_id, None)?;
     let current = validate_action_target(&client, &snapshot)?;
     ensure_pane_owned_by_claude(&current)?;
@@ -787,7 +802,7 @@ fn spawn_observer(
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let client = TmuxClient::default();
+        let client = runtime_tmux_client();
         let (tx, rx) = mpsc::channel();
         let mut observed_sessions = BTreeSet::new();
         let mut last_reconcile = Instant::now() - Duration::from_millis(config.reconcile_ms);
@@ -1350,6 +1365,13 @@ fn now_unix_ms() -> i64 {
 fn current_tmux_socket_path() -> Option<String> {
     let tmux = std::env::var_os("TMUX")?;
     tmux.to_string_lossy().split(',').next().map(str::to_string)
+}
+
+fn runtime_tmux_client() -> TmuxClient {
+    match std::env::var_os(TARGET_TMUX_SOCKET_ENV) {
+        Some(socket_path) if !socket_path.is_empty() => TmuxClient::with_socket_path(socket_path),
+        _ => TmuxClient::default(),
+    }
 }
 
 pub fn build_instance_summary_json(snapshot: &RuntimePaneSnapshot) -> AppResult<serde_json::Value> {

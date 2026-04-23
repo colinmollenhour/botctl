@@ -8,7 +8,7 @@ The project is built around a simple rule: terminal automation is only safe when
 
 These are the commands that matter most in day-to-day use:
 
-- `runtime` to start the single local coordinator that owns live observation and automation
+- `runtime` to start or stop the single local coordinator that owns live observation and automation
 - `dashboard` to see all live Claude panes, grouped by workspace, with state, age, and YOLO controls
 - `yolo` to set central YOLO policy for one pane or a scoped set of panes
 - `serve` to expose HTTP and event output as a facade over runtime state
@@ -63,19 +63,20 @@ cargo test resolves_custom_binding_keys_for_actions
 If you just want the useful path quickly:
 
 ```bash
-cargo run -- runtime
 cargo run -- dashboard
 cargo run -- yolo --pane 0:6.0
 cargo run -- serve --session demo --format jsonl
 ```
 
-Start the runtime first:
+By default, `dashboard`, `yolo`, and `serve` run in managed mode. If no runtime is available, they auto-start one in a hidden tmux session and connect to it. The runtime stays alive while managed clients still need it, and you can manage it directly with:
 
 ```bash
 cargo run -- runtime
+cargo run -- runtime stop
+cargo run -- runtime --foreground
 ```
 
-The runtime is the single owner of live tmux observation, pane classification, yolo supervision, and guarded actions. Other long-lived commands connect to it over `<state-dir>/runtime.sock` instead of running their own control loops.
+Use `--unmanaged` on `dashboard`, `yolo`, or `serve` when you want them to require an already-running runtime instead of auto-starting one.
 
 ## Core Workflows
 
@@ -221,6 +222,8 @@ cargo run -- yolo start --all --workspace .
 ```
 
 The runtime keeps desired YOLO policy in SQLite and enforces the effective supervision state in memory. Disabling YOLO through the dashboard, CLI, or HTTP becomes visible to the other clients immediately because they all read the same runtime state.
+
+Managed clients use shared runtime leases, so a later dashboard or serve session can keep an auto-started runtime alive instead of having it torn down when an earlier client exits.
 
 Show the CLI help:
 

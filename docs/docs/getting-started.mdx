@@ -15,7 +15,7 @@ Most users only need four commands:
 
 Everything else is support around setup, diagnostics, prompt handoff, and lower-level recovery.
 
-If you just want to get value quickly, install it, start `runtime`, open `dashboard`, then try `yolo` or `serve`.
+If you just want to get value quickly, install it, open `dashboard`, then try `yolo` or `serve`.
 
 ## Requirements
 
@@ -34,7 +34,6 @@ cargo install botctl
 Open the dashboard:
 
 ```bash
-botctl runtime
 botctl dashboard
 ```
 
@@ -50,7 +49,22 @@ Stream live session events:
 botctl serve --session demo --format jsonl
 ```
 
-The runtime owns live tmux observation, pane classification, yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` connect to the same local socket at `<state-dir>/runtime.sock`, so they all see the same pane state.
+The runtime owns live tmux observation, pane classification, yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` connect to the same local socket at `<state-dir>/runtime.sock`, and in managed mode they auto-start a hidden tmux-backed runtime when one is not already running.
+
+## Managed versus unmanaged
+
+- managed is the default for `dashboard`, `yolo`, and `serve`
+- managed mode auto-starts a hidden runtime session when needed
+- managed clients share runtime leases so the last managed listener can keep the runtime alive instead of losing it when an earlier client exits
+- `--unmanaged` disables auto-start and requires an existing runtime
+
+Direct runtime commands:
+
+```bash
+botctl runtime
+botctl runtime stop
+botctl runtime --foreground
+```
 
 ## First session
 
@@ -153,7 +167,7 @@ botctl yolo --pane 0:6.0 --follow
 - `serve` is the runtime-backed facade for one tmux session.
 - `serve` does not run its own observer loop anymore.
 
-If you are not sure which one you want, you probably want `runtime` plus `serve`, not `observe`.
+If you are not sure which one you want, you probably want managed `serve`, not `observe`.
 
 Run `serve` against one tmux session:
 

@@ -13,6 +13,8 @@ Purpose: start the central local runtime that owns live observation, guarded act
 Syntax:
 ```bash
 botctl runtime [--reconcile-ms N] [--history-lines N] [--state-dir PATH]
+botctl runtime stop [--state-dir PATH]
+botctl runtime --foreground [--reconcile-ms N] [--history-lines N] [--state-dir PATH]
 ```
 
 Examples:
@@ -24,6 +26,9 @@ botctl runtime --state-dir /tmp/botctl-state
 Notes:
 
 - listens on `<state-dir>/runtime.sock`
+- starts a hidden tmux-backed runtime session by default
+- `stop` shuts down the current runtime
+- `--foreground` runs the runtime in the current process instead of the hidden tmux session
 - other user-facing long-lived commands connect to this process instead of running their own control loops
 - one runtime should own one local state root and tmux socket at a time
 
@@ -33,12 +38,12 @@ Purpose: set centralized yolo policy for one pane, all panes, or a workspace-sco
 
 Start syntax:
 ```bash
-botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Stop syntax:
 ```bash
-botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Examples:
@@ -55,6 +60,7 @@ Notes:
 - accepts explicit pane targets or `--all`
 - `--workspace` scopes `--all` to one workspace registration set
 - `--follow` tails matching runtime events after setting policy
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ### `dashboard`
 
@@ -62,7 +68,7 @@ Purpose: open the live TUI for Claude panes, grouped by workspace, with per-pane
 
 Syntax:
 ```bash
-botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]
+botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]
 ```
 
 Examples:
@@ -81,6 +87,7 @@ Notes:
 - queries the central runtime for Claude panes
 - shows current classified state, wait time, branch, and workspace grouping
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ### `serve`
 
@@ -90,7 +97,7 @@ It can also expose a localhost HTTP API for a polling web UI.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]
 ```
 
 Examples:
@@ -109,6 +116,7 @@ Notes:
 - `--http ADDR` starts a localhost JSON API alongside the stream facade
 - repeat `--allowed-origin URL` to allow browser clients from those exact origins; browser origins are rejected when not listed
 - the full HTTP contract is documented in [HTTP API reference](./api-reference.mdx)
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ## Common targeting and safety rules
 

@@ -26,6 +26,7 @@ The command that owns the live control plane.
 - runs the shared observation and guarded action loop
 - supervises yolo centrally instead of letting each client invent its own view
 - listens on `<state-dir>/runtime.sock`
+- starts in a hidden tmux session by default, with `runtime stop` to shut it down and `runtime --foreground` for direct ownership
 
 ### `dashboard`
 
@@ -68,11 +69,12 @@ cargo install botctl
 ## Quick start
 
 ```bash
-botctl runtime
 botctl dashboard
 botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
 ```
+
+Those commands auto-start a managed runtime when needed. Use `--unmanaged` if you want them to require an existing runtime instead.
 
 ## More detail when you want it
 

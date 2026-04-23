@@ -6,6 +6,8 @@ It is one of the main user-facing commands, alongside `runtime`, `dashboard`, an
 
 The central `runtime` process holds the tmux control-mode connection open and rebases that stream with periodic `capture-pane` snapshots. `serve` connects to that runtime and exposes a session-scoped foreground stream plus optional HTTP API.
 
+In managed mode, `serve` auto-starts the runtime in a hidden tmux session when needed. Use `--unmanaged` if you want it to require an already-running runtime instead.
+
 ## What it does today
 
 `serve` runs in the foreground and emits structured events to stdout from the runtime's shared event stream.

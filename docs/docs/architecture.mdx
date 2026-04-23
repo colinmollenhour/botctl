@@ -111,6 +111,8 @@ The current runtime implementation is intentionally local and explicit:
 
 `serve` sits on top of that runtime and filters the shared state to one session for stdout and HTTP responses.
 
+For operator convenience, `dashboard`, `yolo`, and `serve` can auto-start that runtime in a hidden tmux session. Managed clients keep lightweight runtime leases so the runtime is not torn down while another managed listener is still using it.
+
 This is the first slice of the larger serve-mode plan described in `PLANS-Serve-Mode.md`.
 
 ## Design rules

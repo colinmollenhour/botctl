@@ -8,21 +8,19 @@ For command syntax, see [command reference](./command-reference.mdx). For prompt
 
 For most real use, the loop is:
 
-1. Start `runtime` once.
-2. Open `dashboard` to see all panes.
-3. Use `yolo` on the pane or workspace you want babysat.
-4. Use `serve` when you need a live event stream or machine-readable observation.
+1. Open `dashboard` to see all panes.
+2. Use `yolo` on the pane or workspace you want babysat.
+3. Use `serve` when you need a live event stream or machine-readable observation.
 
 Typical commands:
 
 ```bash
-botctl runtime
 botctl dashboard
 botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
 ```
 
-`runtime` is the single owner of live pane observation, shared yolo supervision, and guarded actions. The other long-lived commands are clients of that runtime.
+`runtime` is the single owner of live pane observation, shared yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` start it automatically in managed mode when needed, or you can run it yourself and use `--unmanaged` clients.
 
 ## Managed session flow
 
