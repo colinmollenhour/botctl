@@ -9,13 +9,23 @@ slug: /
 
 The fun part is not the implementation details. The fun part is that you can:
 
+- start one local `runtime` that owns observation and automation
 - open a live `dashboard` and immediately see what all your Claude panes are doing
-- turn on `yolo` and let `botctl` babysit the boring confirmation flows
-- run `serve` and get a live event stream when you want to watch or integrate the session externally
+- turn on `yolo` and let `botctl` set shared babysitting policy for the boring confirmation flows
+- run `serve` and get a runtime-backed event stream or HTTP facade when you want to watch or integrate the session externally
 
 Also, yes, it is written in Rust. Legally, I believe, all new CLIs must be.
 
-## The three cool commands
+## The four cool commands
+
+### `runtime`
+
+The command that owns the live control plane.
+
+- holds the authoritative pane snapshots in memory
+- runs the shared observation and guarded action loop
+- supervises yolo centrally instead of letting each client invent its own view
+- listens on `<state-dir>/runtime.sock`
 
 ### `dashboard`
 
@@ -36,11 +46,11 @@ The command that removes tedious operator babysitting.
 
 ### `serve`
 
-The command for live observation.
+The runtime-backed API and event facade.
 
 - stream what is happening in a session as it happens
 - use human output for watching, or JSONL for tooling
-- keep a long-running foreground observer attached to one tmux session
+- expose a localhost HTTP API over shared runtime state
 
 ## Start here
 
@@ -58,6 +68,7 @@ cargo install botctl
 ## Quick start
 
 ```bash
+botctl runtime
 botctl dashboard
 botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
@@ -65,7 +76,7 @@ botctl serve --session demo --format jsonl
 
 ## More detail when you want it
 
-- [Serve mode](./serve-mode.mdx) — what the live observer does today
+- [Serve mode](./serve-mode.mdx) — how the runtime-backed facade behaves today
 - [HTTP API reference](./api-reference.mdx) — the localhost control surface exposed by `serve --http`
 - [Prompt handoff](./prompt-handoff.mdx) — prompt staging and editor flow
 - [Automation](./automation.mdx) — guarded workflows and keybinding behavior
