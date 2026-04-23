@@ -2,6 +2,85 @@
 
 This page is the current CLI reference for shipped commands and aliases.
 
+If you just want the useful commands first, start here:
+
+## Main commands
+
+### `yolo`
+
+Purpose: run autonomous babysitting for one pane, all panes, or a workspace-scoped subset.
+
+Start syntax:
+```bash
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
+```
+
+Stop syntax:
+```bash
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
+```
+
+Examples:
+```bash
+botctl yolo --pane 0:6.0
+botctl yolo --all --workspace .
+botctl yolo stop --all
+```
+
+Notes:
+
+- guarded by classified state; `yolo` will not blindly press keys
+- accepts explicit pane targets or `--all`
+- `--workspace` scopes `--all` to one workspace registration set
+
+### `dashboard`
+
+Purpose: open the live TUI for Claude panes, grouped by workspace, with per-pane and per-workspace YOLO controls.
+
+Syntax:
+```bash
+botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]
+```
+
+Examples:
+```bash
+botctl dashboard
+botctl dashboard --persistent
+```
+
+Quick tmux popup binding:
+```tmux
+bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
+```
+
+Notes:
+
+- scans all Claude panes
+- shows current classified state, wait time, branch, and workspace grouping
+- `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
+
+### `serve`
+
+Purpose: run the live observation loop for one tmux session and stream human-readable or JSONL events.
+
+Syntax:
+```bash
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]
+```
+
+Examples:
+```bash
+botctl serve --session demo
+botctl serve --session demo --format jsonl
+botctl serve --session demo --pane 0:2.3
+```
+
+Notes:
+
+- this is the main long-lived observation path
+- `--format jsonl` is the useful mode for tooling and automation
+- persists tape and summary artifacts under the state root
+
 ## Common targeting and safety rules
 
 - `--pane %ID` targets a specific tmux pane by unique pane id.
@@ -15,6 +94,10 @@ This page is the current CLI reference for shipped commands and aliases.
 - Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and yolo registrations now both use SQLite-backed records there.
 - Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
 - Startup bootstrapping also runs in-place schema migrations for supported older `state.db` versions.
+
+## Secondary commands
+
+Everything below is still supported, but these commands are mostly setup, diagnostics, recovery, or deeper reference material.
 
 ## Session and pane management
 
@@ -146,6 +229,41 @@ botctl doctor --session demo
 ```
 
 ## Observation and serving
+
+### `dashboard`
+
+Purpose: open the live dashboard TUI for Claude panes and YOLO toggles.
+
+Syntax:
+```bash
+botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]
+```
+
+Flags:
+- `--poll-ms N` (default: `1000`, must be at least `1`)
+- `--history-lines N` (default: `120`)
+- `--state-dir PATH` (optional; default machine-state root)
+- `--exit-on-navigate` (optional; exit after jumping to a pane)
+- `--persistent` (optional; keep the dashboard alive in a dedicated tmux session and attach to it)
+
+Targeting: no explicit pane target; scans all Claude panes.
+
+Safety:
+- rejects `--poll-ms 0`
+- rejects `--persistent --exit-on-navigate` because persistent mode is intended to keep the dashboard process alive
+
+Persistent mode behavior:
+- creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket also named `botctl-dashboard`
+- attaches to that persistent dashboard session after ensuring it exists
+- when launched from tmux, captures the outer tmux socket first so the dashboard continues inspecting the outer tmux server instead of its own dedicated dashboard session
+- if you launch it from `tmux display-popup`, tmux controls popup size and closing the popup only detaches from the persistent dashboard
+- inside persistent mode, pressing `q` detaches the client instead of terminating the dashboard process
+
+Examples:
+```bash
+botctl dashboard
+botctl dashboard --persistent
+```
 
 ### `observe`
 

@@ -133,6 +133,7 @@ pub struct DashboardArgs {
     pub history_lines: usize,
     pub state_dir: Option<PathBuf>,
     pub exit_on_navigate: bool,
+    pub persistent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,37 +268,120 @@ where
 }
 
 pub fn usage() -> String {
-    String::from(
-        "botctl\n\
-          \n\
-          Commands:\n\
-            start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]\n\
-            attach (--pane %ID|session:window.pane | --session NAME [--window NAME])\n\
-            list [--all]\n\
-            capture --pane %ID|session:window.pane [--history-lines N]\n\
-            status --pane %ID|session:window.pane [--history-lines N]\n\
-            doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]\n\
-            observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]\n\
-            serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]\n\
-            dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate]\n\
-            record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]\n\
-            classify --path PATH\n\
-            replay --path PATH\n\
-            bindings\n\
-            install-bindings [--path PATH]\n\
-            send-action --pane %ID|session:window.pane --action NAME\n\
-            approve --pane %ID|session:window.pane [--format human|jsonl]\n\
-            reject --pane %ID|session:window.pane [--format human|jsonl]\n\
-            dismiss-survey --pane %ID|session:window.pane\n\
-            continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)\n\
-            auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]\n\
-            keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]\n\
-            prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]\n\
-            editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET\n\
-            submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]\n\
-            yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]\n\
-            yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]\n",
-    )
+    const RESET: &str = "\x1b[0m";
+    const BOLD: &str = "\x1b[1m";
+    const DIM: &str = "\x1b[2m";
+    const BRIGHT_CYAN: &str = "\x1b[96m";
+    const BRIGHT_YELLOW: &str = "\x1b[93m";
+    const BRIGHT_WHITE: &str = "\x1b[97m";
+
+    let title = format!("{BOLD}{BRIGHT_WHITE}botctl{RESET}");
+    let subtitle = format!("{DIM}  Claude Code tmux automation for live sessions{RESET}");
+    let section = |name: &str| format!("{BOLD}{BRIGHT_CYAN}{name}{RESET}");
+    let featured = |text: &str| format!("  {BOLD}{BRIGHT_YELLOW}{text}{RESET}");
+    let command = |text: &str| format!("  {text}");
+
+    let mut out = String::new();
+    out.push_str(&title);
+    out.push('\n');
+    out.push_str(&subtitle);
+    out.push_str("\n\n");
+
+    out.push_str(&section("Usage:"));
+    out.push_str("\n  botctl <command> [options]\n\n");
+
+    out.push_str(&section("Main Commands:"));
+    out.push('\n');
+    out.push_str(&featured(
+        "yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
+    ));
+    out.push_str("\n    Start autonomous babysitting for one pane or all registered panes.\n\n");
+    out.push_str(&featured(
+        "yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]",
+    ));
+    out.push_str("\n    Stop autonomous babysitting.\n\n");
+    out.push_str(&featured(
+        "dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]",
+    ));
+    out.push_str("\n    Open the TUI for live Claude panes, state, wait times, and yolo toggles.\n");
+    out.push_str(
+        "    With --persistent, keep the dashboard alive in a dedicated tmux session and reopen it in a popup.\n\n",
+    );
+    out.push_str(&featured(
+        "serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--format human|jsonl] [--state-dir PATH]",
+    ));
+    out.push_str("\n    Continuously inspect a Claude session and emit babysit output.\n\n");
+
+    out.push_str(&section("Common Commands:"));
+    out.push('\n');
+    for line in [
+        "status --pane %ID|session:window.pane [--history-lines N]",
+        "doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]",
+        "continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)",
+        "auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]",
+        "keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]",
+        "approve --pane %ID|session:window.pane [--format human|jsonl]",
+        "reject --pane %ID|session:window.pane [--format human|jsonl]",
+        "dismiss-survey --pane %ID|session:window.pane",
+    ] {
+        out.push_str(&command(line));
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str(&section("Session Setup:"));
+    out.push('\n');
+    for line in [
+        "start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]",
+        "attach (--pane %ID|session:window.pane | --session NAME [--window NAME])",
+        "list [--all]",
+        "capture --pane %ID|session:window.pane [--history-lines N]",
+        "observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]",
+    ] {
+        out.push_str(&command(line));
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str(&section("Prompt Workflow:"));
+    out.push('\n');
+    for line in [
+        "prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]",
+        "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET",
+        "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]",
+    ] {
+        out.push_str(&command(line));
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str(&section("Diagnostics And Fixtures:"));
+    out.push('\n');
+    for line in [
+        "record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]",
+        "classify --path PATH",
+        "replay --path PATH",
+        "bindings",
+        "install-bindings [--path PATH]",
+        "send-action --pane %ID|session:window.pane --action NAME",
+    ] {
+        out.push_str(&command(line));
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str(&section("Quick Start:"));
+    out.push('\n');
+    for line in [
+        "botctl dashboard",
+        "botctl yolo --pane 0:6.0",
+        "botctl serve --session my-session --format jsonl",
+    ] {
+        out.push_str(&featured(line));
+        out.push('\n');
+    }
+
+    out
 }
 
 fn parse_start(args: Vec<String>) -> AppResult<Command> {
@@ -621,6 +705,7 @@ fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
     let mut history_lines = 120usize;
     let mut state_dir = None;
     let mut exit_on_navigate = false;
+    let mut persistent = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -643,6 +728,9 @@ fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
             "--exit-on-navigate" => {
                 exit_on_navigate = true;
             }
+            "--persistent" => {
+                persistent = true;
+            }
             flag => {
                 return Err(AppError::new(format!("unknown dashboard flag: {flag}")));
             }
@@ -656,11 +744,18 @@ fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
         ));
     }
 
+    if persistent && exit_on_navigate {
+        return Err(AppError::new(
+            "dashboard --persistent cannot be combined with --exit-on-navigate",
+        ));
+    }
+
     Ok(Command::Dashboard(DashboardArgs {
         poll_ms,
         history_lines,
         state_dir,
         exit_on_navigate,
+        persistent,
     }))
 }
 
@@ -1520,6 +1615,7 @@ mod tests {
                 assert_eq!(args.history_lines, 200);
                 assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-dashboard")));
                 assert!(!args.exit_on_navigate);
+                assert!(!args.persistent);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1537,9 +1633,43 @@ mod tests {
         match command {
             Command::Dashboard(args) => {
                 assert!(args.exit_on_navigate);
+                assert!(!args.persistent);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_dashboard_persistent_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("dashboard"),
+            String::from("--persistent"),
+        ])
+        .expect("dashboard command should parse persistent flag");
+
+        match command {
+            Command::Dashboard(args) => {
+                assert!(args.persistent);
+                assert!(!args.exit_on_navigate);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_dashboard_persistent_exit_on_navigate_combination() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("dashboard"),
+            String::from("--persistent"),
+            String::from("--exit-on-navigate"),
+        ])
+        .expect_err("dashboard should reject persistent exit-on-navigate");
+
+        assert!(error
+            .to_string()
+            .contains("dashboard --persistent cannot be combined with --exit-on-navigate"));
     }
 
     #[test]
@@ -1564,8 +1694,14 @@ mod tests {
         let usage = super::usage();
 
         assert!(!usage.contains("\\n"));
-        assert!(usage.contains("observe --session NAME"));
+        assert!(usage.contains("Claude Code tmux automation for live sessions"));
+        assert!(usage.contains("Main Commands:"));
+        assert!(usage.contains("yolo [start]"));
         assert!(usage.contains("serve --session NAME"));
+        assert!(usage.contains("dashboard [--poll-ms N]"));
+        assert!(usage.contains("Common Commands:"));
+        assert!(usage.contains("Diagnostics And Fixtures:"));
+        assert!(usage.contains("Quick Start:"));
         assert!(usage.contains("dashboard [--poll-ms N]"));
         assert!(usage.contains("[--exit-on-navigate]"));
     }

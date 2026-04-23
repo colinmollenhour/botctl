@@ -58,6 +58,8 @@ impl TmuxCommandPlan {
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     program: String,
+    socket_name: Option<String>,
+    socket_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,15 +80,33 @@ impl Default for TmuxClient {
     fn default() -> Self {
         Self {
             program: String::from("tmux"),
+            socket_name: None,
+            socket_path: None,
         }
     }
 }
 
 impl TmuxClient {
+    pub fn with_socket<S: Into<String>>(socket_name: S) -> Self {
+        Self {
+            program: String::from("tmux"),
+            socket_name: Some(socket_name.into()),
+            socket_path: None,
+        }
+    }
+
+    pub fn with_socket_path<P: Into<PathBuf>>(socket_path: P) -> Self {
+        Self {
+            program: String::from("tmux"),
+            socket_name: None,
+            socket_path: Some(socket_path.into()),
+        }
+    }
+
     pub fn plan_start_session(&self, request: &StartSessionRequest) -> TmuxCommandPlan {
         TmuxCommandPlan {
             program: self.program.clone(),
-            args: vec![
+            args: self.with_socket_args(vec![
                 String::from("new-session"),
                 String::from("-d"),
                 String::from("-s"),
@@ -96,7 +116,7 @@ impl TmuxClient {
                 String::from("-c"),
                 request.cwd.display().to_string(),
                 request.command.clone(),
-            ],
+            ]),
         }
     }
 
@@ -309,6 +329,23 @@ impl TmuxClient {
         ])
     }
 
+    pub fn set_global_option(&self, name: &str, value: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("set-option"),
+            String::from("-g"),
+            name.to_string(),
+            value.to_string(),
+        ])
+    }
+
+    pub fn kill_session(&self, target_session: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("kill-session"),
+            String::from("-t"),
+            target_session.to_string(),
+        ])
+    }
+
     pub fn attach_session(&self, target_session: &str) -> AppResult<()> {
         self.run_status(vec![
             String::from("attach-session"),
@@ -317,8 +354,38 @@ impl TmuxClient {
         ])
     }
 
+    pub fn detach_client(&self) -> AppResult<()> {
+        self.run_status(vec![String::from("detach-client")])
+    }
+
+    pub fn has_session(&self, target_session: &str) -> AppResult<bool> {
+        let status = Command::new(&self.program)
+            .args(self.with_socket_args(vec![
+                String::from("has-session"),
+                String::from("-t"),
+                target_session.to_string(),
+            ]))
+            .status()?;
+        Ok(status.success())
+    }
+
+    pub fn display_popup(&self, width: &str, height: &str, command: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("display-popup"),
+            String::from("-w"),
+            width.to_string(),
+            String::from("-h"),
+            height.to_string(),
+            String::from("-E"),
+            command.to_string(),
+        ])
+    }
+
     fn run_status(&self, args: Vec<String>) -> AppResult<()> {
-        let status = Command::new(&self.program).args(&args).status()?;
+        let args = self.with_socket_args(args);
+        let status = Command::new(&self.program)
+            .args(&args)
+            .status()?;
         if status.success() {
             Ok(())
         } else {
@@ -331,6 +398,7 @@ impl TmuxClient {
     }
 
     fn run_output(&self, args: Vec<String>) -> AppResult<String> {
+        let args = self.with_socket_args(args);
         let output = Command::new(&self.program).args(&args).output()?;
         if !output.status.success() {
             return Err(AppError::new(format!(
@@ -362,6 +430,15 @@ impl TmuxClient {
             })
             .map(|(pane_id, _, _)| pane_id)
             .collect())
+    }
+
+    fn with_socket_args(&self, mut args: Vec<String>) -> Vec<String> {
+        if let Some(socket_path) = &self.socket_path {
+            args.splice(0..0, [String::from("-S"), socket_path.display().to_string()]);
+        } else if let Some(socket_name) = &self.socket_name {
+            args.splice(0..0, [String::from("-L"), socket_name.clone()]);
+        }
+        args
     }
 }
 
@@ -500,8 +577,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        StartSessionRequest, TmuxClient, parse_explicit_pane_target_line, parse_pane_line,
-        select_explicit_pane_target,
+        StartSessionRequest, TmuxClient, TmuxCommandPlan, parse_explicit_pane_target_line,
+        parse_pane_line, select_explicit_pane_target,
     };
 
     #[test]
@@ -518,6 +595,54 @@ mod tests {
         assert!(rendered.contains("new-session"));
         assert!(rendered.contains("-s demo"));
         assert!(rendered.contains("'claude --print'"));
+    }
+
+    #[test]
+    fn renders_start_plan_with_socket() {
+        let client = TmuxClient::with_socket("botctl-dashboard");
+        let plan = client.plan_start_session(&StartSessionRequest {
+            session_name: String::from("demo"),
+            window_name: String::from("claude"),
+            cwd: PathBuf::from("/tmp/demo"),
+            command: String::from("claude --print"),
+        });
+
+        let rendered = plan.render();
+        assert!(rendered.contains("-L botctl-dashboard"));
+        assert!(rendered.contains("new-session"));
+    }
+
+    #[test]
+    fn set_global_option_uses_socket() {
+        let client = TmuxClient::with_socket("botctl-dashboard");
+        let rendered = TmuxCommandPlan {
+            program: String::from("tmux"),
+            args: client.with_socket_args(vec![
+                String::from("set-option"),
+                String::from("-g"),
+                String::from("status"),
+                String::from("off"),
+            ]),
+        }
+        .render();
+
+        assert!(rendered.contains("-L botctl-dashboard"));
+        assert!(rendered.contains("set-option -g status off"));
+    }
+
+    #[test]
+    fn start_plan_uses_explicit_socket_path() {
+        let client = TmuxClient::with_socket_path("/tmp/tmux-1000/default");
+        let plan = client.plan_start_session(&StartSessionRequest {
+            session_name: String::from("demo"),
+            window_name: String::from("claude"),
+            cwd: PathBuf::from("/tmp/demo"),
+            command: String::from("claude --print"),
+        });
+
+        let rendered = plan.render();
+        assert!(rendered.contains("-S /tmp/tmux-1000/default"));
+        assert!(rendered.contains("new-session"));
     }
 
     #[test]

@@ -4,6 +4,16 @@
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
+## Main Commands
+
+These are the commands that matter most in day-to-day use:
+
+- `dashboard` to see all live Claude panes, grouped by workspace, with state, age, and YOLO controls
+- `yolo` to babysit one pane or a scoped set of panes automatically
+- `serve` to stream live observation data for one tmux session in human or JSONL form
+
+Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing around those flows.
+
 ## Current Features
 
 - launch a managed Claude session in tmux
@@ -46,15 +56,57 @@ Run a single test by name:
 cargo test resolves_custom_binding_keys_for_actions
 ```
 
-## Basic Commands
+## Start Here
+
+If you just want the useful path quickly:
+
+```bash
+cargo run -- dashboard
+cargo run -- yolo --pane 0:6.0
+cargo run -- serve --session demo --format jsonl
+```
+
+## Core Workflows
 
 Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
 
-Show the CLI help:
+Open the live dashboard across Claude panes:
 
 ```bash
-cargo run -- help
+cargo run -- dashboard
 ```
+
+Keep the dashboard alive in a dedicated tmux-backed popup session:
+
+```bash
+cargo run -- dashboard --persistent
+```
+
+Quick and easy tmux popup binding:
+
+```tmux
+bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
+```
+
+Start YOLO babysitting for one pane:
+
+```bash
+cargo run -- yolo --pane 0:6.0
+```
+
+Run the long-lived observer for one tmux session:
+
+```bash
+cargo run -- serve --session demo
+```
+
+Use machine-readable output for tooling:
+
+```bash
+cargo run -- serve --session demo --format jsonl
+```
+
+## Session Setup And Inspection
 
 Start a managed Claude session in the current directory:
 
@@ -92,21 +144,11 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-Run the long-lived observer for one tmux session:
-
-```bash
-cargo run -- serve --session demo
-```
-
-Run the cross-workspace dashboard TUI:
-
-```bash
-cargo run -- dashboard
-```
-
 The dashboard groups Claude panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
-## Real Session Workflow
+Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
+
+## Recovery And Prompt Work
 
 Typical loop:
 
@@ -143,6 +185,12 @@ Scope prompt prep or babysit work to one workspace:
 ```bash
 cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the current repo"
 cargo run -- yolo start --all --workspace .
+```
+
+Show the CLI help:
+
+```bash
+cargo run -- help
 ```
 
 ## Keybinding Policy

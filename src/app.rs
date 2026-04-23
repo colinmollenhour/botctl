@@ -54,6 +54,11 @@ const KEEP_GOING_PROMPT_ANCHOR: &str = "Audit the task currently in scope";
 const KEEP_GOING_CUSTOM_PROMPT_ANCHOR: &str = "[[BOTCTL_KEEP_GOING_END_PROMPT]]";
 const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
 const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
+const DASHBOARD_PERSISTENT_SOCKET: &str = "botctl-dashboard";
+const DASHBOARD_PERSISTENT_SESSION: &str = "botctl-dashboard";
+const DASHBOARD_PERSISTENT_WINDOW: &str = "dashboard";
+const DASHBOARD_PERSISTENT_CHILD_ENV: &str = "BOTCTL_DASHBOARD_PERSISTENT_CHILD";
+const DASHBOARD_TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_DASHBOARD_TARGET_TMUX_SOCKET";
 const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
 
 Check: every deliverable produced (not just described), every file actually written, every stated acceptance criterion met, every test/build you committed to actually run and passing, no unresolved TODOs or stubs in code you just wrote.
@@ -163,7 +168,131 @@ pub fn run(command: Command) -> AppResult<String> {
 }
 
 fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
+    if args.persistent && std::env::var_os(DASHBOARD_PERSISTENT_CHILD_ENV).is_none() {
+        return run_persistent_dashboard(args);
+    }
     dashboard::run(args)
+}
+
+fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
+    let persistent_client = TmuxClient::with_socket(DASHBOARD_PERSISTENT_SOCKET);
+    let desired_target_socket = current_tmux_socket_path();
+    if persistent_client.has_session(DASHBOARD_PERSISTENT_SESSION)? {
+        let current_target_socket = persistent_dashboard_target_socket(&persistent_client)?;
+        if current_target_socket != desired_target_socket {
+            persistent_client.kill_session(DASHBOARD_PERSISTENT_SESSION)?;
+        }
+    }
+
+    if !persistent_client.has_session(DASHBOARD_PERSISTENT_SESSION)? {
+        start_persistent_dashboard_session(&persistent_client, &args, desired_target_socket.as_deref())?;
+    }
+
+    persistent_client.set_global_option("status", "off")?;
+
+    persistent_client.attach_session(DASHBOARD_PERSISTENT_SESSION)?;
+    Ok(String::new())
+}
+
+fn start_persistent_dashboard_session(
+    persistent_client: &TmuxClient,
+    args: &DashboardArgs,
+    target_socket_path: Option<&Path>,
+) -> AppResult<()> {
+    let cwd = std::env::current_dir()?;
+    let request = StartSessionRequest {
+        session_name: String::from(DASHBOARD_PERSISTENT_SESSION),
+        window_name: String::from(DASHBOARD_PERSISTENT_WINDOW),
+        cwd,
+        command: persistent_dashboard_child_command_with_target_socket(args, target_socket_path)?,
+    };
+    persistent_client.start_session(&request)?;
+    Ok(())
+}
+
+fn persistent_dashboard_child_command_with_target_socket(
+    args: &DashboardArgs,
+    target_socket_path: Option<&Path>,
+) -> AppResult<String> {
+    let exe = std::env::current_exe()?;
+    let mut parts = vec![format!("{}=1", DASHBOARD_PERSISTENT_CHILD_ENV)];
+    if let Some(socket_path) = target_socket_path {
+        parts.push(format!(
+            "{}={}",
+            DASHBOARD_TARGET_TMUX_SOCKET_ENV,
+            shell_escape(socket_path.to_string_lossy().as_ref())
+        ));
+    }
+    parts.push(shell_escape(exe.to_string_lossy().as_ref()));
+    parts.push(String::from("dashboard"));
+    parts.push(String::from("--persistent"));
+    parts.push(String::from("--poll-ms"));
+    parts.push(args.poll_ms.to_string());
+    parts.push(String::from("--history-lines"));
+    parts.push(args.history_lines.to_string());
+    if let Some(state_dir) = &args.state_dir {
+        parts.push(String::from("--state-dir"));
+        parts.push(shell_escape(state_dir.to_string_lossy().as_ref()));
+    }
+    Ok(parts.join(" "))
+}
+
+fn shell_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | '%' | ':'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn current_tmux_socket_path() -> Option<PathBuf> {
+    let tmux = std::env::var_os("TMUX")?;
+    tmux_socket_path_from_value(tmux.to_string_lossy().as_ref())
+}
+
+fn tmux_socket_path_from_value(value: &str) -> Option<PathBuf> {
+    let socket_path = value.split(',').next()?.trim();
+    if socket_path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(socket_path))
+    }
+}
+
+fn persistent_dashboard_target_socket(persistent_client: &TmuxClient) -> AppResult<Option<PathBuf>> {
+    let pane = persistent_client
+        .list_panes_for_target(Some(DASHBOARD_PERSISTENT_SESSION))?
+        .into_iter()
+        .next();
+    let Some(pane) = pane else {
+        return Ok(None);
+    };
+    let Some(pid) = pane.pane_pid else {
+        return Ok(None);
+    };
+    dashboard_target_socket_from_pid(pid)
+}
+
+fn dashboard_target_socket_from_pid(pid: u32) -> AppResult<Option<PathBuf>> {
+    let path = PathBuf::from(format!("/proc/{pid}/environ"));
+    let bytes = fs::read(&path).map_err(|error| {
+        AppError::new(format!("failed to read dashboard process environment {}: {error}", path.display()))
+    })?;
+    Ok(parse_env_value_from_environ_bytes(&bytes, DASHBOARD_TARGET_TMUX_SOCKET_ENV)
+        .map(PathBuf::from))
+}
+
+fn parse_env_value_from_environ_bytes(bytes: &[u8], key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    bytes.split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .find_map(|entry| {
+            let entry = std::str::from_utf8(entry).ok()?;
+            entry.strip_prefix(&prefix).map(str::to_string)
+        })
 }
 
 fn run_start(args: StartArgs) -> AppResult<String> {
@@ -3346,22 +3475,26 @@ fn parse_expected_state_arg(
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AppError, BabysitFormat, BabysitOutputFormat, InspectedPane,
+        AppError, BabysitFormat, BabysitOutputFormat, DashboardArgs,
+        DASHBOARD_PERSISTENT_CHILD_ENV, DASHBOARD_TARGET_TMUX_SOCKET_ENV, InspectedPane,
         KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
         ObserveArtifactPaths, RecoveryAction, YoloAction, artifact_state_dir_result,
         cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
         extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, permission_manual_review_reason,
-        prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker,
+        parse_env_value_from_environ_bytes, permission_manual_review_reason,
+        persistent_dashboard_child_command_with_target_socket, prompt_submission_started,
+        raw_key_for_workflow, recovery_action_for_state,
         render_babysit_action_event, render_babysit_output, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_observe_command_output,
-        render_screen_excerpt, render_serve_event_payload, render_status_report,
-        resolve_keep_going_prompt, run_prepare_prompt, submit_prompt_preflight_workflow,
-        yolo_action_for_state,
+        render_babysit_wait_event, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
+        render_status_report, resolve_keep_going_prompt, run_prepare_prompt, shell_escape,
+        submit_prompt_preflight_workflow, tmux_socket_path_from_value, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -4611,6 +4744,90 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
         };
 
         assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn persistent_dashboard_child_command_preserves_dashboard_flags() {
+        let command = persistent_dashboard_child_command_with_target_socket(
+            &DashboardArgs {
+                poll_ms: 750,
+                history_lines: 200,
+                state_dir: Some(PathBuf::from("/tmp/botctl state")),
+                exit_on_navigate: false,
+                persistent: true,
+            },
+            Some(Path::new("/tmp/tmux-1000/default")),
+        )
+        .expect("persistent child command should build");
+
+        assert!(command.contains(&format!("{}=1", DASHBOARD_PERSISTENT_CHILD_ENV)));
+        assert!(command.contains(&format!(
+            "{}=/tmp/tmux-1000/default",
+            DASHBOARD_TARGET_TMUX_SOCKET_ENV
+        )));
+        assert!(command.contains(" dashboard --persistent --poll-ms 750 --history-lines 200 "));
+        assert!(command.contains("--state-dir '/tmp/botctl state'"));
+    }
+
+    #[test]
+    fn parses_tmux_socket_path_from_env_value() {
+        assert_eq!(
+            tmux_socket_path_from_value("/tmp/tmux-1000/default,1234,0"),
+            Some(PathBuf::from("/tmp/tmux-1000/default"))
+        );
+        assert_eq!(tmux_socket_path_from_value(""), None);
+    }
+
+    #[test]
+    fn persistent_dashboard_child_command_captures_outer_tmux_socket() {
+        let command = persistent_dashboard_child_command_with_target_socket(
+            &DashboardArgs {
+                poll_ms: 750,
+                history_lines: 200,
+                state_dir: None,
+                exit_on_navigate: false,
+                persistent: true,
+            },
+            Some(Path::new("/tmp/tmux-1000/default")),
+        )
+        .expect("persistent child command should build");
+
+        assert!(command.contains(&format!(
+            "{}=/tmp/tmux-1000/default",
+            DASHBOARD_TARGET_TMUX_SOCKET_ENV
+        )));
+    }
+
+    #[test]
+    fn persistent_dashboard_child_command_omits_outer_tmux_socket_when_absent() {
+        let command = persistent_dashboard_child_command_with_target_socket(
+            &DashboardArgs {
+                poll_ms: 750,
+                history_lines: 200,
+                state_dir: None,
+                exit_on_navigate: false,
+                persistent: true,
+            },
+            None,
+        )
+        .expect("persistent child command should build");
+
+        assert!(!command.contains(DASHBOARD_TARGET_TMUX_SOCKET_ENV));
+    }
+
+    #[test]
+    fn parse_env_value_from_environ_bytes_extracts_target_socket() {
+        let bytes = b"BOTCTL_DASHBOARD_PERSISTENT_CHILD=1\0BOTCTL_DASHBOARD_TARGET_TMUX_SOCKET=/tmp/tmux-1000/default\0TMUX=/tmp/tmux-1000/botctl-dashboard,1,0\0";
+        assert_eq!(
+            parse_env_value_from_environ_bytes(bytes, DASHBOARD_TARGET_TMUX_SOCKET_ENV),
+            Some(String::from("/tmp/tmux-1000/default"))
+        );
+        assert_eq!(parse_env_value_from_environ_bytes(bytes, "MISSING"), None);
+    }
+
+    #[test]
+    fn shell_escape_quotes_whitespace() {
+        assert_eq!(shell_escape("/tmp/botctl state"), String::from("'/tmp/botctl state'"));
     }
 
     #[test]

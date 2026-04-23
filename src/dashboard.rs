@@ -38,6 +38,7 @@ use crate::tmux::{TmuxClient, TmuxPane};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q quit";
+const PERSISTENT_FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q detach";
 const TABLE_GAP: &str = "  ";
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
@@ -50,8 +51,19 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = DashboardApp::new(state_dir, args.poll_ms, args.history_lines)?;
-    let loop_result = run_dashboard_loop(&mut terminal, &mut app, args.exit_on_navigate);
+    let mut app = DashboardApp::new(
+        dashboard_tmux_client(),
+        host_tmux_client(),
+        state_dir,
+        args.poll_ms,
+        args.history_lines,
+    )?;
+    let loop_result = run_dashboard_loop(
+        &mut terminal,
+        &mut app,
+        args.exit_on_navigate,
+        args.persistent,
+    );
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -68,6 +80,7 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
 
 struct DashboardApp {
     client: TmuxClient,
+    host_client: TmuxClient,
     state_dir: std::path::PathBuf,
     poll_ms: u64,
     history_lines: usize,
@@ -125,10 +138,17 @@ struct SavedSelection {
 }
 
 impl DashboardApp {
-    fn new(state_dir: std::path::PathBuf, poll_ms: u64, history_lines: usize) -> AppResult<Self> {
+    fn new(
+        client: TmuxClient,
+        host_client: TmuxClient,
+        state_dir: std::path::PathBuf,
+        poll_ms: u64,
+        history_lines: usize,
+    ) -> AppResult<Self> {
         let restored_selection = load_saved_selection(&state_dir)?;
         Ok(Self {
-            client: TmuxClient::default(),
+            client,
+            host_client,
             state_dir,
             poll_ms,
             history_lines,
@@ -618,10 +638,22 @@ impl DashboardApp {
     }
 }
 
+fn dashboard_tmux_client() -> TmuxClient {
+    match std::env::var_os("BOTCTL_DASHBOARD_TARGET_TMUX_SOCKET") {
+        Some(socket_path) if !socket_path.is_empty() => TmuxClient::with_socket_path(socket_path),
+        _ => TmuxClient::default(),
+    }
+}
+
+fn host_tmux_client() -> TmuxClient {
+    TmuxClient::default()
+}
+
 fn run_dashboard_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut DashboardApp,
     exit_on_navigate: bool,
+    persistent: bool,
 ) -> AppResult<Option<TmuxPane>> {
     app.refresh()?;
     loop {
@@ -637,6 +669,10 @@ fn run_dashboard_loop(
                     match key.code {
                         KeyCode::Char('q') => {
                             app.persist_selection()?;
+                            if persistent {
+                                app.host_client.detach_client()?;
+                                continue;
+                            }
                             return Ok(None);
                         }
                         KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
@@ -889,7 +925,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         .wrap(Wrap { trim: true });
     frame.render_widget(message, layout.status);
 
-    frame.render_widget(Paragraph::new(FOOTER_TEXT), layout.footer);
+    frame.render_widget(Paragraph::new(footer_text()), layout.footer);
 }
 
 struct DashboardLayout {
@@ -932,6 +968,14 @@ fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> boo
     let yolo_start = columns.state_width + UnicodeWidthStr::width(TABLE_GAP);
     let yolo_end = yolo_start + columns.yolo_width;
     x >= yolo_start && x < yolo_end
+}
+
+fn footer_text() -> &'static str {
+    if std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some() {
+        PERSISTENT_FOOTER_TEXT
+    } else {
+        FOOTER_TEXT
+    }
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -1418,7 +1462,7 @@ mod tests {
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
-    use crate::tmux::TmuxPane;
+    use crate::tmux::{TmuxClient, TmuxPane};
     use ratatui::layout::Rect;
     use unicode_width::UnicodeWidthStr;
 
@@ -1600,8 +1644,14 @@ mod tests {
 
     #[test]
     fn yolo_column_hitbox_matches_rendered_columns() {
-        let app = DashboardApp::new(unique_temp_dir("dashboard-hitbox"), 1000, 120)
-            .expect("app should initialize");
+        let app = DashboardApp::new(
+            TmuxClient::default(),
+            TmuxClient::default(),
+            unique_temp_dir("dashboard-hitbox"),
+            1000,
+            120,
+        )
+        .expect("app should initialize");
         let list_area = Rect {
             x: 10,
             y: 5,
