@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::app::{
     ACTION_GUARD_HISTORY_LINES, AppError, AppResult, InspectedPane, classify_pane,
     ContinueOutcome, continue_from_classification, ensure_pane_owned_by_claude,
+    ensure_workflow_state,
     execute_automation_action, execute_classified_workflow,
     extract_permission_prompt_details, inspect_pane, keys_for_action,
     load_automation_keybindings, render_next_safe_action, render_screen_excerpt,
@@ -83,6 +84,7 @@ fn handle_connection(stream: TcpStream, client: &TmuxClient, request: &ServeRequ
         .ok_or_else(|| AppError::new("invalid http request line: missing path"))?;
 
     let mut content_length = 0usize;
+    let mut origin = None;
     loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
@@ -92,6 +94,8 @@ fn handle_connection(stream: TcpStream, client: &TmuxClient, request: &ServeRequ
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse::<usize>().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("origin") {
+                origin = Some(value.trim().to_string());
             }
         }
     }
@@ -101,7 +105,7 @@ fn handle_connection(stream: TcpStream, client: &TmuxClient, request: &ServeRequ
         reader.read_exact(&mut body)?;
     }
 
-    let response = handle_request(method, target, &body, client, request);
+    let response = handle_request(method, target, &body, origin.as_deref(), client, request);
     let mut stream = reader.into_inner();
     write_response(&mut stream, response)
 }
@@ -110,11 +114,17 @@ fn handle_request(
     method: &str,
     target: &str,
     body: &[u8],
+    origin: Option<&str>,
     client: &TmuxClient,
     request: &ServeRequest,
 ) -> HttpResponse {
+    let cors_origin = match validate_origin(origin, &request.allowed_origins) {
+        Ok(cors_origin) => cors_origin,
+        Err(response) => return response,
+    };
+
     if method == "OPTIONS" {
-        return json_response(200, json!({ "ok": true }));
+        return json_response(200, json!({ "ok": true }), cors_origin);
     }
 
     let path = target.split('?').next().unwrap_or(target);
@@ -125,7 +135,7 @@ fn handle_request(
         .collect::<Result<Vec<_>, _>>();
     let segments = match segments {
         Ok(segments) => segments,
-        Err(error) => return error_response(400, error),
+        Err(error) => return error_response(400, error, cors_origin),
     };
     let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
 
@@ -137,6 +147,7 @@ fn handle_request(
                 "session_name": request.session_name,
                 "target_pane": request.target_pane,
             }),
+            cors_origin,
         ),
         ("GET", ["instances"]) => match list_instances(client, request) {
             Ok(instances) => json_response(
@@ -146,36 +157,39 @@ fn handle_request(
                     "target_pane": request.target_pane,
                     "instances": instances,
                 }),
+                cors_origin,
             ),
-            Err(error) => error_response(500, error.to_string()),
+            Err(error) => error_response(500, error.to_string(), cors_origin),
         },
         ("GET", ["instances", pane_id]) => match instance_detail(client, request, pane_id) {
-            Ok(instance) => json_response(200, json!({ "instance": instance })),
-            Err(error) => map_app_error(error),
+            Ok(instance) => json_response(200, json!({ "instance": instance }), cors_origin),
+            Err(error) => map_app_error(error, cors_origin),
         },
         ("POST", ["instances", pane_id, "actions", action]) => {
             match run_instance_action(client, request, pane_id, action) {
-                Ok(result) => json_response(200, result),
-                Err(error) => map_app_error(error),
+                Ok(result) => json_response(200, result, cors_origin),
+                Err(error) => map_app_error(error, cors_origin),
             }
         }
         ("POST", ["instances", pane_id, "interactions", option_id]) => {
             match run_instance_interaction(client, request, pane_id, option_id) {
-                Ok(result) => json_response(200, result),
-                Err(error) => map_app_error(error),
+                Ok(result) => json_response(200, result, cors_origin),
+                Err(error) => map_app_error(error, cors_origin),
             }
         }
         ("POST", ["instances", pane_id, "prompt"]) => {
             let body = match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(body) => body,
-                Err(error) => return error_response(400, format!("invalid JSON body: {error}")),
+                Err(error) => {
+                    return error_response(400, format!("invalid JSON body: {error}"), cors_origin)
+                }
             };
             match run_instance_prompt(client, request, pane_id, &body) {
-                Ok(result) => json_response(200, result),
-                Err(error) => map_app_error(error),
+                Ok(result) => json_response(200, result, cors_origin),
+                Err(error) => map_app_error(error, cors_origin),
             }
         }
-        _ => error_response(404, format!("unknown route: {method} {path}")),
+        _ => error_response(404, format!("unknown route: {method} {path}"), cors_origin),
     }
 }
 
@@ -240,12 +254,15 @@ fn run_instance_action(
     let classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     let result = match action {
         "approve-permission" => {
+            ensure_workflow_state(GuardedWorkflow::ApprovePermission, &classification)?;
             execute_classified_workflow(client, &pane.pane_id, GuardedWorkflow::ApprovePermission, &classification)?
         }
         "reject-permission" => {
+            ensure_workflow_state(GuardedWorkflow::RejectPermission, &classification)?;
             execute_classified_workflow(client, &pane.pane_id, GuardedWorkflow::RejectPermission, &classification)?
         }
         "dismiss-survey" => {
+            ensure_workflow_state(GuardedWorkflow::DismissSurvey, &classification)?;
             execute_classified_workflow(client, &pane.pane_id, GuardedWorkflow::DismissSurvey, &classification)?
         }
         "confirm-previous" => execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmPrevious)?,
@@ -364,7 +381,7 @@ fn run_instance_prompt(
         client,
         &pane,
         &request.session_name,
-        None,
+        request.state_dir.as_deref(),
         workspace,
         prompt_text,
         submit_delay_ms,
@@ -806,46 +823,74 @@ fn url_decode(input: &str) -> Result<String, String> {
     Ok(out)
 }
 
+#[derive(Debug)]
 struct HttpResponse {
     status: u16,
     body: Vec<u8>,
+    cors_origin: Option<String>,
 }
 
-fn json_response(status: u16, body: serde_json::Value) -> HttpResponse {
-    HttpResponse {
-        status,
-        body: serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec()),
+fn validate_origin(
+    origin: Option<&str>,
+    allowed_origins: &[String],
+) -> Result<Option<String>, HttpResponse> {
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    if allowed_origins.iter().any(|allowed| allowed == origin) {
+        Ok(Some(origin.to_string()))
+    } else {
+        Err(error_response(
+            403,
+            format!("origin not allowed: {origin}"),
+            None,
+        ))
     }
 }
 
-fn error_response(status: u16, message: impl Into<String>) -> HttpResponse {
-    json_response(status, json!({ "ok": false, "error": message.into() }))
+fn json_response(status: u16, body: serde_json::Value, cors_origin: Option<String>) -> HttpResponse {
+    HttpResponse {
+        status,
+        body: serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec()),
+        cors_origin,
+    }
 }
 
-fn map_app_error(error: AppError) -> HttpResponse {
+fn error_response(status: u16, message: impl Into<String>, cors_origin: Option<String>) -> HttpResponse {
+    json_response(status, json!({ "ok": false, "error": message.into() }), cors_origin)
+}
+
+fn map_app_error(error: AppError, cors_origin: Option<String>) -> HttpResponse {
     let status = match error.exit_code() {
         404 => 404,
         409 => 409,
         _ => 400,
     };
-    error_response(status, error.to_string())
+    error_response(status, error.to_string(), cors_origin)
 }
 
 fn write_response(stream: &mut TcpStream, response: HttpResponse) -> AppResult<()> {
     let reason = match response.status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         501 => "Not Implemented",
         _ => "Error",
     };
-    let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut headers = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         response.status,
         reason,
         response.body.len()
     );
+    if let Some(origin) = &response.cors_origin {
+        headers.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
+        ));
+    }
+    headers.push_str("\r\n");
     stream.write_all(headers.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()?;
@@ -854,7 +899,7 @@ fn write_response(stream: &mut TcpStream, response: HttpResponse) -> AppResult<(
 
 #[cfg(test)]
 mod tests {
-    use super::{split_digit_option, split_numbered_option_line, url_decode};
+    use super::{split_digit_option, split_numbered_option_line, url_decode, validate_origin};
 
     #[test]
     fn parses_numbered_option_line() {
@@ -876,5 +921,27 @@ mod tests {
     #[test]
     fn decodes_percent_escaped_pane_ids() {
         assert_eq!(url_decode("%251").unwrap(), "%1");
+    }
+
+    #[test]
+    fn allows_exact_configured_origin() {
+        assert_eq!(
+            validate_origin(
+                Some("http://localhost:3000"),
+                &[String::from("http://localhost:3000")],
+            )
+            .unwrap(),
+            Some(String::from("http://localhost:3000"))
+        );
+    }
+
+    #[test]
+    fn rejects_unconfigured_origin() {
+        let response = validate_origin(
+            Some("http://evil.example"),
+            &[String::from("http://localhost:3000")],
+        )
+        .expect_err("origin should be rejected");
+        assert_eq!(response.status, 403);
     }
 }

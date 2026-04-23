@@ -1,0 +1,538 @@
+---
+sidebar_position: 11
+---
+
+# HTTP API reference
+
+This page documents the localhost HTTP API exposed by `botctl serve`.
+
+The API exists to back polling clients such as a web UI. It is only available while a foreground `serve` process is running with `--http`.
+
+## Start the API
+
+```bash
+botctl serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
+```
+
+Important constraints:
+
+- the API is local-only by default because `botctl` binds exactly the address you pass to `--http`
+- there is no authentication, TLS, or daemon discovery yet
+- the API is scoped to the tmux session currently served by that process
+- all automation still uses the same ownership, classification, and workflow guards as the CLI
+- browser access requires explicit `--allowed-origin URL` entries; origins not on that allowlist are rejected
+
+## Base URL
+
+Example base URL:
+
+```text
+http://127.0.0.1:8787
+```
+
+## Common behavior
+
+### Content types
+
+- requests with bodies should use `Content-Type: application/json`
+- responses are JSON
+- `OPTIONS` requests return `200 OK`
+
+### CORS
+
+When a request includes an `Origin` header, `botctl` only returns CORS headers for exact origins passed with `--allowed-origin URL`.
+
+Allowed origins receive:
+
+- `Access-Control-Allow-Origin: <origin>`
+- `Access-Control-Allow-Methods: GET, POST, OPTIONS`
+- `Access-Control-Allow-Headers: Content-Type`
+
+Requests from other browser origins are rejected with `403`.
+
+### Instance IDs and URL encoding
+
+Instance IDs are tmux pane IDs such as `%1`.
+
+When used in a URL path, encode `%` as `%25`:
+
+- pane id: `%1`
+- URL path segment: `%251`
+
+Example:
+
+```bash
+curl http://127.0.0.1:8787/instances/%251
+```
+
+### Error model
+
+Errors return JSON like:
+
+```json
+{
+  "ok": false,
+  "error": "pane not found: %99"
+}
+```
+
+Current status behavior:
+
+- `200` for success
+- `400` for invalid input, unsupported state, or general request errors
+- `404` for unknown routes, unknown panes, unknown option ids, or unsupported action ids
+- `409` for conflicts such as no visible interaction options or a recovery loop that refuses to continue safely
+
+## Endpoint summary
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | health-style summary |
+| `GET` | `/health` | health-style summary |
+| `GET` | `/instances` | list served panes |
+| `GET` | `/instances/:id` | detailed pane snapshot |
+| `POST` | `/instances/:id/prompt` | submit prompt text through prompt handoff |
+| `POST` | `/instances/:id/actions/:action` | run an explicit action or recovery workflow |
+| `POST` | `/instances/:id/interactions/:optionId` | select one currently visible interaction option |
+
+## `GET /` and `GET /health`
+
+Returns basic process scope information.
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "session_name": "demo",
+  "target_pane": null
+}
+```
+
+`target_pane` is set when `serve` was started with `--pane` and the API is intentionally scoped to one pane.
+
+## `GET /instances`
+
+Lists the panes currently visible to the served session scope.
+
+Example:
+
+```bash
+curl http://127.0.0.1:8787/instances
+```
+
+Example response:
+
+```json
+{
+  "session_name": "demo",
+  "target_pane": null,
+  "instances": [
+    {
+      "id": "%1",
+      "pane": {
+        "pane_id": "%1",
+        "pane_tty": "/dev/pts/3",
+        "pane_pid": 12345,
+        "session_id": "$1",
+        "session_name": "demo",
+        "window_id": "@1",
+        "window_index": 0,
+        "window_name": "claude",
+        "pane_index": 0,
+        "current_command": "claude",
+        "current_path": "/home/colin/Projects/botctl",
+        "pane_active": true,
+        "cursor_x": 0,
+        "cursor_y": 23
+      },
+      "owned_by_claude": true,
+      "classification": {
+        "source": "%1",
+        "state": "PermissionDialog",
+        "recap_present": false,
+        "recap_excerpt": null,
+        "signals": ["permission-keywords"]
+      },
+      "screen_excerpt": "Bash command (unsandboxed) | Do you want to proceed? | ❯ 1. Yes | 2. No",
+      "next_safe_action": "safe-action: approve",
+      "interactions": {
+        "mode": "numbered-options",
+        "selected_option": 1,
+        "options": [
+          {
+            "id": "1",
+            "index": 1,
+            "label": "Yes",
+            "selected": true,
+            "kind": "affirm"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## `GET /instances/:id`
+
+Returns a fuller snapshot for one pane.
+
+Example:
+
+```bash
+curl http://127.0.0.1:8787/instances/%251
+```
+
+Response shape:
+
+- `id`: pane id
+- `pane`: tmux metadata
+- `owned_by_claude`: whether the pane is currently running `claude`
+- `classification`: current classifier output
+- `screen.excerpt`: short flattened excerpt for compact displays
+- `screen.focused_source`: focused multiline source used for interaction parsing and classification context
+- `next_safe_action`: current human-readable recommendation
+- `prompt`: parsed permission prompt details when available
+- `interactions`: current visible options, if any
+- `controls`: low-level control actions currently exposed by the API
+
+Example response:
+
+```json
+{
+  "instance": {
+    "id": "%1",
+    "pane": {
+      "pane_id": "%1",
+      "pane_tty": "/dev/pts/3",
+      "pane_pid": 12345,
+      "session_id": "$1",
+      "session_name": "demo",
+      "window_id": "@1",
+      "window_index": 0,
+      "window_name": "claude",
+      "pane_index": 0,
+      "current_command": "claude",
+      "current_path": "/home/colin/Projects/botctl",
+      "pane_active": true,
+      "cursor_x": 0,
+      "cursor_y": 23
+    },
+    "owned_by_claude": true,
+    "classification": {
+      "source": "%1",
+      "state": "PermissionDialog",
+      "recap_present": false,
+      "recap_excerpt": null,
+      "signals": ["permission-keywords"]
+    },
+    "screen": {
+      "excerpt": "Bash command (unsandboxed) | Do you want to proceed? | ❯ 1. Yes | 2. No",
+      "focused_source": "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No"
+    },
+    "next_safe_action": "safe-action: approve",
+    "prompt": {
+      "prompt_type": "Bash command",
+      "sandbox_mode": "unsandboxed",
+      "command": null,
+      "reason": null,
+      "question": "Do you want to proceed?"
+    },
+    "interactions": {
+      "mode": "numbered-options",
+      "selected_option": 1,
+      "options": [
+        {
+          "id": "1",
+          "index": 1,
+          "label": "Yes",
+          "selected": true,
+          "kind": "affirm"
+        },
+        {
+          "id": "2",
+          "index": 2,
+          "label": "No",
+          "selected": false,
+          "kind": "deny"
+        }
+      ],
+      "source": "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No"
+    },
+    "controls": [
+      {"id": "confirm-previous", "bound": true},
+      {"id": "confirm-next", "bound": true},
+      {"id": "confirm-yes", "bound": true},
+      {"id": "confirm-no", "bound": true},
+      {"id": "interrupt", "bound": true},
+      {"id": "enter", "bound": true}
+    ]
+  }
+}
+```
+
+## `POST /instances/:id/prompt`
+
+Submits prompt text to the target pane through the same prompt handoff path used by the CLI.
+
+This endpoint still enforces normal prompt-submission safety:
+
+- the pane must be Claude-owned
+- the pane must end up in a supported prompt-submission state
+- survey preflight handling still runs first when needed
+- workspace resolution still uses the pane's current path unless you override it
+
+Request body:
+
+```json
+{
+  "text": "Summarize the current repo",
+  "workspace": ".",
+  "submit_delay_ms": 100
+}
+```
+
+Fields:
+
+- `text`: required non-empty string
+- `workspace`: optional workspace selector accepted by existing workspace resolution logic
+- `submit_delay_ms`: optional positive integer, default `100`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8787/instances/%251/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Summarize the current repo","submit_delay_ms":100}'
+```
+
+Example success response:
+
+```json
+{
+  "ok": true,
+  "pane_id": "%1",
+  "workspace_id": "2a6c8b6e-4c22-4e15-9bd1-7d8ef8e3f7bf",
+  "state": "ChatReady",
+  "state_db": "/home/colin/.local/state/botctl/state.db",
+  "delay_ms": 100
+}
+```
+
+## `POST /instances/:id/actions/:action`
+
+Runs one explicit action or recovery workflow.
+
+Available action ids today:
+
+- `approve-permission`
+- `reject-permission`
+- `dismiss-survey`
+- `continue-session`
+- `auto-unstick`
+- `confirm-previous`
+- `confirm-next`
+- `confirm-yes`
+- `confirm-no`
+- `interrupt`
+- `enter`
+
+### Guarded workflow actions
+
+These use the same guard logic as the CLI:
+
+- `approve-permission`
+- `reject-permission`
+- `dismiss-survey`
+- `continue-session`
+- `auto-unstick`
+
+`continue-session` returns structured recovery results, for example:
+
+```json
+{
+  "ok": true,
+  "pane_id": "%1",
+  "action": "approve",
+  "outcome": "usable",
+  "after_state": "ChatReady",
+  "used_permission_approval": true
+}
+```
+
+`auto-unstick` runs a bounded recovery loop with up to 3 steps and returns:
+
+```json
+{
+  "ok": true,
+  "pane_id": "%1",
+  "final_state": "ChatReady",
+  "actions": ["dismiss-survey", "approve"],
+  "steps": 2
+}
+```
+
+### Low-level control actions
+
+These expose keybinding-routed or raw controls directly:
+
+- `confirm-previous`
+- `confirm-next`
+- `confirm-yes`
+- `confirm-no`
+- `interrupt`
+- `enter`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8787/instances/%251/actions/confirm-next
+```
+
+Typical success response:
+
+```json
+{
+  "ok": true,
+  "pane_id": "%1",
+  "action": "confirm-next",
+  "executed": "confirm-next"
+}
+```
+
+## `POST /instances/:id/interactions/:optionId`
+
+Selects one currently visible interaction option by option id.
+
+This is the main endpoint a web GUI should use for on-screen confirmation flows.
+
+### Supported interaction modes
+
+- `numbered-options`
+  - extracted from visible lines like `1. Yes`, `2. No`, `3. Yes, and don't ask again`
+  - the API moves selection using Claude keybindings for `confirm-previous` and `confirm-next`, then sends raw `Enter`
+- `survey-digits`
+  - extracted from visible survey lines like `1: Bad  2: Fine  3: Good  0: Dismiss`
+  - the API sends the selected digit directly
+- `readonly`
+  - used for currently parsed but not yet safely selectable surfaces such as diff dialogs
+  - these return `409 Conflict` from this endpoint
+
+Example numbered prompt selection:
+
+```bash
+curl -X POST http://127.0.0.1:8787/instances/%251/interactions/2
+```
+
+Example success response:
+
+```json
+{
+  "ok": true,
+  "pane_id": "%1",
+  "selected_option": {
+    "id": "2",
+    "index": 2,
+    "label": "No",
+    "selected": false,
+    "kind": "deny"
+  },
+  "interaction_mode": "numbered-options"
+}
+```
+
+## Interaction object reference
+
+When `interactions` is present on an instance, it has this shape:
+
+```json
+{
+  "mode": "numbered-options",
+  "selected_option": 1,
+  "options": [
+    {
+      "id": "1",
+      "index": 1,
+      "label": "Yes",
+      "selected": true,
+      "kind": "affirm"
+    }
+  ],
+  "source": "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes"
+}
+```
+
+Fields:
+
+- `mode`: one of `numbered-options`, `survey-digits`, or `readonly`
+- `selected_option`: currently selected numbered option when known, otherwise `null`
+- `options`: parsed visible choices
+- `source`: only present in the detailed instance view
+
+Option fields:
+
+- `id`: string identifier used by the interaction endpoint
+- `index`: numeric index when the source exposes one, otherwise `null`
+- `label`: visible text
+- `selected`: whether the option is currently selected in the visible screen model
+- `kind`: coarse label heuristic used to help a GUI style options; current values can include `affirm`, `deny`, `dismiss`, `details`, `option`, and occasionally `persist`
+
+## Prompt object reference
+
+When the current pane is a parsed permission prompt, `prompt` is populated with:
+
+```json
+{
+  "prompt_type": "Bash command",
+  "sandbox_mode": "unsandboxed",
+  "command": "npm publish",
+  "reason": "Deploy release artifacts",
+  "question": "Do you want to proceed?"
+}
+```
+
+Fields may be `null` when the prompt parser cannot extract them safely.
+
+## Control object reference
+
+The detailed instance view also returns a `controls` array for low-level control rendering.
+
+Example:
+
+```json
+[
+  {"id": "confirm-previous", "bound": true},
+  {"id": "confirm-next", "bound": true},
+  {"id": "confirm-yes", "bound": true},
+  {"id": "confirm-no", "bound": true},
+  {"id": "interrupt", "bound": true},
+  {"id": "enter", "bound": true}
+]
+```
+
+`bound` reflects whether `botctl` could resolve that action through the current Claude keybindings. `enter` is always available because it is sent as a raw key.
+
+## Safety and refusal semantics
+
+This API is not a bypass around the CLI safety model.
+
+It refuses when:
+
+- the target pane is outside the served session scope
+- the pane is not currently running Claude
+- the current state does not support the requested guarded workflow
+- no visible interaction options can be parsed
+- a visible interaction surface is known but not safely selectable yet
+- a recovery loop would require guessing
+
+Examples of deliberate refusal:
+
+- `DiffDialog` currently appears as `interactions.mode = "readonly"` and cannot be selected through `/interactions/:optionId`
+- `Unknown` remains a refusal state for guarded automation
+
+## Related docs
+
+- [Serve mode](./serve-mode.mdx)
+- [Automation](./automation.mdx)
+- [Command reference](./command-reference.mdx)

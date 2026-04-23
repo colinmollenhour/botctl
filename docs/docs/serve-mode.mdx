@@ -53,8 +53,10 @@ botctl serve --session demo --format jsonl
 Expose the local HTTP API for a browser-based control surface:
 
 ```bash
-botctl serve --session demo --http 127.0.0.1:8787
+botctl serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
 ```
+
+Repeat `--allowed-origin URL` for each browser origin that should be able to call the API.
 
 Current HTTP endpoints include:
 
@@ -63,6 +65,8 @@ Current HTTP endpoints include:
 - `POST /instances/:id/prompt`
 - `POST /instances/:id/actions/:action`
 - `POST /instances/:id/interactions/:optionId`
+
+For the full route, payload, and response reference, see [HTTP API reference](./api-reference.mdx).
 
 The prompt endpoint accepts JSON like:
 

@@ -624,6 +624,8 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
         target_pane: args.pane_id,
         history_lines: args.history_lines,
         reconcile_ms: args.reconcile_ms,
+        state_dir: args.http_addr.as_ref().map(|_| resolve_bootstrapped_state_dir(args.state_dir.as_deref())).transpose()?,
+        allowed_origins: args.allowed_origins,
     };
     let format = args.format;
     let use_color = supports_babysit_color();
@@ -3031,7 +3033,7 @@ pub(crate) fn focused_frame_source(frame: &str) -> String {
     }
 }
 
-fn ensure_workflow_state(
+pub(crate) fn ensure_workflow_state(
     workflow: GuardedWorkflow,
     classification: &Classification,
 ) -> AppResult<()> {
@@ -3731,6 +3733,8 @@ mod tests {
                 target_pane: None,
                 history_lines: 120,
                 reconcile_ms: 1500,
+                state_dir: None,
+                allowed_origins: Vec::new(),
             },
             &ServeEvent::PaneRemoved {
                 pane_id: String::from("%7"),

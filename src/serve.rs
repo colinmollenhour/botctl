@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -21,6 +22,8 @@ pub struct ServeRequest {
     pub target_pane: Option<String>,
     pub history_lines: usize,
     pub reconcile_ms: u64,
+    pub state_dir: Option<PathBuf>,
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +557,8 @@ mod tests {
             target_pane: Some(String::from("%1")),
             history_lines: 20,
             reconcile_ms: 1000,
+            state_dir: None,
+            allowed_origins: Vec::new(),
         };
         tracked.insert(
             String::from("%1"),
@@ -606,6 +611,8 @@ mod tests {
                 target_pane: Some(String::from("%1")),
                 history_lines: 20,
                 reconcile_ms: 1000,
+                state_dir: None,
+                allowed_origins: Vec::new(),
             },
             "%1",
             "\nstream",

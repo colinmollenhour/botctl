@@ -103,7 +103,7 @@ cargo run -- serve --session demo
 Run the observer and a localhost HTTP API for a web UI:
 
 ```bash
-cargo run -- serve --session demo --http 127.0.0.1:8787
+cargo run -- serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
 ```
 
 Use machine-readable output for tooling:
