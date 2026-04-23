@@ -11,6 +11,7 @@ pub enum Command {
     Status(StatusArgs),
     Doctor(DoctorArgs),
     Observe(ObserveArgs),
+    Runtime(RuntimeArgs),
     Serve(ServeArgs),
     Dashboard(DashboardArgs),
     RecordFixture(RecordFixtureArgs),
@@ -118,6 +119,13 @@ pub struct ObserveArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct RuntimeArgs {
+    pub reconcile_ms: u64,
+    pub history_lines: usize,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ServeArgs {
     pub session_name: String,
     pub pane_id: Option<String>,
@@ -213,6 +221,7 @@ pub struct YoloStartArgs {
     pub all: bool,
     pub poll_ms: u64,
     pub live_preview: bool,
+    pub follow: bool,
     pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
     pub workspace: Option<String>,
@@ -246,6 +255,7 @@ where
         "status" => parse_status(rest),
         "doctor" => parse_doctor(rest),
         "observe" => parse_observe(rest),
+        "runtime" => parse_runtime(rest),
         "serve" => parse_serve(rest),
         "dashboard" => parse_dashboard(rest),
         "record-fixture" => parse_record_fixture(rest),
@@ -295,9 +305,13 @@ pub fn usage() -> String {
     out.push_str(&section("Main Commands:"));
     out.push('\n');
     out.push_str(&featured(
-        "yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
+        "runtime [--reconcile-ms N] [--history-lines N] [--state-dir PATH]",
     ));
-    out.push_str("\n    Start autonomous babysitting for one pane or all registered panes.\n\n");
+    out.push_str("\n    Start the central local runtime that owns observation and automation.\n\n");
+    out.push_str(&featured(
+        "yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
+    ));
+    out.push_str("\n    Set central yolo policy for one pane or all panes, optionally tailing runtime events.\n\n");
     out.push_str(&featured(
         "yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]",
     ));
@@ -375,6 +389,7 @@ pub fn usage() -> String {
     out.push_str(&section("Quick Start:"));
     out.push('\n');
     for line in [
+        "botctl runtime",
         "botctl dashboard",
         "botctl yolo --pane 0:6.0",
         "botctl serve --session my-session --format jsonl",
@@ -1265,6 +1280,52 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     }))
 }
 
+fn parse_runtime(args: Vec<String>) -> AppResult<Command> {
+    let mut reconcile_ms = 1000u64;
+    let mut history_lines = 200usize;
+    let mut state_dir = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reconcile-ms" => {
+                let raw = read_value(&args, &mut i, "--reconcile-ms")?;
+                reconcile_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --reconcile-ms: {raw}"))
+                })?;
+            }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            flag => return Err(AppError::new(format!("unknown runtime flag: {flag}"))),
+        }
+        i += 1;
+    }
+
+    if reconcile_ms == 0 {
+        return Err(AppError::new(
+            "runtime requires --reconcile-ms to be at least 1",
+        ));
+    }
+    if history_lines == 0 {
+        return Err(AppError::new(
+            "runtime requires --history-lines to be at least 1",
+        ));
+    }
+
+    Ok(Command::Runtime(RuntimeArgs {
+        reconcile_ms,
+        history_lines,
+        state_dir,
+    }))
+}
+
 fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
     let (mode, start_index) = match args.first().map(String::as_str) {
         Some("start") => ("start", 1),
@@ -1278,6 +1339,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
             let mut all = false;
             let mut poll_ms = 1000u64;
             let mut live_preview = false;
+            let mut follow = false;
             let mut format = BabysitFormat::Human;
             let mut state_dir = None;
             let mut workspace = None;
@@ -1294,6 +1356,9 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     }
                     "--live-preview" => {
                         live_preview = true;
+                    }
+                    "--follow" => {
+                        follow = true;
                     }
                     "--format" => {
                         let raw = read_value(&args, &mut i, "--format")?;
@@ -1326,6 +1391,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                 all,
                 poll_ms,
                 live_preview,
+                follow,
                 format,
                 state_dir,
                 workspace,
@@ -2247,6 +2313,47 @@ mod tests {
             Command::YoloStart(args) => {
                 assert_eq!(args.pane_id.as_deref(), Some("%9"));
                 assert!(args.live_preview);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_yolo_follow_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--follow"),
+        ])
+        .expect("yolo follow should parse");
+
+        match command {
+            Command::YoloStart(args) => {
+                assert_eq!(args.pane_id.as_deref(), Some("%9"));
+                assert!(args.follow);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runtime_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("runtime"),
+            String::from("--reconcile-ms"),
+            String::from("250"),
+            String::from("--history-lines"),
+            String::from("400"),
+        ])
+        .expect("runtime command should parse");
+
+        match command {
+            Command::Runtime(args) => {
+                assert_eq!(args.reconcile_ms, 250);
+                assert_eq!(args.history_lines, 400);
             }
             other => panic!("unexpected command: {other:?}"),
         }

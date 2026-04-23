@@ -26,7 +26,7 @@ use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
     KeepGoingArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
-    RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
+    RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
     SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
@@ -37,7 +37,8 @@ use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
 };
-use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
+use crate::runtime::{RuntimeClient, RuntimeServerConfig, run_runtime_server};
+use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest};
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, capture_artifact_path, export_artifact_path,
     resolve_workspace, resolve_workspace_for_path, state_db_path,
@@ -139,6 +140,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Status(args) => run_status(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Observe(args) => run_observe(args),
+        Command::Runtime(args) => run_runtime(args),
         Command::Serve(args) => run_serve(args),
         Command::Dashboard(args) => run_dashboard(args),
         Command::RecordFixture(args) => run_record_fixture(args),
@@ -173,6 +175,15 @@ fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
         return run_persistent_dashboard(args);
     }
     dashboard::run(args)
+}
+
+fn run_runtime(args: RuntimeArgs) -> AppResult<String> {
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    run_runtime_server(RuntimeServerConfig {
+        state_dir,
+        history_lines: args.history_lines,
+        reconcile_ms: args.reconcile_ms,
+    })
 }
 
 fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
@@ -607,33 +618,25 @@ impl ServeExportSummary {
 }
 
 fn run_serve(args: ServeArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
-    let artifacts_required = args.state_dir.is_some();
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let runtime = RuntimeClient::connect(&state_dir)?;
+    let _ = runtime.get_status()?;
+
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    let (state_dir, artifact_warning) = resolve_artifact_state_dir(args.state_dir.as_deref())?;
-    if let Some(warning) = artifact_warning.as_deref() {
-        eprintln!("warning: serve artifacts unavailable: {warning}");
-    }
-    let mut artifact_root = state_dir;
-    let mut artifacts: Option<ServeArtifacts> = None;
-    let artifact_session_name = args.session_name.clone();
-    let artifact_pane_id = args.pane_id.clone();
-
     let request = ServeRequest {
         session_name: args.session_name,
         target_pane: args.pane_id,
         history_lines: args.history_lines,
         reconcile_ms: args.reconcile_ms,
-        state_dir: args.http_addr.as_ref().map(|_| resolve_bootstrapped_state_dir(args.state_dir.as_deref())).transpose()?,
+        state_dir: Some(state_dir.clone()),
         allowed_origins: args.allowed_origins,
     };
-    let format = args.format;
-    let use_color = supports_babysit_color();
+
     let http_thread = if let Some(http_addr) = args.http_addr.clone() {
         eprintln!("http api listening on http://{http_addr}");
         Some(spawn_http_server(
-            client.clone(),
+            runtime.clone(),
             request.clone(),
             http_addr,
             Arc::clone(&interrupted),
@@ -642,65 +645,36 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
         None
     };
 
-    let serve_result = run_serve_loop(&client, &request, Arc::clone(&interrupted), |event| {
-        let payload = render_serve_event_payload(&request, &event);
-        if artifacts.is_none() {
-            if let Some(state_dir) = artifact_root.as_deref() {
-                match open_serve_artifacts(
-                    state_dir,
-                    &artifact_session_name,
-                    artifact_pane_id.as_deref(),
-                    args.reconcile_ms,
-                    args.history_lines,
-                ) {
-                    Ok(opened_artifacts) => {
-                        artifacts = Some(opened_artifacts);
-                    }
-                    Err(error) if artifacts_required => return Err(error),
-                    Err(error) => {
-                        eprintln!("warning: serve artifacts unavailable: {error}");
-                        artifact_root = None;
+    let mut subscription = runtime.subscribe()?;
+    while !interrupted.load(Ordering::SeqCst) {
+        if let Some(event) = subscription.recv()? {
+            if let Some(snapshot) = event.snapshot.as_ref() {
+                if snapshot.pane.session_name != request.session_name {
+                    continue;
+                }
+                if let Some(target_pane) = request.target_pane.as_deref() {
+                    if snapshot.pane.pane_id != target_pane {
+                        continue;
                     }
                 }
             }
-        }
-        if let Some(active_artifacts) = artifacts.as_mut() {
-            active_artifacts.summary.record_event(&event);
-            if let Err(error) = append_jsonl_event(&mut active_artifacts.tape_writer, &payload) {
-                if artifacts_required {
-                    return Err(error);
-                }
-                eprintln!("warning: serve artifacts disabled after write failure: {error}");
-                artifacts = None;
-                artifact_root = None;
-            }
-        }
-        emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
-    });
-
-    if let Some(mut artifacts) = artifacts {
-        if let Err(error) = &serve_result {
-            if artifacts.summary.stopped_reason.is_none() {
-                artifacts.summary.stopped_reason = Some(error.to_string());
-            }
-        }
-        artifacts.summary.finalize();
-        if let Err(error) = write_serve_summary_export(&artifacts.export_path, &artifacts.summary) {
-            if artifacts_required && serve_result.is_ok() {
-                return Err(error);
-            }
-            eprintln!("warning: serve summary export failed: {error}");
+            let payload = serde_json::json!({
+                "kind": event.kind,
+                "pane_id": event.pane_id,
+                "workspace_id": event.workspace_id,
+                "summary": event.summary,
+                "revision": event.revision,
+                "timestamp_unix_ms": event.timestamp_unix_ms,
+            });
+            emit_babysit_output(render_babysit_output(args.format.into(), payload, supports_babysit_color()))?;
         }
     }
 
-    interrupted.store(true, Ordering::SeqCst);
     if let Some(http_thread) = http_thread {
         http_thread
             .join()
             .map_err(|_| AppError::new("http api thread panicked"))??;
     }
-
-    serve_result?;
 
     Ok(String::new())
 }
@@ -1759,84 +1733,74 @@ pub(crate) fn submit_prompt_for_pane(
 }
 
 fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = match args.workspace.as_deref() {
-        Some(selector) => Some(resolve_selected_workspace(&state_dir, Some(selector))?),
-        None => None,
-    };
-    let interrupted = Arc::new(AtomicBool::new(false));
-    install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    if args.all {
-        run_yolo_all(
-            &client,
-            &state_dir,
-            workspace.as_ref(),
-            args.poll_ms,
-            args.live_preview,
-            args.format,
-            interrupted,
-        )
+    let runtime = RuntimeClient::connect(&state_dir)?;
+    let client = TmuxClient::default();
+    let updated = if args.all {
+        runtime.set_yolo(None, args.workspace.as_deref(), true, true)?
     } else {
-        let pane_id = args.pane_id.as_deref().unwrap();
-        run_yolo_single(
-            &client,
-            &state_dir,
-            args.workspace.as_deref(),
-            pane_id,
-            args.poll_ms,
-            args.live_preview,
-            args.format,
-            interrupted,
-        )
+        let pane = client
+            .pane_by_target(args.pane_id.as_deref().unwrap())?
+            .ok_or_else(|| AppError::new("could not resolve yolo pane target"))?;
+        runtime.set_yolo(Some(&pane.pane_id), args.workspace.as_deref(), false, true)?
+    };
+    if args.follow || args.live_preview {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        install_babysit_sigint_handler(Arc::clone(&interrupted))?;
+        let mut subscription = runtime.subscribe()?;
+        while !interrupted.load(Ordering::SeqCst) {
+            if let Some(event) = subscription.recv()? {
+                let matches_scope = if args.all {
+                    event
+                        .pane_id
+                        .as_ref()
+                        .map(|pane_id| updated.iter().any(|updated_id| updated_id == pane_id))
+                        .unwrap_or(false)
+                } else {
+                    event
+                        .pane_id
+                        .as_ref()
+                        .map(|pane_id| updated.first().map(|updated_id| updated_id == pane_id).unwrap_or(false))
+                        .unwrap_or(false)
+                };
+                if !matches_scope {
+                    continue;
+                }
+                let payload = serde_json::json!({
+                    "kind": event.kind,
+                    "pane_id": event.pane_id,
+                    "summary": event.summary,
+                    "revision": event.revision,
+                    "timestamp_unix_ms": event.timestamp_unix_ms,
+                });
+                emit_babysit_output(render_babysit_output(args.format.into(), payload, supports_babysit_color()))?;
+            }
+        }
+        Ok(String::new())
+    } else if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else {
+        Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
 }
 
 fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = match args.workspace.as_deref() {
-        Some(selector) => Some(resolve_selected_workspace(&state_dir, Some(selector))?),
-        None => None,
-    };
-    if args.all {
-        let mut out = Vec::new();
-        for pane_id in
-            tracked_pane_ids(&state_dir, workspace.as_ref().map(|item| item.id.as_str()))?
-        {
-            let pane_label = babysit_pane_label(&state_dir, &pane_id);
-            let disabled = disable_yolo_record(&state_dir, &pane_id)?;
-            out.push(render_babysit_stop_event(
-                &pane_label,
-                &pane_id,
-                if disabled {
-                    "disabled"
-                } else {
-                    "already-disabled"
-                },
-                BabysitFormat::Human,
-                supports_babysit_color(),
-            ));
-        }
-        Ok(out.join("\n"))
+    let runtime = RuntimeClient::connect(&state_dir)?;
+    let updated = if args.all {
+        runtime.set_yolo(None, args.workspace.as_deref(), true, false)?
     } else {
         let raw_target = args.pane_id.as_deref().unwrap();
         let pane_id = match TmuxClient::default().pane_by_target(raw_target)? {
             Some(pane) => pane.pane_id,
             None => raw_target.to_string(),
         };
-        let pane_label = babysit_pane_label(&state_dir, &pane_id);
-        let disabled = disable_yolo_record(&state_dir, &pane_id)?;
-        Ok(render_babysit_stop_event(
-            &pane_label,
-            &pane_id,
-            if disabled {
-                "disabled"
-            } else {
-                "already-disabled"
-            },
-            BabysitFormat::Human,
-            supports_babysit_color(),
-        ))
+        runtime.set_yolo(Some(&pane_id), args.workspace.as_deref(), false, false)?
+    };
+    if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else {
+        Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
 }
 

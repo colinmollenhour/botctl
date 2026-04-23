@@ -23,19 +23,14 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    AppResult, ensure_pane_owned_by_claude, execute_classified_workflow, inspect_pane,
-    is_yolo_safe_to_approve, try_unstick_pane,
+    AppResult,
 };
-use crate::automation::GuardedWorkflow;
 use crate::classifier::SessionState;
 use crate::cli::DashboardArgs;
 use crate::prompt::resolve_state_dir;
-use crate::storage::{
-    WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
-    sync_tmux_wait_state,
-};
+use crate::runtime::RuntimeClient;
+use crate::storage::{WorkspaceRecord, bootstrap_state_db};
 use crate::tmux::{TmuxClient, TmuxPane};
-use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const FOOTER_LINE1: &[(&str, &str)] = &[
     ("Arrows/jk", "move"),
@@ -71,6 +66,7 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
     let mut app = DashboardApp::new(
         dashboard_tmux_client(),
         host_tmux_client(),
+        RuntimeClient::connect(&state_dir)?,
         state_dir,
         args.poll_ms,
         args.history_lines,
@@ -98,6 +94,7 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
 struct DashboardApp {
     client: TmuxClient,
     host_client: TmuxClient,
+    runtime: RuntimeClient,
     state_dir: std::path::PathBuf,
     poll_ms: u64,
     history_lines: usize,
@@ -106,7 +103,6 @@ struct DashboardApp {
     selected_pane_id: Option<String>,
     selection: usize,
     first_seen: HashMap<String, Instant>,
-    previous_frames: HashMap<String, String>,
     window_names: HashMap<String, ManagedWindowName>,
     message: String,
     last_refresh: Instant,
@@ -125,6 +121,8 @@ struct PaneEntry {
     recap_present: bool,
     recap_excerpt: Option<String>,
     yolo_enabled: bool,
+    yolo_effective: bool,
+    yolo_stop_reason: Option<String>,
     age: Duration,
     wait_duration: Option<Duration>,
     claude_session_id: Option<String>,
@@ -159,6 +157,7 @@ impl DashboardApp {
     fn new(
         client: TmuxClient,
         host_client: TmuxClient,
+        runtime: RuntimeClient,
         state_dir: std::path::PathBuf,
         poll_ms: u64,
         history_lines: usize,
@@ -167,6 +166,7 @@ impl DashboardApp {
         Ok(Self {
             client,
             host_client,
+            runtime,
             state_dir,
             poll_ms,
             history_lines,
@@ -175,7 +175,6 @@ impl DashboardApp {
             selected_pane_id: None,
             selection: 0,
             first_seen: HashMap::new(),
-            previous_frames: HashMap::new(),
             window_names: HashMap::new(),
             message: String::new(),
             last_refresh: Instant::now() - Duration::from_millis(poll_ms),
@@ -188,45 +187,30 @@ impl DashboardApp {
         let mut panes = Vec::new();
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
-        let mut next_frames = HashMap::new();
 
-        for pane in self.client.list_panes()?.into_iter().filter(is_claude_pane) {
+        for snapshot in self.runtime.list_panes(None, None)? {
+            let pane = snapshot.pane.clone();
             seen_pane_ids.insert(pane.pane_id.clone());
             self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
 
-            let inspected = inspect_pane(&self.client, &pane.pane_id, self.history_lines)?;
-            let previous_frame = self.previous_frames.get(&pane.pane_id);
-            let state = dashboard_display_state(
-                inspected.classification.state,
-                previous_frame,
-                &inspected.raw_source,
-            );
-            let workspace =
-                resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
+            let state = snapshot.classification.state;
+            let workspace = WorkspaceRecord {
+                id: snapshot.workspace_id.clone(),
+                workspace_root: snapshot.workspace_root.clone(),
+                repo_key: None,
+            };
             let workspace_group_key = workspace_group_key(&workspace);
             let workspace_group_label = workspace_group_label(&workspace_group_key);
             let branch = branch_by_path
-                .entry(pane.current_path.clone())
-                .or_insert_with(|| git_branch_for_path(&pane.current_path))
+                .entry(snapshot.pane.current_path.clone())
+                .or_insert_with(|| git_branch_for_path(&snapshot.pane.current_path))
                 .clone();
-            let yolo_enabled = matches!(read_yolo_record(&self.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
             let age = process_age(pane.pane_pid).unwrap_or_else(|| {
                 self.first_seen
                     .get(&pane.pane_id)
                     .map(Instant::elapsed)
                     .unwrap_or_default()
             });
-            let wait_duration = sync_tmux_wait_state(
-                &self.state_dir,
-                &workspace.id,
-                &pane,
-                state.as_str(),
-                is_waiting_state(state),
-            )?;
-            let claude_session_id =
-                sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
-            next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
-
             panes.push(PaneEntry {
                 pane,
                 workspace,
@@ -234,20 +218,21 @@ impl DashboardApp {
                 workspace_group_label,
                 branch,
                 state,
-                has_questions: inspected.classification.has_questions,
-                recap_present: inspected.classification.recap_present,
-                recap_excerpt: inspected.classification.recap_excerpt.clone(),
-                yolo_enabled,
+                has_questions: snapshot.classification.has_questions,
+                recap_present: snapshot.classification.recap_present,
+                recap_excerpt: snapshot.classification.recap_excerpt.clone(),
+                yolo_enabled: snapshot.desired_yolo_enabled,
+                yolo_effective: snapshot.actual_yolo_enabled,
+                yolo_stop_reason: snapshot.last_stop_reason.clone(),
                 age,
-                wait_duration,
-                claude_session_id,
-                focused_source: inspected.focused_source,
+                wait_duration: snapshot.wait_duration_ms.map(Duration::from_millis),
+                claude_session_id: snapshot.claude_session_id.clone(),
+                focused_source: snapshot.focused_source.clone(),
             });
         }
 
         self.first_seen
             .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
-        self.previous_frames = next_frames;
 
         let first_window_by_workspace = panes.iter().fold(
             HashMap::<String, u32>::new(),
@@ -280,7 +265,6 @@ impl DashboardApp {
 
         self.panes = panes;
         self.rebuild_rows();
-        self.run_yolo_supervisor()?;
         self.apply_window_name_prefixes()?;
         self.last_refresh = Instant::now();
         Ok(())
@@ -392,49 +376,6 @@ impl DashboardApp {
             .find(|pane| pane.pane.pane_id == pane_id)
             .map(|pane| is_attention_state(pane.state))
             .unwrap_or(false)
-    }
-
-    fn run_yolo_supervisor(&mut self) -> AppResult<()> {
-        let mut message = None;
-        for pane in &self.panes {
-            if !pane.yolo_enabled {
-                continue;
-            }
-
-            let inspected = inspect_pane(&self.client, &pane.pane.pane_id, self.history_lines)?;
-            match inspected.classification.state {
-                SessionState::PermissionDialog if is_yolo_safe_to_approve(&inspected) => {
-                    execute_classified_workflow(
-                        &self.client,
-                        &pane.pane.pane_id,
-                        GuardedWorkflow::ApprovePermission,
-                        &inspected.classification,
-                    )?;
-                    message = Some(format!(
-                        "approved permission for {}",
-                        pane_descriptor(&pane.pane)
-                    ));
-                }
-                SessionState::SurveyPrompt => {
-                    execute_classified_workflow(
-                        &self.client,
-                        &pane.pane.pane_id,
-                        GuardedWorkflow::DismissSurvey,
-                        &inspected.classification,
-                    )?;
-                    message = Some(format!(
-                        "dismissed survey for {}",
-                        pane_descriptor(&pane.pane)
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(message) = message {
-            self.message = message;
-        }
-        Ok(())
     }
 
     fn apply_window_name_prefixes(&mut self) -> AppResult<()> {
@@ -585,8 +526,10 @@ impl DashboardApp {
         let Some(pane) = self.selected_pane().cloned() else {
             return Ok(());
         };
-        ensure_pane_owned_by_claude(&pane.pane)?;
-        self.message = try_unstick_pane(&self.client, &pane.pane)?;
+        let result = self
+            .runtime
+            .run_action(&pane.pane.pane_id, None, "auto-unstick")?;
+        self.message = format!("{} {}", result.pane_id, result.executed);
         Ok(())
     }
 
@@ -647,12 +590,9 @@ impl DashboardApp {
     }
 
     fn set_yolo_for_pane(&mut self, pane: &PaneEntry, enabled: bool) -> AppResult<()> {
-        ensure_pane_owned_by_claude(&pane.pane)?;
-        if enabled {
-            write_yolo_record(&self.state_dir, &pane.workspace.id, &pane.pane)?;
-        } else {
-            let _ = disable_yolo_record(&self.state_dir, &pane.pane.pane_id)?;
-        }
+        let _ = self
+            .runtime
+            .set_yolo(Some(&pane.pane.pane_id), Some(&pane.workspace.id), false, enabled)?;
         Ok(())
     }
 }
@@ -913,7 +853,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
 
     let details_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(3)])
+        .constraints([Constraint::Length(13), Constraint::Min(3)])
         .split(body[1]);
 
     if let Some(pane) = app.selected_pane() {
@@ -931,12 +871,16 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             )),
             Line::from(format!("Has questions: {}", pane.has_questions)),
             Line::from(format!(
-                "YOLO: {}",
+                "YOLO desired: {}",
                 if pane.yolo_enabled {
                     "enabled"
                 } else {
                     "disabled"
                 }
+            )),
+            Line::from(format!(
+                "YOLO active: {}",
+                if pane.yolo_effective { "active" } else { "inactive" }
             )),
             Line::from(format!("Age: {}", format_age(pane.age))),
             Line::from(format!(
@@ -953,6 +897,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         details.push(Line::from(format!(
             "Session ID: {}",
             pane.claude_session_id.as_deref().unwrap_or("-")
+        )));
+        details.push(Line::from(format!(
+            "Stop reason: {}",
+            pane.yolo_stop_reason.as_deref().unwrap_or("-")
         )));
 
         let details = Paragraph::new(details).block(rounded_block(Some("Details")));
@@ -1655,6 +1603,7 @@ mod tests {
         workspace_group_key, workspace_group_label, yolo_column_contains,
     };
     use crate::classifier::SessionState;
+    use crate::runtime::RuntimeClient;
     use crate::storage::WorkspaceRecord;
     use crate::tmux::{TmuxClient, TmuxPane};
     use ratatui::layout::Rect;
@@ -1970,6 +1919,7 @@ mod tests {
         let app = DashboardApp::new(
             TmuxClient::default(),
             TmuxClient::default(),
+            RuntimeClient::with_socket_path(unique_temp_dir("dashboard-runtime-sock").join("runtime.sock")),
             unique_temp_dir("dashboard-hitbox"),
             1000,
             120,
@@ -2027,6 +1977,8 @@ mod tests {
                 None
             },
             yolo_enabled: false,
+            yolo_effective: false,
+            yolo_stop_reason: None,
             age: Duration::from_secs(1),
             wait_duration: None,
             claude_session_id: None,

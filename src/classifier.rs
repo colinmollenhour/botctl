@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     ChatReady,
     BusyResponding,
@@ -72,7 +74,7 @@ const PERMISSION_KEYWORDS: &[&str] = &[
 
 const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "esc"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Classification {
     pub source: String,
     pub state: SessionState,
