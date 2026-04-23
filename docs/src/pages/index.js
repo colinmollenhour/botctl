@@ -15,7 +15,7 @@ function HomepageHeader() {
       <div className="hero-botctl__glow hero-botctl__glow--amber" />
       <div className="hero-botctl__grid" />
       <div className="hero-botctl__content">
-        <p className="hero-botctl__eyebrow">Terminal control, minus the cowboy energy</p>
+        <p className="hero-botctl__eyebrow">Break free from the limits of the TUI</p>
         <Heading as="h1" className="hero-botctl__title">
           {siteConfig.title}
         </Heading>

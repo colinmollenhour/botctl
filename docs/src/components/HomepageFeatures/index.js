@@ -3,63 +3,32 @@ import Heading from '@theme/Heading';
 
 const FeatureList = [
   {
-    eyebrow: 'Session Manager',
-    title: 'Launch and target tmux panes explicitly',
+    eyebrow: 'Dashboard Popup',
+    title: 'Keep a live control panel one keypress away',
     description: (
       <>
-        Start managed Claude sessions, inspect pane metadata, and keep automation pinned
-        to concrete tmux pane IDs instead of vague session guesses.
+        Launch the dashboard in a tmux popup, keep it alive with <code>--persistent</code>,
+        and jump straight into the Claude pane you care about without losing the bigger picture.
       </>
     ),
   },
   {
-    eyebrow: 'Observer',
-    title: 'Watch live terminal state without pretending it is easy',
+    eyebrow: 'YOLO',
+    title: 'Let botctl babysit the boring parts',
     description: (
       <>
-        Blend control-mode events with capture-backed reconciliation so diagnostics stay
-        fast, but final decisions still come from the most trustworthy pane evidence.
+        Turn on <code>yolo</code> for one pane or one workspace and let botctl handle the
+        repetitive safe confirmation flows while keeping the guardrails intact.
       </>
     ),
   },
   {
-    eyebrow: 'Classifier',
-    title: 'Prefer Unknown over sending the wrong key',
+    eyebrow: 'Serve',
+    title: 'Stream live session state for humans or tooling',
     description: (
       <>
-        Map Claude UI frames into explicit states like <code>ChatReady</code>,
-        <code>PermissionDialog</code>, and <code>FolderTrustPrompt</code> while keeping
-        ambiguous flows on the safe side.
-      </>
-    ),
-  },
-  {
-    eyebrow: 'Automation',
-    title: 'Guarded workflows, not blind send-keys macros',
-    description: (
-      <>
-        Submit prompts, approve permissions, reject dialogs, dismiss surveys, and run
-        recovery loops only when ownership, keybindings, and state validation all line up.
-      </>
-    ),
-  },
-  {
-    eyebrow: 'Prompt Handoff',
-    title: 'Stage prompts in SQLite before Claude asks for an editor',
-    description: (
-      <>
-        Keep prepared prompts in <code>state.db</code>, bridge them into Claude&apos;s
-        external-editor flow, and verify transitions instead of assuming submission worked.
-      </>
-    ),
-  },
-  {
-    eyebrow: 'Fixtures',
-    title: 'Replay captured UI cases when Claude changes on you',
-    description: (
-      <>
-        Record fixture cases from live sessions and replay them in tests so classifier and
-        workflow behavior stays explainable as Claude&apos;s terminal UI evolves.
+        Run <code>serve</code> when you want a live event stream, use human output for
+        watching, or switch to JSONL when you want to wire botctl into something bigger.
       </>
     ),
   },
@@ -82,11 +51,11 @@ export default function HomepageFeatures() {
     <section className="feature-grid">
       <div className="container">
         <div className="feature-grid__header">
-          <p className="feature-grid__label">Why botctl exists</p>
-          <Heading as="h2">Automation for Claude sessions that acts like a paranoid operator</Heading>
+          <p className="feature-grid__label">Three ways to break out of the TUI</p>
+          <Heading as="h2">The useful stuff: popup dashboard, yolo babysitting, and live session streaming</Heading>
           <p>
-            botctl is built around one rule: terminal automation is only safe when transport,
-            observation, classification, and policy stay separate.
+            botctl is most fun when it stops feeling like a pile of terminal panes and starts
+            feeling like something you can actually steer.
           </p>
         </div>
         <div className="row">
