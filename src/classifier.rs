@@ -281,7 +281,7 @@ fn detect_recap(frame_text: &str, normalized: &str) -> RecapDetection {
 
 fn extract_recap_excerpt(frame_text: &str) -> Option<String> {
     let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
-    let anchor_index = lines.iter().position(|line| is_recap_anchor(line))?;
+    let anchor_index = lines.iter().rposition(|line| is_recap_anchor(line))?;
 
     if let Some(inline) = inline_recap_excerpt(lines[anchor_index]) {
         return Some(inline);
@@ -302,7 +302,12 @@ fn extract_recap_excerpt(frame_text: &str) -> Option<String> {
         if is_recap_stop(line) {
             break;
         }
-        summary_lines.push(line.chars().take(120).collect::<String>());
+        let normalized = normalize_recap_excerpt(line);
+        if normalized.is_empty() {
+            i += 1;
+            continue;
+        }
+        summary_lines.push(normalized.chars().take(120).collect::<String>());
         i += 1;
     }
 
@@ -325,7 +330,7 @@ fn inline_recap_excerpt(line: &str) -> Option<String> {
     let trimmed = line.trim();
     for prefix in ["※ recap:", "recap:"] {
         if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            let excerpt = trimmed[prefix.len()..].trim();
+            let excerpt = normalize_recap_excerpt(trimmed[prefix.len()..].trim());
             if excerpt.is_empty() {
                 return None;
             }
@@ -333,6 +338,14 @@ fn inline_recap_excerpt(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn normalize_recap_excerpt(excerpt: &str) -> String {
+    excerpt
+        .trim()
+        .trim_end_matches("(disable recaps in /config)")
+        .trim()
+        .to_string()
 }
 
 fn is_recap_stop(line: &str) -> bool {
@@ -821,7 +834,7 @@ mod tests {
 
     #[test]
     fn detects_inline_recap_banner() {
-        let frame = "※ recap: Goal: DEV-2812 Step 1 landed on MR !2505. Next: watch the next pipeline run.\n❯";
+        let frame = "※ recap: Goal: DEV-2812 Step 1 landed on MR !2505. Next: watch the next pipeline run. (disable recaps in /config)\n❯";
         let result = Classifier.classify("test", frame);
         assert!(result.recap_present);
         assert_eq!(
@@ -885,6 +898,18 @@ mod tests {
 
         assert_eq!(result.state, SessionState::ChatReady);
         assert!(!result.has_questions);
+    }
+
+    #[test]
+    fn recap_prefers_most_recent_anchor_when_multiple_are_present() {
+        let frame = "※ recap: Older recap should not win\nOlder detail\n● Some later output\n※ recap: Newest recap should win\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert!(result.recap_present);
+        assert_eq!(
+            result.recap_excerpt.as_deref(),
+            Some("Newest recap should win")
+        );
     }
 
     #[test]

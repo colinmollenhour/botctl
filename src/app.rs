@@ -385,7 +385,7 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
 
 fn run_status(args: StatusArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    let pane = normalize_dashboard_window_name(&client, &resolve_pane_by_id(&client, &args.pane_id)?)?;
     let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
@@ -401,11 +401,11 @@ fn run_status(args: StatusArgs) -> AppResult<String> {
 
 fn run_doctor(args: DoctorArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let pane = resolve_doctor_pane(
+    let pane = normalize_dashboard_window_name(&client, &resolve_doctor_pane(
         &client,
         args.session_name.as_deref(),
         args.pane_id.as_deref(),
-    )?;
+    )?)?;
     let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
@@ -3320,6 +3320,35 @@ fn resolve_target_pane(client: &TmuxClient, target: &PaneTargetArgs) -> AppResul
     }
 }
 
+fn normalize_dashboard_window_name(client: &TmuxClient, pane: &TmuxPane) -> AppResult<TmuxPane> {
+    let base_name = strip_dashboard_window_prefixes(&pane.window_name);
+    if base_name == pane.window_name {
+        return Ok(pane.clone());
+    }
+
+    client.rename_window(
+        &format!("{}:{}", pane.session_name, pane.window_index),
+        &base_name,
+    )?;
+    resolve_pane_by_id(client, &pane.pane_id)
+}
+
+fn strip_dashboard_window_prefixes(value: &str) -> String {
+    const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+
+    let mut rest = value.trim_start();
+    loop {
+        let Some(emoji) = DASHBOARD_STATE_EMOJIS
+            .iter()
+            .find(|emoji| rest.starts_with(**emoji))
+        else {
+            break;
+        };
+        rest = rest[emoji.len()..].trim_start();
+    }
+    rest.to_string()
+}
+
 fn resolve_doctor_pane(
     client: &TmuxClient,
     session_name: Option<&str>,
@@ -3581,6 +3610,7 @@ mod tests {
         render_keep_going_wait_message, render_list_panes, render_next_safe_action,
         render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
         render_status_report, resolve_keep_going_prompt, run_prepare_prompt, shell_escape,
+        strip_dashboard_window_prefixes,
         focused_frame_source,
         submit_prompt_preflight_workflow, tmux_socket_path_from_value, yolo_action_for_state,
     };
@@ -4053,6 +4083,13 @@ mod tests {
 
         assert!(report.contains("recap_present=true"));
         assert!(report.contains("recap_excerpt=Fixed parser edge cases"));
+    }
+
+    #[test]
+    fn strip_dashboard_window_prefixes_removes_stale_state_emoji_prefixes() {
+        assert_eq!(strip_dashboard_window_prefixes("🤔 wms"), "wms");
+        assert_eq!(strip_dashboard_window_prefixes("🤔 💤 wms"), "wms");
+        assert_eq!(strip_dashboard_window_prefixes("wms"), "wms");
     }
 
     #[test]
