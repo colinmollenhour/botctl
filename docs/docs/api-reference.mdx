@@ -11,9 +11,10 @@ The API exists to back polling clients such as a web UI. It is available while a
 ## Start the API
 
 ```bash
-botctl runtime
 botctl serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
 ```
+
+By default, `serve` auto-starts a managed runtime if one is not already running. Add `--unmanaged` when you want to require an existing runtime instead.
 
 Important constraints:
 

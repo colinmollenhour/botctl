@@ -19,7 +19,7 @@ Most users only need a few commands:
 
 For direct blocker recovery, use the canonical names `approve`, `reject`, and `dismiss-survey`. The longer `approve-permission` and `reject-permission` names still work as compatibility aliases.
 
-If you just want to get value quickly, install it, start `runtime`, open `dashboard`, then try `yolo`, `serve`, `prompt`, or `last-message`. Everything else supports setup, diagnostics, prompt handoff, and lower-level recovery.
+If you just want to get value quickly, install it, open `dashboard`, then try `yolo`, `serve`, `prompt`, or `last-message`. `dashboard`, `yolo`, and `serve` auto-start the managed runtime when needed. Everything else supports setup, diagnostics, prompt handoff, and lower-level recovery.
 
 ## Requirements
 
@@ -42,10 +42,9 @@ botctl --version
 botctl help
 ```
 
-Then start the runtime and open the dashboard:
+Then open the dashboard, which starts the managed runtime automatically when needed:
 
 ```bash
-botctl runtime
 botctl dashboard
 ```
 
@@ -85,7 +84,22 @@ botctl prompt --text hi -- --model sonnet --name "Just testing"
 
 By default, stdout contains only the assistant answer. `prompt` uses the shared `botctl` tmux session unless `--session NAME` overrides it, creates that session automatically when needed, creates one new window per run, and kills only that captured window after loading a fresh assistant answer. Failed prompt windows remain available for inspection. Pass `--verbose` to write launch/wait progress to stderr. Arguments after `--` pass through to Claude.
 
-The runtime owns live tmux observation, pane classification, yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` connect to the same local socket at `<state-dir>/runtime.sock`, so they all see the same pane state.
+The runtime owns live tmux observation, pane classification, yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` connect to the same local socket at `<state-dir>/runtime.sock`, and in managed mode they auto-start a hidden tmux-backed runtime when one is not already running.
+
+## Managed versus unmanaged
+
+- managed is the default for `dashboard`, `yolo`, and `serve`
+- managed mode auto-starts a hidden runtime session when needed
+- managed clients share runtime leases so the last managed listener can keep the runtime alive instead of losing it when an earlier client exits
+- `--unmanaged` disables auto-start and requires an existing runtime
+
+Direct runtime commands:
+
+```bash
+botctl runtime
+botctl runtime stop
+botctl runtime --foreground
+```
 
 ## First session
 
@@ -234,7 +248,7 @@ botctl yolo --pane 0:6.0 --follow
 - `serve` is the runtime-backed facade for one tmux session.
 - `serve` does not run its own observer loop anymore.
 
-If you are not sure which one you want, you probably want `runtime` plus `serve`, not `observe`.
+If you are not sure which one you want, you probably want managed `serve`, not `observe`.
 
 Run `serve` against one tmux session:
 
