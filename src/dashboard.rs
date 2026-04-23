@@ -107,6 +107,7 @@ struct DashboardApp {
     selection: usize,
     first_seen: HashMap<String, Instant>,
     previous_frames: HashMap<String, String>,
+    yes_counts: HashMap<String, u32>,
     window_names: HashMap<String, ManagedWindowName>,
     message: String,
     last_refresh: Instant,
@@ -127,6 +128,7 @@ struct PaneEntry {
     yolo_enabled: bool,
     age: Duration,
     wait_duration: Option<Duration>,
+    yes_count: u32,
     claude_session_id: Option<String>,
     focused_source: String,
 }
@@ -176,6 +178,7 @@ impl DashboardApp {
             selection: 0,
             first_seen: HashMap::new(),
             previous_frames: HashMap::new(),
+            yes_counts: HashMap::new(),
             window_names: HashMap::new(),
             message: String::new(),
             last_refresh: Instant::now() - Duration::from_millis(poll_ms),
@@ -225,6 +228,11 @@ impl DashboardApp {
             )?;
             let claude_session_id =
                 sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
+            let yes_count = self
+                .yes_counts
+                .get(&yes_count_key(claude_session_id.as_deref(), &pane.pane_id))
+                .copied()
+                .unwrap_or(0);
             next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
 
             panes.push(PaneEntry {
@@ -240,6 +248,7 @@ impl DashboardApp {
                 yolo_enabled,
                 age,
                 wait_duration,
+                yes_count,
                 claude_session_id,
                 focused_source: inspected.focused_source,
             });
@@ -396,7 +405,7 @@ impl DashboardApp {
 
     fn run_yolo_supervisor(&mut self) -> AppResult<()> {
         let mut message = None;
-        for pane in &self.panes {
+        for pane in self.panes.clone() {
             if !pane.yolo_enabled {
                 continue;
             }
@@ -410,6 +419,7 @@ impl DashboardApp {
                         GuardedWorkflow::ApprovePermission,
                         &inspected.classification,
                     )?;
+                    self.increment_yes_count(&pane);
                     message = Some(format!(
                         "approved permission for {}",
                         pane_descriptor(&pane.pane)
@@ -587,7 +597,15 @@ impl DashboardApp {
         };
         ensure_pane_owned_by_claude(&pane.pane)?;
         self.message = try_unstick_pane(&self.client, &pane.pane)?;
+        if matches!(pane.state, SessionState::PermissionDialog | SessionState::FolderTrustPrompt) {
+            self.increment_yes_count(&pane);
+        }
         Ok(())
+    }
+
+    fn increment_yes_count(&mut self, pane: &PaneEntry) {
+        let key = yes_count_key(pane.claude_session_id.as_deref(), &pane.pane.pane_id);
+        *self.yes_counts.entry(key).or_insert(0) += 1;
     }
 
     fn toggle_workspace_yolo(&mut self) -> AppResult<()> {
@@ -843,6 +861,8 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     header_text.push_str(TABLE_GAP);
     header_text.push_str(&pad_display("Wait", columns.wait_width));
     header_text.push_str(TABLE_GAP);
+    header_text.push_str(&pad_display_right("Yes", columns.yes_width));
+    header_text.push_str(TABLE_GAP);
     header_text.push_str(&pad_display("Branch", columns.branch_width));
     header_text.push_str(TABLE_GAP);
     let header_width = panes_layout[0].width as usize;
@@ -891,6 +911,8 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                             &pane.wait_duration.map(format_age).unwrap_or_default(),
                             columns.wait_width,
                         )),
+                        Span::raw(TABLE_GAP),
+                        Span::raw(pad_display_right(&pane.yes_count.to_string(), columns.yes_width)),
                         Span::raw(TABLE_GAP),
                         Span::raw(pad_display(&pane.branch, columns.branch_width)),
                         Span::raw(TABLE_GAP),
@@ -1099,6 +1121,7 @@ struct PaneListColumns {
     pane_width: usize,
     uptime_width: usize,
     wait_width: usize,
+    yes_width: usize,
     branch_width: usize,
 }
 
@@ -1127,6 +1150,7 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
             .max()
             .unwrap_or(4)
             .max(4),
+        yes_width: 3,
         branch_width: app
             .panes
             .iter()
@@ -1170,6 +1194,10 @@ fn pad_display_right(value: &str, width: usize) -> String {
     } else {
         format!("{}{}", " ".repeat(width - display_width), value)
     }
+}
+
+fn yes_count_key(claude_session_id: Option<&str>, pane_id: &str) -> String {
+    claude_session_id.unwrap_or(pane_id).to_string()
 }
 
 fn render_workspace_header_line(label: &str, width: usize) -> Line<'static> {
@@ -1652,7 +1680,7 @@ mod tests {
         pane_list_content_area, recap_lines, rect_contains, render_workspace_header_line,
         repo_root_from_repo_key, save_selection, should_return_navigation, split_workspace_header,
         state_emoji, strip_dashboard_emoji_prefixes, tmux_object_id_order,
-        workspace_group_key, workspace_group_label, yolo_column_contains,
+        workspace_group_key, workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
@@ -1851,6 +1879,12 @@ mod tests {
     }
 
     #[test]
+    fn yes_count_key_prefers_claude_session_id() {
+        assert_eq!(yes_count_key(Some("session-123"), "%9"), "session-123");
+        assert_eq!(yes_count_key(None, "%9"), "%9");
+    }
+
+    #[test]
     fn split_workspace_header_returns_name_and_path() {
         assert_eq!(
             split_workspace_header("my-workspace  (~/Code/my-workspace)"),
@@ -2029,6 +2063,7 @@ mod tests {
             yolo_enabled: false,
             age: Duration::from_secs(1),
             wait_duration: None,
+            yes_count: 0,
             claude_session_id: None,
             focused_source: focused_source.to_string(),
         }
