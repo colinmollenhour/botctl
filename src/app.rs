@@ -414,7 +414,7 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         is_pane_command_claude(&pane) && bindings.status == KeybindingsStatus::Valid;
 
     Ok(format!(
-        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
+        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
         automation_ready,
         pane.pane_id,
         pane.session_name,
@@ -425,6 +425,7 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         pane.current_path,
         render_cursor(&pane),
         classification.state.as_str(),
+        classification.has_questions,
         classification.recap_present,
         classification.recap_excerpt.as_deref().unwrap_or("none"),
         render_signals(&classification),
@@ -3331,7 +3332,7 @@ fn render_status_report(
     frame: &str,
 ) -> String {
     format!(
-        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
+        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
         pane.pane_id,
         pane.session_name,
         pane.window_name,
@@ -3340,6 +3341,7 @@ fn render_status_report(
         pane.current_path,
         render_cursor(pane),
         classification.state.as_str(),
+        classification.has_questions,
         classification.recap_present,
         classification.recap_excerpt.as_deref().unwrap_or("none"),
         render_signals(classification),
@@ -3663,6 +3665,7 @@ mod tests {
         let before = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("permission-keywords")],
@@ -3765,6 +3768,7 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![],
@@ -3781,6 +3785,7 @@ mod tests {
             render_next_safe_action(
                 &Classification {
                     state: SessionState::Unknown,
+                    has_questions: false,
                     recap_present: false,
                     recap_excerpt: None,
                     ..classification.clone()
@@ -3794,6 +3799,7 @@ mod tests {
             render_next_safe_action(
                 &Classification {
                     state: SessionState::SurveyPrompt,
+                    has_questions: false,
                     recap_present: false,
                     recap_excerpt: None,
                     ..classification.clone()
@@ -3807,6 +3813,7 @@ mod tests {
             render_next_safe_action(
                 &Classification {
                     state: SessionState::PlanApprovalPrompt,
+                    has_questions: false,
                     recap_present: false,
                     recap_excerpt: None,
                     ..classification.clone()
@@ -3823,6 +3830,7 @@ mod tests {
         let folder_trust = Classification {
             source: String::from("pane"),
             state: SessionState::FolderTrustPrompt,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("folder-trust-keywords")],
@@ -3830,6 +3838,7 @@ mod tests {
         let survey = Classification {
             source: String::from("pane"),
             state: SessionState::SurveyPrompt,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("survey-keywords")],
@@ -3850,6 +3859,7 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
@@ -3870,6 +3880,7 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from(SIGNAL_SENSITIVE_CLAUDE_PATH)],
@@ -3890,6 +3901,7 @@ mod tests {
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::PermissionDialog,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
@@ -3910,6 +3922,7 @@ mod tests {
             &Classification {
                 source: String::from("pane"),
                 state: SessionState::FolderTrustPrompt,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("folder-trust")],
@@ -3937,6 +3950,7 @@ mod tests {
             &Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -3963,6 +3977,7 @@ mod tests {
             &Classification {
                 source: String::from("pane"),
                 state: SessionState::ChatReady,
+                has_questions: false,
                 recap_present: true,
                 recap_excerpt: Some(String::from("Fixed parser edge cases")),
                 signals: vec![String::from("chat-keywords")],
@@ -4045,6 +4060,7 @@ mod tests {
         let survey = Classification {
             source: String::from("pane"),
             state: SessionState::SurveyPrompt,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("survey-keywords")],
@@ -4052,6 +4068,7 @@ mod tests {
         let ready = Classification {
             source: String::from("pane"),
             state: SessionState::ChatReady,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("chat-keywords")],
@@ -4195,6 +4212,7 @@ mod tests {
         let after = Classification {
             source: String::from("pane"),
             state: SessionState::BusyResponding,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("busy-keywords")],
@@ -4208,6 +4226,7 @@ mod tests {
         let ready = Classification {
             source: String::from("pane"),
             state: SessionState::ChatReady,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("chat-keywords")],
@@ -4238,6 +4257,7 @@ mod tests {
         let ready = Classification {
             source: String::from("pane"),
             state: SessionState::ChatReady,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("chat-keywords")],
@@ -4253,6 +4273,7 @@ mod tests {
             &Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from(SIGNAL_SELF_SETTINGS_LANGUAGE)],
@@ -4327,6 +4348,7 @@ mod tests {
             &Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![],
@@ -4345,6 +4367,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: true,
                 recap_excerpt: Some(String::from("allow access")),
                 signals: vec![String::from("permission-keywords")],
@@ -4381,6 +4404,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4410,6 +4434,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4440,6 +4465,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4468,6 +4494,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4499,6 +4526,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4531,6 +4559,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4567,6 +4596,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4598,6 +4628,7 @@ mod tests {
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4644,6 +4675,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4692,6 +4724,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4713,6 +4746,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4734,6 +4768,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![
@@ -4758,6 +4793,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![
@@ -4782,6 +4818,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4803,6 +4840,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4908,6 +4946,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4934,6 +4973,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
         let classification = Classification {
             source: String::from("pane"),
             state: SessionState::PlanApprovalPrompt,
+            has_questions: false,
             recap_present: false,
             recap_excerpt: None,
             signals: vec![String::from("plan-approval-keywords")],
@@ -4950,6 +4990,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::PermissionDialog,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("permission-keywords")],
@@ -4986,6 +5027,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             classification: Classification {
                 source: String::from("pane"),
                 state: SessionState::SurveyPrompt,
+                has_questions: false,
                 recap_present: false,
                 recap_excerpt: None,
                 signals: vec![String::from("survey-keywords")],

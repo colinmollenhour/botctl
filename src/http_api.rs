@@ -507,6 +507,7 @@ fn classification_json(inspected: &InspectedPane) -> serde_json::Value {
     json!({
         "source": inspected.classification.source,
         "state": inspected.classification.state.as_str(),
+        "has_questions": inspected.classification.has_questions,
         "recap_present": inspected.classification.recap_present,
         "recap_excerpt": inspected.classification.recap_excerpt,
         "signals": inspected.classification.signals,

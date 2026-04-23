@@ -51,6 +51,7 @@ pub const SIGNAL_SURVEY_KEYWORDS: &str = "survey-keywords";
 pub const SIGNAL_EXTERNAL_EDITOR_KEYWORDS: &str = "external-editor-keywords";
 pub const SIGNAL_DIFF_KEYWORDS: &str = "diff-keywords";
 pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
+pub const SIGNAL_CHAT_QUESTIONS: &str = "chat-questions";
 pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
 pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
 
@@ -75,6 +76,7 @@ const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "
 pub struct Classification {
     pub source: String,
     pub state: SessionState,
+    pub has_questions: bool,
     pub recap_present: bool,
     pub recap_excerpt: Option<String>,
     pub signals: Vec<String>,
@@ -83,6 +85,7 @@ pub struct Classification {
 impl Classification {
     pub fn render(&self) -> String {
         let mut out = format!("source={}\nstate={}", self.source, self.state.as_str());
+        out.push_str(&format!("\nhas_questions={}", self.has_questions));
         out.push_str(&format!("\nrecap_present={}", self.recap_present));
         out.push_str("\nrecap_excerpt=");
         out.push_str(self.recap_excerpt.as_deref().unwrap_or("none"));
@@ -236,9 +239,15 @@ impl Classifier {
             SessionState::Unknown
         };
 
+        let has_questions = state == SessionState::ChatReady && chat_ready_has_questions(frame_text);
+        if has_questions {
+            signals.push(String::from(SIGNAL_CHAT_QUESTIONS));
+        }
+
         Classification {
             source: source.to_string(),
             state,
+            has_questions,
             recap_present: recap.recap_present,
             recap_excerpt: recap.recap_excerpt,
             signals,
@@ -465,6 +474,84 @@ fn is_busy_status_line(line: &str) -> bool {
     stripped.starts_with("thinking...") || stripped.starts_with("thinking…")
 }
 
+fn chat_ready_has_questions(frame_text: &str) -> bool {
+    let tail = recent_chat_ready_tail(frame_text);
+    if tail.is_empty() {
+        return false;
+    }
+
+    let joined = tail.join("\n").to_ascii_lowercase();
+    let has_question_line = tail.iter().any(|line| line.ends_with('?'));
+    let has_question_phrase = contains_any(
+        &joined,
+        &[
+            "should i",
+            "would you like",
+            "do you want",
+            "want me to",
+            "how would you like",
+            "which option",
+            "which approach",
+            "do you prefer",
+            "let me know which",
+        ],
+    );
+    let option_like_lines = tail.iter().filter(|line| is_lettered_option_line(line)).count();
+
+    has_question_line || has_question_phrase || option_like_lines >= 2
+}
+
+fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
+    let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let tail_end = lines
+        .iter()
+        .rposition(|line| !line.is_empty() && !is_terminal_status_line(line))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let lines = &lines[..tail_end];
+
+    let start = lines
+        .iter()
+        .rposition(|line| is_plain_chat_input_line(line))
+        .map(|idx| idx.saturating_sub(8))
+        .unwrap_or_else(|| lines.len().saturating_sub(8));
+
+    let mut tail = lines[start..]
+        .iter()
+        .copied()
+        .filter(|line| !line.is_empty())
+        .filter(|line| !is_plain_chat_input_line(line))
+        .filter(|line| !is_chat_keyword_line(line))
+        .filter(|line| !is_terminal_status_line(line))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tail.len() > 4 {
+        tail = tail.split_off(tail.len() - 4);
+    }
+    tail
+}
+
+fn is_terminal_status_line(line: &str) -> bool {
+    line.starts_with('~')
+        || line.starts_with('/')
+        || line.starts_with('(')
+        || line.ends_with(") ✅")
+        || line.ends_with(")")
+}
+
+fn is_lettered_option_line(line: &str) -> bool {
+    let trimmed = line.trim_start_matches('❯').trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    matches!(bytes[1], b')' | b'.' | b':') && bytes[2] == b' '
+}
+
 fn starts_with_numbered_option(line: &str) -> bool {
     let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digits > 0 && line[digits..].starts_with('.')
@@ -473,9 +560,9 @@ fn starts_with_numbered_option(line: &str) -> bool {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
-        Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_DIFF_KEYWORDS,
-        SIGNAL_PERMISSION_KEYWORDS, SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
-        SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
+        Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_CHAT_QUESTIONS,
+        SIGNAL_DIFF_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS, SIGNAL_PLAN_APPROVAL_KEYWORDS,
+        SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
 
     #[test]
@@ -705,5 +792,33 @@ mod tests {
             result.recap_excerpt.as_deref(),
             Some("Fixed parser edge cases")
         );
+    }
+
+    #[test]
+    fn flags_chat_ready_with_direct_question() {
+        let frame = "I fixed the bug and added coverage. Should I also update the docs?\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.has_questions);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_QUESTIONS)));
+    }
+
+    #[test]
+    fn flags_chat_ready_with_lettered_options() {
+        let frame = "I can take either path:\nA. Keep the current state model and add a modifier\nB. Split done into a separate top-level state\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.has_questions);
+    }
+
+    #[test]
+    fn ignores_stale_scrollback_question_far_above_prompt() {
+        let frame = "Should I update the docs too?\nMore old scrollback\nStill older output\nLatest completed work item\n※ recap: Fixed the parser edge case\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
     }
 }

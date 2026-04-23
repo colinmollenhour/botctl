@@ -273,6 +273,7 @@ mod tests {
             classification: Classification {
                 source: String::from("test"),
                 state: SessionState::ChatReady,
+                has_questions: false,
                 recap_present: true,
                 recap_excerpt: Some(String::from("While you were away")),
                 signals: vec![],

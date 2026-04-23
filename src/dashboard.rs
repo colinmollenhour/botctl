@@ -106,6 +106,7 @@ struct PaneEntry {
     workspace_group_label: String,
     branch: String,
     state: SessionState,
+    has_questions: bool,
     recap_present: bool,
     recap_excerpt: Option<String>,
     yolo_enabled: bool,
@@ -218,6 +219,7 @@ impl DashboardApp {
                 workspace_group_label,
                 branch,
                 state,
+                has_questions: inspected.classification.has_questions,
                 recap_present: inspected.classification.recap_present,
                 recap_excerpt: inspected.classification.recap_excerpt.clone(),
                 yolo_enabled,
@@ -439,7 +441,7 @@ impl DashboardApp {
             let first = panes[0];
             let prefix = panes
                 .iter()
-                .map(|pane| state_emoji(pane.state))
+                .map(|pane| state_emoji(pane.state, pane.has_questions))
                 .collect::<String>();
             let managed = self
                 .window_names
@@ -648,12 +650,38 @@ fn dashboard_tmux_client() -> TmuxClient {
 }
 
 fn host_tmux_client() -> TmuxClient {
-    TmuxClient::default()
+    if std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some() {
+        TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET)
+    } else {
+        TmuxClient::default()
+    }
 }
 
 fn kill_persistent_dashboard_server() -> AppResult<()> {
     TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET)
         .kill_session(PERSISTENT_DASHBOARD_SESSION)
+}
+
+fn should_return_navigation(exit_on_navigate: bool, inside_tmux: bool) -> bool {
+    exit_on_navigate || !inside_tmux
+}
+
+fn open_dashboard_pane(
+    app: &mut DashboardApp,
+    pane: TmuxPane,
+    exit_on_navigate: bool,
+    persistent: bool,
+) -> AppResult<Option<TmuxPane>> {
+    app.persist_selection()?;
+    if should_return_navigation(exit_on_navigate, std::env::var_os("TMUX").is_some()) {
+        return Ok(Some(pane));
+    }
+    navigate_to_pane(&app.client, &pane)?;
+    if persistent {
+        app.host_client.detach_client()?;
+    }
+    app.message = format!("navigated to {}", pane_descriptor(&pane));
+    Ok(None)
 }
 
 fn run_dashboard_loop(
@@ -694,12 +722,9 @@ fn run_dashboard_loop(
                             let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
                                 continue;
                             };
-                            app.persist_selection()?;
-                            if exit_on_navigate || std::env::var_os("TMUX").is_none() {
+                            if let Some(pane) = open_dashboard_pane(app, pane, exit_on_navigate, persistent)? {
                                 return Ok(Some(pane));
                             }
-                            navigate_to_pane(&app.client, &pane)?;
-                            app.message = format!("navigated to {}", pane_descriptor(&pane));
                         }
                         KeyCode::Char('r') => app.refresh()?,
                         KeyCode::Char('u') => app.unstick_selected_pane()?,
@@ -718,7 +743,7 @@ fn run_dashboard_loop(
                         width: size.width,
                         height: size.height,
                     };
-                    if let Some(pane) = handle_mouse_event(app, mouse, area, exit_on_navigate)? {
+                    if let Some(pane) = handle_mouse_event(app, mouse, area, exit_on_navigate, persistent)? {
                         return Ok(Some(pane));
                     }
                 }
@@ -737,6 +762,7 @@ fn handle_mouse_event(
     mouse: MouseEvent,
     terminal_area: Rect,
     exit_on_navigate: bool,
+    persistent: bool,
 ) -> AppResult<Option<TmuxPane>> {
     match mouse.kind {
         MouseEventKind::ScrollDown => {
@@ -769,12 +795,7 @@ fn handle_mouse_event(
                 let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
                     return Ok(None);
                 };
-                app.persist_selection()?;
-                if exit_on_navigate || std::env::var_os("TMUX").is_none() {
-                    return Ok(Some(pane));
-                }
-                navigate_to_pane(&app.client, &pane)?;
-                app.message = format!("navigated to {}", pane_descriptor(&pane));
+                return open_dashboard_pane(app, pane, exit_on_navigate, persistent);
             }
             Ok(None)
         }
@@ -823,19 +844,20 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     for row in &app.rows {
         match row {
             RowItem::WorkspaceHeader { label } => {
-                items.push(ListItem::new(Line::from(vec![Span::styled(
-                    pad_display_right(label, pane_list_width),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )])))
+                items.push(ListItem::new(render_workspace_header_line(
+                    label,
+                    pane_list_width,
+                )))
             }
             RowItem::Pane { pane_id } => {
                 let pane = app.panes.iter().find(|pane| &pane.pane.pane_id == pane_id);
                 if let Some(pane) = pane {
                     let pane_target = pane_target_label(&pane.pane);
                     items.push(ListItem::new(Line::from(vec![
-                        Span::raw(pad_display(state_emoji(pane.state), columns.state_width)),
+                        Span::raw(pad_display(
+                            state_emoji(pane.state, pane.has_questions),
+                            columns.state_width,
+                        )),
                         Span::raw(TABLE_GAP),
                         Span::styled(
                             pad_display(yolo_marker(pane.yolo_enabled), columns.yolo_width),
@@ -889,9 +911,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             )),
             Line::from(format!(
                 "State: {} {}",
-                state_emoji(pane.state),
+                state_emoji(pane.state, pane.has_questions),
                 pane.state.as_str()
             )),
+            Line::from(format!("Has questions: {}", pane.has_questions)),
             Line::from(format!(
                 "YOLO: {}",
                 if pane.yolo_enabled {
@@ -923,7 +946,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         let body_kind = detail_body_kind(pane);
         let body_lines = detail_body_lines(pane, available_body_lines(details_layout[1]));
         let body = Paragraph::new(body_lines.into_iter().map(Line::from).collect::<Vec<_>>())
-            .block(rounded_block(Some(detail_body_title(body_kind))));
+            .block(rounded_block(Some(detail_body_title(body_kind))))
+            .wrap(Wrap {
+                trim: matches!(body_kind, DetailBodyKind::Recap),
+            });
         frame.render_widget(body, details_layout[1]);
     } else {
         let details = Paragraph::new(vec![Line::from("No Claude panes found")])
@@ -1078,6 +1104,30 @@ fn pad_display_right(value: &str, width: usize) -> String {
     }
 }
 
+fn render_workspace_header_line(label: &str, width: usize) -> Line<'static> {
+    let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let Some((name, path)) = split_workspace_header(label) else {
+        return Line::from(vec![Span::styled(pad_display_right(label, width), style)]);
+    };
+
+    let path = format!("({path})");
+
+    let name_width = UnicodeWidthStr::width(name);
+    let path_width = UnicodeWidthStr::width(path.as_str());
+    let spacer_width = width.saturating_sub(name_width + path_width);
+
+    Line::from(vec![
+        Span::styled(name.to_string(), style),
+        Span::styled(" ".repeat(spacer_width), style),
+        Span::styled(path, style),
+    ])
+}
+
+fn split_workspace_header(label: &str) -> Option<(&str, &str)> {
+    let (name, path) = label.rsplit_once("  (")?;
+    Some((name, path.strip_suffix(')')?))
+}
+
 fn detail_body_kind(pane: &PaneEntry) -> DetailBodyKind {
     match pane.state {
         SessionState::PermissionDialog
@@ -1140,16 +1190,57 @@ fn recap_lines(pane: &PaneEntry) -> Vec<String> {
         .skip_while(|line| !is_recap_line(line))
         .take_while(|line| !is_chat_input_prompt(line))
         .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
+        .map(clean_recap_line)
         .collect::<Vec<_>>();
     if recap_region.is_empty() {
         pane.recap_excerpt
             .as_ref()
-            .map(|excerpt| vec![excerpt.clone()])
+            .map(|excerpt| vec![clean_recap_line(excerpt)])
             .unwrap_or_default()
     } else {
-        recap_region
+        collapse_wrapped_recap_lines(&recap_region)
     }
+}
+
+fn collapse_wrapped_recap_lines(lines: &[String]) -> Vec<String> {
+    let mut filtered = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    while filtered.last().is_some_and(|line| is_recap_separator_line(line)) {
+        filtered.pop();
+    }
+
+    let collapsed = filtered.join(" ");
+
+    if collapsed.is_empty() {
+        Vec::new()
+    } else {
+        vec![collapsed]
+    }
+}
+
+fn is_recap_separator_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '-' || ch == '─')
+}
+
+fn clean_recap_line(line: &str) -> String {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["※ recap:", "recap:"] {
+        if lower.starts_with(prefix) {
+            let cleaned = trimmed[prefix.len()..].trim();
+            return if cleaned.is_empty() {
+                String::new()
+            } else {
+                cleaned.to_string()
+            };
+        }
+    }
+    trimmed.to_string()
 }
 
 fn context_lines_above_input(source: &str) -> Vec<String> {
@@ -1406,9 +1497,10 @@ fn yolo_marker(enabled: bool) -> &'static str {
     if enabled { "🤠" } else { "  " }
 }
 
-fn state_emoji(state: SessionState) -> &'static str {
+fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
     match state {
         SessionState::BusyResponding => "⚙️",
+        SessionState::ChatReady if has_questions => "🤔",
         SessionState::ChatReady => "💤",
         SessionState::PermissionDialog => "🔐",
         SessionState::PlanApprovalPrompt => "❓",
@@ -1479,10 +1571,10 @@ mod tests {
         context_lines_above_input, current_base_window_name, dashboard_display_state,
         dashboard_selection_path, derive_base_window_name,
         detail_body_kind, detail_current_path, detail_workspace_label, format_age, recap_lines,
-        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area, rect_contains,
-        repo_root_from_repo_key, save_selection, state_emoji, tmux_object_id_order,
-        workspace_group_key, yolo_column_contains,
-        workspace_group_label,
+        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
+        rect_contains, render_workspace_header_line, repo_root_from_repo_key, save_selection,
+        should_return_navigation, split_workspace_header, state_emoji, tmux_object_id_order,
+        workspace_group_key, workspace_group_label, yolo_column_contains,
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
@@ -1502,8 +1594,9 @@ mod tests {
 
     #[test]
     fn maps_states_to_emojis() {
-        assert_eq!(state_emoji(SessionState::PermissionDialog), "🔐");
-        assert_eq!(state_emoji(SessionState::PlanApprovalPrompt), "❓");
+        assert_eq!(state_emoji(SessionState::PermissionDialog, false), "🔐");
+        assert_eq!(state_emoji(SessionState::PlanApprovalPrompt, false), "❓");
+        assert_eq!(state_emoji(SessionState::ChatReady, true), "🤔");
     }
 
     #[test]
@@ -1562,17 +1655,53 @@ mod tests {
 
     #[test]
     fn idle_pane_prefers_recap_body() {
-        let pane = sample_pane_entry(SessionState::ChatReady, true, "※ recap: fixed issue\n❯");
+        let pane = sample_pane_entry(SessionState::ChatReady, false, true, "※ recap: fixed issue\n❯");
         assert_eq!(detail_body_kind(&pane), DetailBodyKind::Recap);
+        assert_eq!(recap_lines(&pane), vec![String::from("fixed issue")]);
+    }
+
+    #[test]
+    fn recap_excerpt_fallback_drops_recap_prefix() {
+        let mut pane = sample_pane_entry(SessionState::ChatReady, false, true, "");
+        pane.recap_excerpt = Some(String::from("※ recap: fixed issue"));
+        assert_eq!(recap_lines(&pane), vec![String::from("fixed issue")]);
+    }
+
+    #[test]
+    fn recap_lines_collapse_hard_wrapped_lines_before_rendering() {
+        let pane = sample_pane_entry(
+            SessionState::ChatReady,
+            false,
+            true,
+            "※ recap: fixed issue on the dashboard\nthat used to wrap awkwardly\n❯",
+        );
+
         assert_eq!(
             recap_lines(&pane),
-            vec![String::from("※ recap: fixed issue")]
+            vec![String::from(
+                "fixed issue on the dashboard that used to wrap awkwardly"
+            )]
+        );
+    }
+
+    #[test]
+    fn recap_lines_drop_trailing_separator_lines() {
+        let pane = sample_pane_entry(
+            SessionState::ChatReady,
+            false,
+            true,
+            "※ recap: fixed issue on the dashboard\n────────────────────────\n❯",
+        );
+
+        assert_eq!(
+            recap_lines(&pane),
+            vec![String::from("fixed issue on the dashboard")]
         );
     }
 
     #[test]
     fn detail_workspace_label_omits_root_for_non_worktree() {
-        let pane = sample_pane_entry(SessionState::ChatReady, false, "");
+        let pane = sample_pane_entry(SessionState::ChatReady, false, false, "");
         assert_eq!(detail_workspace_label(&pane), "demo");
     }
 
@@ -1643,6 +1772,28 @@ mod tests {
     }
 
     #[test]
+    fn split_workspace_header_returns_name_and_path() {
+        assert_eq!(
+            split_workspace_header("my-workspace  (~/Code/my-workspace)"),
+            Some(("my-workspace", "~/Code/my-workspace"))
+        );
+    }
+
+    #[test]
+    fn render_workspace_header_line_left_aligns_name_and_right_aligns_path() {
+        let rendered = render_workspace_header_line("my-workspace  (~/Code/my-workspace)", 60);
+        let text = rendered
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.starts_with("my-workspace"));
+        assert!(text.ends_with("(~/Code/my-workspace)"));
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 60);
+    }
+
+    #[test]
     fn persistent_footer_mentions_kill_server_action() {
         assert!(PERSISTENT_FOOTER_TEXT.contains("X kill server"));
     }
@@ -1686,6 +1837,13 @@ mod tests {
     }
 
     #[test]
+    fn navigation_returns_to_caller_only_when_requested_or_outside_tmux() {
+        assert!(should_return_navigation(true, true));
+        assert!(should_return_navigation(false, false));
+        assert!(!should_return_navigation(false, true));
+    }
+
+    #[test]
     fn yolo_column_hitbox_matches_rendered_columns() {
         let app = DashboardApp::new(
             TmuxClient::default(),
@@ -1709,6 +1867,7 @@ mod tests {
 
     fn sample_pane_entry(
         state: SessionState,
+        has_questions: bool,
         recap_present: bool,
         focused_source: &str,
     ) -> PaneEntry {
@@ -1738,6 +1897,7 @@ mod tests {
             workspace_group_label: String::from("demo  (/tmp/demo)"),
             branch: String::from("main"),
             state,
+            has_questions,
             recap_present,
             recap_excerpt: if recap_present {
                 Some(String::from("fixed issue"))
@@ -1756,7 +1916,7 @@ mod tests {
         PaneEntry {
             pane: TmuxPane {
                 current_path: current_path.to_string(),
-                ..sample_pane_entry(SessionState::ChatReady, false, "").pane
+                ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
             },
             workspace: WorkspaceRecord {
                 id: String::from("workspace-2"),
@@ -1765,7 +1925,7 @@ mod tests {
             },
             workspace_group_key: String::from("/tmp/demo/project"),
             workspace_group_label: String::from("project  (/tmp/demo/project)"),
-            ..sample_pane_entry(SessionState::ChatReady, false, "")
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
         }
     }
 
