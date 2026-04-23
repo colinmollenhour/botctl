@@ -56,6 +56,8 @@ const FOOTER_COLUMN_GAP: &str = "    ";
 const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
 const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
+const DASHBOARD_LEFT_PANE_PERCENT: u16 = 58;
+const DASHBOARD_LEFT_PANE_MAX_WIDTH: u16 = 80;
 const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
@@ -838,10 +840,7 @@ fn handle_mouse_event(
 
 fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     let layout = dashboard_layout(frame.area());
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(layout.body);
+    let body = dashboard_body_sections(layout.body);
 
     let panes_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1027,11 +1026,22 @@ fn dashboard_layout(area: Rect) -> DashboardLayout {
     }
 }
 
-fn pane_list_content_area(area: Rect) -> Rect {
-    let body = Layout::default()
+fn dashboard_body_sections(area: Rect) -> Vec<Rect> {
+    let preferred_left = area
+        .width
+        .saturating_mul(DASHBOARD_LEFT_PANE_PERCENT)
+        / 100;
+    let left_width = preferred_left.min(DASHBOARD_LEFT_PANE_MAX_WIDTH);
+
+    Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(dashboard_layout(area).body);
+        .constraints([Constraint::Length(left_width), Constraint::Min(0)])
+        .split(area)
+        .to_vec()
+}
+
+fn pane_list_content_area(area: Rect) -> Rect {
+    let body = dashboard_body_sections(dashboard_layout(area).body);
     let panes_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(5)])
@@ -1671,15 +1681,17 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DashboardApp, DetailBodyKind, PaneEntry, SavedSelection, PERSISTENT_DASHBOARD_SESSION,
-        PERSISTENT_DASHBOARD_SOCKET, TABLE_GAP, abbreviate_home_path,
+        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PaneEntry,
+        PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, SavedSelection, TABLE_GAP,
+        abbreviate_home_path,
         context_lines_above_input, current_base_window_name, dashboard_display_state,
-        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
-        detail_workspace_label, footer_column_widths, footer_help_line, footer_lines,
-        format_age, load_saved_selection, pad_display_right, pane_list_columns,
-        pane_list_content_area, recap_lines, rect_contains, render_workspace_header_line,
-        repo_root_from_repo_key, save_selection, should_return_navigation, split_workspace_header,
-        state_emoji, strip_dashboard_emoji_prefixes, tmux_object_id_order,
+        dashboard_body_sections, dashboard_selection_path, derive_base_window_name,
+        detail_body_kind, detail_current_path, detail_workspace_label, footer_column_widths,
+        footer_help_line, footer_lines, format_age, load_saved_selection, pad_display_right,
+        pane_list_columns, pane_list_content_area, recap_lines, rect_contains,
+        render_workspace_header_line, repo_root_from_repo_key, save_selection,
+        should_return_navigation, split_workspace_header, state_emoji,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order,
         workspace_group_key, workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::SessionState;
@@ -1870,6 +1882,27 @@ mod tests {
         assert!(area.width > 0);
         assert!(area.height > 0);
         assert!(rect_contains(area, area.x, area.y));
+    }
+
+    #[test]
+    fn dashboard_body_sections_caps_left_pane_width() {
+        let narrow = dashboard_body_sections(Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        });
+        assert_eq!(narrow[0].width, 34);
+        assert_eq!(narrow[1].width, 26);
+
+        let wide = dashboard_body_sections(Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 20,
+        });
+        assert_eq!(wide[0].width, DASHBOARD_LEFT_PANE_MAX_WIDTH);
+        assert_eq!(wide[1].width, 120);
     }
 
     #[test]
