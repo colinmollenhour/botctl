@@ -14,16 +14,18 @@ Most users only need three commands:
 
 Everything else is support around setup, diagnostics, prompt handoff, and lower-level recovery.
 
+If you just want to get value quickly, install it, open `dashboard`, then try `yolo` or `serve`.
+
 ## Requirements
 
-- Rust and Cargo
 - `tmux`
 - `claude` on `PATH`
+- `botctl` installed
 
-## Build and test
+## Install
 
 ```bash
-cargo test
+cargo install botctl
 ```
 
 ## Fastest useful path
@@ -31,41 +33,41 @@ cargo test
 Open the dashboard:
 
 ```bash
-cargo run -- dashboard
+botctl dashboard
 ```
 
 Start YOLO on one pane:
 
 ```bash
-cargo run -- yolo --pane 0:6.0
+botctl yolo --pane 0:6.0
 ```
 
 Stream live session events:
 
 ```bash
-cargo run -- serve --session demo --format jsonl
+botctl serve --session demo --format jsonl
 ```
 
-## First success
+## First session
 
 Start a managed Claude session:
 
 ```bash
-cargo run -- start --session demo --cwd /path/to/project
+botctl start --session demo --cwd /path/to/project
 ```
 
-Then inspect the session from `botctl`:
+Then check what `botctl` sees:
 
 ```bash
-cargo run -- list
-cargo run -- doctor --session demo
-cargo run -- status --pane %19
+botctl list
+botctl doctor --session demo
+botctl status --pane %19
 ```
 
 Pane-targeted commands also accept tmux's explicit pane syntax:
 
 ```bash
-cargo run -- status --pane 0:2.3
+botctl status --pane 0:2.3
 ```
 
 Attach with tmux when you want the full terminal UI:
@@ -74,19 +76,19 @@ Attach with tmux when you want the full terminal UI:
 tmux attach -t demo
 ```
 
-## If Claude already exists in tmux
+## If Claude is already running in tmux
 
 If Claude was already started inside tmux, resolve and verify the pane explicitly before acting:
 
 ```bash
-cargo run -- list --all
-cargo run -- attach --pane %19
+botctl list --all
+botctl attach --pane %19
 ```
 
 If you already know the tmux pane target, you can use it directly:
 
 ```bash
-cargo run -- attach --pane 0:2.3
+botctl attach --pane 0:2.3
 ```
 
 ## Dashboard and YOLO
@@ -94,13 +96,13 @@ cargo run -- attach --pane 0:2.3
 Open the cross-workspace dashboard TUI:
 
 ```bash
-cargo run -- dashboard
+botctl dashboard
 ```
 
 Keep it alive in a dedicated tmux-backed popup session:
 
 ```bash
-cargo run -- dashboard --persistent
+botctl dashboard --persistent
 ```
 
 If you use tmux popups, this is the quick and easy way to make the dashboard feel built-in:
@@ -112,13 +114,13 @@ bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 Enable YOLO for one explicit pane:
 
 ```bash
-cargo run -- yolo --pane 0:6.0
+botctl yolo --pane 0:6.0
 ```
 
 Enable YOLO for all panes in one workspace:
 
 ```bash
-cargo run -- yolo --all --workspace .
+botctl yolo --all --workspace .
 ```
 
 ## Observe versus serve
@@ -132,19 +134,19 @@ If you are not sure which one you want, you probably want `serve`, not `observe`
 Run `serve` against one tmux session:
 
 ```bash
-cargo run -- serve --session demo
+botctl serve --session demo
 ```
 
 Watch one specific pane only:
 
 ```bash
-cargo run -- serve --session demo --pane %19
+botctl serve --session demo --pane %19
 ```
 
 Machine-readable stream:
 
 ```bash
-cargo run -- serve --session demo --format jsonl
+botctl serve --session demo --format jsonl
 ```
 
 ## Safety rules

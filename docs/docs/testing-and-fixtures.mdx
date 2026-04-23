@@ -22,7 +22,7 @@ Some older cases only contain `expected.txt` and `frame.txt`; replay still reads
 Use `record-fixture` when you have a live session to capture:
 
 ```bash
-cargo run -- record-fixture --session demo --pane %19 --case new_case --output-dir fixtures/cases
+botctl record-fixture --session demo --pane %19 --case new_case --output-dir fixtures/cases
 ```
 
 Recording stores the frame, expected state, and supporting evidence in a new case directory.
@@ -32,7 +32,7 @@ Recording stores the frame, expected state, and supporting evidence in a new cas
 Replay verifies that the classifier still matches the recorded expectation:
 
 ```bash
-cargo run -- replay --path fixtures/cases/new_case
+botctl replay --path fixtures/cases/new_case
 ```
 
 The replay test suite also walks every directory under `fixtures/cases/*`.
@@ -42,7 +42,7 @@ The replay test suite also walks every directory under `fixtures/cases/*`.
 Use the direct classifier command for a single frame or fixture file:
 
 ```bash
-cargo run -- classify --path fixtures/cases/chat_ready/frame.txt
+botctl classify --path fixtures/cases/chat_ready/frame.txt
 ```
 
 ## Regression workflow

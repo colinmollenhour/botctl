@@ -15,9 +15,9 @@ For most real use, the loop is:
 Typical commands:
 
 ```bash
-cargo run -- dashboard
-cargo run -- yolo --pane 0:6.0
-cargo run -- serve --session demo --format jsonl
+botctl dashboard
+botctl yolo --pane 0:6.0
+botctl serve --session demo --format jsonl
 ```
 
 ## Managed session flow
@@ -27,15 +27,15 @@ Use this when `botctl` launches Claude for you.
 1. Start the managed session:
 
    ```bash
-   cargo run -- start --session demo --cwd /path/to/project
+    botctl start --session demo --cwd /path/to/project
    ```
 
 2. Find the pane and inspect the session:
 
    ```bash
-   cargo run -- list
-   cargo run -- doctor --session demo
-   cargo run -- status --pane %19
+    botctl list
+    botctl doctor --session demo
+    botctl status --pane %19
    ```
 
 3. Attach with tmux when you want the terminal UI:
@@ -51,26 +51,26 @@ Use this when Claude is already running inside tmux and you want to verify the p
 1. List panes, including non-managed ones:
 
    ```bash
-   cargo run -- list --all
+    botctl list --all
    ```
 
 2. Resolve only a specific explicit pane:
 
    ```bash
-   cargo run -- attach --pane %19
+    botctl attach --pane %19
    ```
 
    Or, if tmux already gave you the pane target:
 
    ```bash
-   cargo run -- attach --pane 0:2.3
+    botctl attach --pane 0:2.3
    ```
 
 3. Verify the pane before acting:
 
    ```bash
-   cargo run -- doctor --pane %19
-   cargo run -- status --pane %19
+    botctl doctor --pane %19
+    botctl status --pane %19
    ```
 
 ## Blocker recovery flow
@@ -85,11 +85,11 @@ Use the direct pane-targeted actions only when the classified state matches the 
 Examples:
 
 ```bash
-cargo run -- approve-permission --pane %19
-cargo run -- reject-permission --pane %19
-cargo run -- dismiss-survey --pane %19
-cargo run -- continue-session --pane %19
-cargo run -- auto-unstick --pane %19
+botctl approve-permission --pane %19
+botctl reject-permission --pane %19
+botctl dismiss-survey --pane %19
+botctl continue-session --pane %19
+botctl auto-unstick --pane %19
 ```
 
 Notes:
@@ -111,21 +111,21 @@ Manual staging now keeps the session's pending prompt in `<state-root>/state.db`
 One-shot example:
 
 ```bash
-cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the current repo"
+botctl submit-prompt --session demo --pane %19 --text "Summarize the current repo"
 ```
 
 Manual staging example:
 
 ```bash
-cargo run -- prepare-prompt --session demo --text "Summarize the current repo"
-cargo run -- editor-helper --session demo /tmp/claude-editor.txt
+botctl prepare-prompt --session demo --text "Summarize the current repo"
+botctl editor-helper --session demo /tmp/claude-editor.txt
 ```
 
 Workspace example:
 
 ```bash
-cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the current repo"
-cargo run -- yolo start --all --workspace .
+botctl prepare-prompt --session demo --workspace . --text "Summarize the current repo"
+botctl yolo start --all --workspace .
 ```
 
 For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](./prompt-handoff.mdx).

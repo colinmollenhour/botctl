@@ -32,7 +32,7 @@ Current behavior:
 Observe one session:
 
 ```bash
-cargo run -- serve --session demo
+botctl serve --session demo
 ```
 
 This is the main live observation path. Use it when you want a foreground stream; use `observe` only when you specifically want a bounded diagnostic sample.
@@ -40,25 +40,25 @@ This is the main live observation path. Use it when you want a foreground stream
 Observe one specific pane inside that session:
 
 ```bash
-cargo run -- serve --session demo --pane %19
+botctl serve --session demo --pane %19
 ```
 
 Use JSONL output for tooling:
 
 ```bash
-cargo run -- serve --session demo --format jsonl
+botctl serve --session demo --format jsonl
 ```
 
 You can also write artifacts to an explicit state root:
 
 ```bash
-cargo run -- serve --session demo --state-dir /tmp/botctl-state
+botctl serve --session demo --state-dir /tmp/botctl-state
 ```
 
 Slow down periodic reconciliation:
 
 ```bash
-cargo run -- serve --session demo --reconcile-ms 5000
+botctl serve --session demo --reconcile-ms 5000
 ```
 
 ## Event kinds
