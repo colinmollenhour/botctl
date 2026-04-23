@@ -99,16 +99,16 @@ Open the cross-workspace dashboard TUI:
 botctl dashboard
 ```
 
-Keep it alive in a dedicated tmux-backed popup session:
-
-```bash
-botctl dashboard --persistent
-```
-
-If you use tmux popups, this is the quick and easy way to make the dashboard feel built-in:
+If you use tmux, this is the recommended way to launch the dashboard as a popup and keep it alive:
 
 ```tmux
 bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
+```
+
+That uses `--persistent`, which keeps the dashboard alive in a dedicated tmux-backed popup session:
+
+```bash
+botctl dashboard --persistent
 ```
 
 Enable YOLO for one explicit pane:
