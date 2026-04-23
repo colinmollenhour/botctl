@@ -42,6 +42,7 @@ const PERSISTENT_FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open
 const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
 const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
+const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
@@ -1314,22 +1315,32 @@ fn tmux_object_id_order(id: &str) -> u32 {
 
 fn current_base_window_name(
     current_name: &str,
-    applied_name: Option<&str>,
-    previous_base_name: &str,
+    _applied_name: Option<&str>,
+    _previous_base_name: &str,
     prefix: &str,
 ) -> String {
-    if applied_name == Some(current_name) {
-        previous_base_name.to_string()
-    } else {
-        derive_base_window_name(current_name, prefix)
-    }
+    derive_base_window_name(current_name, prefix)
 }
 
 fn derive_base_window_name(current_name: &str, prefix: &str) -> String {
-    current_name
+    strip_dashboard_emoji_prefixes(current_name)
         .strip_prefix(&format!("{prefix} "))
-        .unwrap_or(current_name)
+        .unwrap_or_else(|| strip_dashboard_emoji_prefixes(current_name))
         .to_string()
+}
+
+fn strip_dashboard_emoji_prefixes(value: &str) -> &str {
+    let mut rest = value.trim_start();
+    loop {
+        let Some(emoji) = DASHBOARD_STATE_EMOJIS
+            .iter()
+            .find(|emoji| rest.starts_with(**emoji))
+        else {
+            break;
+        };
+        rest = rest[emoji.len()..].trim_start();
+    }
+    rest
 }
 
 fn dashboard_display_state(
@@ -1573,8 +1584,9 @@ mod tests {
         detail_body_kind, detail_current_path, detail_workspace_label, format_age, recap_lines,
         load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
         rect_contains, render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        should_return_navigation, split_workspace_header, state_emoji, tmux_object_id_order,
-        workspace_group_key, workspace_group_label, yolo_column_contains,
+        should_return_navigation, split_workspace_header, state_emoji,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
+        workspace_group_label, yolo_column_contains,
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
@@ -1825,6 +1837,17 @@ mod tests {
     }
 
     #[test]
+    fn derive_base_window_name_strips_any_known_dashboard_emojis() {
+        assert_eq!(derive_base_window_name("🤔💤🔐 bloodraven", "💤"), "bloodraven");
+        assert_eq!(derive_base_window_name("🤔 💤  bloodraven", "💤"), "bloodraven");
+    }
+
+    #[test]
+    fn strip_dashboard_emoji_prefixes_leaves_plain_names_untouched() {
+        assert_eq!(strip_dashboard_emoji_prefixes("bloodraven"), "bloodraven");
+    }
+
+    #[test]
     fn current_base_window_name_preserves_live_rename() {
         assert_eq!(
             current_base_window_name("renamed-project", Some("💤 old-project"), "old-project", "💤"),
@@ -1833,6 +1856,15 @@ mod tests {
         assert_eq!(
             current_base_window_name("💤 old-project", Some("💤 old-project"), "old-project", "💤"),
             "old-project"
+        );
+        assert_eq!(
+            current_base_window_name(
+                "⚙️💤💤 ⚙️💤💤 ⚙️⚙️💤 bloodraven",
+                Some("⚙️💤💤 ⚙️💤💤 ⚙️⚙️💤 bloodraven"),
+                "⚙️💤💤 ⚙️⚙️💤 bloodraven",
+                "⚙️💤💤"
+            ),
+            "bloodraven"
         );
     }
 
