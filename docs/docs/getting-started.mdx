@@ -10,15 +10,16 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 Most users only need a few commands:
 
-- `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode visibility
+- `runtime` for the single local coordinator that owns live observation and automation
+- `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode/Pi visibility
 - `prompt` for one-shot Claude prompts that still run through an inspectable tmux TUI
-- `yolo` for automated babysitting and recovery
-- `serve` for a long-lived observation stream
+- `yolo` for centralized babysitting policy and recovery
+- `serve` for a runtime-backed observation stream and HTTP facade
 - `last-message` when you need the full latest assistant reply instead of the visible terminal excerpt
 
 For direct blocker recovery, use the canonical names `approve`, `reject`, and `dismiss-survey`. The longer `approve-permission` and `reject-permission` names still work as compatibility aliases.
 
-Everything else supports setup, diagnostics, prompt handoff, and lower-level recovery.
+If you just want to get value quickly, install it, start `runtime`, open `dashboard`, then try `yolo`, `serve`, `prompt`, or `last-message`. Everything else supports setup, diagnostics, prompt handoff, and lower-level recovery.
 
 ## Requirements
 
@@ -39,6 +40,13 @@ Verify the binary is on your `PATH`:
 ```bash
 botctl --version
 botctl help
+```
+
+Then start the runtime and open the dashboard:
+
+```bash
+botctl runtime
+botctl dashboard
 ```
 
 ## First useful run
@@ -76,6 +84,8 @@ botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
 By default, stdout contains only the assistant answer. `prompt` uses the shared `botctl` tmux session unless `--session NAME` overrides it, creates that session automatically when needed, creates one new window per run, and kills only that captured window after loading a fresh assistant answer. Failed prompt windows remain available for inspection. Pass `--verbose` to write launch/wait progress to stderr. Arguments after `--` pass through to Claude.
+
+The runtime owns live tmux observation, pane classification, yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` connect to the same local socket at `<state-dir>/runtime.sock`, so they all see the same pane state.
 
 ## First session
 
@@ -146,7 +156,7 @@ Open the cross-workspace dashboard TUI:
 botctl dashboard
 ```
 
-The dashboard uses one emoji per pane to show the current classified state at a glance.
+The dashboard uses one emoji per pane to show the current classified state at a glance. It also shows pane PID, process-tree average CPU, memory, and observed active `Cook` time so long-running or resource-heavy panes stay visible.
 
 | Emoji | State | Meaning | Automation |
 | --- | --- | --- | --- |
@@ -211,13 +221,20 @@ Enable YOLO for all panes in one workspace:
 botctl yolo --all --workspace .
 ```
 
+Tail the shared runtime events for that yolo policy:
+
+```bash
+botctl yolo --pane 0:6.0 --follow
+```
+
 ## Observe versus serve
 
 - `observe` is bounded and returns a fixed snapshot/event sample.
-- `serve` is the current foreground observer for one tmux session.
-- `serve` is not a full daemon/API/SSE product yet.
+- `runtime` is the long-lived owner of observation and automation.
+- `serve` is the runtime-backed facade for one tmux session.
+- `serve` does not run its own observer loop anymore.
 
-If you are not sure which one you want, you probably want `serve`, not `observe`.
+If you are not sure which one you want, you probably want `runtime` plus `serve`, not `observe`.
 
 Run `serve` against one tmux session:
 
@@ -252,6 +269,7 @@ For blocker recovery, prompt handoff, and recovery examples, see [workflows](./w
 
 ## Current limits
 
-- live classification is still built around `capture-pane`, with `serve` using a best-effort merged stream model when that helps break `Unknown` states
+- live classification is still built around `capture-pane`, with the central runtime using a best-effort merged stream model when that helps break `Unknown` states
 - the classifier is conservative and keyword-based
-- `serve` is a foreground observer, not the full daemon/API system yet
+- `serve` is a runtime-backed foreground facade, not the full daemon/SSE control plane yet
+- the HTTP surface is still polling-based; there is no SSE endpoint yet
