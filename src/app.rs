@@ -3026,7 +3026,7 @@ pub(crate) fn classify_pane(
 }
 
 pub(crate) fn focused_frame_source(frame: &str) -> String {
-    let focused = focus_live_frame(frame, 15);
+    let focused = focus_live_frame(frame, 30);
     if focused.is_empty() {
         frame.to_string()
     } else {
@@ -3223,8 +3223,23 @@ fn focus_live_frame(frame: &str, max_non_empty_lines: usize) -> String {
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>();
 
+    if let Some(prompt_idx) = lines.iter().rposition(|line| is_focus_prompt_line(line)) {
+        let trailing = (max_non_empty_lines / 5).max(1);
+        let start = prompt_idx.saturating_sub(max_non_empty_lines.saturating_sub(trailing));
+        let end = (prompt_idx + trailing + 1).min(lines.len());
+        return lines[start..end].join("\n");
+    }
+
     let start = lines.len().saturating_sub(max_non_empty_lines);
     lines[start..].join("\n")
+}
+
+fn is_focus_prompt_line(line: &&str) -> bool {
+    let trimmed = line.trim();
+    matches!(trimmed, ">" | "❯")
+        || trimmed.starts_with("❯ 1.")
+        || trimmed.starts_with("❯ 2.")
+        || trimmed.starts_with("❯ 3.")
 }
 
 fn raw_key_for_workflow(
@@ -3566,6 +3581,7 @@ mod tests {
         render_keep_going_wait_message, render_list_panes, render_next_safe_action,
         render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
         render_status_report, resolve_keep_going_prompt, run_prepare_prompt, shell_escape,
+        focused_frame_source,
         submit_prompt_preflight_workflow, tmux_socket_path_from_value, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
@@ -3681,6 +3697,55 @@ mod tests {
     fn renders_a_focused_screen_excerpt() {
         let excerpt = render_screen_excerpt("\n\nfirst\n\nsecond\nthird\n");
         assert_eq!(excerpt, "first | second | third");
+    }
+
+    #[test]
+    fn focused_frame_source_keeps_question_block_above_long_footer() {
+        let frame = [
+            "I'd suggest Option A unless you already have a NuxtHub project.",
+            "---",
+            "Want me to:",
+            "1. Update .env.example with the new STUDIO_GITLAB_* vars (and a comment about the moderator allow-list)?",
+            "2. Flip media.external to false (Option A)?",
+            "3. Add a short \"Studio editing\" section to README.md?",
+            "Or all three? Once you create the OAuth app and paste me the Application ID, I can't do that part for you — but I can stage everything else.",
+            "✻ Cogitated for 2m 12s",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "~/Projects/shipstream/knowledge-base/node_modules/.pnpm/nuxt-studio@1.4.0",
+            "🧠 Opus 4.7 (1M context) │ Ctx: 6% │ Commits:6",
+            "MCP:0/0 │ 🔥$13.85/hr │ Cache: 98% hit │ Est: $69.02 (209.6K)",
+        ]
+        .join("\n");
+
+        let focused = focused_frame_source(&frame);
+
+        assert!(focused.contains("Want me to:"));
+        assert!(focused.contains("1. Update .env.example"));
+    }
+
+    #[test]
+    fn focused_frame_source_prefers_active_permission_prompt_over_stale_chat_prompt() {
+        let frame = [
+            "Older chat context",
+            "❯",
+            "More stale chat output",
+            "Bash command (unsandboxed)",
+            "Probe opencode to diagnose empty output",
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "2. Yes, and don't ask again for: opencode run *",
+            "3. No",
+            "Esc to cancel · Tab to amend · ctrl+e to explain",
+        ]
+        .join("\n");
+
+        let focused = focused_frame_source(&frame);
+
+        assert!(focused.contains("Bash command (unsandboxed)"));
+        assert!(focused.contains("Do you want to proceed?"));
+        assert!(focused.contains("❯ 1. Yes"));
     }
 
     #[test]
