@@ -37,8 +37,22 @@ use crate::storage::{
 use crate::tmux::{TmuxClient, TmuxPane};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
-const FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q quit";
-const PERSISTENT_FOOTER_TEXT: &str = "Arrows/jk or wheel move  Click select/open  Enter open  u unstick  y toggle pane  Y toggle workspace  A all on  N all off  r refresh  q detach  X kill server";
+const FOOTER_LINE1: &[(&str, &str)] = &[
+    ("Arrows/jk", "move"),
+    ("y", "toggle pane"),
+    ("Enter", "open"),
+    ("A", "all on"),
+    ("q", "quit"),
+];
+const FOOTER_LINE2: &[(&str, &str)] = &[
+    ("Click", "select/open"),
+    ("Y", "toggle workspace"),
+    ("u", "unstick"),
+    ("N", "all off"),
+];
+const FOOTER_LINE2_PERSISTENT_END: &[(&str, &str)] = &[("q", "detach"), ("X", "kill server")];
+const FOOTER_INDENT: &str = "  ";
+const FOOTER_COLUMN_GAP: &str = "    ";
 const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
 const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
@@ -966,7 +980,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         .wrap(Wrap { trim: true });
     frame.render_widget(message, layout.status);
 
-    frame.render_widget(Paragraph::new(footer_text()), layout.footer);
+    frame.render_widget(render_footer(), layout.footer);
 }
 
 struct DashboardLayout {
@@ -1011,12 +1025,65 @@ fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> boo
     x >= yolo_start && x < yolo_end
 }
 
-fn footer_text() -> &'static str {
-    if std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some() {
-        PERSISTENT_FOOTER_TEXT
+fn render_footer() -> Paragraph<'static> {
+    Paragraph::new(footer_lines(std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some()))
+        .wrap(Wrap { trim: true })
+}
+
+fn footer_lines(persistent: bool) -> Vec<Line<'static>> {
+    let line1 = if persistent {
+        &FOOTER_LINE1[..FOOTER_LINE1.len() - 1]
     } else {
-        FOOTER_TEXT
+        FOOTER_LINE1
+    };
+    let mut line2 = FOOTER_LINE2.to_vec();
+    if persistent {
+        line2.extend_from_slice(FOOTER_LINE2_PERSISTENT_END);
     }
+    let column_widths = footer_column_widths(line1, &line2);
+    vec![
+        footer_help_line(line1, &column_widths),
+        footer_help_line(&line2, &column_widths),
+    ]
+}
+
+fn footer_column_widths(line1: &[(&str, &str)], line2: &[(&str, &str)]) -> Vec<usize> {
+    let columns = line1.len().max(line2.len());
+    (0..columns)
+        .map(|idx| {
+            [line1.get(idx), line2.get(idx)]
+                .into_iter()
+                .flatten()
+                .map(|(key, description)| UnicodeWidthStr::width(format!("{key} {description}").as_str()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn footer_help_line(entries: &[(&str, &str)], column_widths: &[usize]) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::raw(FOOTER_INDENT));
+    for (index, (key, description)) in entries.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(FOOTER_COLUMN_GAP));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            (*description).to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+        let rendered = format!("{key} {description}");
+        let padding = column_widths[index].saturating_sub(UnicodeWidthStr::width(rendered.as_str()));
+        if padding > 0 {
+            spans.push(Span::raw(" ".repeat(padding)));
+        }
+    }
+    Line::from(spans)
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -1577,21 +1644,21 @@ mod tests {
 
     use super::{
         DashboardApp, DetailBodyKind, PaneEntry, SavedSelection, PERSISTENT_DASHBOARD_SESSION,
-        PERSISTENT_DASHBOARD_SOCKET, PERSISTENT_FOOTER_TEXT, TABLE_GAP,
-        abbreviate_home_path,
+        PERSISTENT_DASHBOARD_SOCKET, TABLE_GAP, abbreviate_home_path,
         context_lines_above_input, current_base_window_name, dashboard_display_state,
-        dashboard_selection_path, derive_base_window_name,
-        detail_body_kind, detail_current_path, detail_workspace_label, format_age, recap_lines,
-        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
-        rect_contains, render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        should_return_navigation, split_workspace_header, state_emoji,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
-        workspace_group_label, yolo_column_contains,
+        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
+        detail_workspace_label, footer_column_widths, footer_help_line, footer_lines,
+        format_age, load_saved_selection, pad_display_right, pane_list_columns,
+        pane_list_content_area, recap_lines, rect_contains, render_workspace_header_line,
+        repo_root_from_repo_key, save_selection, should_return_navigation, split_workspace_header,
+        state_emoji, strip_dashboard_emoji_prefixes, tmux_object_id_order,
+        workspace_group_key, workspace_group_label, yolo_column_contains,
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
     use crate::tmux::{TmuxClient, TmuxPane};
     use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -1807,7 +1874,30 @@ mod tests {
 
     #[test]
     fn persistent_footer_mentions_kill_server_action() {
-        assert!(PERSISTENT_FOOTER_TEXT.contains("X kill server"));
+        let lines = footer_lines(true)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(lines.iter().any(|line| line.contains("X kill server")));
+    }
+
+    #[test]
+    fn footer_help_line_emphasizes_keys_and_groups_commands() {
+        let widths = footer_column_widths(&[("Enter", "open")], &[("u", "unstick")]);
+        let line = footer_help_line(&[("Enter", "open"), ("u", "unstick")], &[10, widths[0]]);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "  Enter open    u unstick ");
+        assert_eq!(line.spans[1].style.add_modifier, Modifier::BOLD);
     }
 
     #[test]
