@@ -10,6 +10,7 @@ pub mod observe;
 pub mod opencode;
 pub mod pi;
 pub mod prompt;
+pub mod runtime;
 pub mod screen_model;
 pub mod serve;
 pub mod storage;
