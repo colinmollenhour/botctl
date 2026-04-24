@@ -13,7 +13,7 @@ use crate::app::{
     AppError, AppResult, InspectedPane, extract_permission_prompt_details, keys_for_action,
     load_automation_keybindings,
 };
-use crate::automation::AutomationAction;
+use crate::automation::{AutomationAction, inspect_keybindings};
 use crate::classifier::SessionState;
 use crate::runtime::{RuntimeClient, build_instance_detail_json, build_instance_summary_json};
 use crate::serve::ServeRequest;
@@ -197,10 +197,11 @@ fn list_instances(
     runtime: &RuntimeClient,
     request: &ServeRequest,
 ) -> AppResult<Vec<serde_json::Value>> {
+    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
     runtime
         .list_panes(Some(&request.session_name), request.target_pane.as_deref())?
         .into_iter()
-        .map(|snapshot| build_instance_summary_json(&snapshot))
+        .map(|snapshot| build_instance_summary_json(&snapshot, &bindings))
         .collect()
 }
 
@@ -212,7 +213,8 @@ fn instance_detail(
     let snapshot = runtime
         .get_pane(pane_id, Some(&request.session_name))?
         .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
-    let mut detail = build_instance_detail_json(&snapshot)?;
+    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
+    let mut detail = build_instance_detail_json(&snapshot, &bindings)?;
     if let Some(object) = detail.as_object_mut() {
         object.insert(
             String::from("interactions"),
@@ -277,24 +279,11 @@ fn run_instance_interaction(
                 .id
                 .parse::<usize>()
                 .map_err(|_| AppError::new(format!("invalid numbered option id: {}", option.id)))?;
-            if target > current {
-                for _ in 0..(target - current) {
-                    runtime.run_action(
-                        pane_id,
-                        Some(&request.session_name),
-                        AutomationAction::ConfirmNext.as_str(),
-                    )?;
-                }
-            } else if current > target {
-                for _ in 0..(current - target) {
-                    runtime.run_action(
-                        pane_id,
-                        Some(&request.session_name),
-                        AutomationAction::ConfirmPrevious.as_str(),
-                    )?;
-                }
-            }
-            runtime.run_action(pane_id, Some(&request.session_name), "enter")?;
+            runtime.run_action(
+                pane_id,
+                Some(&request.session_name),
+                &format!("select-numbered-option:{current}:{target}"),
+            )?;
         }
         InteractionMode::Readonly => {
             return Err(AppError::with_exit_code(

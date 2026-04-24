@@ -710,6 +710,7 @@ fn is_permission_anchor_line(line: &str) -> bool {
             "allow for session",
             "do you want to proceed",
             "do you want to allow claude to",
+            "would you like to allow codex",
             "claude wants to",
             "don't ask again",
             "unsandboxed",
