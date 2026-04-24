@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -20,7 +21,7 @@ use crate::app::{
     is_yolo_safe_to_approve, render_next_safe_action, render_screen_excerpt,
     resolve_workspace_for_pane, submit_prompt_for_pane,
 };
-use crate::automation::{AutomationAction, GuardedWorkflow, inspect_keybindings};
+use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection};
 use crate::classifier::{Classification, SessionState};
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
 use crate::screen_model::ScreenModel;
@@ -296,9 +297,6 @@ impl RuntimeSubscription {
         match read_response(&mut self.reader)? {
             RuntimeResponse::Event { event } => Ok(Some(event)),
             RuntimeResponse::Ok => Ok(None),
-            RuntimeResponse::Error { message, exit_code } => {
-                Err(AppError::with_exit_code(message, exit_code))
-            }
             other => Err(unexpected_response("event", &other)),
         }
     }
@@ -310,9 +308,23 @@ pub fn runtime_socket_path(state_dir: &Path) -> PathBuf {
 
 pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
     fs::create_dir_all(&config.state_dir)?;
+    fs::set_permissions(&config.state_dir, fs::Permissions::from_mode(0o700))?;
     let socket_path = runtime_socket_path(&config.state_dir);
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
+    match fs::symlink_metadata(&socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(&socket_path)?;
+        }
+        Ok(_) => {
+            return Err(AppError::with_exit_code(
+                format!(
+                    "refusing to remove non-socket runtime path: {}",
+                    socket_path.display()
+                ),
+                409,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let listener = UnixListener::bind(&socket_path).map_err(|error| {
@@ -321,6 +333,7 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
             socket_path.display()
         ))
     })?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
     let shared = Arc::new(Mutex::new(RuntimeShared::new(&socket_path)));
@@ -354,7 +367,9 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
                 stop.store(true, Ordering::SeqCst);
                 let _ = observer.join();
                 let _ = fs::remove_file(&socket_path);
-                return Err(AppError::new(format!("runtime socket accept failed: {error}")));
+                return Err(AppError::new(format!(
+                    "runtime socket accept failed: {error}"
+                )));
             }
         }
     }
@@ -423,6 +438,12 @@ enum ObserverMessage {
     ControlClosed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlLineEffect {
+    None,
+    Reconcile,
+}
+
 fn handle_client(
     stream: UnixStream,
     shared: Arc<Mutex<RuntimeShared>>,
@@ -468,7 +489,8 @@ fn handle_client(
             all,
             enabled,
         } => {
-            let updated = handle_set_yolo(&config.state_dir, &shared, pane_id, workspace, all, enabled)?;
+            let updated =
+                handle_set_yolo(&config.state_dir, &shared, pane_id, workspace, all, enabled)?;
             write_message(&mut stream, &RuntimeResponse::YoloUpdated { updated })
         }
         RuntimeRequest::RunAction {
@@ -476,7 +498,8 @@ fn handle_client(
             session_name,
             action,
         } => {
-            let result = handle_run_action(&config, &shared, &pane_id, session_name.as_deref(), &action)?;
+            let result =
+                handle_run_action(&config, &shared, &pane_id, session_name.as_deref(), &action)?;
             write_message(&mut stream, &RuntimeResponse::Action { result })
         }
         RuntimeRequest::SubmitPrompt {
@@ -553,6 +576,16 @@ fn handle_set_yolo(
     all: bool,
     enabled: bool,
 ) -> AppResult<Vec<String>> {
+    match (pane_id.is_some(), all) {
+        (true, true) | (false, false) => {
+            return Err(AppError::with_exit_code(
+                "set-yolo requires exactly one target: pane_id or all",
+                400,
+            ));
+        }
+        _ => {}
+    }
+
     let client = runtime_tmux_client();
     let mut updated = Vec::new();
     if let Some(pane_id) = pane_id {
@@ -566,8 +599,13 @@ fn handle_set_yolo(
         } else {
             let _ = disable_yolo_record(state_dir, &pane.pane_id)?;
         }
+        update_yolo_runtime_state(shared, &pane.pane_id, enabled, None);
         updated.push(pane.pane_id.clone());
-        let summary = if enabled { "yolo-enabled" } else { "yolo-disabled" };
+        let summary = if enabled {
+            "yolo-enabled"
+        } else {
+            "yolo-disabled"
+        };
         emit_shared_event(
             shared,
             Some(pane.pane_id),
@@ -613,7 +651,8 @@ fn handle_set_yolo(
                 .into_iter()
                 .filter(|pane| pane.current_command.eq_ignore_ascii_case("claude"))
                 .map(|pane| {
-                    let workspace = resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
+                    let workspace =
+                        resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
                     write_yolo_record(state_dir, &workspace.id, &pane)?;
                     Ok(pane.pane_id)
                 })
@@ -627,6 +666,9 @@ fn handle_set_yolo(
                 })
                 .collect::<AppResult<Vec<_>>>()?
         };
+        for pane_id in &pane_ids {
+            update_yolo_runtime_state(shared, pane_id, enabled, None);
+        }
         updated.extend(pane_ids);
     }
 
@@ -694,7 +736,10 @@ fn handle_submit_prompt(
         action: String::from("submit-prompt"),
         executed: String::from("submit-prompt"),
         after_state: Some(submitted.state),
-        detail: Some(format!("workspace={} delay_ms={}", submitted.workspace_id, submitted.delay_ms)),
+        detail: Some(format!(
+            "workspace={} delay_ms={}",
+            submitted.workspace_id, submitted.delay_ms
+        )),
     };
     emit_shared_event(
         shared,
@@ -723,7 +768,11 @@ fn execute_runtime_action(
                 GuardedWorkflow::ApprovePermission,
                 &classification.classification,
             )?;
-            Some(inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?.classification.state)
+            Some(
+                inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?
+                    .classification
+                    .state,
+            )
         }
         "reject-permission" => {
             execute_classified_workflow(
@@ -732,7 +781,11 @@ fn execute_runtime_action(
                 GuardedWorkflow::RejectPermission,
                 &classification.classification,
             )?;
-            Some(inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?.classification.state)
+            Some(
+                inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?
+                    .classification
+                    .state,
+            )
         }
         "dismiss-survey" => {
             execute_classified_workflow(
@@ -741,7 +794,11 @@ fn execute_runtime_action(
                 GuardedWorkflow::DismissSurvey,
                 &classification.classification,
             )?;
-            Some(inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?.classification.state)
+            Some(
+                inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?
+                    .classification
+                    .state,
+            )
         }
         "confirm-previous" => {
             execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmPrevious)?;
@@ -763,11 +820,41 @@ fn execute_runtime_action(
             execute_automation_action(client, &pane.pane_id, AutomationAction::Interrupt)?;
             None
         }
-        "continue-session" => Some(continue_from_classification(client, pane, &classification.classification)?.after.state),
+        "continue-session" => Some(
+            continue_from_classification(client, pane, &classification.classification)?
+                .after
+                .state,
+        ),
         "auto-unstick" => Some(auto_unstick(client, pane)?.after.state),
         "enter" => {
             client.send_keys(&pane.pane_id, &["Enter"])?;
             None
+        }
+        action if action.starts_with("select-numbered-option:") => {
+            let (current, target) = parse_numbered_option_action(action)?;
+            if target > current {
+                for _ in 0..(target - current) {
+                    execute_automation_action(
+                        client,
+                        &pane.pane_id,
+                        AutomationAction::ConfirmNext,
+                    )?;
+                }
+            } else if current > target {
+                for _ in 0..(current - target) {
+                    execute_automation_action(
+                        client,
+                        &pane.pane_id,
+                        AutomationAction::ConfirmPrevious,
+                    )?;
+                }
+            }
+            client.send_keys(&pane.pane_id, &["Enter"])?;
+            Some(
+                inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?
+                    .classification
+                    .state,
+            )
         }
         action if action.starts_with("send-text:") => {
             let text = action.trim_start_matches("send-text:");
@@ -796,6 +883,22 @@ fn auto_unstick(client: &TmuxClient, pane: &TmuxPane) -> AppResult<ContinueOutco
     continue_from_classification(client, pane, &current.classification)
 }
 
+fn parse_numbered_option_action(action: &str) -> AppResult<(usize, usize)> {
+    let value = action
+        .strip_prefix("select-numbered-option:")
+        .ok_or_else(|| AppError::new(format!("invalid numbered option action: {action}")))?;
+    let (current, target) = value
+        .split_once(':')
+        .ok_or_else(|| AppError::new(format!("invalid numbered option action: {action}")))?;
+    let current = current
+        .parse::<usize>()
+        .map_err(|_| AppError::new(format!("invalid numbered option action: {action}")))?;
+    let target = target
+        .parse::<usize>()
+        .map_err(|_| AppError::new(format!("invalid numbered option action: {action}")))?;
+    Ok((current, target))
+}
+
 fn spawn_observer(
     config: RuntimeServerConfig,
     shared: Arc<Mutex<RuntimeShared>>,
@@ -808,6 +911,7 @@ fn spawn_observer(
         let mut last_reconcile = Instant::now() - Duration::from_millis(config.reconcile_ms);
 
         while !stop.load(Ordering::SeqCst) {
+            let mut force_reconcile = false;
             if let Ok(panes) = client.list_panes() {
                 for session_name in panes
                     .into_iter()
@@ -819,21 +923,36 @@ fn spawn_observer(
                         let tx = tx.clone();
                         let client = client.clone();
                         let stop = Arc::clone(&stop);
-                        thread::spawn(move || observe_session_lines(client, &session_name, tx, stop));
+                        thread::spawn(move || {
+                            observe_session_lines(client, &session_name, tx, stop)
+                        });
                     }
                 }
             }
 
             while let Ok(message) = rx.try_recv() {
                 match message {
-                    ObserverMessage::ControlLine(line) => handle_control_line_shared(&shared, &line),
+                    ObserverMessage::ControlLine(line) => {
+                        if handle_control_line_shared(&shared, &line)
+                            == ControlLineEffect::Reconcile
+                        {
+                            force_reconcile = true;
+                        }
+                    }
                     ObserverMessage::ControlClosed(session_name) => {
                         observed_sessions.remove(&session_name);
+                        force_reconcile = true;
                     }
                 }
             }
 
-            if last_reconcile.elapsed() >= Duration::from_millis(config.reconcile_ms) {
+            if emit_dirty_stream_events(&shared, Duration::from_millis(STREAM_DEBOUNCE_MS)) {
+                last_reconcile = Instant::now();
+            }
+
+            if force_reconcile
+                || last_reconcile.elapsed() >= Duration::from_millis(config.reconcile_ms)
+            {
                 if let Err(error) = reconcile_all(&client, &config, &shared) {
                     emit_shared_event(
                         &shared,
@@ -878,29 +997,85 @@ fn observe_session_lines(
     let _ = tx.send(ObserverMessage::ControlClosed(session_name.to_string()));
 }
 
-fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) {
+fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) -> ControlLineEffect {
     let mut shared = shared.lock().unwrap();
     match parse_control_line(line) {
         Some(ControlEvent::Output { pane_id, payload })
-        | Some(ControlEvent::ExtendedOutput { pane_id, payload, .. }) => {
+        | Some(ControlEvent::ExtendedOutput {
+            pane_id, payload, ..
+        }) => {
             if let Some(tracked) = shared.panes.get_mut(&pane_id) {
                 let decoded = decode_tmux_escaped(&payload);
                 let model = tracked
                     .screen_model
-                    .get_or_insert_with(|| ScreenModel::new(tracked.snapshot.raw_source.lines().count().max(MAX_LIVE_EXCERPT_LINES)));
+                    .get_or_insert_with(|| ScreenModel::new(MAX_LIVE_EXCERPT_LINES));
                 model.ingest(&decoded);
-                tracked.snapshot.live_excerpt = trim_visible_block(&model.render(), MAX_LIVE_EXCERPT_LINES);
+                tracked.snapshot.live_excerpt =
+                    trim_visible_block(&model.render(), MAX_LIVE_EXCERPT_LINES);
                 tracked.dirty = true;
                 tracked.last_stream_activity = Some(Instant::now());
             }
+            ControlLineEffect::None
         }
         Some(ControlEvent::Notification(message)) => {
             if notification_requires_reconcile(&message) {
-                drop(shared);
+                ControlLineEffect::Reconcile
+            } else {
+                ControlLineEffect::None
             }
         }
-        None => {}
+        None => ControlLineEffect::None,
     }
+}
+
+fn emit_dirty_stream_events(shared: &Arc<Mutex<RuntimeShared>>, debounce: Duration) -> bool {
+    let now = Instant::now();
+    let events = {
+        let mut shared = shared.lock().unwrap();
+        let pane_ids = shared
+            .panes
+            .iter()
+            .filter(|(_, tracked)| {
+                tracked.dirty
+                    && tracked
+                        .last_stream_activity
+                        .is_some_and(|last_activity| now.duration_since(last_activity) >= debounce)
+            })
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect::<Vec<_>>();
+
+        pane_ids
+            .into_iter()
+            .filter_map(|pane_id| {
+                let revision = next_revision(&mut shared);
+                let tracked = shared.panes.get_mut(&pane_id)?;
+                tracked.dirty = false;
+                tracked.snapshot.revision = revision;
+                tracked.snapshot.updated_at_unix_ms = now_unix_ms();
+                Some(RuntimeEvent {
+                    revision,
+                    timestamp_unix_ms: tracked.snapshot.updated_at_unix_ms,
+                    kind: String::from("pane-snapshot-updated"),
+                    pane_id: Some(pane_id),
+                    workspace_id: Some(tracked.snapshot.workspace_id.clone()),
+                    summary: String::from("stream-output"),
+                    snapshot: Some(tracked.snapshot.clone()),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if events.is_empty() {
+        return false;
+    }
+
+    let mut shared = shared.lock().unwrap();
+    for event in events {
+        shared
+            .subscribers
+            .retain(|sender| sender.send(event.clone()).is_ok());
+    }
+    true
 }
 
 fn reconcile_all(
@@ -931,7 +1106,10 @@ fn reconcile_all(
     for pane_id in removed {
         let snapshot = {
             let mut shared = shared.lock().unwrap();
-            shared.panes.remove(&pane_id).map(|tracked| tracked.snapshot)
+            shared
+                .panes
+                .remove(&pane_id)
+                .map(|tracked| tracked.snapshot)
         };
         if let Some(snapshot) = snapshot {
             if snapshot.desired_yolo_enabled {
@@ -957,7 +1135,8 @@ fn reconcile_all(
     }
 
     for pane in current_panes {
-        let workspace = resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
+        let workspace =
+            resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
         let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
         let wait_duration = sync_tmux_wait_state(
             &config.state_dir,
@@ -966,7 +1145,8 @@ fn reconcile_all(
             inspected.classification.state.as_str(),
             is_waiting_state(inspected.classification.state),
         )?;
-        let claude_session_id = sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
+        let claude_session_id =
+            sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
         let desired_yolo_enabled = matches!(read_yolo_record(&config.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
 
         let live_excerpt = {
@@ -976,7 +1156,9 @@ fn reconcile_all(
                 .get(&pane.pane_id)
                 .map(|tracked| tracked.snapshot.live_excerpt.clone())
                 .filter(|excerpt| !excerpt.is_empty())
-                .unwrap_or_else(|| trim_visible_block(&inspected.focused_source, MAX_LIVE_EXCERPT_LINES))
+                .unwrap_or_else(|| {
+                    trim_visible_block(&inspected.focused_source, MAX_LIVE_EXCERPT_LINES)
+                })
         };
 
         let updated_at_unix_ms = now_unix_ms();
@@ -985,6 +1167,11 @@ fn reconcile_all(
         let mut state_changed = None;
         {
             let mut shared = shared.lock().unwrap();
+            let previous_stop_reason = shared
+                .panes
+                .get(&pane.pane_id)
+                .and_then(|tracked| tracked.snapshot.last_stop_reason.clone());
+            let actual_yolo_enabled = desired_yolo_enabled && previous_stop_reason.is_none();
             let revision = next_revision(&mut shared);
             let snapshot = RuntimePaneSnapshot {
                 pane: pane.clone(),
@@ -997,8 +1184,8 @@ fn reconcile_all(
                 workspace_id: workspace.id.clone(),
                 workspace_root: workspace.workspace_root.clone(),
                 desired_yolo_enabled,
-                actual_yolo_enabled: desired_yolo_enabled,
-                last_stop_reason: None,
+                actual_yolo_enabled,
+                last_stop_reason: previous_stop_reason,
                 last_action: shared
                     .panes
                     .get(&pane.pane_id)
@@ -1036,7 +1223,8 @@ fn reconcile_all(
                     tracked.signature = signature;
                     tracked.snapshot = snapshot.clone();
                     if !tracked.screen_model_seeded && !inspected.focused_source.is_empty() {
-                        let mut model = ScreenModel::new(config.history_lines.max(MAX_LIVE_EXCERPT_LINES));
+                        let mut model =
+                            ScreenModel::new(config.history_lines.max(MAX_LIVE_EXCERPT_LINES));
                         model.seed(&inspected.focused_source);
                         tracked.screen_model = Some(model);
                         tracked.screen_model_seeded = true;
@@ -1062,7 +1250,11 @@ fn reconcile_all(
                 Some(snapshot.pane.pane_id.clone()),
                 Some(snapshot.workspace_id.clone()),
                 "pane-snapshot-updated",
-                format!("{} {}", snapshot.pane.pane_id, snapshot.classification.state.as_str()),
+                format!(
+                    "{} {}",
+                    snapshot.pane.pane_id,
+                    snapshot.classification.state.as_str()
+                ),
                 Some(snapshot.clone()),
             );
             if let Some(state) = state_changed {
@@ -1091,12 +1283,21 @@ fn maybe_run_yolo_action(
     if !snapshot.desired_yolo_enabled {
         return Ok(());
     }
+    if snapshot.last_stop_reason.is_some() {
+        return Ok(());
+    }
 
     let Some(record) = read_yolo_record(&config.state_dir, &snapshot.pane.pane_id)? else {
         return Ok(());
     };
     if !record.matches_pane(&snapshot.pane) {
         let _ = disable_yolo_record(&config.state_dir, &snapshot.pane.pane_id)?;
+        update_yolo_runtime_state(
+            shared,
+            &snapshot.pane.pane_id,
+            false,
+            Some("identity-changed"),
+        );
         emit_shared_event(
             shared,
             Some(snapshot.pane.pane_id.clone()),
@@ -1131,7 +1332,12 @@ fn maybe_run_yolo_action(
         format!("yolo {} {}", snapshot.pane.pane_id, workflow.as_str()),
         Some(snapshot.clone()),
     );
-    match execute_classified_workflow(client, &snapshot.pane.pane_id, workflow, &snapshot.classification) {
+    match execute_classified_workflow(
+        client,
+        &snapshot.pane.pane_id,
+        workflow,
+        &snapshot.classification,
+    ) {
         Ok(executed) => {
             let after = inspect_pane(client, &snapshot.pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
             let mut next_snapshot = snapshot.clone();
@@ -1149,6 +1355,7 @@ fn maybe_run_yolo_action(
             );
         }
         Err(error) => {
+            update_yolo_runtime_state(shared, &snapshot.pane.pane_id, false, Some("action-failed"));
             emit_shared_event(
                 shared,
                 Some(snapshot.pane.pane_id.clone()),
@@ -1170,6 +1377,19 @@ fn yolo_workflow(snapshot: &RuntimePaneSnapshot) -> Option<GuardedWorkflow> {
     }
 }
 
+fn update_yolo_runtime_state(
+    shared: &Arc<Mutex<RuntimeShared>>,
+    pane_id: &str,
+    actual_yolo_enabled: bool,
+    stop_reason: Option<&str>,
+) {
+    let mut shared = shared.lock().unwrap();
+    if let Some(tracked) = shared.panes.get_mut(pane_id) {
+        tracked.snapshot.actual_yolo_enabled = actual_yolo_enabled;
+        tracked.snapshot.last_stop_reason = stop_reason.map(str::to_string);
+    }
+}
+
 fn filtered_snapshots(
     shared: &RuntimeShared,
     session_name: Option<&str>,
@@ -1180,7 +1400,11 @@ fn filtered_snapshots(
         .values()
         .map(|tracked| tracked.snapshot.clone())
         .filter(|snapshot| session_matches(snapshot, session_name))
-        .filter(|snapshot| target_pane.map(|target| snapshot.pane.pane_id == target).unwrap_or(true))
+        .filter(|snapshot| {
+            target_pane
+                .map(|target| snapshot.pane.pane_id == target)
+                .unwrap_or(true)
+        })
         .collect()
 }
 
@@ -1210,10 +1434,13 @@ fn get_snapshot(
     Ok(snapshot)
 }
 
-fn validate_action_target(client: &TmuxClient, snapshot: &RuntimePaneSnapshot) -> AppResult<TmuxPane> {
-    let current = client
-        .pane_by_id(&snapshot.pane.pane_id)?
-        .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {}", snapshot.pane.pane_id), 404))?;
+fn validate_action_target(
+    client: &TmuxClient,
+    snapshot: &RuntimePaneSnapshot,
+) -> AppResult<TmuxPane> {
+    let current = client.pane_by_id(&snapshot.pane.pane_id)?.ok_or_else(|| {
+        AppError::with_exit_code(format!("pane not found: {}", snapshot.pane.pane_id), 404)
+    })?;
     let current_record = YoloRecord {
         instance_id: String::new(),
         workspace_id: snapshot.workspace_id.clone(),
@@ -1300,11 +1527,12 @@ fn next_revision(shared: &mut RuntimeShared) -> u64 {
 fn read_request(reader: &mut BufReader<UnixStream>) -> AppResult<RuntimeRequest> {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
-        return Err(AppError::new("runtime client closed before sending a request"));
+        return Err(AppError::new(
+            "runtime client closed before sending a request",
+        ));
     }
-    serde_json::from_str(line.trim_end()).map_err(|error| {
-        AppError::new(format!("failed to decode runtime request JSON: {error}"))
-    })
+    serde_json::from_str(line.trim_end())
+        .map_err(|error| AppError::new(format!("failed to decode runtime request JSON: {error}")))
 }
 
 fn read_response(reader: &mut BufReader<UnixStream>) -> AppResult<RuntimeResponse> {
@@ -1312,10 +1540,13 @@ fn read_response(reader: &mut BufReader<UnixStream>) -> AppResult<RuntimeRespons
     if reader.read_line(&mut line)? == 0 {
         return Err(AppError::new("runtime socket closed unexpectedly"));
     }
-    let response = serde_json::from_str::<RuntimeResponse>(line.trim_end())
-        .map_err(|error| AppError::new(format!("failed to decode runtime response JSON: {error}")))?;
+    let response = serde_json::from_str::<RuntimeResponse>(line.trim_end()).map_err(|error| {
+        AppError::new(format!("failed to decode runtime response JSON: {error}"))
+    })?;
     match response {
-        RuntimeResponse::Error { message, exit_code } => Err(AppError::with_exit_code(message, exit_code)),
+        RuntimeResponse::Error { message, exit_code } => {
+            Err(AppError::with_exit_code(message, exit_code))
+        }
         response => Ok(response),
     }
 }
@@ -1330,7 +1561,9 @@ fn write_message<T: Serialize>(stream: &mut UnixStream, value: &T) -> AppResult<
 }
 
 fn unexpected_response(expected: &str, response: &RuntimeResponse) -> AppError {
-    AppError::new(format!("unexpected runtime response for {expected}: {response:?}"))
+    AppError::new(format!(
+        "unexpected runtime response for {expected}: {response:?}"
+    ))
 }
 
 fn trim_visible_block(input: &str, max_lines: usize) -> String {
@@ -1346,9 +1579,15 @@ fn trim_visible_block(input: &str, max_lines: usize) -> String {
 }
 
 fn notification_requires_reconcile(message: &str) -> bool {
-    ["%window-add", "%window-close", "%session-changed", "%pane-add", "%pane-close"]
-        .iter()
-        .any(|prefix| message.starts_with(prefix))
+    [
+        "%window-add",
+        "%window-close",
+        "%session-changed",
+        "%pane-add",
+        "%pane-close",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
 }
 
 fn is_waiting_state(state: SessionState) -> bool {
@@ -1374,9 +1613,11 @@ fn runtime_tmux_client() -> TmuxClient {
     }
 }
 
-pub fn build_instance_summary_json(snapshot: &RuntimePaneSnapshot) -> AppResult<serde_json::Value> {
+pub fn build_instance_summary_json(
+    snapshot: &RuntimePaneSnapshot,
+    bindings: &KeybindingsInspection,
+) -> AppResult<serde_json::Value> {
     let inspected = snapshot.to_inspected_pane();
-    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
     Ok(serde_json::json!({
         "id": snapshot.pane.pane_id,
         "pane": snapshot.pane,
@@ -1390,7 +1631,7 @@ pub fn build_instance_summary_json(snapshot: &RuntimePaneSnapshot) -> AppResult<
             "signals": inspected.classification.signals,
         },
         "screen_excerpt": render_screen_excerpt(&inspected.raw_source),
-        "next_safe_action": render_next_safe_action(&inspected.classification, &snapshot.pane, &bindings),
+        "next_safe_action": render_next_safe_action(&inspected.classification, &snapshot.pane, bindings),
         "runtime": {
             "desired_yolo_enabled": snapshot.desired_yolo_enabled,
             "actual_yolo_enabled": snapshot.actual_yolo_enabled,
@@ -1401,9 +1642,11 @@ pub fn build_instance_summary_json(snapshot: &RuntimePaneSnapshot) -> AppResult<
     }))
 }
 
-pub fn build_instance_detail_json(snapshot: &RuntimePaneSnapshot) -> AppResult<serde_json::Value> {
+pub fn build_instance_detail_json(
+    snapshot: &RuntimePaneSnapshot,
+    bindings: &KeybindingsInspection,
+) -> AppResult<serde_json::Value> {
     let inspected = snapshot.to_inspected_pane();
-    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
     Ok(serde_json::json!({
         "id": snapshot.pane.pane_id,
         "pane": snapshot.pane,
@@ -1427,7 +1670,7 @@ pub fn build_instance_detail_json(snapshot: &RuntimePaneSnapshot) -> AppResult<s
             "reason": details.reason,
             "question": details.question,
         })),
-        "next_safe_action": render_next_safe_action(&inspected.classification, &snapshot.pane, &bindings),
+        "next_safe_action": render_next_safe_action(&inspected.classification, &snapshot.pane, bindings),
         "runtime": {
             "workspace_id": snapshot.workspace_id,
             "workspace_root": snapshot.workspace_root,
@@ -1464,11 +1707,16 @@ mod tests {
             summary: String::from("updated"),
             snapshot: None,
         };
-        let encoded = serde_json::to_string(&RuntimeResponse::Event { event: event.clone() })
-            .expect("event should encode");
-        let decoded = serde_json::from_str::<RuntimeResponse>(&encoded).expect("event should decode");
+        let encoded = serde_json::to_string(&RuntimeResponse::Event {
+            event: event.clone(),
+        })
+        .expect("event should encode");
+        let decoded =
+            serde_json::from_str::<RuntimeResponse>(&encoded).expect("event should decode");
         match decoded {
-            RuntimeResponse::Event { event: decoded } => assert_eq!(decoded.revision, event.revision),
+            RuntimeResponse::Event { event: decoded } => {
+                assert_eq!(decoded.revision, event.revision)
+            }
             other => panic!("unexpected response: {other:?}"),
         }
     }

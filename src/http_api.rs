@@ -10,14 +10,12 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::app::{
-    AppError, AppResult, InspectedPane, extract_permission_prompt_details,
-    keys_for_action, load_automation_keybindings,
+    AppError, AppResult, InspectedPane, extract_permission_prompt_details, keys_for_action,
+    load_automation_keybindings,
 };
-use crate::automation::AutomationAction;
+use crate::automation::{AutomationAction, inspect_keybindings};
 use crate::classifier::SessionState;
-use crate::runtime::{
-    RuntimeClient, build_instance_detail_json, build_instance_summary_json,
-};
+use crate::runtime::{RuntimeClient, build_instance_detail_json, build_instance_summary_json};
 use crate::serve::ServeRequest;
 
 const HTTP_POLL_MS: u64 = 200;
@@ -37,11 +35,12 @@ fn run_http_server(
     bind_addr: &str,
     interrupted: Arc<AtomicBool>,
 ) -> AppResult<()> {
-    let listener = TcpListener::bind(bind_addr)
-        .map_err(|error| AppError::new(format!("failed to bind http api on {bind_addr}: {error}")))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| AppError::new(format!("failed to configure http api listener: {error}")))?;
+    let listener = TcpListener::bind(bind_addr).map_err(|error| {
+        AppError::new(format!("failed to bind http api on {bind_addr}: {error}"))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        AppError::new(format!("failed to configure http api listener: {error}"))
+    })?;
 
     loop {
         if interrupted.load(Ordering::SeqCst) {
@@ -64,7 +63,11 @@ fn run_http_server(
     }
 }
 
-fn handle_connection(stream: TcpStream, runtime: &RuntimeClient, request: &ServeRequest) -> AppResult<()> {
+fn handle_connection(
+    stream: TcpStream,
+    runtime: &RuntimeClient,
+    request: &ServeRequest,
+) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
@@ -178,7 +181,7 @@ fn handle_request(
             let body = match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(body) => body,
                 Err(error) => {
-                    return error_response(400, format!("invalid JSON body: {error}"), cors_origin)
+                    return error_response(400, format!("invalid JSON body: {error}"), cors_origin);
                 }
             };
             match run_instance_prompt(runtime, request, pane_id, &body) {
@@ -190,11 +193,15 @@ fn handle_request(
     }
 }
 
-fn list_instances(runtime: &RuntimeClient, request: &ServeRequest) -> AppResult<Vec<serde_json::Value>> {
+fn list_instances(
+    runtime: &RuntimeClient,
+    request: &ServeRequest,
+) -> AppResult<Vec<serde_json::Value>> {
+    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
     runtime
         .list_panes(Some(&request.session_name), request.target_pane.as_deref())?
         .into_iter()
-        .map(|snapshot| build_instance_summary_json(&snapshot))
+        .map(|snapshot| build_instance_summary_json(&snapshot, &bindings))
         .collect()
 }
 
@@ -206,13 +213,17 @@ fn instance_detail(
     let snapshot = runtime
         .get_pane(pane_id, Some(&request.session_name))?
         .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
-    let mut detail = build_instance_detail_json(&snapshot)?;
+    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
+    let mut detail = build_instance_detail_json(&snapshot, &bindings)?;
     if let Some(object) = detail.as_object_mut() {
         object.insert(
             String::from("interactions"),
             interaction_detail_json(&snapshot.to_inspected_pane()),
         );
-        object.insert(String::from("controls"), serde_json::json!(available_controls_json()?));
+        object.insert(
+            String::from("controls"),
+            serde_json::json!(available_controls_json()?),
+        );
     }
     Ok(detail)
 }
@@ -256,23 +267,23 @@ fn run_instance_interaction(
 
     match interaction.mode {
         InteractionMode::SurveyDigits => {
-            runtime.run_action(pane_id, Some(&request.session_name), &format!("send-text:{}", option.id))?;
+            runtime.run_action(
+                pane_id,
+                Some(&request.session_name),
+                &format!("send-text:{}", option.id),
+            )?;
         }
         InteractionMode::NumberedOptions => {
             let current = interaction.selected_option.unwrap_or(1);
-            let target = option.id.parse::<usize>().map_err(|_| {
-                AppError::new(format!("invalid numbered option id: {}", option.id))
-            })?;
-            if target > current {
-                for _ in 0..(target - current) {
-                    runtime.run_action(pane_id, Some(&request.session_name), AutomationAction::ConfirmNext.as_str())?;
-                }
-            } else if current > target {
-                for _ in 0..(current - target) {
-                    runtime.run_action(pane_id, Some(&request.session_name), AutomationAction::ConfirmPrevious.as_str())?;
-                }
-            }
-            runtime.run_action(pane_id, Some(&request.session_name), "enter")?;
+            let target = option
+                .id
+                .parse::<usize>()
+                .map_err(|_| AppError::new(format!("invalid numbered option id: {}", option.id)))?;
+            runtime.run_action(
+                pane_id,
+                Some(&request.session_name),
+                &format!("select-numbered-option:{current}:{target}"),
+            )?;
         }
         InteractionMode::Readonly => {
             return Err(AppError::with_exit_code(
@@ -308,7 +319,9 @@ fn run_instance_prompt(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(100);
     if submit_delay_ms == 0 {
-        return Err(AppError::new("prompt body requires `submit_delay_ms` to be at least 1"));
+        return Err(AppError::new(
+            "prompt body requires `submit_delay_ms` to be at least 1",
+        ));
     }
 
     let submitted = runtime.submit_prompt(
@@ -536,20 +549,24 @@ fn parse_diff_readonly_interaction(inspected: &InspectedPane) -> Option<Interact
         return None;
     }
 
-    let known = ["Keep changes", "Discard changes", "View details", "Accept", "Reject"];
+    let known = [
+        "Keep changes",
+        "Discard changes",
+        "View details",
+        "Accept",
+        "Reject",
+    ];
     let options = inspected
         .focused_source
         .lines()
         .map(str::trim)
         .filter(|line| known.iter().any(|known_line| line == known_line))
-        .map(|line| {
-            InteractionOption {
-                id: line.to_string(),
-                index: None,
-                label: line.to_string(),
-                selected: false,
-                kind: option_kind(line),
-            }
+        .map(|line| InteractionOption {
+            id: line.to_string(),
+            index: None,
+            label: line.to_string(),
+            selected: false,
+            kind: option_kind(line),
         })
         .collect::<Vec<_>>();
     if options.is_empty() {
@@ -586,7 +603,10 @@ fn split_digit_option(line: &str) -> Option<(usize, String, &str)> {
     let rest = &line[digits + 1..];
     let next = rest.match_indices("  ").find_map(|(idx, _)| {
         let candidate = rest[idx..].trim_start();
-        let digit_count = candidate.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let digit_count = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .count();
         if digit_count > 0 && candidate[digit_count..].starts_with(':') {
             Some(idx)
         } else {
@@ -609,7 +629,8 @@ fn option_kind(label: &str) -> &'static str {
     let lower = label.to_ascii_lowercase();
     if lower.starts_with("yes") || lower.starts_with("allow") {
         "affirm"
-    } else if lower.starts_with("no") || lower.starts_with("reject") || lower.starts_with("discard") {
+    } else if lower.starts_with("no") || lower.starts_with("reject") || lower.starts_with("discard")
+    {
         "deny"
     } else if lower.contains("always") || lower.contains("don't ask again") {
         "persist"
@@ -674,7 +695,11 @@ fn validate_origin(
     }
 }
 
-fn json_response(status: u16, body: serde_json::Value, cors_origin: Option<String>) -> HttpResponse {
+fn json_response(
+    status: u16,
+    body: serde_json::Value,
+    cors_origin: Option<String>,
+) -> HttpResponse {
     HttpResponse {
         status,
         body: serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec()),
@@ -682,8 +707,16 @@ fn json_response(status: u16, body: serde_json::Value, cors_origin: Option<Strin
     }
 }
 
-fn error_response(status: u16, message: impl Into<String>, cors_origin: Option<String>) -> HttpResponse {
-    json_response(status, json!({ "ok": false, "error": message.into() }), cors_origin)
+fn error_response(
+    status: u16,
+    message: impl Into<String>,
+    cors_origin: Option<String>,
+) -> HttpResponse {
+    json_response(
+        status,
+        json!({ "ok": false, "error": message.into() }),
+        cors_origin,
+    )
 }
 
 fn map_app_error(error: AppError, cors_origin: Option<String>) -> HttpResponse {
