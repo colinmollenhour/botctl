@@ -228,7 +228,7 @@ impl Classifier {
         ) {
             signals.push(String::from(SIGNAL_EXTERNAL_EDITOR_KEYWORDS));
             SessionState::ExternalEditorActive
-        } else if has_diff_dialog_keywords(&normalized) {
+        } else if has_diff_dialog_keywords(frame_text) {
             signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
         } else if has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords) {
@@ -283,7 +283,7 @@ fn detect_recap(frame_text: &str, normalized: &str) -> RecapDetection {
 
 fn extract_recap_excerpt(frame_text: &str) -> Option<String> {
     let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
-    let anchor_index = lines.iter().position(|line| is_recap_anchor(line))?;
+    let anchor_index = lines.iter().rposition(|line| is_recap_anchor(line))?;
 
     if let Some(inline) = inline_recap_excerpt(lines[anchor_index]) {
         return Some(inline);
@@ -304,7 +304,12 @@ fn extract_recap_excerpt(frame_text: &str) -> Option<String> {
         if is_recap_stop(line) {
             break;
         }
-        summary_lines.push(line.chars().take(120).collect::<String>());
+        let normalized = normalize_recap_excerpt(line);
+        if normalized.is_empty() {
+            i += 1;
+            continue;
+        }
+        summary_lines.push(normalized.chars().take(120).collect::<String>());
         i += 1;
     }
 
@@ -327,7 +332,7 @@ fn inline_recap_excerpt(line: &str) -> Option<String> {
     let trimmed = line.trim();
     for prefix in ["※ recap:", "recap:"] {
         if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            let excerpt = trimmed[prefix.len()..].trim();
+            let excerpt = normalize_recap_excerpt(trimmed[prefix.len()..].trim());
             if excerpt.is_empty() {
                 return None;
             }
@@ -335,6 +340,14 @@ fn inline_recap_excerpt(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn normalize_recap_excerpt(excerpt: &str) -> String {
+    excerpt
+        .trim()
+        .trim_end_matches("(disable recaps in /config)")
+        .trim()
+        .to_string()
 }
 
 fn is_recap_stop(line: &str) -> bool {
@@ -376,16 +389,31 @@ fn contains_sensitive_claude_path(normalized: &str) -> bool {
     )
 }
 
-fn has_diff_dialog_keywords(normalized: &str) -> bool {
-    let has_diff_context = contains_any(normalized, &["review changes", "view details", "diff"]);
-    let has_diff_choice = contains_any(
-        normalized,
-        &["keep changes", "discard changes", "accept", "reject"],
-    );
+fn has_diff_dialog_keywords(frame_text: &str) -> bool {
+    let lines = frame_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
 
-    // Require both the review context and a concrete choice so stale words like
-    // "reject" in scrollback do not masquerade as an active diff dialog.
-    has_diff_context && has_diff_choice
+    let has_review_changes = lines
+        .iter()
+        .any(|line| line.eq_ignore_ascii_case("Review changes"));
+    let option_count = lines
+        .iter()
+        .filter(|line| is_diff_dialog_option_line(line))
+        .count();
+
+    // Only treat this as an active diff dialog when the screen shows the real
+    // dialog title plus concrete option rows, not stale words in scrollback.
+    has_review_changes && option_count >= 2
+}
+
+fn is_diff_dialog_option_line(line: &str) -> bool {
+    matches!(
+        line,
+        "Keep changes" | "Discard changes" | "View details" | "Accept" | "Reject"
+    )
 }
 
 fn has_chat_indicators_after_permission(lines: &[&str]) -> bool {
@@ -465,6 +493,15 @@ fn is_chat_input_line(line: &str) -> bool {
     !rest.is_empty() && !starts_with_numbered_option(rest)
 }
 
+fn is_submitted_chat_input_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix('❯') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !starts_with_numbered_option(rest)
+}
+
 fn is_plain_chat_input_line(line: &str) -> bool {
     matches!(line.trim(), ">" | "❯")
 }
@@ -483,7 +520,7 @@ fn chat_ready_has_questions(frame_text: &str) -> bool {
     }
 
     let joined = tail.join("\n").to_ascii_lowercase();
-    let has_question_line = tail.iter().any(|line| line.ends_with('?'));
+    let has_question_line = tail.iter().any(|line| line.contains('?'));
     let has_question_phrase = contains_any(
         &joined,
         &[
@@ -498,7 +535,7 @@ fn chat_ready_has_questions(frame_text: &str) -> bool {
             "let me know which",
         ],
     );
-    let option_like_lines = tail.iter().filter(|line| is_lettered_option_line(line)).count();
+    let option_like_lines = tail.iter().filter(|line| is_option_line(line)).count();
 
     has_question_line || has_question_phrase || option_like_lines >= 2
 }
@@ -521,6 +558,16 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
         .rposition(|line| is_plain_chat_input_line(line))
         .map(|idx| idx.saturating_sub(8))
         .unwrap_or_else(|| lines.len().saturating_sub(8));
+    let start = if let Some(input_idx) = lines.iter().rposition(|line| is_submitted_chat_input_line(line)) {
+        start.max(input_idx.saturating_add(1))
+    } else {
+        start
+    };
+    let start = if let Some(recap_idx) = lines.iter().rposition(|line| is_recap_anchor(line)) {
+        start.max(recap_idx.saturating_add(1))
+    } else {
+        start
+    };
 
     let mut tail = lines[start..]
         .iter()
@@ -538,11 +585,19 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
 }
 
 fn is_terminal_status_line(line: &str) -> bool {
-    line.starts_with('~')
+    let trimmed = line.trim();
+    trimmed.starts_with('~')
         || line.starts_with('/')
         || line.starts_with('(')
         || line.ends_with(") ✅")
         || line.ends_with(")")
+        || trimmed.starts_with("🧠 ")
+        || trimmed.starts_with("MCP:")
+        || trimmed.starts_with("✻ ")
+        || !trimmed.is_empty()
+            && trimmed
+                .chars()
+                .all(|ch| matches!(ch, '─' | '━' | '═' | '┄' | '┈' | '╌' | '╍' | '╴' | '╶'))
 }
 
 fn is_lettered_option_line(line: &str) -> bool {
@@ -552,6 +607,10 @@ fn is_lettered_option_line(line: &str) -> bool {
         return false;
     }
     matches!(bytes[1], b')' | b'.' | b':') && bytes[2] == b' '
+}
+
+fn is_option_line(line: &str) -> bool {
+    is_lettered_option_line(line) || starts_with_numbered_option(line.trim_start_matches('❯').trim())
 }
 
 fn starts_with_numbered_option(line: &str) -> bool {
@@ -700,6 +759,16 @@ mod tests {
     }
 
     #[test]
+    fn ignores_stale_view_details_log_and_rejection_text_in_chat() {
+        let frame = "● Bash(git diff shell/scripts/sync-docs.sh)\n… +29 lines (ctrl+o to expand)\nWant me to commit it? Once committed, run ./shell/scripts/sync-docs.sh push and it should take a handful of seconds and succeed.\nfix: sync-docs.sh push — clone/replace/commit instead of git subtree push to avoid non-fast-forward rejection. noref\n● Committed as 37800bb8bd.\n❯\n~/Projects/shipstream/wms (master) ✅";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(!result.signals.contains(&String::from(SIGNAL_DIFF_KEYWORDS)));
+    }
+
+    #[test]
     fn classifies_folder_trust_prompt() {
         let frame = "Accessing workspace:\n/home/colin/Projects/botctl\nQuick safety check: Is this a project you created or one you trust?\nSecurity guide\n1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel";
         let result = Classifier.classify("test", frame);
@@ -767,7 +836,7 @@ mod tests {
 
     #[test]
     fn detects_inline_recap_banner() {
-        let frame = "※ recap: Goal: DEV-2812 Step 1 landed on MR !2505. Next: watch the next pipeline run.\n❯";
+        let frame = "※ recap: Goal: DEV-2812 Step 1 landed on MR !2505. Next: watch the next pipeline run. (disable recaps in /config)\n❯";
         let result = Classifier.classify("test", frame);
         assert!(result.recap_present);
         assert_eq!(
@@ -816,8 +885,56 @@ mod tests {
     }
 
     #[test]
+    fn flags_chat_ready_with_numbered_options_and_inline_question() {
+        let frame = "I'd suggest Option A unless you already have a NuxtHub project.\n1. Update .env.example with the new STUDIO_GITLAB_* vars (and a comment about the moderator allow-list)?\n2. Flip media.external to false (Option A)?\n3. Add a short \"Studio editing\" section to README.md?\nOr all three? Once you create the OAuth app and paste me the Application ID, I can't do that part for you — but I can stage everything else.\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.has_questions);
+    }
+
+    #[test]
     fn ignores_stale_scrollback_question_far_above_prompt() {
         let frame = "Should I update the docs too?\nMore old scrollback\nStill older output\nLatest completed work item\n※ recap: Fixed the parser edge case\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
+    }
+
+    #[test]
+    fn recap_prefers_most_recent_anchor_when_multiple_are_present() {
+        let frame = "※ recap: Older recap should not win\nOlder detail\n● Some later output\n※ recap: Newest recap should win\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert!(result.recap_present);
+        assert_eq!(
+            result.recap_excerpt.as_deref(),
+            Some("Newest recap should win")
+        );
+    }
+
+    #[test]
+    fn ignores_question_superseded_by_recap_near_prompt() {
+        let frame = "Want me to commit it? Once committed, run ./shell/scripts/sync-docs.sh push and it should take a handful of seconds and succeed.\n● Committed as 37800bb8bd. Run ./shell/scripts/sync-docs.sh push now — should finish in seconds and succeed.\n※ recap: Goal was to sync DEV-2958 docs to the knowledge-base repo. All three fixes are committed. Next: run ./shell/scripts/sync-docs.sh push.\n❯\n~/Projects/shipstream/wms (master) ✅";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
+    }
+
+    #[test]
+    fn ignores_question_before_latest_submitted_input() {
+        let frame = "Want me to commit it? Once committed, run ./shell/scripts/sync-docs.sh push and it should take a handful of seconds and succeed.\n❯ yes\n● Committed as 37800bb8bd. Run ./shell/scripts/sync-docs.sh push now — should finish in seconds and succeed.\n※ recap: Goal was to sync DEV-2958 docs to the knowledge-base repo. All three fixes are committed. Next: run ./shell/scripts/sync-docs.sh push.\n❯\n~/Projects/shipstream/wms (master) ✅";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
+    }
+
+    #[test]
+    fn ignores_question_mark_in_claude_footer_status() {
+        let frame = "● Committed as 37800bb8bd. Run ./shell/scripts/sync-docs.sh push now — should finish in seconds and succeed.\n※ recap: Goal was to sync DEV-2958 docs to the knowledge-base repo. All three fixes are committed. Next: run ./shell/scripts/sync-docs.sh push.\n❯\n~/Projects/shipstream/wms (master) ✅\n🧠 Opus 4.7 (1M context) │ Ctx: 14% │ Commits:13 │ +49/-7\nMCP:0/0 │ 🔥$13.98/hr │ Cache: 100% hit │ Est: $69.66 (415.2K)                                new task? /clear to save 135.9k tokens";
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::ChatReady);

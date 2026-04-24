@@ -780,7 +780,7 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
 
 fn run_status(args: StatusArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    let pane = normalize_dashboard_window_name(&client, &resolve_pane_by_id(&client, &args.pane_id)?)?;
     let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
@@ -796,11 +796,11 @@ fn run_status(args: StatusArgs) -> AppResult<String> {
 
 fn run_doctor(args: DoctorArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let pane = resolve_doctor_pane(
+    let pane = normalize_dashboard_window_name(&client, &resolve_doctor_pane(
         &client,
         args.session_name.as_deref(),
         args.pane_id.as_deref(),
-    )?;
+    )?)?;
     let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
@@ -3406,7 +3406,7 @@ pub(crate) fn classify_pane(
 }
 
 pub(crate) fn focused_frame_source(frame: &str) -> String {
-    let focused = focus_live_frame(frame, 15);
+    let focused = focus_live_frame(frame, 30);
     if focused.is_empty() {
         frame.to_string()
     } else {
@@ -3603,8 +3603,23 @@ fn focus_live_frame(frame: &str, max_non_empty_lines: usize) -> String {
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>();
 
+    if let Some(prompt_idx) = lines.iter().rposition(|line| is_focus_prompt_line(line)) {
+        let trailing = (max_non_empty_lines / 5).max(1);
+        let start = prompt_idx.saturating_sub(max_non_empty_lines.saturating_sub(trailing));
+        let end = (prompt_idx + trailing + 1).min(lines.len());
+        return lines[start..end].join("\n");
+    }
+
     let start = lines.len().saturating_sub(max_non_empty_lines);
     lines[start..].join("\n")
+}
+
+fn is_focus_prompt_line(line: &&str) -> bool {
+    let trimmed = line.trim();
+    matches!(trimmed, ">" | "❯")
+        || trimmed.starts_with("❯ 1.")
+        || trimmed.starts_with("❯ 2.")
+        || trimmed.starts_with("❯ 3.")
 }
 
 fn raw_key_for_workflow(
@@ -3683,6 +3698,35 @@ fn resolve_target_pane(client: &TmuxClient, target: &PaneTargetArgs) -> AppResul
             "target must use either --pane %ID or --session NAME [--window NAME]",
         )),
     }
+}
+
+fn normalize_dashboard_window_name(client: &TmuxClient, pane: &TmuxPane) -> AppResult<TmuxPane> {
+    let base_name = strip_dashboard_window_prefixes(&pane.window_name);
+    if base_name == pane.window_name {
+        return Ok(pane.clone());
+    }
+
+    client.rename_window(
+        &format!("{}:{}", pane.session_name, pane.window_index),
+        &base_name,
+    )?;
+    resolve_pane_by_id(client, &pane.pane_id)
+}
+
+fn strip_dashboard_window_prefixes(value: &str) -> String {
+    const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+
+    let mut rest = value.trim_start();
+    loop {
+        let Some(emoji) = DASHBOARD_STATE_EMOJIS
+            .iter()
+            .find(|emoji| rest.starts_with(**emoji))
+        else {
+            break;
+        };
+        rest = rest[emoji.len()..].trim_start();
+    }
+    rest.to_string()
 }
 
 fn resolve_doctor_pane(
@@ -3946,6 +3990,8 @@ mod tests {
         render_keep_going_wait_message, render_list_panes, render_next_safe_action,
         render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
         render_status_report, resolve_keep_going_prompt, run_prepare_prompt, shell_escape,
+        strip_dashboard_window_prefixes,
+        focused_frame_source,
         submit_prompt_preflight_workflow, tmux_socket_path_from_value, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
@@ -4061,6 +4107,55 @@ mod tests {
     fn renders_a_focused_screen_excerpt() {
         let excerpt = render_screen_excerpt("\n\nfirst\n\nsecond\nthird\n");
         assert_eq!(excerpt, "first | second | third");
+    }
+
+    #[test]
+    fn focused_frame_source_keeps_question_block_above_long_footer() {
+        let frame = [
+            "I'd suggest Option A unless you already have a NuxtHub project.",
+            "---",
+            "Want me to:",
+            "1. Update .env.example with the new STUDIO_GITLAB_* vars (and a comment about the moderator allow-list)?",
+            "2. Flip media.external to false (Option A)?",
+            "3. Add a short \"Studio editing\" section to README.md?",
+            "Or all three? Once you create the OAuth app and paste me the Application ID, I can't do that part for you — but I can stage everything else.",
+            "✻ Cogitated for 2m 12s",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "~/Projects/shipstream/knowledge-base/node_modules/.pnpm/nuxt-studio@1.4.0",
+            "🧠 Opus 4.7 (1M context) │ Ctx: 6% │ Commits:6",
+            "MCP:0/0 │ 🔥$13.85/hr │ Cache: 98% hit │ Est: $69.02 (209.6K)",
+        ]
+        .join("\n");
+
+        let focused = focused_frame_source(&frame);
+
+        assert!(focused.contains("Want me to:"));
+        assert!(focused.contains("1. Update .env.example"));
+    }
+
+    #[test]
+    fn focused_frame_source_prefers_active_permission_prompt_over_stale_chat_prompt() {
+        let frame = [
+            "Older chat context",
+            "❯",
+            "More stale chat output",
+            "Bash command (unsandboxed)",
+            "Probe opencode to diagnose empty output",
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "2. Yes, and don't ask again for: opencode run *",
+            "3. No",
+            "Esc to cancel · Tab to amend · ctrl+e to explain",
+        ]
+        .join("\n");
+
+        let focused = focused_frame_source(&frame);
+
+        assert!(focused.contains("Bash command (unsandboxed)"));
+        assert!(focused.contains("Do you want to proceed?"));
+        assert!(focused.contains("❯ 1. Yes"));
     }
 
     #[test]
@@ -4368,6 +4463,13 @@ mod tests {
 
         assert!(report.contains("recap_present=true"));
         assert!(report.contains("recap_excerpt=Fixed parser edge cases"));
+    }
+
+    #[test]
+    fn strip_dashboard_window_prefixes_removes_stale_state_emoji_prefixes() {
+        assert_eq!(strip_dashboard_window_prefixes("🤔 wms"), "wms");
+        assert_eq!(strip_dashboard_window_prefixes("🤔 💤 wms"), "wms");
+        assert_eq!(strip_dashboard_window_prefixes("wms"), "wms");
     }
 
     #[test]
