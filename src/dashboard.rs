@@ -22,20 +22,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{
-    AppResult, ensure_pane_owned_by_claude, execute_classified_workflow, inspect_pane,
-    is_yolo_safe_to_approve, try_unstick_pane,
-};
-use crate::automation::GuardedWorkflow;
+use crate::app::AppResult;
 use crate::classifier::SessionState;
 use crate::cli::DashboardArgs;
 use crate::prompt::resolve_state_dir;
-use crate::storage::{
-    WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
-    sync_tmux_wait_state,
-};
+use crate::runtime::RuntimeClient;
+use crate::storage::{WorkspaceRecord, bootstrap_state_db};
 use crate::tmux::{TmuxClient, TmuxPane};
-use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const FOOTER_LINE1: &[(&str, &str)] = &[
     ("Arrows/jk", "move"),
@@ -58,7 +51,8 @@ const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
 const DASHBOARD_LEFT_PANE_PERCENT: u16 = 58;
 const DASHBOARD_LEFT_PANE_MAX_WIDTH: u16 = 80;
-const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+const DASHBOARD_STATE_EMOJIS: &[&str] =
+    &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
@@ -73,9 +67,9 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
     let mut app = DashboardApp::new(
         dashboard_tmux_client(),
         host_tmux_client(),
+        RuntimeClient::connect(&state_dir)?,
         state_dir,
         args.poll_ms,
-        args.history_lines,
     )?;
     let loop_result = run_dashboard_loop(
         &mut terminal,
@@ -85,7 +79,11 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
     );
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     app.restore_window_names()?;
 
@@ -100,9 +98,9 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
 struct DashboardApp {
     client: TmuxClient,
     host_client: TmuxClient,
+    runtime: RuntimeClient,
     state_dir: std::path::PathBuf,
     poll_ms: u64,
-    history_lines: usize,
     panes: Vec<PaneEntry>,
     rows: Vec<RowItem>,
     selected_pane_id: Option<String>,
@@ -128,6 +126,8 @@ struct PaneEntry {
     recap_present: bool,
     recap_excerpt: Option<String>,
     yolo_enabled: bool,
+    yolo_effective: bool,
+    yolo_stop_reason: Option<String>,
     age: Duration,
     wait_duration: Option<Duration>,
     yes_count: u32,
@@ -163,17 +163,17 @@ impl DashboardApp {
     fn new(
         client: TmuxClient,
         host_client: TmuxClient,
+        runtime: RuntimeClient,
         state_dir: std::path::PathBuf,
         poll_ms: u64,
-        history_lines: usize,
     ) -> AppResult<Self> {
         let restored_selection = load_saved_selection(&state_dir)?;
         Ok(Self {
             client,
             host_client,
+            runtime,
             state_dir,
             poll_ms,
-            history_lines,
             panes: Vec::new(),
             rows: Vec::new(),
             selected_pane_id: None,
@@ -192,51 +192,43 @@ impl DashboardApp {
         let now = Instant::now();
         let mut panes = Vec::new();
         let mut seen_pane_ids = HashSet::new();
-        let mut branch_by_path = HashMap::new();
         let mut next_frames = HashMap::new();
+        let mut branch_by_path = HashMap::new();
 
-        for pane in self.client.list_panes()?.into_iter().filter(is_claude_pane) {
+        for snapshot in self.runtime.list_panes(None, None)? {
+            let pane = snapshot.pane.clone();
             seen_pane_ids.insert(pane.pane_id.clone());
             self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
 
-            let inspected = inspect_pane(&self.client, &pane.pane_id, self.history_lines)?;
-            let previous_frame = self.previous_frames.get(&pane.pane_id);
             let state = dashboard_display_state(
-                inspected.classification.state,
-                previous_frame,
-                &inspected.raw_source,
+                snapshot.classification.state,
+                self.previous_frames.get(&pane.pane_id),
+                &snapshot.raw_source,
             );
-            let workspace =
-                resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
+            let workspace = WorkspaceRecord {
+                id: snapshot.workspace_id.clone(),
+                workspace_root: snapshot.workspace_root.clone(),
+                repo_key: None,
+            };
             let workspace_group_key = workspace_group_key(&workspace);
             let workspace_group_label = workspace_group_label(&workspace_group_key);
             let branch = branch_by_path
-                .entry(pane.current_path.clone())
-                .or_insert_with(|| git_branch_for_path(&pane.current_path))
+                .entry(snapshot.pane.current_path.clone())
+                .or_insert_with(|| git_branch_for_path(&snapshot.pane.current_path))
                 .clone();
-            let yolo_enabled = matches!(read_yolo_record(&self.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
             let age = process_age(pane.pane_pid).unwrap_or_else(|| {
                 self.first_seen
                     .get(&pane.pane_id)
                     .map(Instant::elapsed)
                     .unwrap_or_default()
             });
-            let wait_duration = sync_tmux_wait_state(
-                &self.state_dir,
-                &workspace.id,
-                &pane,
-                state.as_str(),
-                is_waiting_state(state),
-            )?;
-            let claude_session_id =
-                sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
+            let claude_session_id = snapshot.claude_session_id.clone();
             let yes_count = self
                 .yes_counts
                 .get(&yes_count_key(claude_session_id.as_deref(), &pane.pane_id))
                 .copied()
                 .unwrap_or(0);
-            next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
-
+            next_frames.insert(pane.pane_id.clone(), snapshot.raw_source.clone());
             panes.push(PaneEntry {
                 pane,
                 workspace,
@@ -244,15 +236,17 @@ impl DashboardApp {
                 workspace_group_label,
                 branch,
                 state,
-                has_questions: inspected.classification.has_questions,
-                recap_present: inspected.classification.recap_present,
-                recap_excerpt: inspected.classification.recap_excerpt.clone(),
-                yolo_enabled,
+                has_questions: snapshot.classification.has_questions,
+                recap_present: snapshot.classification.recap_present,
+                recap_excerpt: snapshot.classification.recap_excerpt.clone(),
+                yolo_enabled: snapshot.desired_yolo_enabled,
+                yolo_effective: snapshot.actual_yolo_enabled,
+                yolo_stop_reason: snapshot.last_stop_reason.clone(),
                 age,
-                wait_duration,
+                wait_duration: snapshot.wait_duration_ms.map(Duration::from_millis),
                 yes_count,
                 claude_session_id,
-                focused_source: inspected.focused_source,
+                focused_source: snapshot.focused_source.clone(),
             });
         }
 
@@ -291,7 +285,6 @@ impl DashboardApp {
 
         self.panes = panes;
         self.rebuild_rows();
-        self.run_yolo_supervisor()?;
         self.apply_window_name_prefixes()?;
         self.last_refresh = Instant::now();
         Ok(())
@@ -403,50 +396,6 @@ impl DashboardApp {
             .find(|pane| pane.pane.pane_id == pane_id)
             .map(|pane| is_attention_state(pane.state))
             .unwrap_or(false)
-    }
-
-    fn run_yolo_supervisor(&mut self) -> AppResult<()> {
-        let mut message = None;
-        for pane in self.panes.clone() {
-            if !pane.yolo_enabled {
-                continue;
-            }
-
-            let inspected = inspect_pane(&self.client, &pane.pane.pane_id, self.history_lines)?;
-            match inspected.classification.state {
-                SessionState::PermissionDialog if is_yolo_safe_to_approve(&inspected) => {
-                    execute_classified_workflow(
-                        &self.client,
-                        &pane.pane.pane_id,
-                        GuardedWorkflow::ApprovePermission,
-                        &inspected.classification,
-                    )?;
-                    self.increment_yes_count(&pane);
-                    message = Some(format!(
-                        "approved permission for {}",
-                        pane_descriptor(&pane.pane)
-                    ));
-                }
-                SessionState::SurveyPrompt => {
-                    execute_classified_workflow(
-                        &self.client,
-                        &pane.pane.pane_id,
-                        GuardedWorkflow::DismissSurvey,
-                        &inspected.classification,
-                    )?;
-                    message = Some(format!(
-                        "dismissed survey for {}",
-                        pane_descriptor(&pane.pane)
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(message) = message {
-            self.message = message;
-        }
-        Ok(())
     }
 
     fn apply_window_name_prefixes(&mut self) -> AppResult<()> {
@@ -597,9 +546,14 @@ impl DashboardApp {
         let Some(pane) = self.selected_pane().cloned() else {
             return Ok(());
         };
-        ensure_pane_owned_by_claude(&pane.pane)?;
-        self.message = try_unstick_pane(&self.client, &pane.pane)?;
-        if matches!(pane.state, SessionState::PermissionDialog | SessionState::FolderTrustPrompt) {
+        let result = self
+            .runtime
+            .run_action(&pane.pane.pane_id, None, "auto-unstick")?;
+        self.message = format!("{} {}", result.pane_id, result.executed);
+        if matches!(
+            pane.state,
+            SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+        ) {
             self.increment_yes_count(&pane);
         }
         Ok(())
@@ -667,12 +621,12 @@ impl DashboardApp {
     }
 
     fn set_yolo_for_pane(&mut self, pane: &PaneEntry, enabled: bool) -> AppResult<()> {
-        ensure_pane_owned_by_claude(&pane.pane)?;
-        if enabled {
-            write_yolo_record(&self.state_dir, &pane.workspace.id, &pane.pane)?;
-        } else {
-            let _ = disable_yolo_record(&self.state_dir, &pane.pane.pane_id)?;
-        }
+        let _ = self.runtime.set_yolo(
+            Some(&pane.pane.pane_id),
+            Some(&pane.workspace.id),
+            false,
+            enabled,
+        )?;
         Ok(())
     }
 }
@@ -693,8 +647,7 @@ fn host_tmux_client() -> TmuxClient {
 }
 
 fn kill_persistent_dashboard_server() -> AppResult<()> {
-    TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET)
-        .kill_session(PERSISTENT_DASHBOARD_SESSION)
+    TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET).kill_session(PERSISTENT_DASHBOARD_SESSION)
 }
 
 fn should_return_navigation(exit_on_navigate: bool, inside_tmux: bool) -> bool {
@@ -754,10 +707,13 @@ fn run_dashboard_loop(
                         KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
                         KeyCode::Up | KeyCode::Char('k') => app.select_previous()?,
                         KeyCode::Enter => {
-                            let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
+                            let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone())
+                            else {
                                 continue;
                             };
-                            if let Some(pane) = open_dashboard_pane(app, pane, exit_on_navigate, persistent)? {
+                            if let Some(pane) =
+                                open_dashboard_pane(app, pane, exit_on_navigate, persistent)?
+                            {
                                 return Ok(Some(pane));
                             }
                         }
@@ -778,7 +734,9 @@ fn run_dashboard_loop(
                         width: size.width,
                         height: size.height,
                     };
-                    if let Some(pane) = handle_mouse_event(app, mouse, area, exit_on_navigate, persistent)? {
+                    if let Some(pane) =
+                        handle_mouse_event(app, mouse, area, exit_on_navigate, persistent)?
+                    {
                         return Ok(Some(pane));
                     }
                 }
@@ -877,12 +835,9 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     let mut items = Vec::new();
     for row in &app.rows {
         match row {
-            RowItem::WorkspaceHeader { label } => {
-                items.push(ListItem::new(render_workspace_header_line(
-                    label,
-                    pane_list_width,
-                )))
-            }
+            RowItem::WorkspaceHeader { label } => items.push(ListItem::new(
+                render_workspace_header_line(label, pane_list_width),
+            )),
             RowItem::Pane { pane_id } => {
                 let pane = app.panes.iter().find(|pane| &pane.pane.pane_id == pane_id);
                 if let Some(pane) = pane {
@@ -911,7 +866,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                             columns.wait_width,
                         )),
                         Span::raw(TABLE_GAP),
-                        Span::raw(pad_display_right(&pane.yes_count.to_string(), columns.yes_width)),
+                        Span::raw(pad_display_right(
+                            &pane.yes_count.to_string(),
+                            columns.yes_width,
+                        )),
                         Span::raw(TABLE_GAP),
                         Span::raw(pad_display(&pane.branch, columns.branch_width)),
                         Span::raw(TABLE_GAP),
@@ -934,7 +892,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
 
     let details_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(3)])
+        .constraints([Constraint::Length(13), Constraint::Min(3)])
         .split(body[1]);
 
     if let Some(pane) = app.selected_pane() {
@@ -952,18 +910,23 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             )),
             Line::from(format!("Has questions: {}", pane.has_questions)),
             Line::from(format!(
-                "YOLO: {}",
+                "YOLO desired: {}",
                 if pane.yolo_enabled {
                     "enabled"
                 } else {
                     "disabled"
                 }
             )),
-            Line::from(format!("Age: {}", format_age(pane.age))),
             Line::from(format!(
-                "Path: {}",
-                detail_current_path(pane)
+                "YOLO active: {}",
+                if pane.yolo_effective {
+                    "active"
+                } else {
+                    "inactive"
+                }
             )),
+            Line::from(format!("Age: {}", format_age(pane.age))),
+            Line::from(format!("Path: {}", detail_current_path(pane))),
         ];
         if pane.workspace.workspace_root != pane.workspace_group_key {
             details.push(Line::from(format!(
@@ -974,6 +937,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         details.push(Line::from(format!(
             "Session ID: {}",
             pane.claude_session_id.as_deref().unwrap_or("-")
+        )));
+        details.push(Line::from(format!(
+            "Stop reason: {}",
+            pane.yolo_stop_reason.as_deref().unwrap_or("-")
         )));
 
         let details = Paragraph::new(details).block(rounded_block(Some("Details")));
@@ -1027,10 +994,7 @@ fn dashboard_layout(area: Rect) -> DashboardLayout {
 }
 
 fn dashboard_body_sections(area: Rect) -> Vec<Rect> {
-    let preferred_left = area
-        .width
-        .saturating_mul(DASHBOARD_LEFT_PANE_PERCENT)
-        / 100;
+    let preferred_left = area.width.saturating_mul(DASHBOARD_LEFT_PANE_PERCENT) / 100;
     let left_width = preferred_left.min(DASHBOARD_LEFT_PANE_MAX_WIDTH);
 
     Layout::default()
@@ -1058,8 +1022,10 @@ fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> boo
 }
 
 fn render_footer() -> Paragraph<'static> {
-    Paragraph::new(footer_lines(std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some()))
-        .wrap(Wrap { trim: true })
+    Paragraph::new(footer_lines(
+        std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some(),
+    ))
+    .wrap(Wrap { trim: true })
 }
 
 fn footer_lines(persistent: bool) -> Vec<Line<'static>> {
@@ -1086,7 +1052,9 @@ fn footer_column_widths(line1: &[(&str, &str)], line2: &[(&str, &str)]) -> Vec<u
             [line1.get(idx), line2.get(idx)]
                 .into_iter()
                 .flatten()
-                .map(|(key, description)| UnicodeWidthStr::width(format!("{key} {description}").as_str()))
+                .map(|(key, description)| {
+                    UnicodeWidthStr::width(format!("{key} {description}").as_str())
+                })
                 .max()
                 .unwrap_or(0)
         })
@@ -1102,7 +1070,9 @@ fn footer_help_line(entries: &[(&str, &str)], column_widths: &[usize]) -> Line<'
         }
         spans.push(Span::styled(
             (*key).to_string(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -1110,7 +1080,8 @@ fn footer_help_line(entries: &[(&str, &str)], column_widths: &[usize]) -> Line<'
             Style::default().fg(Color::Gray),
         ));
         let rendered = format!("{key} {description}");
-        let padding = column_widths[index].saturating_sub(UnicodeWidthStr::width(rendered.as_str()));
+        let padding =
+            column_widths[index].saturating_sub(UnicodeWidthStr::width(rendered.as_str()));
         if padding > 0 {
             spans.push(Span::raw(" ".repeat(padding)));
         }
@@ -1211,7 +1182,9 @@ fn yes_count_key(claude_session_id: Option<&str>, pane_id: &str) -> String {
 }
 
 fn render_workspace_header_line(label: &str, width: usize) -> Line<'static> {
-    let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let Some((name, path)) = split_workspace_header(label) else {
         return Line::from(vec![Span::styled(pad_display_right(label, width), style)]);
     };
@@ -1315,7 +1288,10 @@ fn collapse_wrapped_recap_lines(lines: &[String]) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
 
-    while filtered.last().is_some_and(|line| is_recap_separator_line(line)) {
+    while filtered
+        .last()
+        .is_some_and(|line| is_recap_separator_line(line))
+    {
         filtered.pop();
     }
 
@@ -1487,8 +1463,14 @@ fn load_saved_selection(state_dir: &Path) -> AppResult<SavedSelection> {
 
 fn save_selection(state_dir: &Path, selection: &SavedSelection) -> AppResult<()> {
     let pane_id = selection.pane_id.as_deref().unwrap_or_default();
-    let row_index = selection.row_index.map(|value| value.to_string()).unwrap_or_default();
-    fs::write(dashboard_selection_path(state_dir), format!("{pane_id}\n{row_index}\n"))?;
+    let row_index = selection
+        .row_index
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    fs::write(
+        dashboard_selection_path(state_dir),
+        format!("{pane_id}\n{row_index}\n"),
+    )?;
     Ok(())
 }
 
@@ -1554,13 +1536,6 @@ fn abbreviate_home_path(path: &str) -> String {
         return format!("~/{suffix}");
     }
     path.to_string()
-}
-
-fn is_waiting_state(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::ChatReady | SessionState::PermissionDialog | SessionState::FolderTrustPrompt
-    )
 }
 
 fn is_attention_state(state: SessionState) -> bool {
@@ -1658,10 +1633,6 @@ fn process_age(pid: Option<u32>) -> Option<Duration> {
     Some(Duration::from_secs_f64(uptime_secs - start_secs))
 }
 
-fn is_claude_pane(pane: &TmuxPane) -> bool {
-    pane.current_command.eq_ignore_ascii_case("claude")
-}
-
 fn navigate_to_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<()> {
     client.select_window(&format!("{}:{}", pane.session_name, pane.window_index))?;
     client.select_pane(&pane.pane_id)?;
@@ -1681,20 +1652,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PaneEntry,
-        PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, SavedSelection, TABLE_GAP,
-        abbreviate_home_path,
-        context_lines_above_input, current_base_window_name, dashboard_display_state,
-        dashboard_body_sections, dashboard_selection_path, derive_base_window_name,
+        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PERSISTENT_DASHBOARD_SESSION,
+        PERSISTENT_DASHBOARD_SOCKET, PaneEntry, SavedSelection, TABLE_GAP, abbreviate_home_path,
+        context_lines_above_input, current_base_window_name, dashboard_body_sections,
+        dashboard_display_state, dashboard_selection_path, derive_base_window_name,
         detail_body_kind, detail_current_path, detail_workspace_label, footer_column_widths,
         footer_help_line, footer_lines, format_age, load_saved_selection, pad_display_right,
         pane_list_columns, pane_list_content_area, recap_lines, rect_contains,
         render_workspace_header_line, repo_root_from_repo_key, save_selection,
         should_return_navigation, split_workspace_header, state_emoji,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order,
-        workspace_group_key, workspace_group_label, yes_count_key, yolo_column_contains,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
+        workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::SessionState;
+    use crate::runtime::RuntimeClient;
     use crate::storage::WorkspaceRecord;
     use crate::tmux::{TmuxClient, TmuxPane};
     use ratatui::layout::Rect;
@@ -1774,7 +1745,12 @@ mod tests {
 
     #[test]
     fn idle_pane_prefers_recap_body() {
-        let pane = sample_pane_entry(SessionState::ChatReady, false, true, "※ recap: fixed issue\n❯");
+        let pane = sample_pane_entry(
+            SessionState::ChatReady,
+            false,
+            true,
+            "※ recap: fixed issue\n❯",
+        );
         assert_eq!(detail_body_kind(&pane), DetailBodyKind::Recap);
         assert_eq!(recap_lines(&pane), vec![String::from("fixed issue")]);
     }
@@ -1972,13 +1948,20 @@ mod tests {
         let client = TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET);
         let plan = client.plan_kill_session(PERSISTENT_DASHBOARD_SESSION);
 
-        assert_eq!(plan.render(), "tmux -L botctl-dashboard kill-session -t botctl-dashboard");
+        assert_eq!(
+            plan.render(),
+            "tmux -L botctl-dashboard kill-session -t botctl-dashboard"
+        );
     }
 
     #[test]
     fn changing_frame_promotes_chat_ready_to_busy_in_dashboard() {
         assert_eq!(
-            dashboard_display_state(SessionState::ChatReady, Some(&String::from("before")), "after"),
+            dashboard_display_state(
+                SessionState::ChatReady,
+                Some(&String::from("before")),
+                "after"
+            ),
             SessionState::BusyResponding
         );
         assert_eq!(
@@ -1995,8 +1978,14 @@ mod tests {
 
     #[test]
     fn derive_base_window_name_strips_any_known_dashboard_emojis() {
-        assert_eq!(derive_base_window_name("🤔💤🔐 bloodraven", "💤"), "bloodraven");
-        assert_eq!(derive_base_window_name("🤔 💤  bloodraven", "💤"), "bloodraven");
+        assert_eq!(
+            derive_base_window_name("🤔💤🔐 bloodraven", "💤"),
+            "bloodraven"
+        );
+        assert_eq!(
+            derive_base_window_name("🤔 💤  bloodraven", "💤"),
+            "bloodraven"
+        );
     }
 
     #[test]
@@ -2007,11 +1996,21 @@ mod tests {
     #[test]
     fn current_base_window_name_preserves_live_rename() {
         assert_eq!(
-            current_base_window_name("renamed-project", Some("💤 old-project"), "old-project", "💤"),
+            current_base_window_name(
+                "renamed-project",
+                Some("💤 old-project"),
+                "old-project",
+                "💤"
+            ),
             "renamed-project"
         );
         assert_eq!(
-            current_base_window_name("💤 old-project", Some("💤 old-project"), "old-project", "💤"),
+            current_base_window_name(
+                "💤 old-project",
+                Some("💤 old-project"),
+                "old-project",
+                "💤"
+            ),
             "old-project"
         );
         assert_eq!(
@@ -2037,9 +2036,11 @@ mod tests {
         let app = DashboardApp::new(
             TmuxClient::default(),
             TmuxClient::default(),
+            RuntimeClient::with_socket_path(
+                unique_temp_dir("dashboard-runtime-sock").join("runtime.sock"),
+            ),
             unique_temp_dir("dashboard-hitbox"),
             1000,
-            120,
         )
         .expect("app should initialize");
         let list_area = Rect {
@@ -2049,7 +2050,8 @@ mod tests {
             height: 10,
         };
         let columns = pane_list_columns(&app);
-        let yolo_x = list_area.x + columns.state_width as u16 + UnicodeWidthStr::width(TABLE_GAP) as u16;
+        let yolo_x =
+            list_area.x + columns.state_width as u16 + UnicodeWidthStr::width(TABLE_GAP) as u16;
         assert!(yolo_column_contains(&app, list_area, yolo_x));
         assert!(!yolo_column_contains(&app, list_area, list_area.x));
     }
@@ -2094,6 +2096,8 @@ mod tests {
                 None
             },
             yolo_enabled: false,
+            yolo_effective: false,
+            yolo_stop_reason: None,
             age: Duration::from_secs(1),
             wait_duration: None,
             yes_count: 0,

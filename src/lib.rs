@@ -7,6 +7,7 @@ pub mod fixtures;
 pub mod http_api;
 pub mod observe;
 pub mod prompt;
+pub mod runtime;
 pub mod screen_model;
 pub mod serve;
 pub mod storage;

@@ -8,20 +8,22 @@ The project is built around a simple rule: terminal automation is only safe when
 
 These are the commands that matter most in day-to-day use:
 
+- `runtime` to start or stop the single local coordinator that owns live observation and automation
 - `dashboard` to see all live Claude panes, grouped by workspace, with state, age, and YOLO controls
-- `yolo` to babysit one pane or a scoped set of panes automatically
-- `serve` to stream live observation data for one tmux session in human or JSONL form
+- `yolo` to set central YOLO policy for one pane or a scoped set of panes
+- `serve` to expose HTTP and event output as a facade over runtime state
 
 Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing around those flows.
 
 ## Current Features
 
 - launch a managed Claude session in tmux
+- run a central local runtime over a Unix socket at `<state-dir>/runtime.sock`
 - list panes and inspect tmux metadata
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude pane
-- run `serve` as a foreground long-lived observer for one tmux session
-- run `dashboard` as a popup-sized TUI across Claude panes, grouped by workspace with per-pane YOLO controls
+- run `serve` as a runtime-backed foreground facade for one tmux session
+- run `dashboard` as a runtime-backed popup-sized TUI across Claude panes, grouped by workspace with per-pane YOLO controls
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
@@ -66,6 +68,16 @@ cargo run -- yolo --pane 0:6.0
 cargo run -- serve --session demo --format jsonl
 ```
 
+By default, `dashboard`, `yolo`, and `serve` run in managed mode. If no runtime is available, they auto-start one in a hidden tmux session and connect to it. The runtime stays alive while managed clients still need it, and you can manage it directly with:
+
+```bash
+cargo run -- runtime
+cargo run -- runtime stop
+cargo run -- runtime --foreground
+```
+
+Use `--unmanaged` on `dashboard`, `yolo`, or `serve` when you want them to require an already-running runtime instead of auto-starting one.
+
 ## Core Workflows
 
 Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
@@ -88,13 +100,19 @@ Quick and easy tmux popup binding:
 bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 ```
 
-Start YOLO babysitting for one pane:
+Set YOLO policy for one pane:
 
 ```bash
 cargo run -- yolo --pane 0:6.0
 ```
 
-Run the long-lived observer for one tmux session:
+Tail runtime-backed YOLO events for one pane:
+
+```bash
+cargo run -- yolo --pane 0:6.0 --follow
+```
+
+Run the runtime facade for one tmux session:
 
 ```bash
 cargo run -- serve --session demo
@@ -106,13 +124,13 @@ Run the observer and a localhost HTTP API for a web UI:
 cargo run -- serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
 ```
 
-Use machine-readable output for tooling:
+Use machine-readable runtime-backed output for tooling:
 
 ```bash
 cargo run -- serve --session demo --format jsonl
 ```
 
-The HTTP API exposes live pane state plus interactive controls such as visible prompt options. Useful endpoints include:
+The HTTP API exposes runtime-backed pane state plus interactive controls such as visible prompt options. Useful endpoints include:
 
 - `GET /instances`
 - `GET /instances/%251`
@@ -160,7 +178,7 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups Claude panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups Claude panes by workspace, shows the shared runtime state for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
 
@@ -202,6 +220,10 @@ Scope prompt prep or babysit work to one workspace:
 cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the current repo"
 cargo run -- yolo start --all --workspace .
 ```
+
+The runtime keeps desired YOLO policy in SQLite and enforces the effective supervision state in memory. Disabling YOLO through the dashboard, CLI, or HTTP becomes visible to the other clients immediately because they all read the same runtime state.
+
+Managed clients use shared runtime leases, so a later dashboard or serve session can keep an auto-started runtime alive instead of having it torn down when an earlier client exits.
 
 Show the CLI help:
 

@@ -6,18 +6,44 @@ If you just want the useful commands first, start here:
 
 ## Main commands
 
+### `runtime`
+
+Purpose: start the central local runtime that owns live observation, guarded actions, and yolo supervision.
+
+Syntax:
+```bash
+botctl runtime [--reconcile-ms N] [--history-lines N] [--state-dir PATH]
+botctl runtime stop [--state-dir PATH]
+botctl runtime --foreground [--reconcile-ms N] [--history-lines N] [--state-dir PATH]
+```
+
+Examples:
+```bash
+botctl runtime
+botctl runtime --state-dir /tmp/botctl-state
+```
+
+Notes:
+
+- listens on `<state-dir>/runtime.sock`
+- starts a hidden tmux-backed runtime session by default
+- `stop` shuts down the current runtime
+- `--foreground` runs the runtime in the current process instead of the hidden tmux session
+- other user-facing long-lived commands connect to this process instead of running their own control loops
+- one runtime should own one local state root and tmux socket at a time
+
 ### `yolo`
 
-Purpose: run autonomous babysitting for one pane, all panes, or a workspace-scoped subset.
+Purpose: set centralized yolo policy for one pane, all panes, or a workspace-scoped subset.
 
 Start syntax:
 ```bash
-botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Stop syntax:
 ```bash
-botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Examples:
@@ -29,17 +55,20 @@ botctl yolo stop --all
 
 Notes:
 
-- guarded by classified state; `yolo` will not blindly press keys
+- updates desired yolo state in SQLite and the runtime's in-memory view
+- guarded by classified state; runtime yolo will not blindly press keys
 - accepts explicit pane targets or `--all`
 - `--workspace` scopes `--all` to one workspace registration set
+- `--follow` tails matching runtime events after setting policy
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ### `dashboard`
 
-Purpose: open the live TUI for Claude panes, grouped by workspace, with per-pane and per-workspace YOLO controls.
+Purpose: open the live TUI for Claude panes, grouped by workspace, with per-pane and per-workspace YOLO controls backed by shared runtime state.
 
 Syntax:
 ```bash
-botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]
+botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]
 ```
 
 Examples:
@@ -55,19 +84,20 @@ bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 
 Notes:
 
-- scans all Claude panes
+- queries the central runtime for Claude panes
 - shows current classified state, wait time, branch, and workspace grouping
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ### `serve`
 
-Purpose: run the live observation loop for one tmux session and stream human-readable or JSONL events.
+Purpose: expose a runtime-backed event stream and HTTP facade for one tmux session.
 
 It can also expose a localhost HTTP API for a polling web UI.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]
 ```
 
 Examples:
@@ -80,12 +110,13 @@ botctl serve --session demo --pane 0:2.3
 
 Notes:
 
-- this is the main long-lived observation path
+- requires a running `runtime` process
+- this is the main session-scoped facade over runtime state
 - `--format jsonl` is the useful mode for tooling and automation
-- `--http ADDR` starts a localhost JSON API alongside the observer
+- `--http ADDR` starts a localhost JSON API alongside the stream facade
 - repeat `--allowed-origin URL` to allow browser clients from those exact origins; browser origins are rejected when not listed
-- persists tape and summary artifacts under the state root
 - the full HTTP contract is documented in [HTTP API reference](./api-reference.mdx)
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ## Common targeting and safety rules
 
@@ -98,6 +129,7 @@ Notes:
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
 - Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and yolo registrations now both use SQLite-backed records there.
+- The central runtime socket lives at `<state-root>/runtime.sock`.
 - Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
 - Startup bootstrapping also runs in-place schema migrations for supported older `state.db` versions.
 
