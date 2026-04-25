@@ -9,6 +9,8 @@ build:
     nodejs: "22"
 
   commands:
+    - cd docs/ && rm -rf node_modules
+    - cd docs/ && npm cache clean --force
     - cd docs/ && npm install
     - cd docs/ && npm run build
     - mkdir --parents $READTHEDOCS_OUTPUT/html/
