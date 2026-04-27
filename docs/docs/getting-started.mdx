@@ -6,11 +6,12 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 ## Learn these first
 
-Most users only need three commands:
+Most users only need four commands:
 
+- `runtime` for the single local coordinator that owns live observation and automation
 - `dashboard` for a live control surface across Claude panes
-- `yolo` for automated babysitting and recovery
-- `serve` for a long-lived observation stream
+- `yolo` for centralized babysitting policy and recovery
+- `serve` for a runtime-backed observation stream and HTTP facade
 
 Everything else is support around setup, diagnostics, prompt handoff, and lower-level recovery.
 
@@ -46,6 +47,23 @@ Stream live session events:
 
 ```bash
 botctl serve --session demo --format jsonl
+```
+
+The runtime owns live tmux observation, pane classification, yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` connect to the same local socket at `<state-dir>/runtime.sock`, and in managed mode they auto-start a hidden tmux-backed runtime when one is not already running.
+
+## Managed versus unmanaged
+
+- managed is the default for `dashboard`, `yolo`, and `serve`
+- managed mode auto-starts a hidden runtime session when needed
+- managed clients share runtime leases so the last managed listener can keep the runtime alive instead of losing it when an earlier client exits
+- `--unmanaged` disables auto-start and requires an existing runtime
+
+Direct runtime commands:
+
+```bash
+botctl runtime
+botctl runtime stop
+botctl runtime --foreground
 ```
 
 ## First session
@@ -136,13 +154,20 @@ Enable YOLO for all panes in one workspace:
 botctl yolo --all --workspace .
 ```
 
+Tail the shared runtime events for that yolo policy:
+
+```bash
+botctl yolo --pane 0:6.0 --follow
+```
+
 ## Observe versus serve
 
 - `observe` is bounded and returns a fixed snapshot/event sample.
-- `serve` is the current foreground observer for one tmux session.
-- `serve` is not a full daemon/API/SSE product yet.
+- `runtime` is the long-lived owner of observation and automation.
+- `serve` is the runtime-backed facade for one tmux session.
+- `serve` does not run its own observer loop anymore.
 
-If you are not sure which one you want, you probably want `serve`, not `observe`.
+If you are not sure which one you want, you probably want managed `serve`, not `observe`.
 
 Run `serve` against one tmux session:
 
@@ -175,6 +200,6 @@ For blocker recovery, prompt handoff, and recovery examples, see [workflows](./w
 
 ## Current limits
 
-- live classification is still built around `capture-pane`, with `serve` using a best-effort merged stream model when that helps break `Unknown` states
+- live classification is still built around `capture-pane`, with the central runtime using a best-effort merged stream model when that helps break `Unknown` states
 - the classifier is conservative and keyword-based
-- `serve` is currently a foreground observer, not the full daemon/API system yet
+- the HTTP surface is still polling-based; there is no SSE endpoint yet

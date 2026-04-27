@@ -20,6 +20,8 @@ botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
 ```
 
+`runtime` is the single owner of live pane observation, shared yolo supervision, and guarded actions. `dashboard`, `yolo`, and `serve` start it automatically in managed mode when needed, or you can run it yourself and use `--unmanaged` clients.
+
 ## Managed session flow
 
 Use this when `botctl` launches Claude for you.
@@ -133,13 +135,13 @@ For the editor-helper, survey preflight, and state-dir variants, see [prompt han
 ## Observe versus serve
 
 - `observe` is bounded: it returns a fixed sample of events and pane state.
-- `serve` is the current long-lived foreground observer for one session.
-- `serve` still depends on tmux control mode and periodic pane snapshots.
+- `runtime` is the long-lived owner of tmux control mode and periodic pane snapshots.
+- `serve` is the foreground facade for one session over that shared runtime state.
 - `serve` now has a localhost HTTP API, but it is still not the full daemon/SSE product.
 
-Use `observe` when you want a bounded diagnostic sample; use `serve` when you want a live foreground stream.
+Use `observe` when you want a bounded diagnostic sample; use `serve` when you want a live foreground stream backed by the shared runtime.
 
-In practice, `observe` is a secondary diagnostic tool. `serve` is the main live observation path.
+In practice, `observe` is a secondary diagnostic tool. `runtime` is the owner, and `serve` is the main live observation facade.
 
 ## Safety rules
 

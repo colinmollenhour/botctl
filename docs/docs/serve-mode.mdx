@@ -1,32 +1,24 @@
 # Serve mode
 
-`botctl serve` is the current long-lived observation path.
+`botctl serve` is the current runtime-backed observation and HTTP facade.
 
-It is one of the three main user-facing commands, alongside `dashboard` and `yolo`.
+It is one of the main user-facing commands, alongside `runtime`, `dashboard`, and `yolo`.
 
-It holds a persistent tmux control-mode connection open for one session, then rebases that stream with periodic `capture-pane` snapshots.
+The central `runtime` process holds the tmux control-mode connection open and rebases that stream with periodic `capture-pane` snapshots. `serve` connects to that runtime and exposes a session-scoped foreground stream plus optional HTTP API.
+
+In managed mode, `serve` auto-starts the runtime in a hidden tmux session when needed. Use `--unmanaged` if you want it to require an already-running runtime instead.
 
 ## What it does today
 
-`serve` runs in the foreground and emits structured events to stdout, while persisting raw event and summary artifacts under state artifacts:
-
-- `tapes/<id>/events.jsonl`
-- `exports/<id>/summary.json`
+`serve` runs in the foreground and emits structured events to stdout from the runtime's shared event stream.
 
 Current behavior:
 
-- attaches to one tmux session in control mode
-- optionally narrows observation to one explicit pane
-- parses tmux output and topology notifications
-- reconstructs a best-effort per-pane live screen from streamed output
-- debounces stream activity before reconciling
-- captures pane text on initial attach, on stream activity, and on periodic reconcile
-- seeds and periodically rebases the stream model from `capture-pane`
-- may classify stream-driven reconciliations from merged stream state when capture is ambiguous
-- falls back conservatively to captured pane state when merged state is not trustworthy
+- requires an existing local `runtime`
+- narrows the shared runtime stream to one tmux session or one explicit pane
 - emits human-readable or JSONL events
 - can also expose a localhost HTTP API for polling clients and web UIs
-- writes event and summary artifacts to `<state-root>/artifacts`
+- uses the same runtime-owned pane snapshots and guarded action scheduler seen by `dashboard` and `yolo`
 
 ## Basic usage
 
@@ -36,7 +28,7 @@ Observe one session:
 botctl serve --session demo
 ```
 
-This is the main live observation path. Use it when you want a foreground stream; use `observe` only when you specifically want a bounded diagnostic sample.
+This is the main session-scoped live observation facade. Use it when you want a foreground stream; use `observe` only when you specifically want a bounded diagnostic sample.
 
 Observe one specific pane inside that session:
 
@@ -77,7 +69,7 @@ The prompt endpoint accepts JSON like:
 }
 ```
 
-You can also write artifacts to an explicit state root:
+You can also point `serve` at an explicit state root so it reaches the right runtime socket:
 
 ```bash
 botctl serve --session demo --state-dir /tmp/botctl-state
@@ -93,41 +85,44 @@ botctl serve --session demo --reconcile-ms 5000
 
 The current stream includes:
 
-- `serve-start`
-- `snapshot`
-- `notify`
+- `runtime-started`
+- `pane-discovered`
+- `pane-snapshot-updated`
+- `pane-state-changed`
+- `yolo-enabled`
+- `yolo-disabled`
+- `yolo-monitoring-stopped`
+- `action-requested`
+- `action-executed`
+- `action-failed`
 - `pane-removed`
-- `serve-stop`
 
-Snapshot events include:
+Snapshot-bearing events include:
 
 - pane metadata
 - current classified state
 - classifier signals
 - whether the state changed
-- why reconciliation happened
-- recent streamed output excerpt when available
+- desired and effective yolo state
+- wait duration and last stop reason when available
 
 ## Current scope
 
-This is the current implementation, not the full serve-mode product yet.
+This is the current implementation, not the final remote/API product yet.
 
 Implemented now:
 
-- long-lived control-mode connection
-- live screen reconstruction from streamed output
-- periodic reconciliation and model rebasing
-- conservative stream-over-capture merge for stream-driven reconciliation
-- basic topology-change detection
-- foreground event stream
+- explicit `runtime` command
+- runtime-owned tmux observation and periodic reconciliation
+- runtime-owned guarded action execution
+- runtime-owned yolo supervision
+- foreground session-scoped `serve` stream and polling HTTP API
 
 Not implemented yet:
 
-- persistent daemon lifecycle
 - SSE endpoints
 - full reconstructed terminal screen model
-- persistent registry of managed/adopted instances
-- continuous policy execution
+- remote/distributed runtimes
 
 ## Safety rules
 
@@ -142,24 +137,10 @@ Serve mode keeps the same safety rules as the rest of `botctl`:
 
 Current limits:
 
-- it is still a foreground observer
-- it does not expose a daemon or SSE yet
-- it does not replace guarded workflow execution
+- it still depends on a local runtime you start explicitly
+- it does not expose SSE yet
 - classification still depends on capture-plus-merge heuristics, not a full terminal model
 
 ## Relationship to the larger plan
 
-The long-term serve-mode plan is documented in [`PLANS-Serve-Mode.md`](https://github.com/colinmollenhour/botctl/blob/main/PLANS-Serve-Mode.md).
-
-The current implementation maps most directly to these wishlist items:
-
-- P1-1 replace the bounded observer with a long-lived control-mode connection
-- P1-3 merge streamed output with periodic reconciliation
-- part of P1-5 detect topology changes
-
-The next meaningful improvements are:
-
-1. improve the live screen model from streamed output
-2. preserve pane ownership across more tmux topology changes
-3. introduce a tracked-instance registry
-4. expose the observer through a local API
+The current shipped shape is already the central-runtime design: one local runtime owns observation and actions, and `serve` is the session-scoped facade over that owner.

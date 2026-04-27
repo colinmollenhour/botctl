@@ -4,6 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::{AppError, AppResult};
 
 #[derive(Debug, Clone)]
@@ -21,7 +23,7 @@ pub struct StartedSession {
     pub cwd: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmuxPane {
     pub pane_id: String,
     pub pane_tty: String,

@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     ChatReady,
     BusyResponding,
@@ -72,7 +74,7 @@ const PERMISSION_KEYWORDS: &[&str] = &[
 
 const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "esc"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Classification {
     pub source: String,
     pub state: SessionState,
@@ -239,7 +241,8 @@ impl Classifier {
             SessionState::Unknown
         };
 
-        let has_questions = state == SessionState::ChatReady && chat_ready_has_questions(frame_text);
+        let has_questions =
+            state == SessionState::ChatReady && chat_ready_has_questions(frame_text);
         if has_questions {
             signals.push(String::from(SIGNAL_CHAT_QUESTIONS));
         }
@@ -396,7 +399,7 @@ fn has_diff_dialog_keywords(frame_text: &str) -> bool {
 
     let has_review_changes = lines
         .iter()
-        .any(|line| line.eq_ignore_ascii_case("Review changes"));
+        .any(|line| line.to_ascii_lowercase().starts_with("review changes"));
     let option_count = lines
         .iter()
         .filter(|line| is_diff_dialog_option_line(line))
@@ -454,10 +457,8 @@ fn is_chat_keyword_line(line: &str) -> bool {
 
 fn is_permission_anchor_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        PERMISSION_KEYWORDS,
-    ) || is_permission_choice_line(line)
+    contains_any(&lower, PERMISSION_KEYWORDS)
+        || is_permission_choice_line(line)
         || contains_any(
             &lower,
             &[
@@ -556,7 +557,10 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
         .rposition(|line| is_plain_chat_input_line(line))
         .map(|idx| idx.saturating_sub(8))
         .unwrap_or_else(|| lines.len().saturating_sub(8));
-    let start = if let Some(input_idx) = lines.iter().rposition(|line| is_submitted_chat_input_line(line)) {
+    let start = if let Some(input_idx) = lines
+        .iter()
+        .rposition(|line| is_submitted_chat_input_line(line))
+    {
         start.max(input_idx.saturating_add(1))
     } else {
         start
@@ -608,7 +612,8 @@ fn is_lettered_option_line(line: &str) -> bool {
 }
 
 fn is_option_line(line: &str) -> bool {
-    is_lettered_option_line(line) || starts_with_numbered_option(line.trim_start_matches('❯').trim())
+    is_lettered_option_line(line)
+        || starts_with_numbered_option(line.trim_start_matches('❯').trim())
 }
 
 fn starts_with_numbered_option(line: &str) -> bool {
@@ -695,7 +700,11 @@ mod tests {
 
         assert_eq!(result.state, SessionState::ChatReady);
         assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
-        assert!(!result.signals.contains(&String::from(SIGNAL_PERMISSION_KEYWORDS)));
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
         assert!(result.recap_present);
     }
 
@@ -870,7 +879,11 @@ mod tests {
 
         assert_eq!(result.state, SessionState::ChatReady);
         assert!(result.has_questions);
-        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_QUESTIONS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CHAT_QUESTIONS))
+        );
     }
 
     #[test]

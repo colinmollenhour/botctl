@@ -5,9 +5,10 @@
 ## Current module map
 
 - `src/tmux.rs` — tmux transport, pane discovery, capture, key sending, and control-mode session management
+- `src/runtime.rs` — central local runtime, Unix-socket RPC, shared pane snapshots, event fanout, and yolo/action ownership
 - `src/observe.rs` — bounded observation, control-line parsing, and capture-backed reports
-- `src/serve.rs` — long-lived foreground observer loop for `serve`
-- `src/screen_model.rs` — best-effort stream reconstruction helper for serve mode
+- `src/serve.rs` — legacy observation helpers reused by tests while the runtime owns the live loop
+- `src/screen_model.rs` — best-effort stream reconstruction helper used by the runtime
 - `src/classifier.rs` — frame-to-state classification and recap metadata detection
 - `src/automation.rs` — action definitions, keybinding resolution, and guarded workflow rules
 - `src/fixtures.rs` — fixture recording, loading, and replay support
@@ -40,7 +41,7 @@ Observation is responsible for gathering terminal evidence:
 - tmux notifications
 - `capture-pane` snapshots for reconciliation
 
-`capture-pane` is still the primary source for classification. In `serve`, the live stream model is a best-effort helper that can break ties when stream-driven reconciliation would otherwise stay `Unknown`, but capture-backed snapshots remain the base truth.
+`capture-pane` is still the primary source for classification. In the central runtime, the live stream model is a best-effort helper that can break ties when stream-driven reconciliation would otherwise stay `Unknown`, but capture-backed snapshots remain the base truth.
 
 ### Classification
 
@@ -69,12 +70,24 @@ Automation should only run after:
 
 This is why raw `send-keys` success is never enough.
 
+## Runtime model
+
+Today `botctl` uses one authoritative live owner and several clients:
+
+- `runtime` owns tmux control mode, pane discovery, classification snapshots, guarded actions, and yolo supervision
+- `dashboard` is a runtime client
+- `serve` is a runtime-backed stream and HTTP facade
+- `yolo` is a runtime policy client
+- `observe` remains a bounded one-shot diagnostic command
+
+SQLite remains the durable store for workspace identity, pending prompts, desired yolo state, and cached runtime metadata.
+
 ## Observation model
 
 Today `botctl` uses two observation paths:
 
 - bounded one-shot observation through `observe`
-- long-lived observation through `serve`
+- long-lived observation through `runtime`
 
 The current live model is still a compromise:
 
@@ -82,18 +95,23 @@ The current live model is still a compromise:
 - `capture-pane` gives authoritative snapshots
 - classification still runs on captured pane text, not a full reconstructed terminal screen
 
-That means serve mode is a foundation, not the finished screen model.
+That means the central runtime is a foundation, not the finished screen model.
 
-## Serve-mode architecture today
+## Central runtime architecture today
 
-The current `serve` implementation is intentionally small:
+The current runtime implementation is intentionally local and explicit:
 
-- one foreground process
-- one tmux control-mode session per served tmux session
+- one foreground runtime process
+- one Unix socket per state root at `<state-root>/runtime.sock`
+- one tmux control-mode session per observed tmux session
 - per-pane buffering of recent streamed output
 - `screen_model` reconstruction as a helper layer, not the source of truth
 - debounced reconciliation via `capture-pane`
-- structured human or JSONL events on stdout
+- structured events fanned out to local clients
+
+`serve` sits on top of that runtime and filters the shared state to one session for stdout and HTTP responses.
+
+For operator convenience, `dashboard`, `yolo`, and `serve` can auto-start that runtime in a hidden tmux session. Managed clients keep lightweight runtime leases so the runtime is not torn down while another managed listener is still using it.
 
 This is the first slice of the larger serve-mode plan described in `PLANS-Serve-Mode.md`.
 

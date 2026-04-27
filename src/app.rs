@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::hash::{Hash, Hasher};
+use std::process;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -26,7 +30,7 @@ use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
     KeepGoingArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
-    RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
+    RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
     SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
@@ -37,7 +41,8 @@ use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
 };
-use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
+use crate::runtime::{RuntimeClient, RuntimeServerConfig, run_runtime_server};
+use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest};
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, capture_artifact_path, export_artifact_path,
     resolve_workspace, resolve_workspace_for_path, state_db_path,
@@ -60,6 +65,12 @@ const DASHBOARD_PERSISTENT_SESSION: &str = "botctl-dashboard";
 const DASHBOARD_PERSISTENT_WINDOW: &str = "dashboard";
 const DASHBOARD_PERSISTENT_CHILD_ENV: &str = "BOTCTL_DASHBOARD_PERSISTENT_CHILD";
 const DASHBOARD_TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_DASHBOARD_TARGET_TMUX_SOCKET";
+const RUNTIME_TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_RUNTIME_TARGET_TMUX_SOCKET";
+const RUNTIME_BACKGROUND_WINDOW: &str = "runtime";
+const RUNTIME_MANAGER_METADATA_FILE: &str = "runtime-manager.json";
+const RUNTIME_MANAGER_LEASES_DIR: &str = "runtime-leases";
+const RUNTIME_AUTOSTART_TIMEOUT_MS: u64 = 5_000;
+const RUNTIME_AUTOSTART_POLL_MS: u64 = 100;
 const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
 
 Check: every deliverable produced (not just described), every file actually written, every stated acceptance criterion met, every test/build you committed to actually run and passing, no unresolved TODOs or stubs in code you just wrote.
@@ -83,6 +94,69 @@ If any git step fails (push rejected, auth failure, merge conflict, etc.), switc
 Be honest: unsure if something works → `OKIE_DOKIE`, go verify. Don't use `ALL_DONE` just because the turn got long. Don't use `OKIE_DOKIE` to invent new work. Don't use `PANIC` to avoid effort."#;
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeManagementMode {
+    Managed,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum RuntimeLaunchMode {
+    Manual,
+    AutoManaged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeManagerMetadata {
+    mode: RuntimeLaunchMode,
+    session_name: Option<String>,
+    tmux_socket_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeBootstrapConfig {
+    reconcile_ms: u64,
+    history_lines: usize,
+}
+
+struct ManagedRuntimeGuard {
+    state_dir: PathBuf,
+    lease_path: Option<PathBuf>,
+    should_consider_stop: bool,
+}
+
+impl ManagedRuntimeGuard {
+    fn noop(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            lease_path: None,
+            should_consider_stop: false,
+        }
+    }
+}
+
+impl Drop for ManagedRuntimeGuard {
+    fn drop(&mut self) {
+        if let Some(lease_path) = self.lease_path.take() {
+            let _ = fs::remove_file(&lease_path);
+        }
+        if !self.should_consider_stop {
+            return;
+        }
+        match should_stop_auto_runtime(&self.state_dir) {
+            Ok(true) => {
+                if let Err(error) = stop_runtime_process(&self.state_dir) {
+                    eprintln!("warning: failed to stop managed runtime: {error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("warning: failed to evaluate managed runtime shutdown: {error}");
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AppError {
@@ -139,6 +213,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Status(args) => run_status(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Observe(args) => run_observe(args),
+        Command::Runtime(args) => run_runtime(args),
         Command::Serve(args) => run_serve(args),
         Command::Dashboard(args) => run_dashboard(args),
         Command::RecordFixture(args) => run_record_fixture(args),
@@ -172,7 +247,61 @@ fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
     if args.persistent && std::env::var_os(DASHBOARD_PERSISTENT_CHILD_ENV).is_none() {
         return run_persistent_dashboard(args);
     }
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let (_runtime_client, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: 1000,
+            history_lines: args.history_lines.max(200),
+        },
+    )?;
     dashboard::run(args)
+}
+
+fn run_runtime(args: RuntimeArgs) -> AppResult<String> {
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    if args.stop {
+        stop_runtime_process(&state_dir)?;
+        return Ok(String::from("stopped runtime"));
+    }
+    if !args.foreground {
+        let client = start_background_runtime(
+            &state_dir,
+            RuntimeBootstrapConfig {
+                reconcile_ms: args.reconcile_ms,
+                history_lines: args.history_lines,
+            },
+            RuntimeLaunchMode::Manual,
+        )?;
+        let status = client.get_status()?;
+        return Ok(format!("runtime listening on {}", status.socket_path));
+    }
+
+    let metadata = load_runtime_manager_metadata(&state_dir)?;
+    if metadata.is_none() {
+        write_runtime_manager_metadata(
+            &state_dir,
+            &RuntimeManagerMetadata {
+                mode: RuntimeLaunchMode::Manual,
+                session_name: None,
+                tmux_socket_path: managed_runtime_target_socket_path()
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            },
+        )?;
+    }
+    let result = run_runtime_server(RuntimeServerConfig {
+        state_dir: state_dir.clone(),
+        history_lines: args.history_lines,
+        reconcile_ms: args.reconcile_ms,
+    });
+    let _ = remove_runtime_manager_metadata(&state_dir);
+    result
 }
 
 fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
@@ -235,6 +364,9 @@ fn persistent_dashboard_child_command_with_target_socket(
         parts.push(String::from("--state-dir"));
         parts.push(shell_escape(state_dir.to_string_lossy().as_ref()));
     }
+    if args.unmanaged {
+        parts.push(String::from("--unmanaged"));
+    }
     Ok(parts.join(" "))
 }
 
@@ -252,6 +384,269 @@ fn shell_escape(value: &str) -> String {
 fn current_tmux_socket_path() -> Option<PathBuf> {
     let tmux = std::env::var_os("TMUX")?;
     tmux_socket_path_from_value(tmux.to_string_lossy().as_ref())
+}
+
+fn managed_runtime_target_socket_path() -> Option<PathBuf> {
+    match std::env::var_os(DASHBOARD_TARGET_TMUX_SOCKET_ENV) {
+        Some(socket_path) if !socket_path.is_empty() => Some(PathBuf::from(socket_path)),
+        _ => current_tmux_socket_path(),
+    }
+}
+
+fn managed_runtime_tmux_client() -> TmuxClient {
+    match managed_runtime_target_socket_path() {
+        Some(socket_path) => TmuxClient::with_socket_path(socket_path),
+        None => TmuxClient::default(),
+    }
+}
+
+fn runtime_manager_metadata_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(RUNTIME_MANAGER_METADATA_FILE)
+}
+
+fn runtime_manager_leases_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(RUNTIME_MANAGER_LEASES_DIR)
+}
+
+fn runtime_session_name(state_dir: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    state_dir.hash(&mut hasher);
+    format!("botctl-runtime-{:x}", hasher.finish())
+}
+
+fn load_runtime_manager_metadata(state_dir: &Path) -> AppResult<Option<RuntimeManagerMetadata>> {
+    let path = runtime_manager_metadata_path(state_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)?;
+    let metadata = serde_json::from_str(&content)
+        .map_err(|error| AppError::new(format!("failed to parse {}: {error}", path.display())))?;
+    Ok(Some(metadata))
+}
+
+fn write_runtime_manager_metadata(
+    state_dir: &Path,
+    metadata: &RuntimeManagerMetadata,
+) -> AppResult<()> {
+    fs::create_dir_all(state_dir)?;
+    let content = serde_json::to_string_pretty(metadata)
+        .map_err(|error| AppError::new(format!("failed to encode runtime metadata: {error}")))?;
+    fs::write(runtime_manager_metadata_path(state_dir), content)?;
+    Ok(())
+}
+
+fn remove_runtime_manager_metadata(state_dir: &Path) -> AppResult<()> {
+    let path = runtime_manager_metadata_path(state_dir);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn create_runtime_lease(state_dir: &Path) -> AppResult<PathBuf> {
+    let lease_dir = runtime_manager_leases_dir(state_dir);
+    fs::create_dir_all(&lease_dir)?;
+    let lease_path = lease_dir.join(format!("{}-{}", process::id(), current_unix_millis()?));
+    fs::write(&lease_path, process::id().to_string())?;
+    Ok(lease_path)
+}
+
+fn live_runtime_leases(state_dir: &Path) -> AppResult<Vec<PathBuf>> {
+    let lease_dir = runtime_manager_leases_dir(state_dir);
+    if !lease_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut live = Vec::new();
+    for entry in fs::read_dir(&lease_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(content) = fs::read_to_string(&path) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        let Ok(pid) = content.trim().parse::<u32>() else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        if process_exists(pid) {
+            live.push(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(live)
+}
+
+fn process_exists(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+fn current_unix_millis() -> AppResult<u128> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::new(format!("system clock before unix epoch: {error}")))?
+        .as_millis())
+}
+
+fn background_runtime_command(
+    state_dir: &Path,
+    config: RuntimeBootstrapConfig,
+    target_socket_path: Option<&Path>,
+) -> AppResult<String> {
+    let exe = std::env::current_exe()?;
+    let mut parts = Vec::new();
+    if let Some(socket_path) = target_socket_path {
+        parts.push(format!(
+            "{}={}",
+            RUNTIME_TARGET_TMUX_SOCKET_ENV,
+            shell_escape(socket_path.to_string_lossy().as_ref())
+        ));
+    }
+    parts.push(shell_escape(exe.to_string_lossy().as_ref()));
+    parts.push(String::from("runtime"));
+    parts.push(String::from("--foreground"));
+    parts.push(String::from("--reconcile-ms"));
+    parts.push(config.reconcile_ms.to_string());
+    parts.push(String::from("--history-lines"));
+    parts.push(config.history_lines.to_string());
+    parts.push(String::from("--state-dir"));
+    parts.push(shell_escape(state_dir.to_string_lossy().as_ref()));
+    Ok(parts.join(" "))
+}
+
+fn wait_for_runtime(state_dir: &Path) -> AppResult<RuntimeClient> {
+    let client = RuntimeClient::connect(state_dir)?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(RUNTIME_AUTOSTART_TIMEOUT_MS);
+    loop {
+        match client.get_status() {
+            Ok(_) => return Ok(client),
+            Err(error) if std::time::Instant::now() < deadline => {
+                if !matches!(error.exit_code(), 1) {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(RUNTIME_AUTOSTART_POLL_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn start_background_runtime(
+    state_dir: &Path,
+    config: RuntimeBootstrapConfig,
+    mode: RuntimeLaunchMode,
+) -> AppResult<RuntimeClient> {
+    let tmux_client = managed_runtime_tmux_client();
+    let session_name = runtime_session_name(state_dir);
+    let target_socket_path = managed_runtime_target_socket_path();
+    write_runtime_manager_metadata(
+        state_dir,
+        &RuntimeManagerMetadata {
+            mode,
+            session_name: Some(session_name.clone()),
+            tmux_socket_path: target_socket_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        },
+    )?;
+
+    if tmux_client.has_session(&session_name)? {
+        if let Ok(client) = wait_for_runtime(state_dir) {
+            return Ok(client);
+        }
+        tmux_client.kill_session(&session_name)?;
+    }
+
+    let request = StartSessionRequest {
+        session_name,
+        window_name: String::from(RUNTIME_BACKGROUND_WINDOW),
+        cwd: std::env::current_dir()?,
+        command: background_runtime_command(state_dir, config, target_socket_path.as_deref())?,
+    };
+    tmux_client.start_session(&request)?;
+    wait_for_runtime(state_dir)
+}
+
+fn ensure_runtime_client(
+    state_dir: &Path,
+    management: RuntimeManagementMode,
+    config: RuntimeBootstrapConfig,
+) -> AppResult<(RuntimeClient, ManagedRuntimeGuard)> {
+    if management == RuntimeManagementMode::Unmanaged {
+        let client = RuntimeClient::connect(state_dir)?;
+        client.get_status()?;
+        return Ok((client, ManagedRuntimeGuard::noop(state_dir.to_path_buf())));
+    }
+
+    let client = RuntimeClient::connect(state_dir)?;
+    let client = match client.get_status() {
+        Ok(_) => client,
+        Err(_) => start_background_runtime(state_dir, config, RuntimeLaunchMode::AutoManaged)?,
+    };
+    let lease_path = create_runtime_lease(state_dir)?;
+    let should_consider_stop = matches!(
+        load_runtime_manager_metadata(state_dir)?.map(|metadata| metadata.mode),
+        Some(RuntimeLaunchMode::AutoManaged)
+    );
+    Ok((
+        client,
+        ManagedRuntimeGuard {
+            state_dir: state_dir.to_path_buf(),
+            lease_path: Some(lease_path),
+            should_consider_stop,
+        },
+    ))
+}
+
+fn runtime_has_active_yolo(state_dir: &Path) -> AppResult<bool> {
+    let client = RuntimeClient::connect(state_dir)?;
+    Ok(client
+        .list_panes(None, None)?
+        .into_iter()
+        .any(|snapshot| snapshot.desired_yolo_enabled))
+}
+
+fn should_stop_auto_runtime(state_dir: &Path) -> AppResult<bool> {
+    let metadata = load_runtime_manager_metadata(state_dir)?;
+    if !matches!(metadata.map(|item| item.mode), Some(RuntimeLaunchMode::AutoManaged)) {
+        return Ok(false);
+    }
+    if !live_runtime_leases(state_dir)?.is_empty() {
+        return Ok(false);
+    }
+    if runtime_has_active_yolo(state_dir).unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn stop_runtime_process(state_dir: &Path) -> AppResult<()> {
+    let client = RuntimeClient::connect(state_dir)?;
+    if client.stop().is_ok() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(RUNTIME_AUTOSTART_TIMEOUT_MS);
+        while std::time::Instant::now() < deadline {
+            if client.get_status().is_err() {
+                let _ = remove_runtime_manager_metadata(state_dir);
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(RUNTIME_AUTOSTART_POLL_MS));
+        }
+    }
+
+    if let Some(metadata) = load_runtime_manager_metadata(state_dir)? {
+        if let Some(session_name) = metadata.session_name {
+            let tmux_client = match metadata.tmux_socket_path {
+                Some(socket_path) => TmuxClient::with_socket_path(socket_path),
+                None => TmuxClient::default(),
+            };
+            if tmux_client.has_session(&session_name)? {
+                tmux_client.kill_session(&session_name)?;
+            }
+        }
+    }
+    remove_runtime_manager_metadata(state_dir)?;
+    Ok(())
 }
 
 fn tmux_socket_path_from_value(value: &str) -> Option<PathBuf> {
@@ -309,7 +704,7 @@ fn run_start(args: StartArgs) -> AppResult<String> {
         command: args.command,
     };
 
-    let client = TmuxClient::default();
+    let client = managed_runtime_tmux_client();
 
     if args.dry_run {
         Ok(client.plan_start_session(&request).render())
@@ -607,33 +1002,35 @@ impl ServeExportSummary {
 }
 
 fn run_serve(args: ServeArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
-    let artifacts_required = args.state_dir.is_some();
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let (runtime, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: args.reconcile_ms,
+            history_lines: args.history_lines.max(200),
+        },
+    )?;
+
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    let (state_dir, artifact_warning) = resolve_artifact_state_dir(args.state_dir.as_deref())?;
-    if let Some(warning) = artifact_warning.as_deref() {
-        eprintln!("warning: serve artifacts unavailable: {warning}");
-    }
-    let mut artifact_root = state_dir;
-    let mut artifacts: Option<ServeArtifacts> = None;
-    let artifact_session_name = args.session_name.clone();
-    let artifact_pane_id = args.pane_id.clone();
-
     let request = ServeRequest {
         session_name: args.session_name,
         target_pane: args.pane_id,
         history_lines: args.history_lines,
         reconcile_ms: args.reconcile_ms,
-        state_dir: args.http_addr.as_ref().map(|_| resolve_bootstrapped_state_dir(args.state_dir.as_deref())).transpose()?,
+        state_dir: Some(state_dir.clone()),
         allowed_origins: args.allowed_origins,
     };
-    let format = args.format;
-    let use_color = supports_babysit_color();
+
     let http_thread = if let Some(http_addr) = args.http_addr.clone() {
         eprintln!("http api listening on http://{http_addr}");
         Some(spawn_http_server(
-            client.clone(),
+            runtime.clone(),
             request.clone(),
             http_addr,
             Arc::clone(&interrupted),
@@ -642,65 +1039,36 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
         None
     };
 
-    let serve_result = run_serve_loop(&client, &request, Arc::clone(&interrupted), |event| {
-        let payload = render_serve_event_payload(&request, &event);
-        if artifacts.is_none() {
-            if let Some(state_dir) = artifact_root.as_deref() {
-                match open_serve_artifacts(
-                    state_dir,
-                    &artifact_session_name,
-                    artifact_pane_id.as_deref(),
-                    args.reconcile_ms,
-                    args.history_lines,
-                ) {
-                    Ok(opened_artifacts) => {
-                        artifacts = Some(opened_artifacts);
-                    }
-                    Err(error) if artifacts_required => return Err(error),
-                    Err(error) => {
-                        eprintln!("warning: serve artifacts unavailable: {error}");
-                        artifact_root = None;
+    let mut subscription = runtime.subscribe()?;
+    while !interrupted.load(Ordering::SeqCst) {
+        if let Some(event) = subscription.recv()? {
+            if let Some(snapshot) = event.snapshot.as_ref() {
+                if snapshot.pane.session_name != request.session_name {
+                    continue;
+                }
+                if let Some(target_pane) = request.target_pane.as_deref() {
+                    if snapshot.pane.pane_id != target_pane {
+                        continue;
                     }
                 }
             }
-        }
-        if let Some(active_artifacts) = artifacts.as_mut() {
-            active_artifacts.summary.record_event(&event);
-            if let Err(error) = append_jsonl_event(&mut active_artifacts.tape_writer, &payload) {
-                if artifacts_required {
-                    return Err(error);
-                }
-                eprintln!("warning: serve artifacts disabled after write failure: {error}");
-                artifacts = None;
-                artifact_root = None;
-            }
-        }
-        emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
-    });
-
-    if let Some(mut artifacts) = artifacts {
-        if let Err(error) = &serve_result {
-            if artifacts.summary.stopped_reason.is_none() {
-                artifacts.summary.stopped_reason = Some(error.to_string());
-            }
-        }
-        artifacts.summary.finalize();
-        if let Err(error) = write_serve_summary_export(&artifacts.export_path, &artifacts.summary) {
-            if artifacts_required && serve_result.is_ok() {
-                return Err(error);
-            }
-            eprintln!("warning: serve summary export failed: {error}");
+            let payload = serde_json::json!({
+                "kind": event.kind,
+                "pane_id": event.pane_id,
+                "workspace_id": event.workspace_id,
+                "summary": event.summary,
+                "revision": event.revision,
+                "timestamp_unix_ms": event.timestamp_unix_ms,
+            });
+            emit_babysit_output(render_babysit_output(args.format.into(), payload, supports_babysit_color()))?;
         }
     }
 
-    interrupted.store(true, Ordering::SeqCst);
     if let Some(http_thread) = http_thread {
         http_thread
             .join()
             .map_err(|_| AppError::new("http api thread panicked"))??;
     }
-
-    serve_result?;
 
     Ok(String::new())
 }
@@ -1759,84 +2127,96 @@ pub(crate) fn submit_prompt_for_pane(
 }
 
 fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = match args.workspace.as_deref() {
-        Some(selector) => Some(resolve_selected_workspace(&state_dir, Some(selector))?),
-        None => None,
-    };
-    let interrupted = Arc::new(AtomicBool::new(false));
-    install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    if args.all {
-        run_yolo_all(
-            &client,
-            &state_dir,
-            workspace.as_ref(),
-            args.poll_ms,
-            args.live_preview,
-            args.format,
-            interrupted,
-        )
+    let (runtime, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: args.poll_ms.max(1000),
+            history_lines: 200,
+        },
+    )?;
+    let client = TmuxClient::default();
+    let updated = if args.all {
+        runtime.set_yolo(None, args.workspace.as_deref(), true, true)?
     } else {
-        let pane_id = args.pane_id.as_deref().unwrap();
-        run_yolo_single(
-            &client,
-            &state_dir,
-            args.workspace.as_deref(),
-            pane_id,
-            args.poll_ms,
-            args.live_preview,
-            args.format,
-            interrupted,
-        )
+        let pane = client
+            .pane_by_target(args.pane_id.as_deref().unwrap())?
+            .ok_or_else(|| AppError::new("could not resolve yolo pane target"))?;
+        runtime.set_yolo(Some(&pane.pane_id), args.workspace.as_deref(), false, true)?
+    };
+    if args.follow || args.live_preview {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        install_babysit_sigint_handler(Arc::clone(&interrupted))?;
+        let mut subscription = runtime.subscribe()?;
+        while !interrupted.load(Ordering::SeqCst) {
+            if let Some(event) = subscription.recv()? {
+                let matches_scope = if args.all {
+                    event
+                        .pane_id
+                        .as_ref()
+                        .map(|pane_id| updated.iter().any(|updated_id| updated_id == pane_id))
+                        .unwrap_or(false)
+                } else {
+                    event
+                        .pane_id
+                        .as_ref()
+                        .map(|pane_id| updated.first().map(|updated_id| updated_id == pane_id).unwrap_or(false))
+                        .unwrap_or(false)
+                };
+                if !matches_scope {
+                    continue;
+                }
+                let payload = serde_json::json!({
+                    "kind": event.kind,
+                    "pane_id": event.pane_id,
+                    "summary": event.summary,
+                    "revision": event.revision,
+                    "timestamp_unix_ms": event.timestamp_unix_ms,
+                });
+                emit_babysit_output(render_babysit_output(args.format.into(), payload, supports_babysit_color()))?;
+            }
+        }
+        Ok(String::new())
+    } else if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else {
+        Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
 }
 
 fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = match args.workspace.as_deref() {
-        Some(selector) => Some(resolve_selected_workspace(&state_dir, Some(selector))?),
-        None => None,
-    };
-    if args.all {
-        let mut out = Vec::new();
-        for pane_id in
-            tracked_pane_ids(&state_dir, workspace.as_ref().map(|item| item.id.as_str()))?
-        {
-            let pane_label = babysit_pane_label(&state_dir, &pane_id);
-            let disabled = disable_yolo_record(&state_dir, &pane_id)?;
-            out.push(render_babysit_stop_event(
-                &pane_label,
-                &pane_id,
-                if disabled {
-                    "disabled"
-                } else {
-                    "already-disabled"
-                },
-                BabysitFormat::Human,
-                supports_babysit_color(),
-            ));
-        }
-        Ok(out.join("\n"))
+    let (runtime, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: 1000,
+            history_lines: 200,
+        },
+    )?;
+    let updated = if args.all {
+        runtime.set_yolo(None, args.workspace.as_deref(), true, false)?
     } else {
         let raw_target = args.pane_id.as_deref().unwrap();
-        let pane_id = match TmuxClient::default().pane_by_target(raw_target)? {
+        let pane_id = match managed_runtime_tmux_client().pane_by_target(raw_target)? {
             Some(pane) => pane.pane_id,
             None => raw_target.to_string(),
         };
-        let pane_label = babysit_pane_label(&state_dir, &pane_id);
-        let disabled = disable_yolo_record(&state_dir, &pane_id)?;
-        Ok(render_babysit_stop_event(
-            &pane_label,
-            &pane_id,
-            if disabled {
-                "disabled"
-            } else {
-                "already-disabled"
-            },
-            BabysitFormat::Human,
-            supports_babysit_color(),
-        ))
+        runtime.set_yolo(Some(&pane_id), args.workspace.as_deref(), false, false)?
+    };
+    if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else {
+        Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
 }
 
@@ -4967,6 +5347,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 state_dir: Some(PathBuf::from("/tmp/botctl state")),
                 exit_on_navigate: false,
                 persistent: true,
+                unmanaged: false,
             },
             Some(Path::new("/tmp/tmux-1000/default")),
         )
@@ -4999,6 +5380,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 state_dir: None,
                 exit_on_navigate: false,
                 persistent: true,
+                unmanaged: false,
             },
             Some(Path::new("/tmp/tmux-1000/default")),
         )
@@ -5019,6 +5401,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 state_dir: None,
                 exit_on_navigate: false,
                 persistent: true,
+                unmanaged: false,
             },
             None,
         )
