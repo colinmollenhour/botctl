@@ -10,13 +10,11 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::app::{
-    ACTION_GUARD_HISTORY_LINES, AppError, AppResult, InspectedPane, classify_pane,
-    ContinueOutcome, continue_from_classification, ensure_pane_owned_by_claude,
-    ensure_workflow_state,
-    execute_automation_action, execute_classified_workflow,
-    extract_permission_prompt_details, inspect_pane, keys_for_action,
-    load_automation_keybindings, render_next_safe_action, render_screen_excerpt,
-    submit_prompt_for_pane,
+    ACTION_GUARD_HISTORY_LINES, AppError, AppResult, ContinueOutcome, InspectedPane, classify_pane,
+    continue_from_classification, ensure_pane_owned_by_claude, ensure_workflow_state,
+    execute_automation_action, execute_classified_workflow, extract_permission_prompt_details,
+    inspect_pane, keys_for_action, load_automation_keybindings, render_next_safe_action,
+    render_screen_excerpt, submit_prompt_for_pane,
 };
 use crate::automation::{AutomationAction, GuardedWorkflow, inspect_keybindings};
 use crate::classifier::SessionState;
@@ -40,11 +38,12 @@ fn run_http_server(
     bind_addr: &str,
     interrupted: Arc<AtomicBool>,
 ) -> AppResult<()> {
-    let listener = TcpListener::bind(bind_addr)
-        .map_err(|error| AppError::new(format!("failed to bind http api on {bind_addr}: {error}")))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| AppError::new(format!("failed to configure http api listener: {error}")))?;
+    let listener = TcpListener::bind(bind_addr).map_err(|error| {
+        AppError::new(format!("failed to bind http api on {bind_addr}: {error}"))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        AppError::new(format!("failed to configure http api listener: {error}"))
+    })?;
 
     loop {
         if interrupted.load(Ordering::SeqCst) {
@@ -67,7 +66,11 @@ fn run_http_server(
     }
 }
 
-fn handle_connection(stream: TcpStream, client: &TmuxClient, request: &ServeRequest) -> AppResult<()> {
+fn handle_connection(
+    stream: TcpStream,
+    client: &TmuxClient,
+    request: &ServeRequest,
+) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
@@ -181,7 +184,7 @@ fn handle_request(
             let body = match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(body) => body,
                 Err(error) => {
-                    return error_response(400, format!("invalid JSON body: {error}"), cors_origin)
+                    return error_response(400, format!("invalid JSON body: {error}"), cors_origin);
                 }
             };
             match run_instance_prompt(client, request, pane_id, &body) {
@@ -193,7 +196,10 @@ fn handle_request(
     }
 }
 
-fn list_instances(client: &TmuxClient, request: &ServeRequest) -> AppResult<Vec<serde_json::Value>> {
+fn list_instances(
+    client: &TmuxClient,
+    request: &ServeRequest,
+) -> AppResult<Vec<serde_json::Value>> {
     list_requested_panes(client, request)?
         .into_iter()
         .map(|pane| build_instance_summary(client, &pane))
@@ -224,7 +230,10 @@ fn build_instance_summary(client: &TmuxClient, pane: &TmuxPane) -> AppResult<ser
     }))
 }
 
-fn build_instance_detail_value(pane: &TmuxPane, inspected: &InspectedPane) -> AppResult<serde_json::Value> {
+fn build_instance_detail_value(
+    pane: &TmuxPane,
+    inspected: &InspectedPane,
+) -> AppResult<serde_json::Value> {
     let bindings = inspect_keybindings(None).map_err(AppError::new)?;
     let controls = available_controls_json()?;
     Ok(json!({
@@ -255,21 +264,46 @@ fn run_instance_action(
     let result = match action {
         "approve-permission" => {
             ensure_workflow_state(GuardedWorkflow::ApprovePermission, &classification)?;
-            execute_classified_workflow(client, &pane.pane_id, GuardedWorkflow::ApprovePermission, &classification)?
+            execute_classified_workflow(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::ApprovePermission,
+                &classification,
+            )?
         }
         "reject-permission" => {
             ensure_workflow_state(GuardedWorkflow::RejectPermission, &classification)?;
-            execute_classified_workflow(client, &pane.pane_id, GuardedWorkflow::RejectPermission, &classification)?
+            execute_classified_workflow(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::RejectPermission,
+                &classification,
+            )?
         }
         "dismiss-survey" => {
             ensure_workflow_state(GuardedWorkflow::DismissSurvey, &classification)?;
-            execute_classified_workflow(client, &pane.pane_id, GuardedWorkflow::DismissSurvey, &classification)?
+            execute_classified_workflow(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::DismissSurvey,
+                &classification,
+            )?
         }
-        "confirm-previous" => execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmPrevious)?,
-        "confirm-next" => execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmNext)?,
-        "confirm-yes" => execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmYes)?,
-        "confirm-no" => execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmNo)?,
-        "interrupt" => execute_automation_action(client, &pane.pane_id, AutomationAction::Interrupt)?,
+        "confirm-previous" => {
+            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmPrevious)?
+        }
+        "confirm-next" => {
+            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmNext)?
+        }
+        "confirm-yes" => {
+            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmYes)?
+        }
+        "confirm-no" => {
+            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmNo)?
+        }
+        "interrupt" => {
+            execute_automation_action(client, &pane.pane_id, AutomationAction::Interrupt)?
+        }
         "continue-session" => {
             let outcome = continue_from_classification(client, &pane, &classification)?;
             return Ok(continue_outcome_json(&pane, &outcome));
@@ -322,9 +356,10 @@ fn run_instance_interaction(
         InteractionMode::NumberedOptions => {
             let bindings = load_automation_keybindings(None)?;
             let current = interaction.selected_option.unwrap_or(1);
-            let target = option.id.parse::<usize>().map_err(|_| {
-                AppError::new(format!("invalid numbered option id: {}", option.id))
-            })?;
+            let target = option
+                .id
+                .parse::<usize>()
+                .map_err(|_| AppError::new(format!("invalid numbered option id: {}", option.id)))?;
             if target > current {
                 let keys = keys_for_action(&bindings, AutomationAction::ConfirmNext)?;
                 for _ in 0..(target - current) {
@@ -374,7 +409,9 @@ fn run_instance_prompt(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(100);
     if submit_delay_ms == 0 {
-        return Err(AppError::new("prompt body requires `submit_delay_ms` to be at least 1"));
+        return Err(AppError::new(
+            "prompt body requires `submit_delay_ms` to be at least 1",
+        ));
     }
 
     let submitted = submit_prompt_for_pane(
@@ -402,7 +439,10 @@ fn run_instance_auto_unstick(client: &TmuxClient, pane: &TmuxPane) -> AppResult<
     let mut current = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
 
     for _ in 0..3 {
-        if matches!(current.state, SessionState::ChatReady | SessionState::BusyResponding) {
+        if matches!(
+            current.state,
+            SessionState::ChatReady | SessionState::BusyResponding
+        ) {
             return Ok(json!({
                 "ok": true,
                 "pane_id": pane.pane_id,
@@ -429,7 +469,10 @@ fn run_instance_auto_unstick(client: &TmuxClient, pane: &TmuxPane) -> AppResult<
         current = outcome.after;
     }
 
-    if matches!(current.state, SessionState::ChatReady | SessionState::BusyResponding) {
+    if matches!(
+        current.state,
+        SessionState::ChatReady | SessionState::BusyResponding
+    ) {
         Ok(json!({
             "ok": true,
             "pane_id": pane.pane_id,
@@ -461,7 +504,11 @@ fn continue_outcome_json(pane: &TmuxPane, outcome: &ContinueOutcome) -> serde_js
     })
 }
 
-fn resolve_api_pane(client: &TmuxClient, request: &ServeRequest, pane_id: &str) -> AppResult<TmuxPane> {
+fn resolve_api_pane(
+    client: &TmuxClient,
+    request: &ServeRequest,
+    pane_id: &str,
+) -> AppResult<TmuxPane> {
     let pane = client
         .pane_by_target(pane_id)?
         .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
@@ -711,20 +758,24 @@ fn parse_diff_readonly_interaction(inspected: &InspectedPane) -> Option<Interact
         return None;
     }
 
-    let known = ["Keep changes", "Discard changes", "View details", "Accept", "Reject"];
+    let known = [
+        "Keep changes",
+        "Discard changes",
+        "View details",
+        "Accept",
+        "Reject",
+    ];
     let options = inspected
         .focused_source
         .lines()
         .map(str::trim)
         .filter(|line| known.iter().any(|known_line| line == known_line))
-        .map(|line| {
-            InteractionOption {
-                id: line.to_string(),
-                index: None,
-                label: line.to_string(),
-                selected: false,
-                kind: option_kind(line),
-            }
+        .map(|line| InteractionOption {
+            id: line.to_string(),
+            index: None,
+            label: line.to_string(),
+            selected: false,
+            kind: option_kind(line),
         })
         .collect::<Vec<_>>();
     if options.is_empty() {
@@ -761,7 +812,10 @@ fn split_digit_option(line: &str) -> Option<(usize, String, &str)> {
     let rest = &line[digits + 1..];
     let next = rest.match_indices("  ").find_map(|(idx, _)| {
         let candidate = rest[idx..].trim_start();
-        let digit_count = candidate.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let digit_count = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .count();
         if digit_count > 0 && candidate[digit_count..].starts_with(':') {
             Some(idx)
         } else {
@@ -784,7 +838,8 @@ fn option_kind(label: &str) -> &'static str {
     let lower = label.to_ascii_lowercase();
     if lower.starts_with("yes") || lower.starts_with("allow") {
         "affirm"
-    } else if lower.starts_with("no") || lower.starts_with("reject") || lower.starts_with("discard") {
+    } else if lower.starts_with("no") || lower.starts_with("reject") || lower.starts_with("discard")
+    {
         "deny"
     } else if lower.contains("always") || lower.contains("don't ask again") {
         "persist"
@@ -849,7 +904,11 @@ fn validate_origin(
     }
 }
 
-fn json_response(status: u16, body: serde_json::Value, cors_origin: Option<String>) -> HttpResponse {
+fn json_response(
+    status: u16,
+    body: serde_json::Value,
+    cors_origin: Option<String>,
+) -> HttpResponse {
     HttpResponse {
         status,
         body: serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec()),
@@ -857,8 +916,16 @@ fn json_response(status: u16, body: serde_json::Value, cors_origin: Option<Strin
     }
 }
 
-fn error_response(status: u16, message: impl Into<String>, cors_origin: Option<String>) -> HttpResponse {
-    json_response(status, json!({ "ok": false, "error": message.into() }), cors_origin)
+fn error_response(
+    status: u16,
+    message: impl Into<String>,
+    cors_origin: Option<String>,
+) -> HttpResponse {
+    json_response(
+        status,
+        json!({ "ok": false, "error": message.into() }),
+        cors_origin,
+    )
 }
 
 fn map_app_error(error: AppError, cors_origin: Option<String>) -> HttpResponse {

@@ -161,7 +161,7 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
         )));
     }
 
-        while version < CURRENT_SCHEMA_VERSION {
+    while version < CURRENT_SCHEMA_VERSION {
         match version {
             0 => migrate_to_v1(&tx)?,
             1 => migrate_to_v2(&tx)?,
@@ -538,7 +538,9 @@ pub fn sync_tmux_wait_state(
             } else {
                 None::<i64>
             },
-            existing.as_ref().and_then(|row| row.claude_session_id.clone()),
+            existing
+                .as_ref()
+                .and_then(|row| row.claude_session_id.clone()),
             existing
                 .as_ref()
                 .and_then(|row| row.claude_session_checked_at_unix_ms),
@@ -586,7 +588,9 @@ pub fn sync_tmux_claude_session_id(
         params![
             instance.id,
             existing.as_ref().and_then(|row| row.last_state.clone()),
-            existing.as_ref().and_then(|row| row.wait_started_at_unix_ms),
+            existing
+                .as_ref()
+                .and_then(|row| row.wait_started_at_unix_ms),
             claude_session_id,
             Some(now_ms),
         ],
@@ -1300,8 +1304,8 @@ fn validate_artifact_path_token(label: &str, value: &str) -> AppResult<()> {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;

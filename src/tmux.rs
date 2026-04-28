@@ -390,9 +390,7 @@ impl TmuxClient {
 
     fn run_status(&self, args: Vec<String>) -> AppResult<()> {
         let args = self.with_socket_args(args);
-        let status = Command::new(&self.program)
-            .args(&args)
-            .status()?;
+        let status = Command::new(&self.program).args(&args).status()?;
         if status.success() {
             Ok(())
         } else {
@@ -441,7 +439,10 @@ impl TmuxClient {
 
     fn with_socket_args(&self, mut args: Vec<String>) -> Vec<String> {
         if let Some(socket_path) = &self.socket_path {
-            args.splice(0..0, [String::from("-S"), socket_path.display().to_string()]);
+            args.splice(
+                0..0,
+                [String::from("-S"), socket_path.display().to_string()],
+            );
         } else if let Some(socket_name) = &self.socket_name {
             args.splice(0..0, [String::from("-L"), socket_name.clone()]);
         }
