@@ -6,8 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -58,7 +58,10 @@ const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
 const DASHBOARD_LEFT_PANE_PERCENT: u16 = 58;
 const DASHBOARD_LEFT_PANE_MAX_WIDTH: u16 = 80;
-const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+const DASHBOARD_STATE_EMOJIS: &[&str] =
+    &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+const DASHBOARD_YOLO_MARKER: &str = "ʸ";
+const LEGACY_YOLO_PREFIX_CHARS: &[&str] = &["🤠", "\u{200D}"];
 
 pub fn run(args: DashboardArgs) -> AppResult<String> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
@@ -85,7 +88,11 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
     );
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     app.restore_window_names()?;
 
@@ -468,7 +475,7 @@ impl DashboardApp {
             let first = panes[0];
             let prefix = panes
                 .iter()
-                .map(|pane| state_emoji(pane.state, pane.has_questions))
+                .map(|pane| pane_window_prefix(pane.state, pane.has_questions, pane.yolo_enabled))
                 .collect::<String>();
             let managed = self
                 .window_names
@@ -599,7 +606,10 @@ impl DashboardApp {
         };
         ensure_pane_owned_by_claude(&pane.pane)?;
         self.message = try_unstick_pane(&self.client, &pane.pane)?;
-        if matches!(pane.state, SessionState::PermissionDialog | SessionState::FolderTrustPrompt) {
+        if matches!(
+            pane.state,
+            SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+        ) {
             self.increment_yes_count(&pane);
         }
         Ok(())
@@ -693,8 +703,7 @@ fn host_tmux_client() -> TmuxClient {
 }
 
 fn kill_persistent_dashboard_server() -> AppResult<()> {
-    TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET)
-        .kill_session(PERSISTENT_DASHBOARD_SESSION)
+    TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET).kill_session(PERSISTENT_DASHBOARD_SESSION)
 }
 
 fn should_return_navigation(exit_on_navigate: bool, inside_tmux: bool) -> bool {
@@ -736,7 +745,16 @@ fn run_dashboard_loop(
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    match key.code {
+                    let code = match key.code {
+                        KeyCode::Char(c)
+                            if c.is_ascii_uppercase()
+                                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            KeyCode::Char(c.to_ascii_lowercase())
+                        }
+                        other => other,
+                    };
+                    match code {
                         KeyCode::Char('q') => {
                             app.persist_selection()?;
                             if persistent {
@@ -754,10 +772,13 @@ fn run_dashboard_loop(
                         KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
                         KeyCode::Up | KeyCode::Char('k') => app.select_previous()?,
                         KeyCode::Enter => {
-                            let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
+                            let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone())
+                            else {
                                 continue;
                             };
-                            if let Some(pane) = open_dashboard_pane(app, pane, exit_on_navigate, persistent)? {
+                            if let Some(pane) =
+                                open_dashboard_pane(app, pane, exit_on_navigate, persistent)?
+                            {
                                 return Ok(Some(pane));
                             }
                         }
@@ -778,7 +799,9 @@ fn run_dashboard_loop(
                         width: size.width,
                         height: size.height,
                     };
-                    if let Some(pane) = handle_mouse_event(app, mouse, area, exit_on_navigate, persistent)? {
+                    if let Some(pane) =
+                        handle_mouse_event(app, mouse, area, exit_on_navigate, persistent)?
+                    {
                         return Ok(Some(pane));
                     }
                 }
@@ -877,12 +900,9 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     let mut items = Vec::new();
     for row in &app.rows {
         match row {
-            RowItem::WorkspaceHeader { label } => {
-                items.push(ListItem::new(render_workspace_header_line(
-                    label,
-                    pane_list_width,
-                )))
-            }
+            RowItem::WorkspaceHeader { label } => items.push(ListItem::new(
+                render_workspace_header_line(label, pane_list_width),
+            )),
             RowItem::Pane { pane_id } => {
                 let pane = app.panes.iter().find(|pane| &pane.pane.pane_id == pane_id);
                 if let Some(pane) = pane {
@@ -911,7 +931,10 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                             columns.wait_width,
                         )),
                         Span::raw(TABLE_GAP),
-                        Span::raw(pad_display_right(&pane.yes_count.to_string(), columns.yes_width)),
+                        Span::raw(pad_display_right(
+                            &pane.yes_count.to_string(),
+                            columns.yes_width,
+                        )),
                         Span::raw(TABLE_GAP),
                         Span::raw(pad_display(&pane.branch, columns.branch_width)),
                         Span::raw(TABLE_GAP),
@@ -960,10 +983,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 }
             )),
             Line::from(format!("Age: {}", format_age(pane.age))),
-            Line::from(format!(
-                "Path: {}",
-                detail_current_path(pane)
-            )),
+            Line::from(format!("Path: {}", detail_current_path(pane))),
         ];
         if pane.workspace.workspace_root != pane.workspace_group_key {
             details.push(Line::from(format!(
@@ -1027,10 +1047,7 @@ fn dashboard_layout(area: Rect) -> DashboardLayout {
 }
 
 fn dashboard_body_sections(area: Rect) -> Vec<Rect> {
-    let preferred_left = area
-        .width
-        .saturating_mul(DASHBOARD_LEFT_PANE_PERCENT)
-        / 100;
+    let preferred_left = area.width.saturating_mul(DASHBOARD_LEFT_PANE_PERCENT) / 100;
     let left_width = preferred_left.min(DASHBOARD_LEFT_PANE_MAX_WIDTH);
 
     Layout::default()
@@ -1058,8 +1075,10 @@ fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> boo
 }
 
 fn render_footer() -> Paragraph<'static> {
-    Paragraph::new(footer_lines(std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some()))
-        .wrap(Wrap { trim: true })
+    Paragraph::new(footer_lines(
+        std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some(),
+    ))
+    .wrap(Wrap { trim: true })
 }
 
 fn footer_lines(persistent: bool) -> Vec<Line<'static>> {
@@ -1086,7 +1105,9 @@ fn footer_column_widths(line1: &[(&str, &str)], line2: &[(&str, &str)]) -> Vec<u
             [line1.get(idx), line2.get(idx)]
                 .into_iter()
                 .flatten()
-                .map(|(key, description)| UnicodeWidthStr::width(format!("{key} {description}").as_str()))
+                .map(|(key, description)| {
+                    UnicodeWidthStr::width(format!("{key} {description}").as_str())
+                })
                 .max()
                 .unwrap_or(0)
         })
@@ -1102,7 +1123,9 @@ fn footer_help_line(entries: &[(&str, &str)], column_widths: &[usize]) -> Line<'
         }
         spans.push(Span::styled(
             (*key).to_string(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -1110,7 +1133,8 @@ fn footer_help_line(entries: &[(&str, &str)], column_widths: &[usize]) -> Line<'
             Style::default().fg(Color::Gray),
         ));
         let rendered = format!("{key} {description}");
-        let padding = column_widths[index].saturating_sub(UnicodeWidthStr::width(rendered.as_str()));
+        let padding =
+            column_widths[index].saturating_sub(UnicodeWidthStr::width(rendered.as_str()));
         if padding > 0 {
             spans.push(Span::raw(" ".repeat(padding)));
         }
@@ -1211,7 +1235,9 @@ fn yes_count_key(claude_session_id: Option<&str>, pane_id: &str) -> String {
 }
 
 fn render_workspace_header_line(label: &str, width: usize) -> Line<'static> {
-    let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let Some((name, path)) = split_workspace_header(label) else {
         return Line::from(vec![Span::styled(pad_display_right(label, width), style)]);
     };
@@ -1315,7 +1341,10 @@ fn collapse_wrapped_recap_lines(lines: &[String]) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
 
-    while filtered.last().is_some_and(|line| is_recap_separator_line(line)) {
+    while filtered
+        .last()
+        .is_some_and(|line| is_recap_separator_line(line))
+    {
         filtered.pop();
     }
 
@@ -1437,6 +1466,17 @@ fn derive_base_window_name(current_name: &str, prefix: &str) -> String {
 fn strip_dashboard_emoji_prefixes(value: &str) -> &str {
     let mut rest = value.trim_start();
     loop {
+        if let Some(stripped) = rest.strip_prefix(DASHBOARD_YOLO_MARKER) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = LEGACY_YOLO_PREFIX_CHARS
+            .iter()
+            .find_map(|legacy| rest.strip_prefix(*legacy))
+        {
+            rest = stripped.trim_start();
+            continue;
+        }
         let Some(emoji) = DASHBOARD_STATE_EMOJIS
             .iter()
             .find(|emoji| rest.starts_with(**emoji))
@@ -1487,8 +1527,14 @@ fn load_saved_selection(state_dir: &Path) -> AppResult<SavedSelection> {
 
 fn save_selection(state_dir: &Path, selection: &SavedSelection) -> AppResult<()> {
     let pane_id = selection.pane_id.as_deref().unwrap_or_default();
-    let row_index = selection.row_index.map(|value| value.to_string()).unwrap_or_default();
-    fs::write(dashboard_selection_path(state_dir), format!("{pane_id}\n{row_index}\n"))?;
+    let row_index = selection
+        .row_index
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    fs::write(
+        dashboard_selection_path(state_dir),
+        format!("{pane_id}\n{row_index}\n"),
+    )?;
     Ok(())
 }
 
@@ -1628,6 +1674,15 @@ fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
     }
 }
 
+fn pane_window_prefix(state: SessionState, has_questions: bool, yolo_enabled: bool) -> String {
+    let state = state_emoji(state, has_questions);
+    if yolo_enabled {
+        format!("{state}{DASHBOARD_YOLO_MARKER}")
+    } else {
+        state.to_string()
+    }
+}
+
 fn format_age(age: Duration) -> String {
     let total = age.as_secs();
     let hours = total / 3600;
@@ -1681,18 +1736,17 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PaneEntry,
-        PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, SavedSelection, TABLE_GAP,
-        abbreviate_home_path,
-        context_lines_above_input, current_base_window_name, dashboard_display_state,
-        dashboard_body_sections, dashboard_selection_path, derive_base_window_name,
+        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PERSISTENT_DASHBOARD_SESSION,
+        PERSISTENT_DASHBOARD_SOCKET, PaneEntry, SavedSelection, TABLE_GAP, abbreviate_home_path,
+        context_lines_above_input, current_base_window_name, dashboard_body_sections,
+        dashboard_display_state, dashboard_selection_path, derive_base_window_name,
         detail_body_kind, detail_current_path, detail_workspace_label, footer_column_widths,
         footer_help_line, footer_lines, format_age, load_saved_selection, pad_display_right,
-        pane_list_columns, pane_list_content_area, recap_lines, rect_contains,
+        pane_list_columns, pane_list_content_area, pane_window_prefix, recap_lines, rect_contains,
         render_workspace_header_line, repo_root_from_repo_key, save_selection,
         should_return_navigation, split_workspace_header, state_emoji,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order,
-        workspace_group_key, workspace_group_label, yes_count_key, yolo_column_contains,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
+        workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::SessionState;
     use crate::storage::WorkspaceRecord;
@@ -1774,7 +1828,12 @@ mod tests {
 
     #[test]
     fn idle_pane_prefers_recap_body() {
-        let pane = sample_pane_entry(SessionState::ChatReady, false, true, "※ recap: fixed issue\n❯");
+        let pane = sample_pane_entry(
+            SessionState::ChatReady,
+            false,
+            true,
+            "※ recap: fixed issue\n❯",
+        );
         assert_eq!(detail_body_kind(&pane), DetailBodyKind::Recap);
         assert_eq!(recap_lines(&pane), vec![String::from("fixed issue")]);
     }
@@ -1972,13 +2031,20 @@ mod tests {
         let client = TmuxClient::with_socket(PERSISTENT_DASHBOARD_SOCKET);
         let plan = client.plan_kill_session(PERSISTENT_DASHBOARD_SESSION);
 
-        assert_eq!(plan.render(), "tmux -L botctl-dashboard kill-session -t botctl-dashboard");
+        assert_eq!(
+            plan.render(),
+            "tmux -L botctl-dashboard kill-session -t botctl-dashboard"
+        );
     }
 
     #[test]
     fn changing_frame_promotes_chat_ready_to_busy_in_dashboard() {
         assert_eq!(
-            dashboard_display_state(SessionState::ChatReady, Some(&String::from("before")), "after"),
+            dashboard_display_state(
+                SessionState::ChatReady,
+                Some(&String::from("before")),
+                "after"
+            ),
             SessionState::BusyResponding
         );
         assert_eq!(
@@ -1995,8 +2061,14 @@ mod tests {
 
     #[test]
     fn derive_base_window_name_strips_any_known_dashboard_emojis() {
-        assert_eq!(derive_base_window_name("🤔💤🔐 bloodraven", "💤"), "bloodraven");
-        assert_eq!(derive_base_window_name("🤔 💤  bloodraven", "💤"), "bloodraven");
+        assert_eq!(
+            derive_base_window_name("🤔💤🔐 bloodraven", "💤"),
+            "bloodraven"
+        );
+        assert_eq!(
+            derive_base_window_name("🤔 💤  bloodraven", "💤"),
+            "bloodraven"
+        );
     }
 
     #[test]
@@ -2005,13 +2077,59 @@ mod tests {
     }
 
     #[test]
+    fn strip_dashboard_emoji_prefixes_handles_yolo_marker() {
+        assert_eq!(
+            strip_dashboard_emoji_prefixes("\u{2699}\u{fe0f}\u{02b8} project"),
+            "project"
+        );
+        assert_eq!(
+            strip_dashboard_emoji_prefixes("\u{2699}\u{fe0f}\u{02b8}\u{1f4a4} project"),
+            "project"
+        );
+    }
+
+    #[test]
+    fn strip_dashboard_emoji_prefixes_handles_legacy_cowboy_zwj() {
+        assert_eq!(
+            strip_dashboard_emoji_prefixes("\u{2699}\u{fe0f}\u{200d}\u{1f920} project"),
+            "project"
+        );
+        assert_eq!(
+            strip_dashboard_emoji_prefixes("\u{2699}\u{fe0f}\u{1f920} project"),
+            "project"
+        );
+    }
+
+    #[test]
+    fn pane_window_prefix_omits_marker_when_yolo_off() {
+        let prefix = pane_window_prefix(SessionState::BusyResponding, false, false);
+        assert_eq!(prefix, "\u{2699}\u{fe0f}");
+    }
+
+    #[test]
+    fn pane_window_prefix_appends_superscript_y_when_yolo_on() {
+        let prefix = pane_window_prefix(SessionState::BusyResponding, false, true);
+        assert_eq!(prefix, "\u{2699}\u{fe0f}\u{02b8}");
+    }
+
+    #[test]
     fn current_base_window_name_preserves_live_rename() {
         assert_eq!(
-            current_base_window_name("renamed-project", Some("💤 old-project"), "old-project", "💤"),
+            current_base_window_name(
+                "renamed-project",
+                Some("💤 old-project"),
+                "old-project",
+                "💤"
+            ),
             "renamed-project"
         );
         assert_eq!(
-            current_base_window_name("💤 old-project", Some("💤 old-project"), "old-project", "💤"),
+            current_base_window_name(
+                "💤 old-project",
+                Some("💤 old-project"),
+                "old-project",
+                "💤"
+            ),
             "old-project"
         );
         assert_eq!(
@@ -2049,7 +2167,8 @@ mod tests {
             height: 10,
         };
         let columns = pane_list_columns(&app);
-        let yolo_x = list_area.x + columns.state_width as u16 + UnicodeWidthStr::width(TABLE_GAP) as u16;
+        let yolo_x =
+            list_area.x + columns.state_width as u16 + UnicodeWidthStr::width(TABLE_GAP) as u16;
         assert!(yolo_column_contains(&app, list_area, yolo_x));
         assert!(!yolo_column_contains(&app, list_area, list_area.x));
     }

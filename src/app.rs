@@ -186,7 +186,11 @@ fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
     }
 
     if !persistent_client.has_session(DASHBOARD_PERSISTENT_SESSION)? {
-        start_persistent_dashboard_session(&persistent_client, &args, desired_target_socket.as_deref())?;
+        start_persistent_dashboard_session(
+            &persistent_client,
+            &args,
+            desired_target_socket.as_deref(),
+        )?;
     }
 
     persistent_client.set_global_option("status", "off")?;
@@ -263,7 +267,9 @@ fn tmux_socket_path_from_value(value: &str) -> Option<PathBuf> {
     }
 }
 
-fn persistent_dashboard_target_socket(persistent_client: &TmuxClient) -> AppResult<Option<PathBuf>> {
+fn persistent_dashboard_target_socket(
+    persistent_client: &TmuxClient,
+) -> AppResult<Option<PathBuf>> {
     let pane = persistent_client
         .list_panes_for_target(Some(DASHBOARD_PERSISTENT_SESSION))?
         .into_iter()
@@ -280,15 +286,21 @@ fn persistent_dashboard_target_socket(persistent_client: &TmuxClient) -> AppResu
 fn dashboard_target_socket_from_pid(pid: u32) -> AppResult<Option<PathBuf>> {
     let path = PathBuf::from(format!("/proc/{pid}/environ"));
     let bytes = fs::read(&path).map_err(|error| {
-        AppError::new(format!("failed to read dashboard process environment {}: {error}", path.display()))
+        AppError::new(format!(
+            "failed to read dashboard process environment {}: {error}",
+            path.display()
+        ))
     })?;
-    Ok(parse_env_value_from_environ_bytes(&bytes, DASHBOARD_TARGET_TMUX_SOCKET_ENV)
-        .map(PathBuf::from))
+    Ok(
+        parse_env_value_from_environ_bytes(&bytes, DASHBOARD_TARGET_TMUX_SOCKET_ENV)
+            .map(PathBuf::from),
+    )
 }
 
 fn parse_env_value_from_environ_bytes(bytes: &[u8], key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    bytes.split(|byte| *byte == 0)
+    bytes
+        .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
         .find_map(|entry| {
             let entry = std::str::from_utf8(entry).ok()?;
@@ -385,7 +397,8 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
 
 fn run_status(args: StatusArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let pane = normalize_dashboard_window_name(&client, &resolve_pane_by_id(&client, &args.pane_id)?)?;
+    let pane =
+        normalize_dashboard_window_name(&client, &resolve_pane_by_id(&client, &args.pane_id)?)?;
     let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
@@ -401,11 +414,14 @@ fn run_status(args: StatusArgs) -> AppResult<String> {
 
 fn run_doctor(args: DoctorArgs) -> AppResult<String> {
     let client = TmuxClient::default();
-    let pane = normalize_dashboard_window_name(&client, &resolve_doctor_pane(
+    let pane = normalize_dashboard_window_name(
         &client,
-        args.session_name.as_deref(),
-        args.pane_id.as_deref(),
-    )?)?;
+        &resolve_doctor_pane(
+            &client,
+            args.session_name.as_deref(),
+            args.pane_id.as_deref(),
+        )?,
+    )?;
     let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
@@ -625,7 +641,11 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
         target_pane: args.pane_id,
         history_lines: args.history_lines,
         reconcile_ms: args.reconcile_ms,
-        state_dir: args.http_addr.as_ref().map(|_| resolve_bootstrapped_state_dir(args.state_dir.as_deref())).transpose()?,
+        state_dir: args
+            .http_addr
+            .as_ref()
+            .map(|_| resolve_bootstrapped_state_dir(args.state_dir.as_deref()))
+            .transpose()?,
         allowed_origins: args.allowed_origins,
     };
     let format = args.format;
@@ -3334,10 +3354,24 @@ fn normalize_dashboard_window_name(client: &TmuxClient, pane: &TmuxPane) -> AppR
 }
 
 fn strip_dashboard_window_prefixes(value: &str) -> String {
-    const DASHBOARD_STATE_EMOJIS: &[&str] = &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+    const DASHBOARD_STATE_EMOJIS: &[&str] =
+        &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+    const DASHBOARD_YOLO_MARKER: &str = "ʸ";
+    const LEGACY_YOLO_PREFIX_CHARS: &[&str] = &["🤠", "\u{200D}"];
 
     let mut rest = value.trim_start();
     loop {
+        if let Some(stripped) = rest.strip_prefix(DASHBOARD_YOLO_MARKER) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = LEGACY_YOLO_PREFIX_CHARS
+            .iter()
+            .find_map(|legacy| rest.strip_prefix(*legacy))
+        {
+            rest = stripped.trim_start();
+            continue;
+        }
         let Some(emoji) = DASHBOARD_STATE_EMOJIS
             .iter()
             .find(|emoji| rest.starts_with(**emoji))
@@ -3595,23 +3629,21 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AppError, BabysitFormat, BabysitOutputFormat, DashboardArgs,
-        DASHBOARD_PERSISTENT_CHILD_ENV, DASHBOARD_TARGET_TMUX_SOCKET_ENV, InspectedPane,
+        AppError, BabysitFormat, BabysitOutputFormat, DASHBOARD_PERSISTENT_CHILD_ENV,
+        DASHBOARD_TARGET_TMUX_SOCKET_ENV, DashboardArgs, InspectedPane,
         KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
         ObserveArtifactPaths, RecoveryAction, YoloAction, artifact_state_dir_result,
         cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
-        extract_keep_going_response, extract_permission_prompt_details, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker,
+        extract_keep_going_response, extract_permission_prompt_details, focused_frame_source,
+        is_usable_state, is_yolo_safe_to_approve, keep_going_no_yolo_blocker,
         parse_env_value_from_environ_bytes, permission_manual_review_reason,
         persistent_dashboard_child_command_with_target_socket, prompt_submission_started,
-        raw_key_for_workflow, recovery_action_for_state,
-        render_babysit_action_event, render_babysit_output, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output,
-        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
-        render_status_report, resolve_keep_going_prompt, run_prepare_prompt, shell_escape,
-        strip_dashboard_window_prefixes,
-        focused_frame_source,
+        raw_key_for_workflow, recovery_action_for_state, render_babysit_action_event,
+        render_babysit_output, render_babysit_start_event, render_babysit_wait_event,
+        render_guarded_workflow_output, render_keep_going_wait_message, render_list_panes,
+        render_next_safe_action, render_observe_command_output, render_screen_excerpt,
+        render_serve_event_payload, render_status_report, resolve_keep_going_prompt,
+        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
         submit_prompt_preflight_workflow, tmux_socket_path_from_value, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
@@ -5039,7 +5071,10 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
 
     #[test]
     fn shell_escape_quotes_whitespace() {
-        assert_eq!(shell_escape("/tmp/botctl state"), String::from("'/tmp/botctl state'"));
+        assert_eq!(
+            shell_escape("/tmp/botctl state"),
+            String::from("'/tmp/botctl state'")
+        );
     }
 
     #[test]

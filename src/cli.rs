@@ -305,7 +305,9 @@ pub fn usage() -> String {
     out.push_str(&featured(
         "dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]",
     ));
-    out.push_str("\n    Open the TUI for live Claude panes, state, wait times, and yolo toggles.\n");
+    out.push_str(
+        "\n    Open the TUI for live Claude panes, state, wait times, and yolo toggles.\n",
+    );
     out.push_str(
         "    With --persistent, keep the dashboard alive in a dedicated tmux session and reopen it in a popup.\n\n",
     );
@@ -1693,9 +1695,11 @@ mod tests {
         ])
         .expect_err("dashboard should reject persistent exit-on-navigate");
 
-        assert!(error
-            .to_string()
-            .contains("dashboard --persistent cannot be combined with --exit-on-navigate"));
+        assert!(
+            error
+                .to_string()
+                .contains("dashboard --persistent cannot be combined with --exit-on-navigate")
+        );
     }
 
     #[test]
