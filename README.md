@@ -4,6 +4,26 @@
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
+## Install
+
+The recommended install method is Cargo:
+
+```bash
+cargo install botctl
+```
+
+This pulls the latest release from [crates.io](https://crates.io/crates/botctl) and places the `botctl` binary on your `PATH` (typically `~/.cargo/bin`).
+
+To build from source instead:
+
+```bash
+git clone https://github.com/colinmollenhour/botctl
+cd botctl
+cargo install --path .
+```
+
+See [Requirements](#requirements) for the runtime dependencies (`tmux`, `claude`).
+
 ## Main Commands
 
 These are the commands that matter most in day-to-day use:
