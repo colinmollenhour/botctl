@@ -1,6 +1,8 @@
 # Getting started
 
-`botctl` is a Rust CLI for launching, observing, and safely driving Claude Code sessions inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code and OpenCode sessions visible and controlled inside `tmux`.
+
+Claude Code panes support guarded automation. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status.
 
 For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
@@ -8,7 +10,7 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 Most users only need three commands:
 
-- `dashboard` for a live control surface across Claude panes plus passive OpenCode visibility
+- `dashboard` for a live control surface across Claude Code panes plus passive OpenCode visibility
 - `yolo` for automated babysitting and recovery
 - `serve` for a long-lived observation stream
 
@@ -19,7 +21,8 @@ If you just want to get value quickly, install it, open `dashboard`, then try `y
 ## Requirements
 
 - `tmux`
-- `claude` on `PATH`
+- `claude` on `PATH` for Claude Code automation
+- `opencode` panes with `OC | <session title>` pane titles for passive OpenCode dashboard visibility
 - `botctl` installed
 
 ## Install
@@ -30,7 +33,7 @@ cargo install botctl
 
 ## Fastest useful path
 
-Open the dashboard:
+Open the dashboard across Claude Code and resolvable OpenCode panes:
 
 ```bash
 botctl dashboard

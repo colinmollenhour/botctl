@@ -1,6 +1,8 @@
 # botctl
 
-`botctl` is a Rust CLI for launching, inspecting, and driving Claude Code sessions inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code and OpenCode sessions visible and controlled inside `tmux`.
+
+It can launch and safely drive Claude Code panes, and it can passively discover OpenCode panes for dashboard visibility, recent-message context, state classification, and tmux window status.
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
@@ -22,13 +24,13 @@ cd botctl
 cargo install --path .
 ```
 
-See [Requirements](#requirements) for the runtime dependencies (`tmux`, `claude`).
+See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `claude` for Claude automation and `opencode` for OpenCode dashboard visibility).
 
 ## Main Commands
 
 These are the commands that matter most in day-to-day use:
 
-- `dashboard` to see all live Claude panes plus resolvable OpenCode panes, grouped by workspace, with state, age, and YOLO controls for Claude
+- `dashboard` to see Claude Code panes and resolvable OpenCode panes, grouped by workspace, with state, age, and YOLO controls for Claude
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
 
@@ -36,12 +38,13 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 
 ## Current Features
 
-- launch a managed Claude session in tmux
+- launch a managed Claude Code session in tmux
+- passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database
 - list panes and inspect tmux metadata
 - capture pane contents and classify the current UI state
-- run `status` and `doctor` against a live Claude pane
+- run `status` and `doctor` against a live Claude Code pane
 - run `serve` as a foreground long-lived observer for one tmux session
-- run `dashboard` as a popup-sized TUI across Claude panes and resolvable OpenCode panes, grouped by workspace with per-pane YOLO controls for Claude
+- run `dashboard` as a popup-sized TUI across Claude Code panes and resolvable OpenCode panes, grouped by workspace with per-pane YOLO controls for Claude
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
@@ -60,7 +63,8 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 
 - Rust and Cargo
 - `tmux`
-- `claude` available on `PATH`
+- `claude` available on `PATH` for Claude Code automation
+- `opencode` panes with `OC | <session title>` pane titles for passive OpenCode dashboard visibility
 
 ## Test
 
@@ -90,7 +94,7 @@ cargo run -- serve --session demo --format jsonl
 
 Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
 
-Open the live dashboard across Claude panes:
+Open the live dashboard across Claude Code and resolvable OpenCode panes:
 
 ```bash
 cargo run -- dashboard
@@ -180,11 +184,11 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups Claude panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups Claude Code panes and resolvable OpenCode panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
 
-Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
+Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude Code and resolvable OpenCode panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
 
 ## Recovery And Prompt Work
 
@@ -274,6 +278,7 @@ cargo run -- replay --path fixtures/cases/permission_dialog
 The classifier currently recognizes:
 
 - `ChatReady`
+- `UserQuestionPrompt`
 - `BusyResponding`
 - `PermissionDialog`
 - `FolderTrustPrompt`
@@ -290,5 +295,6 @@ Recap is auxiliary metadata, not a primary state. Strong anchors like `while you
 
 - Live classification is still built around `capture-pane`, with `serve` using a best-effort merged stream model when that helps break `Unknown` states.
 - The classifier is keyword-based and intentionally conservative.
-- `botctl` can attach to existing Claude panes, but the strongest and most tested path is still managed sessions.
+- `botctl` can attach to existing Claude Code panes, but the strongest and most tested automation path is still managed Claude sessions.
+- OpenCode support is passive dashboard visibility; guarded keypress automation remains Claude-only.
 - `serve` is an initial foreground observer, not the full daemon/API/SSE control plane described in `PLANS-Serve-Mode.md` yet.
