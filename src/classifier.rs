@@ -529,8 +529,7 @@ fn is_permission_anchor_line(line: &str) -> bool {
             "ctrl+e to explain",
             "confirm action",
         ],
-    )
-        || lower.starts_with("claude code needs permission")
+    ) || lower.starts_with("claude code needs permission")
         || is_permission_choice_line(line)
         || contains_any(
             &lower,
@@ -900,7 +899,11 @@ mod tests {
         let result = Classifier.classify("test", &frame);
 
         assert_eq!(result.state, SessionState::SurveyPrompt);
-        assert!(result.signals.contains(&String::from(SIGNAL_SURVEY_KEYWORDS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_SURVEY_KEYWORDS))
+        );
     }
 
     #[test]
@@ -918,7 +921,11 @@ mod tests {
 
         assert_eq!(result.state, SessionState::ChatReady);
         assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
-        assert!(!result.signals.contains(&String::from(SIGNAL_SURVEY_KEYWORDS)));
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_SURVEY_KEYWORDS))
+        );
     }
 
     #[test]

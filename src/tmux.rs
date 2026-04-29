@@ -34,6 +34,7 @@ pub struct TmuxPane {
     pub pane_index: u16,
     pub current_command: String,
     pub current_path: String,
+    pub pane_title: String,
     pub pane_active: bool,
     pub cursor_x: Option<u16>,
     pub cursor_y: Option<u16>,
@@ -154,7 +155,7 @@ impl TmuxClient {
         }
         args.push(String::from("-F"));
         args.push(String::from(
-            "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
+            "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
         ));
 
         let output = self.run_output(args)?;
@@ -505,7 +506,7 @@ impl Drop for ControlModeSession {
 
 fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 14 {
+    if parts.len() != 15 {
         return None;
     }
 
@@ -521,9 +522,10 @@ fn parse_pane_line(line: &str) -> Option<TmuxPane> {
         pane_index: parts[8].parse::<u16>().ok()?,
         current_command: parts[9].to_string(),
         current_path: parts[10].to_string(),
-        pane_active: parts[11] == "1",
-        cursor_x: parse_cursor(parts[12]),
-        cursor_y: parse_cursor(parts[13]),
+        pane_title: parts[11].to_string(),
+        pane_active: parts[12] == "1",
+        cursor_x: parse_cursor(parts[13]),
+        cursor_y: parse_cursor(parts[14]),
     })
 }
 
@@ -656,12 +658,13 @@ mod tests {
     #[test]
     fn parses_pane_listing() {
         let pane = parse_pane_line(
-            "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\t1\t12\t4",
+            "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\tClaude\t1\t12\t4",
         )
         .expect("pane should parse");
         assert_eq!(pane.pane_id, "%1");
         assert_eq!(pane.window_index, 3);
         assert_eq!(pane.pane_index, 1);
+        assert_eq!(pane.pane_title, "Claude");
         assert!(pane.pane_active);
         assert_eq!(pane.cursor_x, Some(12));
         assert_eq!(pane.cursor_y, Some(4));

@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod fixtures;
 pub mod http_api;
 pub mod observe;
+pub mod opencode;
 pub mod prompt;
 pub mod screen_model;
 pub mod serve;

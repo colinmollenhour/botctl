@@ -28,7 +28,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, `claude`
 
 These are the commands that matter most in day-to-day use:
 
-- `dashboard` to see all live Claude panes, grouped by workspace, with state, age, and YOLO controls
+- `dashboard` to see all live Claude panes plus resolvable OpenCode panes, grouped by workspace, with state, age, and YOLO controls for Claude
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
 
@@ -41,7 +41,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude pane
 - run `serve` as a foreground long-lived observer for one tmux session
-- run `dashboard` as a popup-sized TUI across Claude panes, grouped by workspace with per-pane YOLO controls
+- run `dashboard` as a popup-sized TUI across Claude panes and resolvable OpenCode panes, grouped by workspace with per-pane YOLO controls for Claude
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
@@ -181,6 +181,8 @@ cargo run -- status --pane 0:2.3
 ```
 
 The dashboard groups Claude panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+
+The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
 
 Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
 

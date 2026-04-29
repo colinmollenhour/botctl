@@ -1741,6 +1741,7 @@ mod tests {
             pane_index: 0,
             current_command: String::from("claude"),
             current_path: String::from("/tmp/demo"),
+            pane_title: String::new(),
             pane_active: true,
             cursor_x: Some(1),
             cursor_y: Some(2),

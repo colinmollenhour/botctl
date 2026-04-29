@@ -8,7 +8,7 @@ For command syntax, see [command reference](./command-reference.mdx). For prompt
 
 For most real use, the loop is:
 
-1. Open `dashboard` to see all panes.
+1. Open `dashboard` to see Claude panes and passively resolvable OpenCode panes.
 2. Use `yolo` on the pane or workspace you want babysat.
 3. Use `serve` when you need a live event stream or machine-readable observation.
 
@@ -47,6 +47,8 @@ Use this when `botctl` launches Claude for you.
 ## Resolve an existing pane
 
 Use this when Claude is already running inside tmux and you want to verify the pane before acting.
+
+OpenCode panes are handled differently: the dashboard only includes them passively when the pane title has the form `OC | <session title>` and that title plus the pane cwd uniquely match OpenCode's SQLite `session` table. OpenCode titles truncated with `...` are accepted as prefixes only when still unique within the same cwd. Resolved OpenCode panes show recent SQLite message context in the details panel and can show `PermissionDialog` when SQLite shows a running file/glob tool targeting an absolute path outside the session directory. OpenCode panes can be selected and opened from the dashboard, but automation and YOLO remain Claude-only.
 
 1. List panes, including non-managed ones:
 

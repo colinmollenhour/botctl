@@ -29,6 +29,7 @@ use crate::app::{
 use crate::automation::GuardedWorkflow;
 use crate::classifier::SessionState;
 use crate::cli::DashboardArgs;
+use crate::opencode::resolve_opencode_session_for_pane;
 use crate::prompt::resolve_state_dir;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
@@ -126,6 +127,7 @@ struct DashboardApp {
 #[derive(Clone)]
 struct PaneEntry {
     pane: TmuxPane,
+    source: PaneSource,
     workspace: WorkspaceRecord,
     workspace_group_key: String,
     workspace_group_label: String,
@@ -140,6 +142,12 @@ struct PaneEntry {
     yes_count: u32,
     claude_session_id: Option<String>,
     focused_source: String,
+}
+
+#[derive(Clone)]
+enum PaneSource {
+    Claude,
+    OpenCode { session_id: String, title: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,17 +210,76 @@ impl DashboardApp {
         let mut branch_by_path = HashMap::new();
         let mut next_frames = HashMap::new();
 
-        for pane in self.client.list_panes()?.into_iter().filter(is_claude_pane) {
+        for pane in self.client.list_panes()? {
+            if is_claude_pane(&pane) {
+                seen_pane_ids.insert(pane.pane_id.clone());
+                self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
+
+                let inspected = inspect_pane(&self.client, &pane.pane_id, self.history_lines)?;
+                let previous_frame = self.previous_frames.get(&pane.pane_id);
+                let state = dashboard_display_state(
+                    inspected.classification.state,
+                    previous_frame,
+                    &inspected.raw_source,
+                );
+                let workspace =
+                    resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
+                let workspace_group_key = workspace_group_key(&workspace);
+                let workspace_group_label = workspace_group_label(&workspace_group_key);
+                let branch = branch_by_path
+                    .entry(pane.current_path.clone())
+                    .or_insert_with(|| git_branch_for_path(&pane.current_path))
+                    .clone();
+                let yolo_enabled = matches!(read_yolo_record(&self.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
+                let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+                    self.first_seen
+                        .get(&pane.pane_id)
+                        .map(Instant::elapsed)
+                        .unwrap_or_default()
+                });
+                let wait_duration = sync_tmux_wait_state(
+                    &self.state_dir,
+                    &workspace.id,
+                    &pane,
+                    state.as_str(),
+                    is_waiting_state(state),
+                )?;
+                let claude_session_id =
+                    sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
+                let yes_count = self
+                    .yes_counts
+                    .get(&yes_count_key(claude_session_id.as_deref(), &pane.pane_id))
+                    .copied()
+                    .unwrap_or(0);
+                next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
+
+                panes.push(PaneEntry {
+                    pane,
+                    source: PaneSource::Claude,
+                    workspace,
+                    workspace_group_key,
+                    workspace_group_label,
+                    branch,
+                    state,
+                    has_questions: inspected.classification.has_questions,
+                    recap_present: inspected.classification.recap_present,
+                    recap_excerpt: inspected.classification.recap_excerpt.clone(),
+                    yolo_enabled,
+                    age,
+                    wait_duration,
+                    yes_count,
+                    claude_session_id,
+                    focused_source: inspected.focused_source,
+                });
+                continue;
+            }
+
+            let Some(opencode_session) = resolve_opencode_session_for_pane(&pane) else {
+                continue;
+            };
             seen_pane_ids.insert(pane.pane_id.clone());
             self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
 
-            let inspected = inspect_pane(&self.client, &pane.pane_id, self.history_lines)?;
-            let previous_frame = self.previous_frames.get(&pane.pane_id);
-            let state = dashboard_display_state(
-                inspected.classification.state,
-                previous_frame,
-                &inspected.raw_source,
-            );
             let workspace =
                 resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
             let workspace_group_key = workspace_group_key(&workspace);
@@ -221,45 +288,33 @@ impl DashboardApp {
                 .entry(pane.current_path.clone())
                 .or_insert_with(|| git_branch_for_path(&pane.current_path))
                 .clone();
-            let yolo_enabled = matches!(read_yolo_record(&self.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
             let age = process_age(pane.pane_pid).unwrap_or_else(|| {
                 self.first_seen
                     .get(&pane.pane_id)
                     .map(Instant::elapsed)
                     .unwrap_or_default()
             });
-            let wait_duration = sync_tmux_wait_state(
-                &self.state_dir,
-                &workspace.id,
-                &pane,
-                state.as_str(),
-                is_waiting_state(state),
-            )?;
-            let claude_session_id =
-                sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
-            let yes_count = self
-                .yes_counts
-                .get(&yes_count_key(claude_session_id.as_deref(), &pane.pane_id))
-                .copied()
-                .unwrap_or(0);
-            next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
 
             panes.push(PaneEntry {
                 pane,
+                source: PaneSource::OpenCode {
+                    session_id: opencode_session.id,
+                    title: opencode_session.title,
+                },
                 workspace,
                 workspace_group_key,
                 workspace_group_label,
                 branch,
-                state,
-                has_questions: inspected.classification.has_questions,
-                recap_present: inspected.classification.recap_present,
-                recap_excerpt: inspected.classification.recap_excerpt.clone(),
-                yolo_enabled,
+                state: opencode_session.state,
+                has_questions: opencode_session.has_questions,
+                recap_present: false,
+                recap_excerpt: None,
+                yolo_enabled: false,
                 age,
-                wait_duration,
-                yes_count,
-                claude_session_id,
-                focused_source: inspected.focused_source,
+                wait_duration: None,
+                yes_count: 0,
+                claude_session_id: None,
+                focused_source: opencode_session.context,
             });
         }
 
@@ -415,7 +470,7 @@ impl DashboardApp {
     fn run_yolo_supervisor(&mut self) -> AppResult<()> {
         let mut message = None;
         for pane in self.panes.clone() {
-            if !pane.yolo_enabled {
+            if !pane.is_claude() || !pane.yolo_enabled {
                 continue;
             }
 
@@ -667,6 +722,10 @@ impl DashboardApp {
     }
 
     fn toggle_yolo_for_pane(&mut self, pane: &PaneEntry) -> AppResult<()> {
+        if !pane.is_claude() {
+            self.message = String::from("YOLO is only available for Claude panes");
+            return Ok(());
+        }
         self.set_yolo_for_pane(pane, !pane.yolo_enabled)?;
         self.message = if pane.yolo_enabled {
             format!("disabled yolo for {}", pane_descriptor(&pane.pane))
@@ -677,6 +736,9 @@ impl DashboardApp {
     }
 
     fn set_yolo_for_pane(&mut self, pane: &PaneEntry, enabled: bool) -> AppResult<()> {
+        if !pane.is_claude() {
+            return Ok(());
+        }
         ensure_pane_owned_by_claude(&pane.pane)?;
         if enabled {
             write_yolo_record(&self.state_dir, &pane.workspace.id, &pane.pane)?;
@@ -684,6 +746,12 @@ impl DashboardApp {
             let _ = disable_yolo_record(&self.state_dir, &pane.pane.pane_id)?;
         }
         Ok(())
+    }
+}
+
+impl PaneEntry {
+    fn is_claude(&self) -> bool {
+        matches!(self.source, PaneSource::Claude)
     }
 }
 
@@ -963,6 +1031,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     if let Some(pane) = app.selected_pane() {
         let mut details = vec![
             Line::from(format!("Workspace: {}", detail_workspace_label(pane))),
+            Line::from(format!("Provider: {}", pane_provider_label(pane))),
             Line::from(format!("Pane: {}", pane.pane.pane_id)),
             Line::from(format!(
                 "Target: {}:{}.{}",
@@ -991,9 +1060,12 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 abbreviate_home_path(&pane.workspace.workspace_root)
             )));
         }
+        if let PaneSource::OpenCode { title, .. } = &pane.source {
+            details.push(Line::from(format!("Title: {title}")));
+        }
         details.push(Line::from(format!(
             "Session ID: {}",
-            pane.claude_session_id.as_deref().unwrap_or("-")
+            pane_session_id(pane).unwrap_or("-")
         )));
 
         let details = Paragraph::new(details).block(rounded_block(Some("Details")));
@@ -1008,7 +1080,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             });
         frame.render_widget(body, details_layout[1]);
     } else {
-        let details = Paragraph::new(vec![Line::from("No Claude panes found")])
+        let details = Paragraph::new(vec![Line::from("No supported panes found")])
             .block(rounded_block(Some("Details")));
         frame.render_widget(details, details_layout[0]);
         let body =
@@ -1588,6 +1660,20 @@ fn detail_current_path(pane: &PaneEntry) -> String {
     }
 }
 
+fn pane_provider_label(pane: &PaneEntry) -> &str {
+    match pane.source {
+        PaneSource::Claude => "Claude",
+        PaneSource::OpenCode { .. } => "OpenCode",
+    }
+}
+
+fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
+    match &pane.source {
+        PaneSource::Claude => pane.claude_session_id.as_deref(),
+        PaneSource::OpenCode { session_id, .. } => Some(session_id.as_str()),
+    }
+}
+
 fn abbreviate_home_path(path: &str) -> String {
     let Some(home) = std::env::var_os("HOME") else {
         return path.to_string();
@@ -1737,14 +1823,14 @@ mod tests {
 
     use super::{
         DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PERSISTENT_DASHBOARD_SESSION,
-        PERSISTENT_DASHBOARD_SOCKET, PaneEntry, SavedSelection, TABLE_GAP, abbreviate_home_path,
-        context_lines_above_input, current_base_window_name, dashboard_body_sections,
-        dashboard_display_state, dashboard_selection_path, derive_base_window_name,
-        detail_body_kind, detail_current_path, detail_workspace_label, footer_column_widths,
-        footer_help_line, footer_lines, format_age, load_saved_selection, pad_display_right,
-        pane_list_columns, pane_list_content_area, pane_window_prefix, recap_lines, rect_contains,
-        render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        should_return_navigation, split_workspace_header, state_emoji,
+        PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource, SavedSelection, TABLE_GAP,
+        abbreviate_home_path, context_lines_above_input, current_base_window_name,
+        dashboard_body_sections, dashboard_display_state, dashboard_selection_path,
+        derive_base_window_name, detail_body_kind, detail_current_path, detail_workspace_label,
+        footer_column_widths, footer_help_line, footer_lines, format_age, load_saved_selection,
+        pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
+        recap_lines, rect_contains, render_workspace_header_line, repo_root_from_repo_key,
+        save_selection, should_return_navigation, split_workspace_header, state_emoji,
         strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
     };
@@ -2192,10 +2278,12 @@ mod tests {
                 pane_index: 0,
                 current_command: String::from("claude"),
                 current_path: String::from("/tmp/demo"),
+                pane_title: String::new(),
                 pane_active: true,
                 cursor_x: Some(0),
                 cursor_y: Some(0),
             },
+            source: PaneSource::Claude,
             workspace: WorkspaceRecord {
                 id: String::from("workspace-1"),
                 workspace_root: String::from("/tmp/demo"),

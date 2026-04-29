@@ -35,7 +35,7 @@ Notes:
 
 ### `dashboard`
 
-Purpose: open the live TUI for Claude panes, grouped by workspace, with per-pane and per-workspace YOLO controls.
+Purpose: open the live TUI for Claude panes and passively resolvable OpenCode panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude.
 
 Syntax:
 ```bash
@@ -56,6 +56,12 @@ bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 Notes:
 
 - scans all Claude panes
+- also scans OpenCode panes when the tmux pane title is `OC | <session title>` and exactly one OpenCode SQLite `session` row matches the pane cwd plus that title
+- accepts OpenCode titles truncated with `...` as a prefix only when that prefix is unique within the same cwd
+- shows a bounded recent-message excerpt for resolved OpenCode panes from SQLite `message`/`part` rows
+- maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
+- ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
+- OpenCode support is visibility-only; YOLO and guarded automation remain Claude-only
 - shows current classified state, wait time, branch, and workspace grouping
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 

@@ -8,7 +8,7 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 Most users only need three commands:
 
-- `dashboard` for a live control surface across Claude panes
+- `dashboard` for a live control surface across Claude panes plus passive OpenCode visibility
 - `yolo` for automated babysitting and recovery
 - `serve` for a long-lived observation stream
 
@@ -111,6 +111,8 @@ The dashboard uses one emoji per pane to show the current classified state at a 
 - `✏️` `ExternalEditorActive`: paused for an external editor flow
 - `🧾` `DiffDialog`: waiting on a diff review choice
 - `❔` `Unknown`: classifier could not identify the current surface safely
+
+OpenCode panes can appear in the same dashboard without terminal capture or keypress automation. They are included only when the tmux command is `opencode`, the pane title is `OC | <session title>`, and OpenCode's SQLite database has exactly one `session` row whose `directory` matches the pane cwd and whose `title` matches the stripped pane title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. If that match is missing, duplicated, ambiguous, or unreadable, the pane is ignored rather than guessed. Resolved OpenCode panes show a bounded recent-message excerpt from SQLite `message`/`part` rows and can show `PermissionDialog` when a running file/glob tool targets an absolute path outside the session directory. OpenCode panes are navigable and contribute window-title emojis, but YOLO and recovery actions are still Claude-only.
 
 If you use tmux, this is the recommended way to launch the dashboard as a popup and keep it alive:
 
