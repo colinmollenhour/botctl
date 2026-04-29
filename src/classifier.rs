@@ -374,7 +374,7 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
-    if contains_any(
+    let has_survey_keywords = contains_any(
         normalized,
         &[
             "how likely are you to recommend claude code",
@@ -384,8 +384,22 @@ fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
             "survey",
             "rate this conversation",
         ],
-    ) {
-        return true;
+    );
+    let survey_anchor = lines
+        .iter()
+        .rposition(|line| is_survey_prompt_line(line))
+        .or_else(|| has_survey_keywords.then_some(0));
+    let Some(anchor_idx) = survey_anchor else {
+        return false;
+    };
+
+    if lines
+        .iter()
+        .skip(anchor_idx + 1)
+        .copied()
+        .any(is_submitted_chat_input_line)
+    {
+        return false;
     }
 
     let has_session_feedback_question = lines.iter().copied().any(|line| {
@@ -394,7 +408,21 @@ fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
     });
     let has_rating_options = lines.iter().copied().any(is_survey_rating_option_line);
 
-    has_session_feedback_question && has_rating_options
+    has_survey_keywords || has_session_feedback_question && has_rating_options
+}
+
+fn is_survey_prompt_line(line: &str) -> bool {
+    contains_any(
+        &line.to_ascii_lowercase(),
+        &[
+            "how likely are you to recommend claude code",
+            "how is claude doing this session",
+            "rate your experience",
+            "take our survey",
+            "survey",
+            "rate this conversation",
+        ],
+    )
 }
 
 fn is_survey_rating_option_line(line: &str) -> bool {
@@ -873,6 +901,24 @@ mod tests {
 
         assert_eq!(result.state, SessionState::SurveyPrompt);
         assert!(result.signals.contains(&String::from(SIGNAL_SURVEY_KEYWORDS)));
+    }
+
+    #[test]
+    fn ignores_stale_session_feedback_prompt_after_dismissal_input() {
+        let frame = [
+            "● How is Claude doing this session? (optional)",
+            "  1: Bad    2: Fine   3: Good   0: Dismiss",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯ 00000000000000000",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "🧠 Opus 4.7 (1M context) │ Ctx: 3%",
+        ]
+        .join("\n");
+        let result = Classifier.classify("test", &frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(!result.signals.contains(&String::from(SIGNAL_SURVEY_KEYWORDS)));
     }
 
     #[test]
