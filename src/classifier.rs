@@ -112,8 +112,13 @@ impl Classifier {
             || lines.iter().copied().any(is_chat_input_line);
         let has_permission_keywords = contains_any(&normalized, PERMISSION_KEYWORDS)
             && contains_any(&normalized, PERMISSION_CONFIRM_KEYWORDS);
-        let has_plain_chat_prompt_after_permission =
-            has_permission_keywords && has_plain_chat_prompt_after_permission(&lines);
+        let has_permission_anchor = lines
+            .iter()
+            .copied()
+            .any(|line| is_permission_anchor_line(line.trim()));
+        let has_plain_chat_prompt_after_permission = has_permission_keywords
+            && (has_plain_chat_prompt_after_permission(&lines)
+                || (!has_permission_anchor && lines.iter().copied().any(is_plain_chat_input_line)));
         let has_conflicting_chat_after_permission =
             has_permission_keywords && has_chat_indicators_after_permission(&lines);
         let has_plan_approval_keywords = contains_any(
@@ -397,7 +402,7 @@ fn has_diff_dialog_keywords(frame_text: &str) -> bool {
 
     let has_review_changes = lines
         .iter()
-        .any(|line| line.eq_ignore_ascii_case("Review changes"));
+        .any(|line| line.to_ascii_lowercase().starts_with("review changes"));
     let option_count = lines
         .iter()
         .filter(|line| is_diff_dialog_option_line(line))
@@ -455,7 +460,22 @@ fn is_chat_keyword_line(line: &str) -> bool {
 
 fn is_permission_anchor_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    contains_any(&lower, PERMISSION_KEYWORDS)
+    contains_any(
+        &lower,
+        &[
+            "allow once",
+            "allow for session",
+            "do you want to proceed",
+            "do you want to allow claude to",
+            "claude wants to",
+            "don't ask again",
+            "unsandboxed",
+            "tab to amend",
+            "ctrl+e to explain",
+            "confirm action",
+        ],
+    )
+        || lower.starts_with("claude code needs permission")
         || is_permission_choice_line(line)
         || contains_any(
             &lower,
@@ -704,6 +724,20 @@ mod tests {
                 .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
         );
         assert!(result.recap_present);
+    }
+
+    #[test]
+    fn treats_permission_words_in_scrollback_above_plain_prompt_as_chat_ready() {
+        let frame = "The pre-commit hook has a documented escape hatch for this case.\nCommitted as 815a061.\n※ recap: Fix is committed. Next: rebase or merge main before opening the MR.\n────────────────────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────────────────────\n~/Projects/shipstream/knowledge-base/.claude/worktrees/fix-ai-assistant\n⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
     }
 
     #[test]
