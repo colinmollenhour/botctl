@@ -144,6 +144,7 @@ impl Classifier {
             ],
         );
         let mentions_sensitive_claude_path = contains_sensitive_claude_path(&normalized);
+        let has_survey_prompt = has_survey_prompt(&normalized, &lines);
 
         let has_busy_interrupt_hint = contains_any(
             &normalized,
@@ -183,6 +184,9 @@ impl Classifier {
         } else if has_plan_approval_keywords {
             signals.push(String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS));
             SessionState::PlanApprovalPrompt
+        } else if has_survey_prompt {
+            signals.push(String::from(SIGNAL_SURVEY_KEYWORDS));
+            SessionState::SurveyPrompt
         } else if has_permission_keywords && has_plain_chat_prompt_after_permission {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             SessionState::ChatReady
@@ -206,19 +210,6 @@ impl Classifier {
                 signals.push(String::from(SIGNAL_SENSITIVE_CLAUDE_PATH));
             }
             SessionState::PermissionDialog
-        } else if contains_any(
-            &normalized,
-            &[
-                "how likely are you to recommend claude code",
-                "how is claude doing this session",
-                "rate your experience",
-                "take our survey",
-                "survey",
-                "rate this conversation",
-            ],
-        ) {
-            signals.push(String::from(SIGNAL_SURVEY_KEYWORDS));
-            SessionState::SurveyPrompt
         } else if contains_any(
             &normalized,
             &[
@@ -380,6 +371,42 @@ fn normalize(input: &str) -> String {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
+    if contains_any(
+        normalized,
+        &[
+            "how likely are you to recommend claude code",
+            "how is claude doing this session",
+            "rate your experience",
+            "take our survey",
+            "survey",
+            "rate this conversation",
+        ],
+    ) {
+        return true;
+    }
+
+    let has_session_feedback_question = lines.iter().copied().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("how is") && lower.contains("doing this session")
+    });
+    let has_rating_options = lines.iter().copied().any(is_survey_rating_option_line);
+
+    has_session_feedback_question && has_rating_options
+}
+
+fn is_survey_rating_option_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("1:")
+        && lower.contains("bad")
+        && lower.contains("2:")
+        && lower.contains("fine")
+        && lower.contains("3:")
+        && lower.contains("good")
+        && lower.contains("0:")
+        && lower.contains("dismiss")
 }
 
 fn contains_sensitive_claude_path(normalized: &str) -> bool {
@@ -644,7 +671,8 @@ mod tests {
     use super::{
         Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_CHAT_QUESTIONS,
         SIGNAL_DIFF_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS, SIGNAL_PLAN_APPROVAL_KEYWORDS,
-        SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
+        SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SIGNAL_SURVEY_KEYWORDS,
+        SessionState,
     };
 
     #[test]
@@ -826,6 +854,25 @@ mod tests {
         let frame = "How is Claude doing this session? (optional)\n1: Bad    2: Fine   3: Good   0: Dismiss";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::SurveyPrompt);
+    }
+
+    #[test]
+    fn classifies_session_feedback_prompt_with_visible_chat_input_as_survey() {
+        let frame = [
+            "● Ultrareview launched. I'll wait for the findings to arrive.",
+            "※ recap: Next: wait for the cloud review findings to come back, then triage them.",
+            "● How is Claude doing this session? (optional)",
+            "  1: Bad    2: Fine   3: Good   0: Dismiss",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "🧠 Opus 4.7 (1M context) │ Ctx: 3%",
+        ]
+        .join("\n");
+        let result = Classifier.classify("test", &frame);
+
+        assert_eq!(result.state, SessionState::SurveyPrompt);
+        assert!(result.signals.contains(&String::from(SIGNAL_SURVEY_KEYWORDS)));
     }
 
     #[test]
