@@ -1335,6 +1335,7 @@ fn split_workspace_header(label: &str) -> Option<(&str, &str)> {
 fn detail_body_kind(pane: &PaneEntry) -> DetailBodyKind {
     match pane.state {
         SessionState::PermissionDialog
+        | SessionState::UserQuestionPrompt
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
         | SessionState::SurveyPrompt
@@ -1699,6 +1700,7 @@ fn is_attention_state(state: SessionState) -> bool {
     matches!(
         state,
         SessionState::PermissionDialog
+            | SessionState::UserQuestionPrompt
             | SessionState::PlanApprovalPrompt
             | SessionState::FolderTrustPrompt
             | SessionState::SurveyPrompt
@@ -1748,6 +1750,7 @@ fn yolo_marker(enabled: bool) -> &'static str {
 fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
     match state {
         SessionState::BusyResponding => "⚙️",
+        SessionState::UserQuestionPrompt => "🤔",
         SessionState::ChatReady if has_questions => "🤔",
         SessionState::ChatReady => "💤",
         SessionState::PermissionDialog => "🔐",

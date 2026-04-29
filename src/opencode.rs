@@ -77,7 +77,10 @@ fn resolve_opencode_session(
         .unwrap_or_else(|| String::from("No OpenCode message context found."));
     let has_questions =
         latest_assistant_message_has_question(&connection, &row.id).unwrap_or(false);
-    let state = opencode_session_state(&connection, &row).unwrap_or(SessionState::ChatReady);
+    let mut state = opencode_session_state(&connection, &row).unwrap_or(SessionState::ChatReady);
+    if state == SessionState::ChatReady && has_questions {
+        state = SessionState::UserQuestionPrompt;
+    }
     Some(OpenCodeSession {
         id: row.id,
         title: row.title,
@@ -677,7 +680,7 @@ mod tests {
             11,
             r#"{"type":"text","text":"Can you wire this up?"}"#,
         );
-        insert_message(&db, "msg-assistant", "one", 20, "assistant");
+        insert_completed_message(&db, "msg-assistant", "one", 20, "assistant");
         insert_part(
             &db,
             "part-tool",
@@ -715,7 +718,7 @@ mod tests {
     fn detects_question_in_latest_assistant_message() {
         let db = test_db();
         insert_session(&db, "one", "/tmp/project", "Build feature", None);
-        insert_message(&db, "msg-assistant", "one", 20, "assistant");
+        insert_completed_message(&db, "msg-assistant", "one", 20, "assistant");
         insert_part(
             &db,
             "part-assistant",
@@ -728,6 +731,7 @@ mod tests {
         let session = resolve_opencode_session(&db, "/tmp/project", "Build feature")
             .expect("unique session should resolve");
 
+        assert_eq!(session.state, SessionState::UserQuestionPrompt);
         assert!(session.has_questions);
     }
 

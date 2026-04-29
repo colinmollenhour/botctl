@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     ChatReady,
+    UserQuestionPrompt,
     BusyResponding,
     PermissionDialog,
     PlanApprovalPrompt,
@@ -15,6 +16,7 @@ impl SessionState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ChatReady => "ChatReady",
+            Self::UserQuestionPrompt => "UserQuestionPrompt",
             Self::BusyResponding => "BusyResponding",
             Self::PermissionDialog => "PermissionDialog",
             Self::PlanApprovalPrompt => "PlanApprovalPrompt",
@@ -29,6 +31,7 @@ impl SessionState {
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "ChatReady" => Some(Self::ChatReady),
+            "UserQuestionPrompt" => Some(Self::UserQuestionPrompt),
             "BusyResponding" => Some(Self::BusyResponding),
             "PermissionDialog" => Some(Self::PermissionDialog),
             "PlanApprovalPrompt" => Some(Self::PlanApprovalPrompt),
@@ -166,7 +169,7 @@ impl Classifier {
         );
         let has_busy_status_banner = lines.iter().copied().any(is_busy_status_line);
 
-        let state = if contains_any(
+        let mut state = if contains_any(
             &normalized,
             &[
                 "quick safety check",
@@ -235,10 +238,16 @@ impl Classifier {
             SessionState::Unknown
         };
 
-        let has_questions =
-            state == SessionState::ChatReady && chat_ready_has_questions(frame_text);
+        let has_questions = matches!(
+            state,
+            SessionState::ChatReady | SessionState::UserQuestionPrompt
+        ) && (chat_ready_has_questions(frame_text)
+            || recap_has_user_question(&recap));
         if has_questions {
             signals.push(String::from(SIGNAL_CHAT_QUESTIONS));
+            if state == SessionState::ChatReady {
+                state = SessionState::UserQuestionPrompt;
+            }
         }
 
         Classification {
@@ -592,8 +601,24 @@ fn chat_ready_has_questions(frame_text: &str) -> bool {
 
     let joined = tail.join("\n").to_ascii_lowercase();
     let has_question_line = tail.iter().any(|line| line.contains('?'));
-    let has_question_phrase = contains_any(
-        &joined,
+    let has_question_phrase = contains_question_phrase(&joined);
+    let option_like_lines = tail.iter().filter(|line| is_option_line(line)).count();
+
+    (has_question_line || has_question_phrase || option_like_lines >= 2)
+        && !question_is_superseded_in_tail(&tail)
+}
+
+fn recap_has_user_question(recap: &RecapDetection) -> bool {
+    recap
+        .recap_excerpt
+        .as_deref()
+        .map(|excerpt| contains_question_phrase(&excerpt.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
+fn contains_question_phrase(normalized: &str) -> bool {
+    contains_any(
+        normalized,
         &[
             "should i",
             "would you like",
@@ -604,11 +629,23 @@ fn chat_ready_has_questions(frame_text: &str) -> bool {
             "which approach",
             "do you prefer",
             "let me know which",
+            "next action is for you to",
+            "pick which",
         ],
-    );
-    let option_like_lines = tail.iter().filter(|line| is_option_line(line)).count();
+    )
+}
 
-    has_question_line || has_question_phrase || option_like_lines >= 2
+fn question_is_superseded_in_tail(tail: &[String]) -> bool {
+    let Some(question_idx) = tail.iter().rposition(|line| {
+        let lower = line.to_ascii_lowercase();
+        line.contains('?') || contains_question_phrase(&lower)
+    }) else {
+        return false;
+    };
+
+    tail.iter()
+        .skip(question_idx + 1)
+        .any(|line| line.starts_with('●') || line.starts_with('⎿') || is_recap_anchor(line))
 }
 
 fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
@@ -1005,11 +1042,11 @@ mod tests {
     }
 
     #[test]
-    fn flags_chat_ready_with_direct_question() {
+    fn classifies_direct_question_as_user_question_prompt() {
         let frame = "I fixed the bug and added coverage. Should I also update the docs?\n❯\n~/Projects/botctl (main)";
         let result = Classifier.classify("test", frame);
 
-        assert_eq!(result.state, SessionState::ChatReady);
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
         assert!(result.has_questions);
         assert!(
             result
@@ -1019,21 +1056,35 @@ mod tests {
     }
 
     #[test]
-    fn flags_chat_ready_with_lettered_options() {
+    fn classifies_lettered_options_as_user_question_prompt() {
         let frame = "I can take either path:\nA. Keep the current state model and add a modifier\nB. Split done into a separate top-level state\n❯\n~/Projects/botctl (main)";
         let result = Classifier.classify("test", frame);
 
-        assert_eq!(result.state, SessionState::ChatReady);
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
         assert!(result.has_questions);
     }
 
     #[test]
-    fn flags_chat_ready_with_numbered_options_and_inline_question() {
+    fn classifies_numbered_options_and_inline_question_as_user_question_prompt() {
         let frame = "I'd suggest Option A unless you already have a NuxtHub project.\n1. Update .env.example with the new STUDIO_GITLAB_* vars (and a comment about the moderator allow-list)?\n2. Flip media.external to false (Option A)?\n3. Add a short \"Studio editing\" section to README.md?\nOr all three? Once you create the OAuth app and paste me the Application ID, I can't do that part for you — but I can stage everything else.\n❯\n~/Projects/botctl (main)";
         let result = Classifier.classify("test", frame);
 
-        assert_eq!(result.state, SessionState::ChatReady);
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
         assert!(result.has_questions);
+    }
+
+    #[test]
+    fn classifies_visible_which_do_you_want_prompt_as_user_question_prompt() {
+        let frame = "The remaining work is substantial and the scope branches a few different ways. Where do you want to focus?\n\n1. Playground integration + chaos scenarios (item 44)\n2. Continuous-writes regression test\n3. Dashboards + runbook (item 43 finish)\n4. All of the above, sequenced\n\nWhich do you want?\n\n※ recap: Goal is finishing the Dragonfly integration. Next action is for you to pick which of those to tackle first.\n❯\n~/Projects/bloodraven/dragonfly";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
+        assert!(result.has_questions);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CHAT_QUESTIONS))
+        );
     }
 
     #[test]

@@ -1378,6 +1378,7 @@ fn keep_going_no_yolo_blocker(classification: &Classification, pane_id: &str) ->
     if !matches!(
         classification.state,
         SessionState::PermissionDialog
+            | SessionState::UserQuestionPrompt
             | SessionState::PlanApprovalPrompt
             | SessionState::FolderTrustPrompt
     ) {
@@ -1407,6 +1408,7 @@ fn prompt_submission_started(
 ) -> bool {
     match after_classification.state {
         SessionState::BusyResponding
+        | SessionState::UserQuestionPrompt
         | SessionState::PermissionDialog
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
@@ -2315,6 +2317,7 @@ enum YoloAction {
 fn yolo_action_for_state(state: SessionState) -> YoloAction {
     match state {
         SessionState::ChatReady
+        | SessionState::UserQuestionPrompt
         | SessionState::BusyResponding
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
@@ -3188,6 +3191,9 @@ enum RecoveryAction {
 fn recovery_action_for_state(state: SessionState) -> AppResult<Option<RecoveryAction>> {
     match state {
         SessionState::ChatReady | SessionState::BusyResponding => Ok(None),
+        SessionState::UserQuestionPrompt => Err(AppError::new(
+            "no safe automatic recovery is defined for UserQuestionPrompt; review the pane manually",
+        )),
         SessionState::PermissionDialog => Ok(Some(RecoveryAction::ApprovePermission)),
         SessionState::PlanApprovalPrompt => Err(AppError::new(
             "no safe automatic recovery is defined for PlanApprovalPrompt; review the pane manually",
@@ -3453,6 +3459,9 @@ pub(crate) fn render_next_safe_action(
     }
     match classification.state {
         SessionState::ChatReady => String::from("safe-action: submit-prompt"),
+        SessionState::UserQuestionPrompt => {
+            String::from("manual-review: Claude is asking an operator question")
+        }
         SessionState::BusyResponding => String::from("safe-action: wait"),
         SessionState::PermissionDialog => {
             if let Some(reason) = permission_manual_review_reason(classification) {
