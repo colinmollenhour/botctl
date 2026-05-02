@@ -4,6 +4,14 @@ This page is the current CLI reference for shipped commands and aliases.
 
 `botctl` supports Claude Code as an actively guarded automation target and OpenCode as a passively discovered dashboard target. OpenCode panes are visible in the dashboard when their tmux title and cwd can be matched safely to OpenCode's SQLite session database; keypress automation remains Claude-only.
 
+Global conventions:
+
+- `botctl --version` prints the installed version.
+- `botctl help`, `botctl help <command>`, and `<command> --help` show terminal help.
+- `--no-color`, `NO_COLOR`, `TERM=dumb`, and non-TTY output disable rich help color.
+- Usage errors exit with code `2` and point at focused help instead of dumping global help.
+- `--json` is available on one-shot inspection commands where documented; JSON is printed to stdout.
+
 If you just want the useful commands first, start here:
 
 ## Main commands
@@ -166,17 +174,19 @@ Purpose: list tmux panes.
 
 Syntax:
 ```bash
-botctl list [--all]
+botctl list [--all] [--json]
 ```
 
 Flags:
 - `--all` (default: off; without it, only Claude Code panes are shown)
+- `--json` (emit a stable JSON object with a `panes` array)
 
 Targeting: no explicit target; scans all panes.
 
 Example:
 ```bash
 botctl list
+botctl list --json
 ```
 
 ### `capture`
@@ -205,18 +215,20 @@ Purpose: inspect a pane, classify its state, and report keybinding/next-action d
 
 Syntax:
 ```bash
-botctl status --pane %ID|session:window.pane [--history-lines N]
+botctl status --pane %ID|session:window.pane [--history-lines N] [--json]
 ```
 
 Flags:
 - `--pane %ID|session:window.pane` (required)
 - `--history-lines N` (default: `120`)
+- `--json` (emit a stable JSON object)
 
 Targeting: explicit pane only.
 
 Example:
 ```bash
 botctl status --pane 0:2.3
+botctl status --pane 0:2.3 --json
 ```
 
 ### `doctor`
@@ -225,7 +237,7 @@ Purpose: diagnose a pane or session and report automation readiness.
 
 Syntax:
 ```bash
-botctl doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]
+botctl doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH] [--json]
 ```
 
 Flags:
@@ -233,6 +245,7 @@ Flags:
 - `--pane %ID|session:window.pane` (optional)
 - `--history-lines N` (default: `120`)
 - `--bindings-path PATH` (optional)
+- `--json` (emit a stable JSON object)
 
 Targeting: requires at least one of `--pane` or `--session`.
 
@@ -241,6 +254,7 @@ Safety: refuses if both are missing.
 Example:
 ```bash
 botctl doctor --session demo
+botctl doctor --session demo --json
 ```
 
 ## Observation and serving

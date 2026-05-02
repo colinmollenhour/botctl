@@ -14,9 +14,12 @@ fn main() {
             }
         },
         Err(error) => {
-            eprintln!("error: {error}");
-            eprintln!();
-            eprintln!("{}", cli::usage());
+            eprintln!("{error}");
+            let hint = cli::error_hint(&error.to_string());
+            if !hint.is_empty() {
+                eprintln!();
+                eprintln!("{hint}");
+            }
             std::process::exit(2);
         }
     }

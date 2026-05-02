@@ -67,6 +67,16 @@ botctl doctor --session demo
 botctl status --pane %19
 ```
 
+For scripts, use JSON on one-shot inspection commands:
+
+```bash
+botctl list --json
+botctl status --pane %19 --json
+botctl doctor --session demo --json
+```
+
+Use `botctl --version`, `botctl help`, or `botctl help status` for terminal-local reference.
+
 Pane-targeted commands also accept tmux's explicit pane syntax:
 
 ```bash
