@@ -282,6 +282,17 @@ Replay a saved fixture:
 cargo run -- replay --path fixtures/cases/permission_dialog
 ```
 
+## Release
+
+Minimal release flow:
+
+```bash
+cargo fmt --check && cargo test && cargo package
+git tag vX.Y.Z
+cargo publish
+git push && git push origin vX.Y.Z
+```
+
 ## Current State Model
 
 The classifier currently recognizes:
