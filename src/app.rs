@@ -3104,7 +3104,8 @@ pub(crate) fn ensure_workflow_state(
     workflow: GuardedWorkflow,
     classification: &Classification,
 ) -> AppResult<()> {
-    validate_workflow_state(workflow, classification).map_err(AppError::new)
+    validate_workflow_state(workflow, classification)
+        .map_err(|error| AppError::with_exit_code(error, 2))
 }
 
 fn send_actions(

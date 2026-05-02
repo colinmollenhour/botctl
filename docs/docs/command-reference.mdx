@@ -9,8 +9,20 @@ Global conventions:
 - `botctl --version` prints the installed version.
 - `botctl help`, `botctl help <command>`, and `<command> --help` show terminal help.
 - `--no-color`, `NO_COLOR`, `TERM=dumb`, and non-TTY output disable rich help color.
-- Usage errors exit with code `2` and point at focused help instead of dumping global help.
+- Exit code `0` means success, including help and `--version`.
+- Exit code `1` means runtime failure, such as tmux, filesystem, state database, or keybinding errors.
+- Exit code `2` means usage error or guarded refusal where `botctl` intentionally refuses unsafe or non-actionable automation.
+- Exit code `130` means interrupted when the process is terminated by the default Ctrl-C/SIGINT path; long-running cleanup handlers may stop gracefully with `0`.
+- Usage errors point at focused help instead of dumping global help.
 - `--json` is available on one-shot inspection commands where documented; JSON is printed to stdout.
+- `--plain` preserves current line-oriented output for `attach`, `list`, `status`, and `doctor`; it cannot be combined with `--json`.
+
+Canonical command names:
+
+- Use `yolo`, `approve`, `reject`, and `dismiss-survey` in new docs and scripts.
+- `approve-permission` remains a compatibility alias for `approve`.
+- `reject-permission` remains a compatibility alias for `reject`.
+- Commands marked advanced are supported, but intended for diagnostics, fixtures, prompt plumbing, or low-level automation.
 
 If you just want the useful commands first, start here:
 
@@ -154,10 +166,12 @@ Purpose: resolve and report a Claude pane target.
 Syntax:
 ```bash
 botctl attach (--pane %ID|session:window.pane | --session NAME [--window NAME])
+botctl attach (--pane %ID|session:window.pane | --session NAME [--window NAME]) --plain
 ```
 
 Flags:
 - `--pane %ID|session:window.pane` or `--session NAME [--window NAME]` (required)
+- `--plain` (preserve current line-oriented output)
 
 Targeting: accepts either an explicit pane or a session target; a window-only target is refused.
 
@@ -174,12 +188,13 @@ Purpose: list tmux panes.
 
 Syntax:
 ```bash
-botctl list [--all] [--json]
+botctl list [--all] [--json | --plain]
 ```
 
 Flags:
 - `--all` (default: off; without it, only Claude Code panes are shown)
 - `--json` (emit a stable JSON object with a `panes` array)
+- `--plain` (preserve current line-oriented output; mutually exclusive with `--json`)
 
 Targeting: no explicit target; scans all panes.
 
@@ -187,6 +202,7 @@ Example:
 ```bash
 botctl list
 botctl list --json
+botctl list --plain
 ```
 
 ### `capture`
@@ -215,13 +231,14 @@ Purpose: inspect a pane, classify its state, and report keybinding/next-action d
 
 Syntax:
 ```bash
-botctl status --pane %ID|session:window.pane [--history-lines N] [--json]
+botctl status --pane %ID|session:window.pane [--history-lines N] [--json | --plain]
 ```
 
 Flags:
 - `--pane %ID|session:window.pane` (required)
 - `--history-lines N` (default: `120`)
 - `--json` (emit a stable JSON object)
+- `--plain` (preserve current line-oriented output; mutually exclusive with `--json`)
 
 Targeting: explicit pane only.
 
@@ -229,6 +246,7 @@ Example:
 ```bash
 botctl status --pane 0:2.3
 botctl status --pane 0:2.3 --json
+botctl status --pane 0:2.3 --plain
 ```
 
 ### `doctor`
@@ -237,7 +255,7 @@ Purpose: diagnose a pane or session and report automation readiness.
 
 Syntax:
 ```bash
-botctl doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH] [--json]
+botctl doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH] [--json | --plain]
 ```
 
 Flags:
@@ -246,6 +264,7 @@ Flags:
 - `--history-lines N` (default: `120`)
 - `--bindings-path PATH` (optional)
 - `--json` (emit a stable JSON object)
+- `--plain` (preserve current line-oriented output; mutually exclusive with `--json`)
 
 Targeting: requires at least one of `--pane` or `--session`.
 
@@ -255,6 +274,7 @@ Example:
 ```bash
 botctl doctor --session demo
 botctl doctor --session demo --json
+botctl doctor --session demo --plain
 ```
 
 ## Observation and serving
@@ -372,6 +392,8 @@ botctl serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localh
 
 ## Fixtures and replay
 
+These commands are advanced diagnostics for maintaining classifier fixtures and replaying saved cases.
+
 ### `record-fixture`
 
 Purpose: capture a fixture case from a live session.
@@ -477,7 +499,7 @@ botctl install-bindings
 
 ### `send-action`
 
-Purpose: send one named automation action to a pane.
+Purpose: advanced plumbing command that sends one named automation action to a pane.
 
 Syntax:
 ```bash
@@ -509,9 +531,9 @@ botctl send-action --pane 0:2.3 --action submit
 
 ## Guarded workflows
 
-### `approve` / `approve-permission`
+### `approve`
 
-Purpose: approve a permission dialog.
+Purpose: approve a permission dialog. Canonical name: `approve`; compatibility alias: `approve-permission`.
 
 Syntax:
 ```bash
@@ -532,9 +554,9 @@ Example:
 botctl approve --pane 0:2.3
 ```
 
-### `reject` / `reject-permission`
+### `reject`
 
-Purpose: decline a permission dialog.
+Purpose: decline a permission dialog. Canonical name: `reject`; compatibility alias: `reject-permission`.
 
 Syntax:
 ```bash
@@ -557,7 +579,7 @@ botctl reject --pane 0:2.3 --format jsonl
 
 ### `dismiss-survey`
 
-Purpose: dismiss a survey prompt.
+Purpose: dismiss a survey prompt. Canonical name: `dismiss-survey`.
 
 Syntax:
 ```bash
@@ -697,7 +719,7 @@ botctl prepare-prompt --session demo --text "Write the summary"
 
 ### `editor-helper`
 
-Purpose: generate an editor target file for the prompt workflow.
+Purpose: advanced prompt plumbing command that generates an editor target file for the prompt workflow.
 
 Syntax:
 ```bash
@@ -751,14 +773,12 @@ botctl submit-prompt --session demo --pane 0:2.3 --text "Continue"
 
 ### `yolo`
 
-Purpose: start or stop the long-running permission loop.
+Purpose: start or stop the long-running permission loop. Canonical name: `yolo`.
 
 Syntax:
 ```bash
 botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
 botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
-botctl permission-babysit [same as yolo]
-botctl babysit [same as yolo]
 ```
 
 Subcommands:
@@ -801,6 +821,7 @@ Purpose: print the command list and usage summary.
 Syntax:
 ```bash
 botctl help
+botctl help exit-codes
 botctl --help
 botctl -h
 ```
@@ -808,4 +829,6 @@ botctl -h
 Example:
 ```bash
 botctl --help
+botctl help safety
+botctl help exit-codes
 ```

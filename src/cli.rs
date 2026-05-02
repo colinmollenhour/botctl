@@ -66,6 +66,7 @@ pub struct PaneTargetArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachArgs {
     pub target: PaneTargetArgs,
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,7 @@ pub struct CaptureArgs {
 pub struct ListPanesArgs {
     pub all: bool,
     pub json: bool,
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +109,7 @@ pub struct StatusArgs {
     pub pane_id: String,
     pub history_lines: usize,
     pub json: bool,
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +119,7 @@ pub struct DoctorArgs {
     pub history_lines: usize,
     pub bindings_path: Option<PathBuf>,
     pub json: bool,
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +405,12 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Usage:"));
     out.push_str("\n  botctl <command> [options]\n\n");
 
+    out.push_str(&section("Canonical Names:"));
+    out.push_str(
+        "\n  Use `yolo`, `approve`, `reject`, and `dismiss-survey` in new docs and scripts.\n",
+    );
+    out.push_str("  Compatibility aliases: `approve-permission` -> `approve`, `reject-permission` -> `reject`.\n\n");
+
     out.push_str(&section("Main Commands:"));
     out.push('\n');
     out.push_str(&featured(
@@ -428,13 +438,13 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Common Commands:"));
     out.push('\n');
     for line in [
-        "status --pane %ID|session:window.pane [--history-lines N]",
-        "doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH]",
+        "status --pane %ID|session:window.pane [--history-lines N] [--json | --plain]",
+        "doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH] [--json | --plain]",
         "continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)",
         "auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]",
         "keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]",
-        "approve --pane %ID|session:window.pane [--format human|jsonl]",
-        "reject --pane %ID|session:window.pane [--format human|jsonl]",
+        "approve --pane %ID|session:window.pane [--format human|jsonl]  (alias: approve-permission)",
+        "reject --pane %ID|session:window.pane [--format human|jsonl]  (alias: reject-permission)",
         "dismiss-survey --pane %ID|session:window.pane",
     ] {
         out.push_str(&command(line));
@@ -446,8 +456,8 @@ fn usage_with_color(color: bool) -> String {
     out.push('\n');
     for line in [
         "start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]",
-        "attach (--pane %ID|session:window.pane | --session NAME [--window NAME])",
-        "list [--all]",
+        "attach (--pane %ID|session:window.pane | --session NAME [--window NAME]) [--plain]",
+        "list [--all] [--json | --plain]",
         "capture --pane %ID|session:window.pane [--history-lines N]",
         "observe --session NAME [--pane %ID|session:window.pane] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]",
     ] {
@@ -460,7 +470,7 @@ fn usage_with_color(color: bool) -> String {
     out.push('\n');
     for line in [
         "prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]",
-        "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET",
+        "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET  [advanced]",
         "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]",
     ] {
         out.push_str(&command(line));
@@ -468,15 +478,15 @@ fn usage_with_color(color: bool) -> String {
     }
     out.push('\n');
 
-    out.push_str(&section("Diagnostics And Fixtures:"));
+    out.push_str(&section("Advanced Diagnostics And Plumbing:"));
     out.push('\n');
     for line in [
-        "record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]",
-        "classify --path PATH",
-        "replay --path PATH",
+        "record-fixture --session NAME --case NAME [--pane %ID|session:window.pane] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]  [advanced]",
+        "classify --path PATH  [advanced]",
+        "replay --path PATH  [advanced]",
         "bindings",
         "install-bindings [--path PATH]",
-        "send-action --pane %ID|session:window.pane --action NAME",
+        "send-action --pane %ID|session:window.pane --action NAME  [advanced]",
     ] {
         out.push_str(&command(line));
         out.push('\n');
@@ -493,6 +503,12 @@ fn usage_with_color(color: bool) -> String {
         out.push_str(&featured(line));
         out.push('\n');
     }
+    out.push('\n');
+
+    out.push_str(&section("Help Topics:"));
+    out.push_str(
+        "\n  botctl help targeting\n  botctl help safety\n  botctl help json\n  botctl help state-dir\n  botctl help dashboard-keys\n  botctl help opencode\n  botctl help exit-codes\n",
+    );
 
     out
 }
@@ -613,7 +629,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         ),
         "yolo" => (
             "yolo",
-            "Start autonomous babysitting for one pane or all registered panes.",
+            "Start autonomous babysitting for one pane or all registered panes. Canonical name: yolo.",
             "botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
             &[
                 "botctl yolo --pane %19",
@@ -671,10 +687,39 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             "JSONL is stable machine stream on stdout. Warnings go to stderr.",
         ),
+        "attach" => (
+            "attach",
+            "Validate and report an existing Claude pane target.",
+            "botctl attach (--pane TARGET | --session NAME [--window NAME]) [--plain]",
+            &[
+                "botctl attach --pane %19",
+                "botctl attach --session demo --window claude --plain",
+            ][..],
+            &[
+                "--pane TARGET",
+                "--session NAME",
+                "--window NAME",
+                "--plain",
+                "--no-color",
+            ][..],
+            TARGET_HELP,
+        ),
+        "list" => (
+            "list",
+            "List Claude panes, or all tmux panes with --all.",
+            "botctl list [--all] [--json | --plain]",
+            &[
+                "botctl list",
+                "botctl list --all --plain",
+                "botctl list --json",
+            ][..],
+            &["--all", "--json", "--plain", "--no-color"][..],
+            "Default and --plain output are line-oriented. --json emits a one-shot object on stdout.",
+        ),
         "status" => (
             "status",
             "Classify one pane and show next safe action.",
-            "botctl status --pane %ID|session:window.pane [--history-lines N] [--json]",
+            "botctl status --pane %ID|session:window.pane [--history-lines N] [--json | --plain]",
             &[
                 "botctl status --pane %19",
                 "botctl status --pane 0:2.3 --json",
@@ -683,6 +728,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--pane TARGET",
                 "--history-lines N (default: 120)",
                 "--json",
+                "--plain",
                 "--no-color",
             ][..],
             TARGET_HELP,
@@ -690,7 +736,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "doctor" => (
             "doctor",
             "Inspect one pane plus keybinding readiness.",
-            "botctl doctor (--pane TARGET | --session NAME) [--history-lines N] [--bindings-path PATH] [--json]",
+            "botctl doctor (--pane TARGET | --session NAME) [--history-lines N] [--bindings-path PATH] [--json | --plain]",
             &[
                 "botctl doctor --pane %19",
                 "botctl doctor --session demo --json",
@@ -701,13 +747,14 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--history-lines N (default: 120)",
                 "--bindings-path PATH",
                 "--json",
+                "--plain",
                 "--no-color",
             ][..],
             TARGET_HELP,
         ),
         "approve" | "approve-permission" => (
             "approve",
-            "Approve current Claude permission or folder-trust prompt when safe.",
+            "Approve current Claude permission or folder-trust prompt when safe. Canonical name: approve. Alias: approve-permission.",
             "botctl approve --pane %ID|session:window.pane [--format human|jsonl]",
             &[
                 "botctl approve --pane %19",
@@ -722,7 +769,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         ),
         "reject" | "reject-permission" => (
             "reject",
-            "Reject current Claude permission prompt when safe.",
+            "Reject current Claude permission prompt when safe. Canonical name: reject. Alias: reject-permission.",
             "botctl reject --pane %ID|session:window.pane [--format human|jsonl]",
             &["botctl reject --pane %19"][..],
             &[
@@ -764,7 +811,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "json" => {
             return Some(topic_page(
                 "json",
-                "Use --json for one-shot objects on list, status, and doctor. Use --format jsonl for long event streams such as serve and yolo.",
+                "Use --json for one-shot objects on list, status, and doctor. Use --plain to require current line-oriented output on attach, list, status, and doctor. Use --format jsonl for long event streams such as serve and yolo.",
             ));
         }
         "state-dir" => {
@@ -785,6 +832,12 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "OpenCode panes are dashboard-visible only when tmux command, title, cwd, and SQLite session metadata match uniquely. botctl never sends automation keys to OpenCode panes.",
             ));
         }
+        "exit-codes" => {
+            return Some(topic_page(
+                "exit-codes",
+                "0 success, including help and --version.\n1 runtime failure, such as tmux, filesystem, state database, or keybinding errors.\n2 usage error or guarded refusal where botctl intentionally refuses unsafe/non-actionable automation.\n130 interrupted when the process is terminated by the default Ctrl-C/SIGINT path; long-running cleanup handlers may stop gracefully with 0.",
+            ));
+        }
         _ => return generic_command_usage(topic, color),
     };
     Some(render_command_usage(
@@ -803,8 +856,8 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "start" => {
             "botctl start --session NAME [--window NAME] [--cwd PATH] [--command CMD] [--dry-run]"
         }
-        "attach" => "botctl attach (--pane TARGET | --session NAME [--window NAME])",
-        "list" => "botctl list [--all] [--json]",
+        "attach" => "botctl attach (--pane TARGET | --session NAME [--window NAME]) [--plain]",
+        "list" => "botctl list [--all] [--json | --plain]",
         "capture" => "botctl capture --pane TARGET [--history-lines N]",
         "observe" => {
             "botctl observe --session NAME [--pane TARGET] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]"
@@ -838,9 +891,20 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         }
         _ => return None,
     };
+    let purpose = match topic {
+        "record-fixture" => "Advanced: capture a fixture case from a live session.",
+        "classify" => "Advanced: classify a saved frame file.",
+        "replay" => "Advanced: replay and compare a saved fixture case.",
+        "send-action" => "Advanced plumbing: send one named automation action to a pane.",
+        "dismiss-survey" => "Dismiss a survey prompt. Canonical name: dismiss-survey.",
+        "editor-helper" => {
+            "Advanced prompt plumbing: generate an editor target file for prompt handoff."
+        }
+        _ => "Run command-specific workflow.",
+    };
     Some(render_command_usage(
         topic,
-        "Run command-specific workflow.",
+        purpose,
         usage,
         &[usage],
         &["--help", "--no-color"],
@@ -935,8 +999,17 @@ fn parse_start(args: Vec<String>) -> AppResult<Command> {
 }
 
 fn parse_attach(args: Vec<String>) -> AppResult<Command> {
-    let target = parse_pane_target_args(args, "attach")?;
-    Ok(Command::Attach(AttachArgs { target }))
+    let mut target_args = Vec::new();
+    let mut plain = false;
+    for arg in args {
+        if arg == "--plain" {
+            plain = true;
+        } else {
+            target_args.push(arg);
+        }
+    }
+    let target = parse_pane_target_args(target_args, "attach")?;
+    Ok(Command::Attach(AttachArgs { target, plain }))
 }
 
 fn parse_approve_reject(
@@ -970,17 +1043,20 @@ fn parse_approve_reject(
 fn parse_list_panes(args: Vec<String>) -> AppResult<Command> {
     let mut all = false;
     let mut json = false;
+    let mut plain = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--all" => all = true,
             "--json" => json = true,
+            "--plain" => plain = true,
             flag => return Err(AppError::new(format!("unknown list flag: {flag}"))),
         }
         i += 1;
     }
 
-    Ok(Command::ListPanes(ListPanesArgs { all, json }))
+    reject_json_plain_conflict("list", json, plain)?;
+    Ok(Command::ListPanes(ListPanesArgs { all, json, plain }))
 }
 
 fn parse_capture(args: Vec<String>) -> AppResult<Command> {
@@ -1018,6 +1094,7 @@ fn parse_status(args: Vec<String>) -> AppResult<Command> {
     let mut pane_id = None;
     let mut history_lines = 120usize;
     let mut json = false;
+    let mut plain = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1034,6 +1111,9 @@ fn parse_status(args: Vec<String>) -> AppResult<Command> {
             "--json" => {
                 json = true;
             }
+            "--plain" => {
+                plain = true;
+            }
             flag => {
                 return Err(AppError::new(format!("unknown status flag: {flag}")));
             }
@@ -1042,10 +1122,12 @@ fn parse_status(args: Vec<String>) -> AppResult<Command> {
     }
 
     let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+    reject_json_plain_conflict("status", json, plain)?;
     Ok(Command::Status(StatusArgs {
         pane_id,
         history_lines,
         json,
+        plain,
     }))
 }
 
@@ -1055,6 +1137,7 @@ fn parse_doctor(args: Vec<String>) -> AppResult<Command> {
     let mut history_lines = 120usize;
     let mut bindings_path = None;
     let mut json = false;
+    let mut plain = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1077,6 +1160,9 @@ fn parse_doctor(args: Vec<String>) -> AppResult<Command> {
             "--json" => {
                 json = true;
             }
+            "--plain" => {
+                plain = true;
+            }
             flag => {
                 return Err(AppError::new(format!("unknown doctor flag: {flag}")));
             }
@@ -1089,6 +1175,7 @@ fn parse_doctor(args: Vec<String>) -> AppResult<Command> {
             "doctor requires either --pane %ID|session:window.pane or --session NAME",
         ));
     }
+    reject_json_plain_conflict("doctor", json, plain)?;
 
     Ok(Command::Doctor(DoctorArgs {
         session_name,
@@ -1096,7 +1183,18 @@ fn parse_doctor(args: Vec<String>) -> AppResult<Command> {
         history_lines,
         bindings_path,
         json,
+        plain,
     }))
+}
+
+fn reject_json_plain_conflict(command: &str, json: bool, plain: bool) -> AppResult<()> {
+    if json && plain {
+        Err(AppError::new(format!(
+            "{command} cannot combine --json and --plain"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_observe(args: Vec<String>) -> AppResult<Command> {
@@ -1970,7 +2068,11 @@ mod tests {
             .expect("list command should parse");
 
         match command {
-            Command::ListPanes(args) => assert!(!args.all),
+            Command::ListPanes(args) => {
+                assert!(!args.all);
+                assert!(!args.json);
+                assert!(!args.plain);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -1985,9 +2087,48 @@ mod tests {
         .expect("list --all command should parse");
 
         match command {
-            Command::ListPanes(args) => assert!(args.all),
+            Command::ListPanes(args) => {
+                assert!(args.all);
+                assert!(!args.json);
+                assert!(!args.plain);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_list_plain_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("list"),
+            String::from("--plain"),
+        ])
+        .expect("list --plain command should parse");
+
+        match command {
+            Command::ListPanes(args) => {
+                assert!(args.plain);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_list_json_plain_combination() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("list"),
+            String::from("--json"),
+            String::from("--plain"),
+        ])
+        .expect_err("list should reject conflicting output formats");
+
+        assert!(
+            error
+                .to_string()
+                .contains("list cannot combine --json and --plain")
+        );
     }
 
     #[test]
@@ -2007,6 +2148,7 @@ mod tests {
                 assert_eq!(args.target.session_name.as_deref(), Some("demo"));
                 assert_eq!(args.target.window_name.as_deref(), Some("claude"));
                 assert!(args.target.pane_id.is_none());
+                assert!(!args.plain);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2027,6 +2169,27 @@ mod tests {
                 assert_eq!(args.target.pane_id.as_deref(), Some("0:2.3"));
                 assert!(args.target.session_name.is_none());
                 assert!(args.target.window_name.is_none());
+                assert!(!args.plain);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attach_plain_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("attach"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--plain"),
+        ])
+        .expect("attach --plain command should parse");
+
+        match command {
+            Command::Attach(args) => {
+                assert_eq!(args.target.pane_id.as_deref(), Some("%7"));
+                assert!(args.plain);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2244,10 +2407,29 @@ mod tests {
         assert!(usage.contains("serve --session NAME"));
         assert!(usage.contains("dashboard [--poll-ms N]"));
         assert!(usage.contains("Common Commands:"));
-        assert!(usage.contains("Diagnostics And Fixtures:"));
+        assert!(usage.contains("[--json | --plain]"));
+        assert!(usage.contains("Canonical Names:"));
+        assert!(usage.contains("approve-permission` -> `approve"));
+        assert!(usage.contains("Advanced Diagnostics And Plumbing:"));
         assert!(usage.contains("Quick Start:"));
+        assert!(usage.contains("Help Topics:"));
         assert!(usage.contains("dashboard [--poll-ms N]"));
         assert!(usage.contains("[--exit-on-navigate]"));
+        assert!(usage.contains("botctl help exit-codes"));
+    }
+
+    #[test]
+    fn exit_codes_help_topic_documents_stable_codes() {
+        let usage = super::usage_for(&super::HelpArgs {
+            topic: Some(String::from("exit-codes")),
+            color: false,
+        });
+
+        assert!(usage.contains("botctl help exit-codes"));
+        assert!(usage.contains("0 success"));
+        assert!(usage.contains("1 runtime failure"));
+        assert!(usage.contains("2 usage error or guarded refusal"));
+        assert!(usage.contains("130 interrupted"));
     }
 
     #[test]
@@ -2264,6 +2446,8 @@ mod tests {
             Command::Status(args) => {
                 assert_eq!(args.pane_id, "%7");
                 assert_eq!(args.history_lines, 120);
+                assert!(!args.json);
+                assert!(!args.plain);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2283,9 +2467,50 @@ mod tests {
             Command::Status(args) => {
                 assert_eq!(args.pane_id, "0:2.3");
                 assert_eq!(args.history_lines, 120);
+                assert!(!args.json);
+                assert!(!args.plain);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_status_plain_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("status"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--plain"),
+        ])
+        .expect("status --plain command should parse");
+
+        match command {
+            Command::Status(args) => {
+                assert!(args.plain);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_status_json_plain_combination() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("status"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--json"),
+            String::from("--plain"),
+        ])
+        .expect_err("status should reject conflicting output formats");
+
+        assert!(
+            error
+                .to_string()
+                .contains("status cannot combine --json and --plain")
+        );
     }
 
     #[test]
@@ -2302,9 +2527,51 @@ mod tests {
             Command::Doctor(args) => {
                 assert_eq!(args.session_name.as_deref(), Some("demo"));
                 assert!(args.pane_id.is_none());
+                assert!(!args.json);
+                assert!(!args.plain);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_doctor_plain_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("doctor"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--plain"),
+        ])
+        .expect("doctor --plain command should parse");
+
+        match command {
+            Command::Doctor(args) => {
+                assert_eq!(args.session_name.as_deref(), Some("demo"));
+                assert!(args.plain);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_doctor_json_plain_combination() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("doctor"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--json"),
+            String::from("--plain"),
+        ])
+        .expect_err("doctor should reject conflicting output formats");
+
+        assert!(
+            error
+                .to_string()
+                .contains("doctor cannot combine --json and --plain")
+        );
     }
 
     #[test]

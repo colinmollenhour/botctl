@@ -35,8 +35,8 @@ Before any guarded workflow runs, `botctl` checks that the pane is owned by Clau
 Guarded workflows validate state before acting:
 
 - `submit-prompt` requires `ChatReady`
-- `approve-permission` accepts `PermissionDialog` and `FolderTrustPrompt`
-- `reject-permission` requires `PermissionDialog`
+- `approve` accepts `PermissionDialog` and `FolderTrustPrompt`; `approve-permission` is a compatibility alias
+- `reject` requires `PermissionDialog`; `reject-permission` is a compatibility alias
 - `dismiss-survey` requires `SurveyPrompt`
 
 Refusal states are part of the safety model:

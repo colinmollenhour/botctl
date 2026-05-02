@@ -12,7 +12,7 @@ This is a CLI-first wishlist for making `botctl` feel safer, clearer, and more b
 6. [ ] P0-6 Add stable `--json` output for inspection and one-shot state-changing commands.
 7. [x] P0-7 Add per-command help pages for `dashboard`, `yolo`, `serve`, `status`, `doctor`, target syntax, and safety rules.
 8. [ ] P1-1 Move to a mature parser such as `clap` before adding more command surface.
-9. [ ] P1-2 Normalize naming around `yolo`, `approve`, `reject`, `dismiss-survey`, and long aliases.
+9. [x] P1-2 Normalize naming around `yolo`, `approve`, `reject`, `dismiss-survey`, and long aliases.
 10. [ ] P1-3 Create a reusable target grammar and document it everywhere as one concept.
 11. [ ] P1-4 Add `--no-input`, `--quiet`, `--verbose`, `--debug`, and `--no-color` where they matter.
 12. [ ] P1-5 Add interactive target selection only when stdin is a TTY and no explicit target is provided.
@@ -22,8 +22,8 @@ This is a CLI-first wishlist for making `botctl` feel safer, clearer, and more b
 16. [x] P2-2 Add `botctl help <topic>` for concepts: `targeting`, `safety`, `json`, `state-dir`, `dashboard-keys`, and `opencode`.
 17. [ ] P2-3 Add shell completions and completions docs.
 18. [x] P2-4 Add command examples to help output, not only docs.
-19. [ ] P2-5 Add `--plain` for line-oriented output where rich text may evolve.
-20. [ ] P2-6 Add structured exit-code conventions and document them.
+19. [x] P2-5 Add `--plain` for line-oriented output where rich text may evolve.
+20. [x] P2-6 Add structured exit-code conventions and document them.
 21. [ ] P3-1 Consider a larger command taxonomy redesign after contracts stabilize.
 22. [ ] P3-2 Consider aliases for common human flows, but keep canonical commands explicit.
 23. [ ] P3-3 Add terminal-accessible docs generated from the same source as web docs.
@@ -133,7 +133,8 @@ Exit codes:
 - help success: `0`
 - usage/parse errors: `2`
 - runtime failure: `1`
-- guarded refusal / unsafe state: document as either `1` or `3`, then keep stable
+- guarded refusal / unsafe state where botctl intentionally refuses unsafe or non-actionable automation: `2`
+- interrupted by the default Ctrl-C/SIGINT path: `130`; long-running cleanup handlers may stop gracefully with `0`
 
 ### P0-6 Add Stable `--json` For One-Shot Commands
 
@@ -392,9 +393,9 @@ Recommended contract:
 - `0`: success
 - `1`: runtime failure
 - `2`: usage error or unsafe/non-actionable guarded refusal
-- `130`: interrupted by Ctrl-C, if not already handled as graceful success
+- `130`: interrupted by Ctrl-C when botctl is terminated by the default SIGINT path; long-running cleanup handlers may stop gracefully with `0`
 
-If guarded refusal deserves a separate code, choose it now and document it before scripts depend on current behavior.
+The terminal help topic is `botctl help exit-codes`.
 
 ## P3: Bigger Redesign Ideas
 
