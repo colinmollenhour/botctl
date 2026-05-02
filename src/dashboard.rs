@@ -1055,11 +1055,6 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     );
     frame.render_stateful_widget(list, panes_layout[1], &mut list_state);
 
-    let details_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(3)])
-        .split(body[1]);
-
     if let Some(pane) = app.selected_pane() {
         let mut details = vec![
             Line::from(format!("Workspace: {}", detail_workspace_label(pane))),
@@ -1100,6 +1095,14 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             pane_session_id(pane).unwrap_or("-")
         )));
 
+        let details_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(details_panel_height(details.len())),
+                Constraint::Min(3),
+            ])
+            .split(body[1]);
+
         let details = Paragraph::new(details).block(rounded_block(Some("Details")));
         frame.render_widget(details, details_layout[0]);
 
@@ -1112,6 +1115,11 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             });
         frame.render_widget(body, details_layout[1]);
     } else {
+        let details_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(body[1]);
+
         let details = Paragraph::new(vec![Line::from("No supported panes found")])
             .block(rounded_block(Some("Details")));
         frame.render_widget(details, details_layout[0]);
@@ -1159,6 +1167,10 @@ fn dashboard_body_sections(area: Rect) -> Vec<Rect> {
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
         .split(area)
         .to_vec()
+}
+
+fn details_panel_height(line_count: usize) -> u16 {
+    line_count.saturating_add(2).min(u16::MAX as usize) as u16
 }
 
 fn pane_list_content_area(area: Rect) -> Rect {
@@ -1904,11 +1916,11 @@ mod tests {
         abbreviate_home_path, context_lines_above_input, current_base_window_name,
         dashboard_body_sections, dashboard_display_state, dashboard_selection_path,
         derive_base_window_name, detail_body_kind, detail_current_path, detail_workspace_label,
-        footer_column_widths, footer_help_line, footer_lines, format_age, load_saved_selection,
-        pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
-        recap_lines, rect_contains, render_workspace_header_line, repo_root_from_repo_key,
-        save_selection, should_return_navigation, split_workspace_header, state_emoji,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
+        details_panel_height, footer_column_widths, footer_help_line, footer_lines, format_age,
+        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
+        pane_window_prefix, recap_lines, rect_contains, render_workspace_header_line,
+        repo_root_from_repo_key, save_selection, should_return_navigation, split_workspace_header,
+        state_emoji, strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::SessionState;
@@ -2181,6 +2193,11 @@ mod tests {
         });
         assert_eq!(wide[0].width, DASHBOARD_LEFT_PANE_MAX_WIDTH);
         assert_eq!(wide[1].width, 120);
+    }
+
+    #[test]
+    fn details_panel_height_includes_borders() {
+        assert_eq!(details_panel_height(10), 12);
     }
 
     #[test]
