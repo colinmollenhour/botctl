@@ -34,6 +34,8 @@ These are the commands that matter most in day-to-day use:
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
 
+For recovery actions, use the canonical names `approve`, `reject`, and `dismiss-survey`. The long names `approve-permission` and `reject-permission` remain compatibility aliases.
+
 Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing around those flows.
 
 ## Current Features
@@ -158,12 +160,14 @@ See what pane was created:
 
 ```bash
 cargo run -- list
+cargo run -- list --plain
 ```
 
 Inspect a managed session:
 
 ```bash
 cargo run -- doctor --session demo
+cargo run -- doctor --session demo --plain
 ```
 
 Capture a pane directly:
@@ -176,7 +180,10 @@ Check the live classified state for a pane:
 
 ```bash
 cargo run -- status --pane %19
+cargo run -- status --pane %19 --plain
 ```
+
+`--plain` preserves the current line-oriented output for `attach`, `list`, `status`, and `doctor` if richer human output is added later. `list`, `status`, and `doctor` also support `--json`; `--json` and `--plain` are mutually exclusive.
 
 The same command using tmux pane syntax:
 
@@ -204,16 +211,18 @@ tmux attach -t demo
 If the session is blocked on a known confirmation flow, target the pane directly:
 
 ```bash
-cargo run -- approve-permission --pane %19
-cargo run -- reject-permission --pane %19
+cargo run -- approve --pane %19
+cargo run -- reject --pane %19
 cargo run -- dismiss-survey --pane %19
 ```
 
 Or with an explicit tmux pane target:
 
 ```bash
-cargo run -- approve-permission --pane 0:2.3
+cargo run -- approve --pane 0:2.3
 ```
+
+`approve-permission` and `reject-permission` still work as aliases for older scripts.
 
 Prepare and submit a prompt:
 
@@ -289,7 +298,7 @@ The classifier currently recognizes:
 
 Recap is auxiliary metadata, not a primary state. Strong anchors like `while you were away` and `away summary` can surface it, but `/recap` by itself does not.
 
-`approve-permission` accepts both `PermissionDialog` and `FolderTrustPrompt`. For `FolderTrustPrompt`, `botctl` sends raw `Enter` because that flow must confirm the default selected option directly.
+`approve` accepts both `PermissionDialog` and `FolderTrustPrompt`. For `FolderTrustPrompt`, `botctl` sends raw `Enter` because that flow must confirm the default selected option directly. `approve-permission` remains an alias for older scripts.
 
 ## Current Limits
 

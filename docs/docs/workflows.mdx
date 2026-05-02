@@ -81,16 +81,18 @@ OpenCode panes are handled differently: the dashboard only includes them passive
 
 Use the direct pane-targeted actions only when the classified state matches the flow.
 
-- permission dialog: `approve-permission` or `reject-permission`
+- permission dialog: `approve` or `reject`
 - survey prompt: `dismiss-survey`
 - blocked but usable session: `continue-session`
 - repeated prompt recovery: `auto-unstick`
 
+`approve` and `reject` are the canonical names. `approve-permission` and `reject-permission` remain compatibility aliases for older scripts.
+
 Examples:
 
 ```bash
-botctl approve-permission --pane %19
-botctl reject-permission --pane %19
+botctl approve --pane %19
+botctl reject --pane %19
 botctl dismiss-survey --pane %19
 botctl continue-session --pane %19
 botctl auto-unstick --pane %19
@@ -99,7 +101,7 @@ botctl auto-unstick --pane %19
 Notes:
 
 - `Unknown` is a refusal state; do not guess.
-- `approve-permission` accepts `PermissionDialog` and `FolderTrustPrompt`.
+- `approve` accepts `PermissionDialog` and `FolderTrustPrompt`.
 - Folder trust approval is special and uses raw `Enter`.
 - Prefer explicit pane IDs over session names for recovery.
 

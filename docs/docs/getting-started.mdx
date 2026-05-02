@@ -14,6 +14,8 @@ Most users only need three commands:
 - `yolo` for automated babysitting and recovery
 - `serve` for a long-lived observation stream
 
+For direct blocker recovery, use the canonical names `approve`, `reject`, and `dismiss-survey`. The longer `approve-permission` and `reject-permission` names still work as compatibility aliases.
+
 Everything else is support around setup, diagnostics, prompt handoff, and lower-level recovery.
 
 If you just want to get value quickly, install it, open `dashboard`, then try `yolo` or `serve`.
@@ -66,6 +68,18 @@ botctl list
 botctl doctor --session demo
 botctl status --pane %19
 ```
+
+Use `--plain` on `attach`, `list`, `status`, and `doctor` when scripts need the current line-oriented output contract.
+
+For scripts, use JSON on one-shot inspection commands:
+
+```bash
+botctl list --json
+botctl status --pane %19 --json
+botctl doctor --session demo --json
+```
+
+Use `botctl --version`, `botctl help`, or `botctl help status` for terminal-local reference.
 
 Pane-targeted commands also accept tmux's explicit pane syntax:
 

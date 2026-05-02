@@ -164,7 +164,8 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::SubmitPrompt(args) => run_submit_prompt(args),
         Command::YoloStart(args) => run_yolo_start(args),
         Command::YoloStop(args) => run_yolo_stop(args),
-        Command::Help => Ok(crate::cli::usage()),
+        Command::Version => Ok(crate::cli::version()),
+        Command::Help(args) => Ok(crate::cli::usage_for(&args)),
     }
 }
 
@@ -352,7 +353,11 @@ fn run_attach(args: AttachArgs) -> AppResult<String> {
 
 fn run_list_panes(args: ListPanesArgs) -> AppResult<String> {
     let panes = TmuxClient::default().list_panes()?;
-    Ok(render_list_panes(&panes, args.all))
+    if args.json {
+        render_list_panes_json(&panes, args.all)
+    } else {
+        Ok(render_list_panes(&panes, args.all))
+    }
 }
 
 fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
@@ -392,6 +397,29 @@ fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
     out.trim_end().to_string()
 }
 
+fn render_list_panes_json(panes: &[TmuxPane], include_all: bool) -> AppResult<String> {
+    let panes = panes
+        .iter()
+        .filter(|pane| include_all || is_pane_command_claude(pane))
+        .map(|pane| {
+            serde_json::json!({
+                "pane_id": pane.pane_id,
+                "session": pane.session_name,
+                "window": pane.window_name,
+                "active": pane.pane_active,
+                "command": pane.current_command,
+                "cwd": pane.current_path,
+                "cursor": {
+                    "x": pane.cursor_x,
+                    "y": pane.cursor_y,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&serde_json::json!({ "panes": panes }))
+        .map_err(|error| AppError::new(format!("failed to encode list JSON: {error}")))
+}
+
 fn run_capture(args: CaptureArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
@@ -407,12 +435,16 @@ fn run_status(args: StatusArgs) -> AppResult<String> {
     let classification = Classifier.classify(&pane.pane_id, &focused);
     let bindings = inspect_keybindings(None).map_err(AppError::new)?;
 
-    Ok(render_status_report(
-        &pane,
-        &classification,
-        &bindings,
-        &frame,
-    ))
+    if args.json {
+        render_status_json(&pane, &classification, &bindings, &frame, false)
+    } else {
+        Ok(render_status_report(
+            &pane,
+            &classification,
+            &bindings,
+            &frame,
+        ))
+    }
 }
 
 fn run_doctor(args: DoctorArgs) -> AppResult<String> {
@@ -432,29 +464,33 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
     let automation_ready =
         is_pane_command_claude(&pane) && bindings.status == KeybindingsStatus::Valid;
 
-    Ok(format!(
-        "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
-        automation_ready,
-        pane.pane_id,
-        pane.session_name,
-        pane.window_name,
-        pane.pane_active,
-        pane.current_command,
-        is_pane_command_claude(&pane),
-        pane.current_path,
-        render_cursor(&pane),
-        classification.state.as_str(),
-        classification.has_questions,
-        classification.recap_present,
-        classification.recap_excerpt.as_deref().unwrap_or("none"),
-        render_signals(&classification),
-        render_screen_excerpt(&frame),
-        render_next_safe_action(&classification, &pane, &bindings),
-        bindings.path.display(),
-        bindings.status.as_str(),
-        render_missing_bindings(&bindings),
-        render_doctor_recommendations(&pane, &bindings)
-    ))
+    if args.json {
+        render_status_json(&pane, &classification, &bindings, &frame, automation_ready)
+    } else {
+        Ok(format!(
+            "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
+            automation_ready,
+            pane.pane_id,
+            pane.session_name,
+            pane.window_name,
+            pane.pane_active,
+            pane.current_command,
+            is_pane_command_claude(&pane),
+            pane.current_path,
+            render_cursor(&pane),
+            classification.state.as_str(),
+            classification.has_questions,
+            classification.recap_present,
+            classification.recap_excerpt.as_deref().unwrap_or("none"),
+            render_signals(&classification),
+            render_screen_excerpt(&frame),
+            render_next_safe_action(&classification, &pane, &bindings),
+            bindings.path.display(),
+            bindings.status.as_str(),
+            render_missing_bindings(&bindings),
+            render_doctor_recommendations(&pane, &bindings)
+        ))
+    }
 }
 
 fn run_install_bindings(args: InstallBindingsArgs) -> AppResult<String> {
@@ -2340,7 +2376,11 @@ fn emit_babysit_output(line: String) -> AppResult<()> {
 }
 
 fn supports_babysit_color() -> bool {
-    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .map(|term| term != "dumb")
+            .unwrap_or(true)
 }
 
 fn current_babysit_timestamp() -> String {
@@ -3064,7 +3104,8 @@ pub(crate) fn ensure_workflow_state(
     workflow: GuardedWorkflow,
     classification: &Classification,
 ) -> AppResult<()> {
-    validate_workflow_state(workflow, classification).map_err(AppError::new)
+    validate_workflow_state(workflow, classification)
+        .map_err(|error| AppError::with_exit_code(error, 2))
 }
 
 fn send_actions(
@@ -3438,6 +3479,42 @@ fn render_status_report(
         bindings.status.as_str(),
         render_missing_bindings(bindings)
     )
+}
+
+fn render_status_json(
+    pane: &TmuxPane,
+    classification: &Classification,
+    bindings: &KeybindingsInspection,
+    frame: &str,
+    automation_ready: bool,
+) -> AppResult<String> {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "pane_id": pane.pane_id,
+        "session": pane.session_name,
+        "window": pane.window_name,
+        "active": pane.pane_active,
+        "command": pane.current_command,
+        "command_matches_claude": is_pane_command_claude(pane),
+        "cwd": pane.current_path,
+        "cursor": {
+            "x": pane.cursor_x,
+            "y": pane.cursor_y,
+        },
+        "state": classification.state.as_str(),
+        "has_questions": classification.has_questions,
+        "recap_present": classification.recap_present,
+        "recap_excerpt": classification.recap_excerpt.as_deref(),
+        "signals": classification.signals.clone(),
+        "screen_excerpt": render_screen_excerpt(frame),
+        "automation_ready": automation_ready,
+        "next_safe_action": render_next_safe_action(classification, pane, bindings),
+        "bindings": {
+            "path": bindings.path.display().to_string(),
+            "status": bindings.status.as_str(),
+            "missing": bindings.missing_bindings.clone(),
+        },
+    }))
+    .map_err(|error| AppError::new(format!("failed to encode status JSON: {error}")))
 }
 
 pub(crate) fn render_screen_excerpt(frame: &str) -> String {
