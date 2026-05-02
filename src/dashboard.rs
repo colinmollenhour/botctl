@@ -74,12 +74,15 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let client = dashboard_tmux_client();
+    let preferred_pane_id = current_dashboard_pane_id(&client);
     let mut app = DashboardApp::new(
-        dashboard_tmux_client(),
+        client,
         host_tmux_client(),
         state_dir,
         args.poll_ms,
         args.history_lines,
+        preferred_pane_id,
     )?;
     let loop_result = run_dashboard_loop(
         &mut terminal,
@@ -122,6 +125,7 @@ struct DashboardApp {
     message: String,
     last_refresh: Instant,
     restored_selection: SavedSelection,
+    preferred_pane_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -181,6 +185,7 @@ impl DashboardApp {
         state_dir: std::path::PathBuf,
         poll_ms: u64,
         history_lines: usize,
+        preferred_pane_id: Option<String>,
     ) -> AppResult<Self> {
         let restored_selection = load_saved_selection(&state_dir)?;
         Ok(Self {
@@ -200,6 +205,7 @@ impl DashboardApp {
             message: String::new(),
             last_refresh: Instant::now() - Duration::from_millis(poll_ms),
             restored_selection,
+            preferred_pane_id,
         })
     }
 
@@ -351,11 +357,23 @@ impl DashboardApp {
                 .then(left.pane.pane_index.cmp(&right.pane.pane_index))
         });
 
+        if let Some(pane_id) = take_requested_dashboard_pane_selection(&self.state_dir)? {
+            self.preferred_pane_id = Some(pane_id);
+        }
+
         self.panes = panes;
         self.rebuild_rows();
         self.run_yolo_supervisor()?;
         self.apply_window_name_prefixes()?;
         self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    fn apply_requested_pane_selection(&mut self) -> AppResult<()> {
+        if let Some(pane_id) = take_requested_dashboard_pane_selection(&self.state_dir)? {
+            self.preferred_pane_id = Some(pane_id);
+            self.rebuild_rows();
+        }
         Ok(())
     }
 
@@ -380,6 +398,18 @@ impl DashboardApp {
             self.selection = 0;
             self.selected_pane_id = None;
             return;
+        }
+
+        if let Some(pane_id) = self.preferred_pane_id.take() {
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == &pane_id))
+            {
+                self.selection = index;
+                self.selected_pane_id = Some(pane_id);
+                return;
+            }
         }
 
         if let Some(pane_id) = previous {
@@ -804,10 +834,12 @@ fn run_dashboard_loop(
 ) -> AppResult<Option<TmuxPane>> {
     app.refresh()?;
     loop {
+        app.apply_requested_pane_selection()?;
         terminal.draw(|frame| render_dashboard(frame, app))?;
 
         let timeout = Duration::from_millis(100);
         if event::poll(timeout)? {
+            app.apply_requested_pane_selection()?;
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -1579,6 +1611,48 @@ fn dashboard_selection_path(state_dir: &Path) -> PathBuf {
     state_dir.join("dashboard-selection")
 }
 
+fn requested_dashboard_pane_selection_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("dashboard-requested-pane")
+}
+
+pub(crate) fn request_dashboard_pane_selection(
+    state_dir: &Path,
+    pane_id: Option<&str>,
+) -> AppResult<()> {
+    let Some(pane_id) = pane_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    fs::create_dir_all(state_dir)?;
+    fs::write(requested_dashboard_pane_selection_path(state_dir), pane_id)?;
+    Ok(())
+}
+
+fn take_requested_dashboard_pane_selection(state_dir: &Path) -> AppResult<Option<String>> {
+    let path = requested_dashboard_pane_selection_path(state_dir);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let _ = fs::remove_file(path);
+    Ok(content
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
+}
+
+pub(crate) fn current_dashboard_pane_id(client: &TmuxClient) -> Option<String> {
+    std::env::var("TMUX_PANE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| client.display_message("#{pane_id}").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn load_saved_selection(state_dir: &Path) -> AppResult<SavedSelection> {
     let path = dashboard_selection_path(state_dir);
     let Ok(content) = fs::read_to_string(path) else {
@@ -2020,6 +2094,62 @@ mod tests {
     }
 
     #[test]
+    fn preferred_pane_selection_wins_over_saved_selection() {
+        let state_dir = unique_temp_dir("dashboard-preferred-selection");
+        fs::create_dir_all(&state_dir).expect("state dir should exist");
+        save_selection(
+            &state_dir,
+            &SavedSelection {
+                pane_id: Some(String::from("%2")),
+                row_index: None,
+            },
+        )
+        .expect("selection should save");
+
+        let mut app = DashboardApp::new(
+            TmuxClient::default(),
+            TmuxClient::default(),
+            state_dir.clone(),
+            1000,
+            120,
+            Some(String::from("%1")),
+        )
+        .expect("app should initialize");
+        app.panes = vec![
+            sample_pane_entry_with_id("%1"),
+            sample_pane_entry_with_id("%2"),
+        ];
+
+        app.rebuild_rows();
+
+        assert_eq!(app.selected_pane_id.as_deref(), Some("%1"));
+        let _ = fs::remove_file(dashboard_selection_path(&state_dir));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn preferred_pane_selection_wins_over_previous_selection() {
+        let mut app = DashboardApp::new(
+            TmuxClient::default(),
+            TmuxClient::default(),
+            unique_temp_dir("dashboard-preferred-over-previous"),
+            1000,
+            120,
+            Some(String::from("%1")),
+        )
+        .expect("app should initialize");
+        app.selected_pane_id = Some(String::from("%2"));
+        app.panes = vec![
+            sample_pane_entry_with_id("%1"),
+            sample_pane_entry_with_id("%2"),
+        ];
+
+        app.rebuild_rows();
+
+        assert_eq!(app.selected_pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
     fn pane_list_content_area_excludes_borders() {
         let area = pane_list_content_area(Rect {
             x: 0,
@@ -2247,6 +2377,7 @@ mod tests {
             unique_temp_dir("dashboard-hitbox"),
             1000,
             120,
+            None,
         )
         .expect("app should initialize");
         let list_area = Rect {
@@ -2309,6 +2440,16 @@ mod tests {
             yes_count: 0,
             claude_session_id: None,
             focused_source: focused_source.to_string(),
+        }
+    }
+
+    fn sample_pane_entry_with_id(pane_id: &str) -> PaneEntry {
+        PaneEntry {
+            pane: TmuxPane {
+                pane_id: pane_id.to_string(),
+                ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
+            },
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
         }
     }
 

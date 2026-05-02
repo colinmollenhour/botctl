@@ -177,6 +177,8 @@ fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
 
 fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
     let persistent_client = TmuxClient::with_socket(DASHBOARD_PERSISTENT_SOCKET);
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let current_pane_id = dashboard::current_dashboard_pane_id(&TmuxClient::default());
     let desired_target_socket = current_tmux_socket_path();
     if persistent_client.has_session(DASHBOARD_PERSISTENT_SESSION)? {
         let current_target_socket = persistent_dashboard_target_socket(&persistent_client)?;
@@ -194,6 +196,7 @@ fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
     }
 
     persistent_client.set_global_option("status", "off")?;
+    dashboard::request_dashboard_pane_selection(&state_dir, current_pane_id.as_deref())?;
 
     persistent_client.attach_session(DASHBOARD_PERSISTENT_SESSION)?;
     Ok(String::new())

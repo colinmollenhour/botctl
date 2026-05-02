@@ -389,6 +389,17 @@ impl TmuxClient {
         ])
     }
 
+    pub fn display_message(&self, format: &str) -> AppResult<String> {
+        Ok(self
+            .run_output(vec![
+                String::from("display-message"),
+                String::from("-p"),
+                format.to_string(),
+            ])?
+            .trim()
+            .to_string())
+    }
+
     fn run_status(&self, args: Vec<String>) -> AppResult<()> {
         let args = self.with_socket_args(args);
         let status = Command::new(&self.program).args(&args).status()?;

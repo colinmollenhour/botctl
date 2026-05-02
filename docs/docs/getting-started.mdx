@@ -129,6 +129,8 @@ That uses `--persistent`, which keeps the dashboard alive in a dedicated tmux-ba
 botctl dashboard --persistent
 ```
 
+When opened from tmux, the dashboard selects the row for the pane that launched the popup when that pane is visible. That makes the fast path `prefix C-c`, then `y`, to toggle YOLO for the current Claude pane.
+
 Enable YOLO for one explicit pane:
 
 ```bash
