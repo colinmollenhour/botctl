@@ -21,7 +21,7 @@ This is a CLI-first wishlist for making `botctl` feel safer, clearer, and more b
 15. [ ] P2-1 Reorganize commands by operator workflow, not implementation layer.
 16. [x] P2-2 Add `botctl help <topic>` for concepts: `targeting`, `safety`, `json`, `state-dir`, `dashboard-keys`, and `opencode`.
 17. [ ] P2-3 Add shell completions and completions docs.
-18. [ ] P2-4 Add command examples to help output, not only docs.
+18. [x] P2-4 Add command examples to help output, not only docs.
 19. [ ] P2-5 Add `--plain` for line-oriented output where rich text may evolve.
 20. [ ] P2-6 Add structured exit-code conventions and document them.
 21. [ ] P3-1 Consider a larger command taxonomy redesign after contracts stabilize.
