@@ -10,7 +10,7 @@ This is a CLI-first wishlist for making `botctl` feel safer, clearer, and more b
 4. [ ] P0-4 Split output streams: data/results to `stdout`; errors, warnings, progress, prompts, and long-running status to `stderr`.
 5. [x] P0-5 Replace full global help dumps on parse errors with concise, command-specific errors plus one next command.
 6. [ ] P0-6 Add stable `--json` output for inspection and one-shot state-changing commands.
-7. [ ] P0-7 Add per-command help pages for `dashboard`, `yolo`, `serve`, `status`, `doctor`, target syntax, and safety rules.
+7. [x] P0-7 Add per-command help pages for `dashboard`, `yolo`, `serve`, `status`, `doctor`, target syntax, and safety rules.
 8. [ ] P1-1 Move to a mature parser such as `clap` before adding more command surface.
 9. [ ] P1-2 Normalize naming around `yolo`, `approve`, `reject`, `dismiss-survey`, and long aliases.
 10. [ ] P1-3 Create a reusable target grammar and document it everywhere as one concept.

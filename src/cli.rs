@@ -732,6 +732,28 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             "Sends keys only from PermissionDialog.",
         ),
+        "keep-going" => (
+            "keep-going",
+            "Audit current task progress and submit follow-up work when Claude is ready.",
+            "botctl keep-going (--pane TARGET | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]",
+            &[
+                "botctl keep-going --pane %19",
+                "botctl keep-going --session demo --window claude --no-yolo",
+                "botctl keep-going --pane %19 --text \"Finish only the requested change, then stop.\"",
+            ][..],
+            &[
+                "--pane TARGET",
+                "--session NAME --window NAME",
+                "--poll-ms N (default: 1000)",
+                "--submit-delay-ms N (default: 250)",
+                "--state-dir PATH",
+                "--source PATH",
+                "--text TEXT",
+                "--no-yolo",
+                "--no-color",
+            ][..],
+            "Targets must be explicit. Default mode may use yolo state while waiting; --no-yolo refuses blockers instead of auto-recovering. Prompt input must use either --source or --text, not both.",
+        ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {
             return Some(topic_page(
