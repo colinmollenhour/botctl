@@ -5,28 +5,28 @@
 1. [x] P0-1 Attach to existing Claude tmux targets.
 2. [x] P0-2 Add `continue-session` and `auto-unstick` commands.
 3. [x] P0-3 Validate Claude ownership before driving a pane.
-4. [ ] P0-4 Keep higher-level automation state-aware.
+4. [x] P0-4 Keep higher-level automation state-aware.
 5. [ ] P0-5 Improve live status and doctor output.
-6. [ ] P1-1 Replace the bounded observer with a long-lived control-mode connection.
-7. [ ] P1-2 Reconstruct a live terminal screen model.
-8. [ ] P1-3 Merge streamed output with periodic `capture-pane` reconciliation.
-9. [ ] P1-4 Capture structured event tapes for fixtures.
-10. [ ] P1-5 Detect pane swaps, session renames, and window changes.
-11. [ ] P1-6 Decorate tmux window titles when user attention is needed.
+6. [x] P1-1 Replace the bounded observer with a long-lived control-mode connection.
+7. [x] P1-2 Reconstruct a live terminal screen model.
+8. [x] P1-3 Merge streamed output with periodic `capture-pane` reconciliation.
+9. [x] P1-4 Capture structured event tapes for fixtures.
+10. [x] P1-5 Detect pane swaps, session renames, and window changes.
+11. [x] P1-6 Decorate tmux window titles when user attention is needed.
 12. [ ] P2-1 Expand the classifier to cover more Claude UI states.
-13. [ ] P2-2 Distinguish similar confirmation flows.
+13. [x] P2-2 Distinguish similar confirmation flows.
 14. [ ] P2-3 Track classifier confidence and drift.
 15. [ ] P2-4 Improve fixture organization and coverage.
 16. [ ] P2-5 Add tooling to diff and refresh fixture corpora.
 17. [ ] P3-1 Add full session lifecycle commands.
 18. [ ] P3-2 Persist managed-session metadata and recent history.
-19. [ ] P3-3 Add policy-driven continuous automation.
-20. [ ] P3-4 Improve CLI and scripting ergonomics.
+19. [x] P3-3 Add policy-driven continuous automation.
+20. [x] P3-4 Improve CLI and scripting ergonomics.
 21. [ ] P3-5 Add end-to-end tests against real tmux sessions.
 22. [ ] P3-6 Add docs, packaging, and release automation.
 23. [x] P3-7 Add a one-off permission babysit mode for a single instance.
 24. [ ] P3-8 Add interactive target selection for single-pane commands.
-25. [ ] P3-9 Move runtime state to XDG and split SQLite control-plane state from file artifacts.
+25. [x] P3-9 Move runtime state to XDG and split SQLite control-plane state from file artifacts.
 26. [x] P3-10 Let `keep-going` run user-supplied prompt loops.
 27. [ ] P3-11 Add support for OpenCode.
 
