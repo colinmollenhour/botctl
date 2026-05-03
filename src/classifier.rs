@@ -55,6 +55,7 @@ pub const SIGNAL_EXTERNAL_EDITOR_KEYWORDS: &str = "external-editor-keywords";
 pub const SIGNAL_DIFF_KEYWORDS: &str = "diff-keywords";
 pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
 pub const SIGNAL_CHAT_QUESTIONS: &str = "chat-questions";
+pub const SIGNAL_CODEX_KEYWORDS: &str = "codex-keywords";
 pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
 pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
 
@@ -71,9 +72,13 @@ const PERMISSION_KEYWORDS: &[&str] = &[
     "ctrl+e to explain",
     "confirm action",
     "approve",
+    "would you like to run the following command",
+    "would you like to run this command",
+    "would you like to allow codex",
 ];
 
 const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "esc"];
+const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to cancel";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
@@ -112,16 +117,41 @@ impl Classifier {
         let recap = detect_recap(frame_text, &normalized);
         let mut signals = Vec::new();
         let has_chat_input = lines.iter().copied().any(is_chat_keyword_line)
-            || lines.iter().copied().any(is_chat_input_line);
-        let has_permission_keywords = contains_any(&normalized, PERMISSION_KEYWORDS)
+            || lines.iter().copied().any(is_chat_input_line)
+            || lines.iter().copied().any(is_codex_chat_input_line);
+        let has_codex_statusline = lines.iter().copied().any(is_codex_statusline_line);
+        let has_codex_ready_statusline = lines.iter().copied().any(is_codex_ready_statusline_line);
+        let has_codex_busy_statusline = lines.iter().copied().any(is_codex_busy_statusline_line);
+        let has_codex_footer = lines.iter().copied().any(is_codex_footer_line);
+        let has_codex_permission_confirm_footer =
+            has_codex_permission_confirm_footer_at_live_tail(&lines);
+        let has_codex_keywords = contains_any(
+            &normalized,
+            &[
+                "openai codex",
+                ">_ openai codex",
+                "/model to change",
+                "tell codex what to do differently",
+                "approved codex to always run commands",
+                "pursuing goal",
+                "tab to queue message",
+                "suppress_unstable_features_warning",
+                "under-development features enabled: goals",
+            ],
+        ) || has_codex_statusline
+            || has_codex_footer
+            || has_codex_permission_confirm_footer;
+        let has_permission_words = contains_any(&normalized, PERMISSION_KEYWORDS)
             && contains_any(&normalized, PERMISSION_CONFIRM_KEYWORDS);
         let has_permission_anchor = lines
             .iter()
             .copied()
-            .any(|line| is_permission_anchor_line(line.trim()));
-        let has_plain_chat_prompt_after_permission = has_permission_keywords
-            && (has_plain_chat_prompt_after_permission(&lines)
-                || (!has_permission_anchor && lines.iter().copied().any(is_plain_chat_input_line)));
+            .any(|line| is_permission_anchor_line(line.trim()))
+            || has_codex_permission_confirm_footer;
+        let has_permission_keywords = has_permission_words && has_permission_anchor;
+        let has_unanchored_permission_words = has_permission_words && !has_permission_anchor;
+        let has_plain_chat_prompt_after_permission =
+            has_permission_keywords && has_plain_chat_prompt_after_permission(&lines);
         let has_conflicting_chat_after_permission =
             has_permission_keywords && has_chat_indicators_after_permission(&lines);
         let has_plan_approval_keywords = contains_any(
@@ -165,6 +195,7 @@ impl Classifier {
                 "background task",
                 "still thinking",
                 "working",
+                "waiting",
             ],
         );
         let has_busy_status_banner = lines.iter().copied().any(is_busy_status_line);
@@ -176,25 +207,54 @@ impl Classifier {
                 "yes, i trust this folder",
                 "i trust this folder",
                 "trust this folder",
+                "do you trust the contents of this directory",
+                "working with untrusted contents",
+                "project-local config, hooks, and exec policies",
                 "accessing workspace:",
                 "security guide",
                 "this folder",
             ],
-        ) && contains_any(&normalized, &["enter to confirm", "esc to cancel"])
-        {
+        ) && contains_any(
+            &normalized,
+            &[
+                "enter to confirm",
+                "esc to cancel",
+                "press enter to continue",
+            ],
+        ) {
             signals.push(String::from(SIGNAL_FOLDER_TRUST_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
             SessionState::FolderTrustPrompt
         } else if has_plan_approval_keywords {
             signals.push(String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS));
             SessionState::PlanApprovalPrompt
+        } else if has_codex_busy_statusline
+            || (has_codex_keywords
+                && (has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords)))
+        {
+            signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
+            signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            SessionState::BusyResponding
+        } else if has_codex_ready_statusline {
+            signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
+            signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            SessionState::ChatReady
         } else if has_survey_prompt {
             signals.push(String::from(SIGNAL_SURVEY_KEYWORDS));
             SessionState::SurveyPrompt
         } else if has_permission_keywords && has_plain_chat_prompt_after_permission {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
             SessionState::ChatReady
         } else if has_permission_keywords && has_conflicting_chat_after_permission {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
             if mentions_self_settings_language {
                 signals.push(String::from(SIGNAL_SELF_SETTINGS_LANGUAGE));
             }
@@ -206,6 +266,9 @@ impl Classifier {
             SessionState::Unknown
         } else if has_permission_keywords {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
             if mentions_self_settings_language {
                 signals.push(String::from(SIGNAL_SELF_SETTINGS_LANGUAGE));
             }
@@ -213,6 +276,18 @@ impl Classifier {
                 signals.push(String::from(SIGNAL_SENSITIVE_CLAUDE_PATH));
             }
             SessionState::PermissionDialog
+        } else if has_unanchored_permission_words && (has_chat_input || has_codex_keywords) {
+            signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
+            SessionState::ChatReady
+        } else if has_unanchored_permission_words {
+            signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
+            SessionState::Unknown
         } else if contains_any(
             &normalized,
             &[
@@ -230,9 +305,15 @@ impl Classifier {
             SessionState::DiffDialog
         } else if has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords) {
             signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
             SessionState::BusyResponding
-        } else if has_chat_input || contains_any(&normalized, &["claude"]) {
+        } else if has_chat_input || contains_any(&normalized, &["claude"]) || has_codex_keywords {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
             SessionState::ChatReady
         } else {
             SessionState::Unknown
@@ -406,7 +487,7 @@ fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
         .iter()
         .skip(anchor_idx + 1)
         .copied()
-        .any(is_submitted_chat_input_line)
+        .any(|line| is_submitted_chat_input_line(line) || is_codex_chat_input_line(line))
     {
         return false;
     }
@@ -497,7 +578,9 @@ fn has_chat_indicators_after_permission(lines: &[&str]) -> bool {
         .iter()
         .skip(last_permission_anchor + 1)
         .copied()
-        .any(|line| is_chat_keyword_line(line) || is_chat_input_line(line))
+        .any(|line| {
+            is_chat_keyword_line(line) || is_chat_input_line(line) || is_codex_chat_input_line(line)
+        })
 }
 
 fn has_plain_chat_prompt_after_permission(lines: &[&str]) -> bool {
@@ -512,7 +595,7 @@ fn has_plain_chat_prompt_after_permission(lines: &[&str]) -> bool {
         .iter()
         .skip(last_permission_anchor + 1)
         .copied()
-        .any(is_plain_chat_input_line)
+        .any(|line| is_plain_chat_input_line(line) || is_codex_chat_input_line(line))
 }
 
 fn is_chat_keyword_line(line: &str) -> bool {
@@ -537,6 +620,8 @@ fn is_permission_anchor_line(line: &str) -> bool {
             "tab to amend",
             "ctrl+e to explain",
             "confirm action",
+            "would you like to run the following command",
+            "would you like to run this command",
         ],
     ) || lower.starts_with("claude code needs permission")
         || is_permission_choice_line(line)
@@ -551,12 +636,37 @@ fn is_permission_anchor_line(line: &str) -> bool {
         )
 }
 
+fn has_codex_permission_confirm_footer_at_live_tail(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| is_codex_permission_confirm_footer(line))
+}
+
+fn is_codex_permission_confirm_footer(line: &str) -> bool {
+    line.trim()
+        .eq_ignore_ascii_case(CODEX_PERMISSION_CONFIRM_FOOTER)
+}
+
 fn is_permission_choice_line(line: &str) -> bool {
-    let trimmed = line.trim().trim_start_matches('❯').trim();
+    let trimmed = line
+        .trim()
+        .trim_start_matches('❯')
+        .trim_start_matches('›')
+        .trim();
     (trimmed.starts_with("1.") || trimmed.starts_with("2.") || trimmed.starts_with("3."))
         && contains_any(
             &trimmed.to_ascii_lowercase(),
-            &["yes", "no", "allow once", "allow for session"],
+            &[
+                "yes",
+                "no",
+                "allow once",
+                "allow for session",
+                "proceed",
+                "don't ask again",
+                "quit",
+            ],
         )
 }
 
@@ -584,6 +694,57 @@ fn is_submitted_chat_input_line(line: &str) -> bool {
 
 fn is_plain_chat_input_line(line: &str) -> bool {
     matches!(line.trim(), ">" | "❯")
+}
+
+fn is_codex_chat_input_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == "›" {
+        return true;
+    }
+
+    let Some(rest) = trimmed.strip_prefix('›') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !starts_with_numbered_option(rest)
+}
+
+fn is_codex_statusline_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("gpt-")
+        && lower.contains("·")
+        && lower.contains("context")
+        && !lower.contains("claude")
+}
+
+fn is_codex_footer_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("gpt-") && lower.contains("·") && !lower.contains("claude")
+}
+
+fn is_codex_ready_statusline_line(line: &str) -> bool {
+    matches!(
+        codex_statusline_run_state(&line.to_ascii_lowercase()),
+        Some("ready")
+    )
+}
+
+fn is_codex_busy_statusline_line(line: &str) -> bool {
+    matches!(
+        codex_statusline_run_state(&line.to_ascii_lowercase()),
+        Some("working" | "thinking")
+    )
+}
+
+fn codex_statusline_run_state(lower: &str) -> Option<&str> {
+    if !is_codex_statusline_line(lower) {
+        return None;
+    }
+
+    lower
+        .split('·')
+        .map(str::trim)
+        .find(|part| matches!(*part, "ready" | "working" | "thinking"))
 }
 
 fn is_busy_status_line(line: &str) -> bool {
@@ -712,7 +873,7 @@ fn is_terminal_status_line(line: &str) -> bool {
 }
 
 fn is_lettered_option_line(line: &str) -> bool {
-    let trimmed = line.trim_start_matches('❯').trim();
+    let trimmed = line.trim_start_matches('❯').trim_start_matches('›').trim();
     let bytes = trimmed.as_bytes();
     if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() {
         return false;
@@ -722,7 +883,7 @@ fn is_lettered_option_line(line: &str) -> bool {
 
 fn is_option_line(line: &str) -> bool {
     is_lettered_option_line(line)
-        || starts_with_numbered_option(line.trim_start_matches('❯').trim())
+        || starts_with_numbered_option(line.trim_start_matches('❯').trim_start_matches('›').trim())
 }
 
 fn starts_with_numbered_option(line: &str) -> bool {
@@ -734,9 +895,9 @@ fn starts_with_numbered_option(line: &str) -> bool {
 mod tests {
     use super::{
         Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_CHAT_QUESTIONS,
-        SIGNAL_DIFF_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS, SIGNAL_PLAN_APPROVAL_KEYWORDS,
-        SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SIGNAL_SURVEY_KEYWORDS,
-        SessionState,
+        SIGNAL_CODEX_KEYWORDS, SIGNAL_DIFF_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
+        SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
+        SIGNAL_SURVEY_KEYWORDS, SessionState,
     };
 
     #[test]
@@ -751,6 +912,193 @@ mod tests {
         let frame = "Bash command (unsandboxed)\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::PermissionDialog);
+    }
+
+    #[test]
+    fn classifies_codex_command_approval_dialog() {
+        let frame = "Would you like to run the following command?\n\nReason: Do you want to allow golangci-lint to write Go build/cache files while verifying the CI failure is fixed?\n\n$ /home/colin/go/bin/golangci-lint run ./...\n\n1. Yes, proceed (y)\n› 2. Yes, and don't ask again for commands that start with `/home/colin/go/bin/golangci-lint run` (p)\n3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_approval_dialog_from_live_confirm_footer() {
+        let frame = "› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `tmux list-panes` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_folder_trust_prompt() {
+        let frame = "> You are in /home/colin/Projects/botctl\n\nDo you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.\n\n› 1. Yes, continue\n2. No, quit\n\nPress enter to continue\n\n╭────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                 │\n╰────────────────────────────────────────────╯";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::FolderTrustPrompt);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_chat_ready() {
+        let frame = "╭────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                 │\n│                                            │\n│ model:     gpt-5.5 high   /model to change │\n│ directory: ~/Projects/botctl               │\n╰────────────────────────────────────────────╯\n\n› /goal\n\n  gpt-5.5 high · ~/Projects/botctl";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_busy_footer_wins_over_stale_test_output() {
+        let frame = "test classifier::tests::classifies_survey_prompt ... ok\nstate=SurveyPrompt\n• Waiting for background terminal (9m 42s • esc to interrupt)\n› Explain this codebase\n  tab to queue message";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_editing_prompt_wins_over_stale_permission_text() {
+        let frame = "signals=permission-keywords\nEsc to cancel · Tab to amend\n› Note that codex supports the use\n  tab to queue message";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_prompt_wins_over_stale_permission_dialog() {
+        let frame = "Would you like to run the following command?\n$ cargo test\n1. Yes, proceed\n2. No, tell Codex what to do differently\nPress enter to confirm or esc to cancel\n\n• Tests are running in another pane.\n› Write tests for @filename\n  tab to queue message";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_working_statusline_wins_over_stale_permission_dialog() {
+        let frame = "Would you like to run the following command?\n$ cargo test\n1. Yes, proceed\n2. No, tell Codex what to do differently\nPress enter to confirm or esc to cancel\n\n• Working (2m 53s • esc to interrupt)\n› Write tests for @filename\n  gpt-5.5 high · ~/Projects/shipstream/thespider · main · Working · Context 18% used";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_statusline_ready_maps_to_chat_ready() {
+        let frame = "gpt-5.5 high · ~/Projects/botctl · gpt-5.5 · main · Ready · Context 100% left · Context 0% used";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_statusline_working_and_thinking_map_to_busy() {
+        for run_state in ["Working", "Thinking"] {
+            let frame = format!(
+                "gpt-5.5 high · ~/Projects/botctl · gpt-5.5 · main · {run_state} · Context 100% left · Context 0% used"
+            );
+            let result = Classifier.classify("test", &frame);
+            assert_eq!(result.state, SessionState::BusyResponding);
+            assert!(
+                result
+                    .signals
+                    .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+            );
+        }
+    }
+
+    #[test]
+    fn codex_statusline_without_run_state_keeps_permission_dialog_signal() {
+        let frame = "Would you like to run the following command?\n$ cargo test\n1. Yes, proceed\n2. No, tell Codex what to do differently\nPress enter to confirm or esc to cancel\ngpt-5.5 high · ~/Projects/botctl · gpt-5.5 · main · Context 100% left · Context 0% used";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_footer_wins_over_unanchored_stale_permission_words() {
+        let frame = "assert_eq!(result.state, SessionState::PermissionDialog);\nsignals=permission-keywords,codex-keywords\n• The full Rust suite is green now.\n› Explain this codebase\n\ngpt-5.5 high · ~/Projects/botctl";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn unanchored_permission_words_do_not_classify_as_permission_dialog() {
+        let frame = "Copied diagnostics:\nstate=PermissionDialog\nsignals=permission-keywords\noperator pressed enter";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::Unknown);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
     }
 
     #[test]
