@@ -1,8 +1,8 @@
 [package]
 name = "botctl"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
-description = "CLI for observing and safely driving Claude Code sessions inside tmux"
+description = "CLI for observing and safely driving Claude, Codex and OpenCode sessions inside tmux"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/colinmollenhour/botctl"
