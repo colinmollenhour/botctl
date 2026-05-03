@@ -1,8 +1,8 @@
 # Getting started
 
-`botctl` is a Rust CLI for keeping Claude Code and OpenCode sessions visible and controlled inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, and OpenCode sessions visible and controlled inside `tmux`.
 
-Claude Code panes support guarded automation. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status.
+Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status.
 
 For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
@@ -10,7 +10,7 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 Most users only need three commands:
 
-- `dashboard` for a live control surface across Claude Code panes plus passive OpenCode visibility
+- `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode visibility
 - `yolo` for automated babysitting and recovery
 - `serve` for a long-lived observation stream
 
@@ -24,6 +24,7 @@ If you just want to get value quickly, install it, open `dashboard`, then try `y
 
 - `tmux`
 - `claude` on `PATH` for Claude Code automation
+- `codex` panes for Codex CLI screen classification and command permission approval
 - `opencode` panes with `OC | <session title>` pane titles for passive OpenCode dashboard visibility
 - `botctl` installed
 
@@ -35,7 +36,7 @@ cargo install botctl
 
 ## Fastest useful path
 
-Open the dashboard across Claude Code and resolvable OpenCode panes:
+Open the dashboard across Claude Code, screen-detected Codex CLI, and resolvable OpenCode panes:
 
 ```bash
 botctl dashboard
@@ -129,7 +130,9 @@ The dashboard uses one emoji per pane to show the current classified state at a 
 - `🧾` `DiffDialog`: waiting on a diff review choice
 - `❔` `Unknown`: classifier could not identify the current surface safely
 
-OpenCode panes can appear in the same dashboard without terminal capture or keypress automation. They are included only when the tmux command is `opencode`, the pane title is `OC | <session title>`, and OpenCode's SQLite database has exactly one `session` row whose `directory` matches the pane cwd and whose `title` matches the stripped pane title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. If that match is missing, duplicated, ambiguous, or unreadable, the pane is ignored rather than guessed. Resolved OpenCode panes show a bounded recent-message excerpt from SQLite `message`/`part` rows and can show `PermissionDialog` when a running file/glob tool targets an absolute path outside the session directory. OpenCode panes are navigable and contribute window-title emojis, but YOLO and recovery actions are still Claude-only.
+OpenCode panes can appear in the same dashboard without terminal capture or keypress automation. They are included only when the tmux command is `opencode`, the pane title is `OC | <session title>`, and OpenCode's SQLite database has exactly one `session` row whose `directory` matches the pane cwd and whose `title` matches the stripped pane title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. If that match is missing, duplicated, ambiguous, or unreadable, the pane is ignored rather than guessed. Resolved OpenCode panes show a bounded recent-message excerpt from SQLite `message`/`part` rows and can show `PermissionDialog` when a running file/glob tool targets an absolute path outside the session directory. OpenCode panes are navigable and contribute window-title emojis, but YOLO and recovery actions are not enabled for OpenCode.
+
+Codex CLI panes can also appear in the same dashboard. They are included only after `botctl` captures a likely Codex pane and sees Codex screen text such as the OpenAI Codex header, Codex approval prompt language, or a `/statusline` with `run-state`. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex panes are navigable and classified from their screen, and Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`. Broader recovery actions remain Claude-only.
 
 If you use tmux, this is the recommended way to launch the dashboard as a popup and keep it alive:
 

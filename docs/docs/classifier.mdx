@@ -15,9 +15,9 @@ Recap data is auxiliary metadata, not a primary state.
 
 ## States
 
-- `ChatReady` — Claude is ready for input
-- `UserQuestionPrompt` — Claude is waiting for an operator decision or follow-up answer
-- `BusyResponding` — Claude appears to be working
+- `ChatReady` — Claude or Codex is ready for input
+- `UserQuestionPrompt` — Claude or Codex is waiting for an operator decision or follow-up answer
+- `BusyResponding` — Claude or Codex appears to be working
 - `PermissionDialog` — a permission confirmation flow is open
 - `FolderTrustPrompt` — the folder trust prompt is open
 - `SurveyPrompt` — a feedback/survey prompt is open
@@ -39,10 +39,13 @@ Classifier output includes signals that explain the decision, such as:
 - external editor keywords
 - diff keywords
 - busy keywords
+- Codex keywords
 - sensitive Claude path references
 - self-settings language references
 
 Signals are meant to explain why a state was chosen, not to override the state contract.
+
+Codex CLI support is screen-capture based. The classifier recognizes Codex chrome, Codex input prompts, Codex command approval dialogs, Codex directory trust prompts, and Codex `/statusline` output when it includes `run-state`. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; broader guarded keypress workflows still remain Claude-only.
 
 ## Recap handling
 

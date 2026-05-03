@@ -2,7 +2,7 @@
 
 This page is the current CLI reference for shipped commands and aliases.
 
-`botctl` supports Claude Code as an actively guarded automation target and OpenCode as a passively discovered dashboard target. OpenCode panes are visible in the dashboard when their tmux title and cwd can be matched safely to OpenCode's SQLite session database; keypress automation remains Claude-only.
+`botctl` supports Claude Code as an actively guarded automation target, Codex CLI as a screen-classified target with narrow YOLO permission approval, and OpenCode as a passively discovered dashboard target. Codex panes are visible when captured terminal text identifies a Codex screen; Codex YOLO can send `y` for `Yes, proceed` on command permission dialogs. OpenCode panes are visible when their tmux title and cwd can be matched safely to OpenCode's SQLite session database. Broader keybinding automation remains Claude-only.
 
 Global conventions:
 
@@ -57,7 +57,7 @@ Notes:
 
 ### `dashboard`
 
-Purpose: open the live TUI for Claude Code panes and passively resolvable OpenCode panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude.
+Purpose: open the live TUI for Claude Code panes, screen-detected Codex CLI panes, and passively resolvable OpenCode panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude and Codex.
 
 Syntax:
 ```bash
@@ -78,12 +78,13 @@ bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 Notes:
 
 - scans all Claude Code panes
+- captures likely Codex CLI panes and includes them only when Codex screen text is visible; a Codex `/statusline` with `run-state` gives the strongest signal, mapping `Ready` to `ChatReady` and `Working`/`Thinking` to `BusyResponding`
 - also scans OpenCode panes when the tmux pane title is `OC | <session title>` and exactly one OpenCode SQLite `session` row matches the pane cwd plus that title
 - accepts OpenCode titles truncated with `...` as a prefix only when that prefix is unique within the same cwd
 - shows a bounded recent-message excerpt for resolved OpenCode panes from SQLite `message`/`part` rows
 - maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
 - ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
-- OpenCode support is visibility-only; YOLO and guarded automation remain Claude-only
+- Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode support is visibility-only, and broader guarded automation remains Claude-only
 - shows current classified state, wait time, branch, and workspace grouping
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
@@ -281,7 +282,7 @@ botctl doctor --session demo --plain
 
 ### `dashboard`
 
-Purpose: open the live dashboard TUI for Claude Code panes, passively resolvable OpenCode panes, and Claude YOLO toggles.
+Purpose: open the live dashboard TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Claude/Codex YOLO toggles.
 
 Syntax:
 ```bash
@@ -295,7 +296,7 @@ Flags:
 - `--exit-on-navigate` (optional; exit after jumping to a pane)
 - `--persistent` (optional; keep the dashboard alive in a dedicated tmux session and attach to it)
 
-Targeting: no explicit pane target; scans all Claude Code panes and passively resolvable OpenCode panes.
+Targeting: no explicit pane target; scans all Claude Code panes, likely Codex CLI panes with visible Codex screen text, and passively resolvable OpenCode panes.
 
 Safety:
 - rejects `--poll-ms 0`
@@ -799,13 +800,13 @@ Stop flags:
 - `--workspace PATH|UUID` (optional; filters `stop --all`)
 
 Targeting:
-- `start` can target one pane or scan all Claude Code panes with `--all`
+- `start` can target one pane or scan all supported Claude Code and Codex panes with `--all`
 - `start --all` and `stop --all` remain global by default
 - `--workspace` limits `--all` operations to one workspace
 - `stop --all` disables tracked yolo registrations stored in `<state-root>/state.db`
 - neither mode allows mixing `--pane` and `--all`
 
-Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed targets.
+Safety: `start` refuses `--poll-ms 0`; both modes refuse missing or mixed targets. Codex YOLO is limited to command permission dialogs and sends raw `y` for `Yes, proceed`; other Codex states still require manual review.
 
 Example:
 ```bash

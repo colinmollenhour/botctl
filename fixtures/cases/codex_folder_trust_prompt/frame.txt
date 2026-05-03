@@ -1,0 +1,17 @@
+› codex
+> You are in /home/colin/Projects/botctl
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of
+  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                 │
+│                                            │
+│ model:     gpt-5.5 high   /model to change │
+│ directory: ~/Projects/botctl               │
+╰────────────────────────────────────────────╯

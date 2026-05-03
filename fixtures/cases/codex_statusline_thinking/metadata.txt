@@ -1,0 +1,3 @@
+source=user-described codex /statusline run-state
+expected_state=BusyResponding
+note=Codex statusline includes run-state=Thinking

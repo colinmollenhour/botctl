@@ -1,0 +1,6 @@
+source=live tmux capture-pane
+session=0
+pane=%8
+target=0:2.0
+current_command=node
+expected_state=FolderTrustPrompt

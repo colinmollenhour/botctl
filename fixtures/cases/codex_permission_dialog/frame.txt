@@ -1,0 +1,16 @@
+• The CI linter install completed. I’m running golangci-lint run ./... now with the same installed binary, outside
+  the sandbox because Go cache writes are required.
+
+• Running /home/colin/go/bin/golangci-lint run ./...
+
+  Would you like to run the following command?
+
+  Reason: Do you want to allow golangci-lint to write Go build/cache files while verifying the CI failure is fixed?
+
+  $ /home/colin/go/bin/golangci-lint run ./...
+
+  1. Yes, proceed (y)
+› 2. Yes, and don't ask again for commands that start with `/home/colin/go/bin/golangci-lint run` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

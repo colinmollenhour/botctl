@@ -19,8 +19,8 @@ use crate::automation::{
     validate_workflow_state,
 };
 use crate::classifier::{
-    Classification, Classifier, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
-    SessionState,
+    Classification, Classifier, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
+    SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
@@ -53,6 +53,7 @@ const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
 const KEEP_GOING_HISTORY_LINES: usize = 2000;
 const KEEP_GOING_PROMPT_ANCHOR: &str = "Audit the task currently in scope";
 const KEEP_GOING_CUSTOM_PROMPT_ANCHOR: &str = "[[BOTCTL_KEEP_GOING_END_PROMPT]]";
+const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to cancel";
 const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
 const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
 const DASHBOARD_PERSISTENT_SOCKET: &str = "botctl-dashboard";
@@ -384,11 +385,12 @@ fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
             _ => String::from("-"),
         };
         out.push_str(&format!(
-            "{}\tsession={}\twindow={}\tactive={}\tcommand={}\tcwd={}\tcursor={}\n",
+            "{}\tsession={}\twindow={}\tactive={}\tprovider={}\tcommand={}\tcwd={}\tcursor={}\n",
             pane.pane_id,
             pane.session_name,
             pane.window_name,
             pane.pane_active,
+            pane_provider_label(pane),
             pane.current_command,
             pane.current_path,
             cursor
@@ -407,6 +409,7 @@ fn render_list_panes_json(panes: &[TmuxPane], include_all: bool) -> AppResult<St
                 "session": pane.session_name,
                 "window": pane.window_name,
                 "active": pane.pane_active,
+                "provider": pane_provider_label(pane),
                 "command": pane.current_command,
                 "cwd": pane.current_path,
                 "cursor": {
@@ -468,12 +471,13 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
         render_status_json(&pane, &classification, &bindings, &frame, automation_ready)
     } else {
         Ok(format!(
-            "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
+            "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\nprovider={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
             automation_ready,
             pane.pane_id,
             pane.session_name,
             pane.window_name,
             pane.pane_active,
+            classification_provider_label(&classification, &pane),
             pane.current_command,
             is_pane_command_claude(&pane),
             pane.current_path,
@@ -1117,8 +1121,8 @@ fn run_guarded_pane_workflow(
 ) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    ensure_pane_owned_by_claude(&pane)?;
     let classification = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    ensure_pane_owned_by_automatable_provider(&pane, &classification)?;
     ensure_workflow_state(workflow, &classification)?;
     let executed_actions =
         execute_classified_workflow(&client, &pane.pane_id, workflow, &classification)?;
@@ -1951,9 +1955,12 @@ fn run_yolo_single(
             pane.pane_id
         )));
     }
-    ensure_pane_owned_by_claude(&pane)?;
-    let bindings = load_automation_keybindings(None)?;
-    let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
+    let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    ensure_pane_owned_by_yolo_provider(&pane, &inspected.classification)?;
+    if is_pane_command_claude(&pane) {
+        let bindings = load_automation_keybindings(None)?;
+        let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
+    }
     let record_path = write_yolo_record(state_dir, &workspace.id, &pane)?;
     let record = read_yolo_record(state_dir, &pane.pane_id)?.ok_or_else(|| {
         AppError::new(format!(
@@ -2144,11 +2151,7 @@ fn run_yolo_all(
             cleanup_all_babysit_records(state_dir, tracked.keys())?;
             return Ok(String::new());
         }
-        for pane in client
-            .list_panes()?
-            .into_iter()
-            .filter(is_pane_command_claude)
-        {
+        for pane in discover_yolo_supported_panes(client)? {
             let pane_workspace =
                 resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
             if workspace.is_some_and(|workspace| workspace.id != pane_workspace.id) {
@@ -2307,6 +2310,24 @@ fn run_yolo_all(
         }
         thread::sleep(Duration::from_millis(poll_ms));
     }
+}
+
+fn discover_yolo_supported_panes(client: &TmuxClient) -> AppResult<Vec<TmuxPane>> {
+    let mut supported = Vec::new();
+    for pane in client.list_panes()? {
+        if is_pane_command_claude(&pane) {
+            supported.push(pane);
+            continue;
+        }
+        if !is_pane_codex_candidate(&pane) {
+            continue;
+        }
+        let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        if is_classified_codex(&inspected.classification, &pane) {
+            supported.push(pane);
+        }
+    }
+    Ok(supported)
 }
 
 struct TrackedYoloPane {
@@ -2829,6 +2850,10 @@ pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
         return false;
     }
 
+    if is_codex_permission_prompt_safe_to_approve(inspected) {
+        return true;
+    }
+
     let Some(details) = extract_permission_prompt_details(inspected) else {
         return has_project_scoped_permission_option(inspected)
             && !permission_prompt_lines(inspected)
@@ -2857,6 +2882,65 @@ pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
             .iter()
             .map(|line| line.trim())
             .any(is_chat_input_line_for_yolo)
+}
+
+fn is_codex_permission_prompt_safe_to_approve(inspected: &InspectedPane) -> bool {
+    if !inspected
+        .classification
+        .signals
+        .iter()
+        .any(|signal| signal == SIGNAL_CODEX_KEYWORDS)
+    {
+        return false;
+    }
+
+    codex_permission_prompt_source_is_safe(&inspected.focused_source)
+        || codex_permission_prompt_source_is_safe(&inspected.raw_source)
+}
+
+fn codex_permission_prompt_source_is_safe(source: &str) -> bool {
+    let lines = source.lines().map(str::trim).collect::<Vec<_>>();
+    let Some(prompt_start) = latest_codex_permission_prompt_start(&lines) else {
+        return false;
+    };
+    let prompt_lines = &lines[prompt_start..];
+    let normalized = prompt_lines.join("\n").to_ascii_lowercase();
+
+    normalized.contains("yes, proceed")
+        && (prompt_lines
+            .iter()
+            .copied()
+            .any(|line| line.eq_ignore_ascii_case("would you like to run the following command?"))
+            || codex_permission_confirm_footer_is_live_tail(prompt_lines))
+        && !prompt_lines
+            .iter()
+            .copied()
+            .any(is_chat_input_line_for_yolo)
+}
+
+fn latest_codex_permission_prompt_start(lines: &[&str]) -> Option<usize> {
+    let prompt_header = lines.iter().rposition(|line| {
+        line.eq_ignore_ascii_case("would you like to run the following command?")
+    });
+    if codex_permission_confirm_footer_is_live_tail(lines) {
+        return prompt_header.or_else(|| {
+            lines
+                .iter()
+                .rposition(|line| line.to_ascii_lowercase().contains("yes, proceed"))
+        });
+    }
+    prompt_header
+}
+
+fn codex_permission_confirm_footer_is_live_tail(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            line.trim()
+                .eq_ignore_ascii_case(CODEX_PERMISSION_CONFIRM_FOOTER)
+        })
 }
 
 fn has_project_scoped_permission_option(inspected: &InspectedPane) -> bool {
@@ -2920,11 +3004,14 @@ fn permission_manual_review_reason(classification: &Classification) -> Option<&'
 
 fn is_chat_input_line_for_yolo(line: &str) -> bool {
     let trimmed = line.trim();
-    if trimmed == ">" || trimmed == "❯" {
+    if trimmed == ">" || trimmed == "❯" || trimmed == "›" {
         return true;
     }
 
-    let Some(rest) = trimmed.strip_prefix('❯') else {
+    let Some(rest) = trimmed
+        .strip_prefix('❯')
+        .or_else(|| trimmed.strip_prefix('›'))
+    else {
         return false;
     };
     let rest = rest.trim();
@@ -3307,9 +3394,21 @@ fn focus_live_frame(frame: &str, max_non_empty_lines: usize) -> String {
 fn is_focus_prompt_line(line: &&str) -> bool {
     let trimmed = line.trim();
     matches!(trimmed, ">" | "❯")
+        || trimmed == "›"
         || trimmed.starts_with("❯ 1.")
         || trimmed.starts_with("❯ 2.")
         || trimmed.starts_with("❯ 3.")
+        || trimmed.starts_with("› 1.")
+        || trimmed.starts_with("› 2.")
+        || trimmed.starts_with("› 3.")
+        || (trimmed.starts_with("› ")
+            && !starts_with_numbered_focus_option(trimmed.trim_start_matches('›').trim()))
+}
+
+fn starts_with_numbered_focus_option(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    matches!(chars.next(), Some('0'..='9')) && matches!(chars.next(), Some('.' | ')'))
 }
 
 fn raw_key_for_workflow(
@@ -3317,6 +3416,14 @@ fn raw_key_for_workflow(
     classification: &Classification,
 ) -> Option<(&'static str, &'static str)> {
     match (workflow, classification.state) {
+        (GuardedWorkflow::ApprovePermission, SessionState::PermissionDialog)
+            if classification
+                .signals
+                .iter()
+                .any(|signal| signal == SIGNAL_CODEX_KEYWORDS) =>
+        {
+            Some(("y", "y"))
+        }
         (GuardedWorkflow::ApprovePermission, SessionState::FolderTrustPrompt) => {
             Some(("Enter", "enter"))
         }
@@ -3460,11 +3567,12 @@ fn render_status_report(
     frame: &str,
 ) -> String {
     format!(
-        "pane={}\nsession={}\nwindow={}\nactive={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
+        "pane={}\nsession={}\nwindow={}\nactive={}\nprovider={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
         pane.pane_id,
         pane.session_name,
         pane.window_name,
         pane.pane_active,
+        classification_provider_label(classification, pane),
         pane.current_command,
         pane.current_path,
         render_cursor(pane),
@@ -3493,6 +3601,7 @@ fn render_status_json(
         "session": pane.session_name,
         "window": pane.window_name,
         "active": pane.pane_active,
+        "provider": classification_provider_label(classification, pane),
         "command": pane.current_command,
         "command_matches_claude": is_pane_command_claude(pane),
         "cwd": pane.current_path,
@@ -3531,6 +3640,13 @@ pub(crate) fn render_next_safe_action(
     pane: &TmuxPane,
     bindings: &KeybindingsInspection,
 ) -> String {
+    if is_classified_codex(classification, pane) {
+        return match classification.state {
+            SessionState::BusyResponding => String::from("safe-action: wait"),
+            SessionState::PermissionDialog => String::from("safe-action: approve (y)"),
+            _ => String::from("manual-review: Codex automation is not implemented"),
+        };
+    }
     if !is_pane_command_claude(pane) {
         return format!("manual-review: pane is running {}", pane.current_command);
     }
@@ -3638,6 +3754,72 @@ fn is_pane_command_claude(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("claude")
 }
 
+fn is_pane_likely_codex(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("codex")
+}
+
+fn is_pane_codex_candidate(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("codex")
+        || (pane.current_command.eq_ignore_ascii_case("node")
+            && !pane.pane_title.starts_with("OC | "))
+}
+
+fn pane_provider_label(pane: &TmuxPane) -> &'static str {
+    if is_pane_command_claude(pane) {
+        "Claude"
+    } else if is_pane_likely_codex(pane) {
+        "Codex"
+    } else {
+        "Unknown"
+    }
+}
+
+fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool {
+    is_pane_likely_codex(pane)
+        || classification
+            .signals
+            .iter()
+            .any(|signal| signal == SIGNAL_CODEX_KEYWORDS)
+}
+
+fn classification_provider_label(classification: &Classification, pane: &TmuxPane) -> &'static str {
+    if is_pane_command_claude(pane) {
+        "Claude"
+    } else if is_classified_codex(classification, pane) {
+        "Codex"
+    } else {
+        "Unknown"
+    }
+}
+
+fn ensure_pane_owned_by_automatable_provider(
+    pane: &TmuxPane,
+    classification: &Classification,
+) -> AppResult<()> {
+    if is_pane_command_claude(pane) || is_classified_codex(classification, pane) {
+        Ok(())
+    } else {
+        Err(AppError::new(format!(
+            "refusing to drive pane {} because current command is {} instead of claude or codex",
+            pane.pane_id, pane.current_command
+        )))
+    }
+}
+
+fn ensure_pane_owned_by_yolo_provider(
+    pane: &TmuxPane,
+    classification: &Classification,
+) -> AppResult<()> {
+    if is_pane_command_claude(pane) || is_classified_codex(classification, pane) {
+        Ok(())
+    } else {
+        Err(AppError::new(format!(
+            "refusing to start yolo for pane {} because current command is {} and the screen is not classified as codex",
+            pane.pane_id, pane.current_command
+        )))
+    }
+}
+
 pub(crate) fn ensure_pane_owned_by_claude(pane: &TmuxPane) -> AppResult<()> {
     if is_pane_command_claude(pane) {
         Ok(())
@@ -3737,7 +3919,8 @@ mod tests {
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
-        Classification, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
+        Classification, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
+        SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
     use crate::cli::PreparePromptArgs;
     use crate::prompt::pending_prompt_text;
@@ -4040,6 +4223,21 @@ mod tests {
             ),
             "manual-review: plan approval prompt needs operator confirmation"
         );
+        assert_eq!(
+            render_next_safe_action(
+                &Classification {
+                    state: SessionState::PermissionDialog,
+                    has_questions: false,
+                    recap_present: false,
+                    recap_excerpt: None,
+                    signals: vec![String::from(SIGNAL_CODEX_KEYWORDS)],
+                    ..classification
+                },
+                &sample_pane("node"),
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "safe-action: approve (y)"
+        );
     }
 
     #[test]
@@ -4060,10 +4258,22 @@ mod tests {
             recap_excerpt: None,
             signals: vec![String::from("survey-keywords")],
         };
+        let codex_permission = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from(SIGNAL_CODEX_KEYWORDS)],
+        };
 
         assert_eq!(
             raw_key_for_workflow(GuardedWorkflow::ApprovePermission, &folder_trust),
             Some(("Enter", "enter"))
+        );
+        assert_eq!(
+            raw_key_for_workflow(GuardedWorkflow::ApprovePermission, &codex_permission),
+            Some(("y", "y"))
         );
         assert_eq!(
             raw_key_for_workflow(GuardedWorkflow::DismissSurvey, &survey),
@@ -4980,6 +5190,106 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
             raw_source: String::from(
                 "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ Here's some of the output:",
+            ),
+        };
+
+        assert!(!is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_allows_codex_command_permission_prompt() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_CODEX_KEYWORDS),
+                ],
+            },
+            focused_source: String::from(
+                "Would you like to run the following command?\n\n$ tmux list-windows -a -F '#{session_name}:#{window_index} #{window_name}'\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for tmux list-windows commands in /home/colin/Projects/botctl (a)\n  3. No, and tell Codex what to do differently (esc)",
+            ),
+            raw_source: String::from(
+                "Would you like to run the following command?\n\n$ tmux list-windows -a -F '#{session_name}:#{window_index} #{window_name}'\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for tmux list-windows commands in /home/colin/Projects/botctl (a)\n  3. No, and tell Codex what to do differently (esc)",
+            ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_allows_codex_permission_prompt_after_stale_chat_input() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_CODEX_KEYWORDS),
+                ],
+            },
+            focused_source: String::from(
+                "› Look at 0:7.0 it is being incorrectly identified as a permission prompt\n\n• Running tmux list-panes -a\n\nWould you like to run the following command?\n\n$ tmux list-panes -a\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `tmux list-panes` (p)\n  3. No, and tell Codex what to do differently (esc)",
+            ),
+            raw_source: String::from(
+                "› Look at 0:7.0 it is being incorrectly identified as a permission prompt\n\n• Running tmux list-panes -a\n\nWould you like to run the following command?\n\n$ tmux list-panes -a\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `tmux list-panes` (p)\n  3. No, and tell Codex what to do differently (esc)",
+            ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_allows_truncated_codex_prompt_with_live_confirm_footer() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_CODEX_KEYWORDS),
+                ],
+            },
+            focused_source: String::from(
+                "› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `tmux list-panes` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel",
+            ),
+            raw_source: String::from(
+                "› Look at 0:7.0 it is being incorrectly identified as a permission prompt\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `tmux list-panes` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel",
+            ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_refuses_codex_permission_prompt_when_chat_input_is_active() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_CODEX_KEYWORDS),
+                ],
+            },
+            focused_source: String::from(
+                "Would you like to run the following command?\n\n$ tmux list-windows -a\n\n› 1. Yes, proceed (y)\n  2. No\n› explain why this is needed first",
+            ),
+            raw_source: String::from(
+                "Would you like to run the following command?\n\n$ tmux list-windows -a\n\n› 1. Yes, proceed (y)\n  2. No\n› explain why this is needed first",
             ),
         };
 

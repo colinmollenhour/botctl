@@ -4,13 +4,13 @@ This guide collects the operator flows that are currently shipped.
 
 For command syntax, see [command reference](./command-reference.mdx). For prompt handoff details, see [prompt handoff](./prompt-handoff.mdx).
 
-Claude Code panes support guarded automation and prompt workflows. OpenCode panes are supported passively in the dashboard when `botctl` can safely match the tmux pane to OpenCode's SQLite session database.
+Claude Code panes support guarded automation and prompt workflows. Codex CLI panes are supported through screen-capture classification with narrow YOLO approval for command permission dialogs. OpenCode panes are supported passively in the dashboard when `botctl` can safely match the tmux pane to OpenCode's SQLite session database.
 
 ## Main operator loop
 
 For most real use, the loop is:
 
-1. Open `dashboard` to see Claude Code panes and passively resolvable OpenCode panes.
+1. Open `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, and passively resolvable OpenCode panes.
 2. Use `yolo` on the pane or workspace you want babysat.
 3. Use `serve` when you need a live event stream or machine-readable observation.
 
@@ -50,7 +50,9 @@ Use this when `botctl` launches Claude for you.
 
 Use this when Claude is already running inside tmux and you want to verify the pane before acting.
 
-OpenCode panes are handled differently: the dashboard only includes them passively when the pane title has the form `OC | <session title>` and that title plus the pane cwd uniquely match OpenCode's SQLite `session` table. OpenCode titles truncated with `...` are accepted as prefixes only when still unique within the same cwd. Resolved OpenCode panes show recent SQLite message context in the details panel and can show `PermissionDialog` when SQLite shows a running file/glob tool targeting an absolute path outside the session directory. OpenCode panes can be selected and opened from the dashboard, but automation and YOLO remain Claude-only.
+OpenCode panes are handled differently: the dashboard only includes them passively when the pane title has the form `OC | <session title>` and that title plus the pane cwd uniquely match OpenCode's SQLite `session` table. OpenCode titles truncated with `...` are accepted as prefixes only when still unique within the same cwd. Resolved OpenCode panes show recent SQLite message context in the details panel and can show `PermissionDialog` when SQLite shows a running file/glob tool targeting an absolute path outside the session directory. OpenCode panes can be selected and opened from the dashboard, but automation and YOLO are not enabled for OpenCode.
+
+Codex CLI panes are screen-classified from captured terminal text. The dashboard captures likely Codex panes and includes them only when the screen shows Codex-specific text. A Codex `/statusline` with `run-state` is the most accurate signal: `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex panes can be selected and opened from the dashboard, and Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; broader automation remains Claude-only.
 
 1. List panes, including non-managed ones:
 

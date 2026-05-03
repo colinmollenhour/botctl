@@ -72,10 +72,11 @@ These commands are recovery loops, not magic fixers.
 - the built-in `keep-going` prompt tells Claude to verify completion, commit before `ALL_DONE`, push on branches other than `main`, `master`, `develop`, `dev`, `trunk`, or `release/*`, and open a PR only when the user explicitly asked for one
 - `--no-yolo` turns `PermissionDialog` and `FolderTrustPrompt` into manual-review exits.
 - `yolo` is the long-running loop for supported permission dialogs and survey dismissal.
+- for Codex panes, `yolo` only approves command permission dialogs by sending raw `y` for `Yes, proceed`
 
 Limits:
 
-- they still require Claude-owned panes
+- `auto-unstick` and `keep-going` still require Claude-owned panes
 - they still refuse on ambiguous or unsupported states
 - they do not bypass classifier or keybinding checks
 - `yolo` does not auto-handle `FolderTrustPrompt`

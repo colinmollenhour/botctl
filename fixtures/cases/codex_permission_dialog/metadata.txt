@@ -1,0 +1,7 @@
+source=live tmux capture-pane
+session=0
+pane=%16
+target=0:4.3
+current_command=node
+pane_title=[ . ] Action Required | bloodraven
+expected_state=PermissionDialog

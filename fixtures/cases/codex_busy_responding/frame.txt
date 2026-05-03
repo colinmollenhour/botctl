@@ -1,0 +1,11 @@
+• The live capture already gives us a useful Codex fixture: it includes Codex’s directory-trust prompt in
+  scrollback and the active Codex session footer/status. I’m going to use that to teach the classifier
+  Codex-specific screen language while keeping Claude-only automation guarded.
+
+• Running tmux capture-pane -p -J -S -120 -t %8
+
+› Explain this codebase
+
+  gpt-5.5 high · ~/Projects/botctl                                                   Pursuing goal (5m)
+
+• Working (54s • esc to interrupt)

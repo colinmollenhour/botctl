@@ -1,6 +1,6 @@
 # Testing and fixtures
 
-`botctl` uses recorded fixtures to keep classifier behavior stable as Claude UI text changes.
+`botctl` uses recorded fixtures to keep classifier behavior stable as Claude and Codex UI text changes.
 
 ## Corpus layout
 
@@ -26,6 +26,8 @@ botctl record-fixture --session demo --pane %19 --case new_case --output-dir fix
 ```
 
 Recording stores the frame, expected state, and supporting evidence in a new case directory.
+
+For Codex CLI panes, fixtures can also be created from direct `tmux capture-pane` snapshots when control-mode recording is not appropriate. Preserve enough screen text to explain the Codex prompt or dialog that produced the expected state.
 
 ## Replaying a fixture
 

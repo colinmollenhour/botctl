@@ -27,7 +27,7 @@ use crate::app::{
     is_yolo_safe_to_approve, try_unstick_pane,
 };
 use crate::automation::GuardedWorkflow;
-use crate::classifier::SessionState;
+use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
 use crate::opencode::resolve_opencode_session_for_pane;
 use crate::prompt::resolve_state_dir;
@@ -151,6 +151,7 @@ struct PaneEntry {
 #[derive(Clone)]
 enum PaneSource {
     Claude,
+    Codex,
     OpenCode { session_id: String, title: String },
 }
 
@@ -280,9 +281,58 @@ impl DashboardApp {
                 continue;
             }
 
-            let Some(opencode_session) = resolve_opencode_session_for_pane(&pane) else {
+            if let Some(opencode_session) = resolve_opencode_session_for_pane(&pane) {
+                seen_pane_ids.insert(pane.pane_id.clone());
+                self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
+
+                let workspace =
+                    resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
+                let workspace_group_key = workspace_group_key(&workspace);
+                let workspace_group_label = workspace_group_label(&workspace_group_key);
+                let branch = branch_by_path
+                    .entry(pane.current_path.clone())
+                    .or_insert_with(|| git_branch_for_path(&pane.current_path))
+                    .clone();
+                let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+                    self.first_seen
+                        .get(&pane.pane_id)
+                        .map(Instant::elapsed)
+                        .unwrap_or_default()
+                });
+
+                panes.push(PaneEntry {
+                    pane,
+                    source: PaneSource::OpenCode {
+                        session_id: opencode_session.id,
+                        title: opencode_session.title,
+                    },
+                    workspace,
+                    workspace_group_key,
+                    workspace_group_label,
+                    branch,
+                    state: opencode_session.state,
+                    has_questions: opencode_session.has_questions,
+                    recap_present: false,
+                    recap_excerpt: None,
+                    yolo_enabled: false,
+                    age,
+                    wait_duration: None,
+                    yes_count: 0,
+                    claude_session_id: None,
+                    focused_source: opencode_session.context,
+                });
                 continue;
-            };
+            }
+
+            if !is_codex_candidate_pane(&pane) {
+                continue;
+            }
+
+            let inspected = inspect_pane(&self.client, &pane.pane_id, self.history_lines)?;
+            if !is_codex_screen(&inspected.raw_source, &inspected.classification.signals) {
+                continue;
+            }
+
             seen_pane_ids.insert(pane.pane_id.clone());
             self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
 
@@ -300,27 +350,29 @@ impl DashboardApp {
                     .map(Instant::elapsed)
                     .unwrap_or_default()
             });
+            next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
+            let yolo_enabled = matches!(
+                read_yolo_record(&self.state_dir, &pane.pane_id)?,
+                Some(record) if record.enabled
+            );
 
             panes.push(PaneEntry {
                 pane,
-                source: PaneSource::OpenCode {
-                    session_id: opencode_session.id,
-                    title: opencode_session.title,
-                },
+                source: PaneSource::Codex,
                 workspace,
                 workspace_group_key,
                 workspace_group_label,
                 branch,
-                state: opencode_session.state,
-                has_questions: opencode_session.has_questions,
-                recap_present: false,
-                recap_excerpt: None,
-                yolo_enabled: false,
+                state: inspected.classification.state,
+                has_questions: inspected.classification.has_questions,
+                recap_present: inspected.classification.recap_present,
+                recap_excerpt: inspected.classification.recap_excerpt.clone(),
+                yolo_enabled,
                 age,
                 wait_duration: None,
                 yes_count: 0,
                 claude_session_id: None,
-                focused_source: opencode_session.context,
+                focused_source: inspected.focused_source,
             });
         }
 
@@ -500,7 +552,7 @@ impl DashboardApp {
     fn run_yolo_supervisor(&mut self) -> AppResult<()> {
         let mut message = None;
         for pane in self.panes.clone() {
-            if !pane.is_claude() || !pane.yolo_enabled {
+            if !pane.supports_yolo() || !pane.yolo_enabled {
                 continue;
             }
 
@@ -752,8 +804,8 @@ impl DashboardApp {
     }
 
     fn toggle_yolo_for_pane(&mut self, pane: &PaneEntry) -> AppResult<()> {
-        if !pane.is_claude() {
-            self.message = String::from("YOLO is only available for Claude panes");
+        if !pane.supports_yolo() {
+            self.message = String::from("YOLO is only available for Claude or Codex panes");
             return Ok(());
         }
         self.set_yolo_for_pane(pane, !pane.yolo_enabled)?;
@@ -766,10 +818,12 @@ impl DashboardApp {
     }
 
     fn set_yolo_for_pane(&mut self, pane: &PaneEntry, enabled: bool) -> AppResult<()> {
-        if !pane.is_claude() {
+        if !pane.supports_yolo() {
             return Ok(());
         }
-        ensure_pane_owned_by_claude(&pane.pane)?;
+        if pane.is_claude() {
+            ensure_pane_owned_by_claude(&pane.pane)?;
+        }
         if enabled {
             write_yolo_record(&self.state_dir, &pane.workspace.id, &pane.pane)?;
         } else {
@@ -782,6 +836,10 @@ impl DashboardApp {
 impl PaneEntry {
     fn is_claude(&self) -> bool {
         matches!(self.source, PaneSource::Claude)
+    }
+
+    fn supports_yolo(&self) -> bool {
+        matches!(self.source, PaneSource::Claude | PaneSource::Codex)
     }
 }
 
@@ -1518,7 +1576,16 @@ fn context_lines_above_input(source: &str) -> Vec<String> {
 }
 
 fn is_chat_input_prompt(line: &str) -> bool {
-    matches!(line.trim(), "❯" | ">")
+    let trimmed = line.trim();
+    matches!(trimmed, "❯" | ">" | "›")
+        || (trimmed.starts_with("› ")
+            && !starts_with_numbered_context_option(trimmed.trim_start_matches('›').trim()))
+}
+
+fn starts_with_numbered_context_option(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    matches!(chars.next(), Some('0'..='9')) && matches!(chars.next(), Some('.' | ')'))
 }
 
 fn is_recap_line(line: &str) -> bool {
@@ -1750,6 +1817,7 @@ fn detail_current_path(pane: &PaneEntry) -> String {
 fn pane_provider_label(pane: &PaneEntry) -> &str {
     match pane.source {
         PaneSource::Claude => "Claude",
+        PaneSource::Codex => "Codex",
         PaneSource::OpenCode { .. } => "OpenCode",
     }
 }
@@ -1757,6 +1825,7 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
 fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
     match &pane.source {
         PaneSource::Claude => pane.claude_session_id.as_deref(),
+        PaneSource::Codex => None,
         PaneSource::OpenCode { session_id, .. } => Some(session_id.as_str()),
     }
 }
@@ -1892,6 +1961,38 @@ fn is_claude_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("claude")
 }
 
+fn is_codex_candidate_pane(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("codex")
+        || (pane.current_command.eq_ignore_ascii_case("node")
+            && !pane.pane_title.starts_with("OC | "))
+}
+
+fn is_codex_screen(frame: &str, signals: &[String]) -> bool {
+    if signals.iter().any(|signal| signal == SIGNAL_CODEX_KEYWORDS) {
+        return true;
+    }
+
+    let normalized = frame.to_ascii_lowercase();
+    normalized.contains("openai codex")
+        || normalized.contains(">_ openai codex")
+        || normalized.contains("pursuing goal")
+        || normalized.contains("tab to queue message")
+        || normalized.contains("suppress_unstable_features_warning")
+        || normalized.lines().any(is_codex_statusline_line)
+        || normalized.lines().any(is_codex_footer_line)
+}
+
+fn is_codex_statusline_line(line: &str) -> bool {
+    line.contains("gpt-")
+        && line.contains("·")
+        && line.contains("context")
+        && !line.contains("claude")
+}
+
+fn is_codex_footer_line(line: &str) -> bool {
+    line.contains("gpt-") && line.contains("·") && !line.contains("claude")
+}
+
 fn navigate_to_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<()> {
     client.select_window(&format!("{}:{}", pane.session_name, pane.window_index))?;
     client.select_pane(&pane.pane_id)?;
@@ -1917,13 +2018,14 @@ mod tests {
         dashboard_body_sections, dashboard_display_state, dashboard_selection_path,
         derive_base_window_name, detail_body_kind, detail_current_path, detail_workspace_label,
         details_panel_height, footer_column_widths, footer_help_line, footer_lines, format_age,
-        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
-        pane_window_prefix, recap_lines, rect_contains, render_workspace_header_line,
-        repo_root_from_repo_key, save_selection, should_return_navigation, split_workspace_header,
-        state_emoji, strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
+        is_codex_candidate_pane, is_codex_screen, load_saved_selection, pad_display_right,
+        pane_list_columns, pane_list_content_area, pane_window_prefix, recap_lines, rect_contains,
+        render_workspace_header_line, repo_root_from_repo_key, save_selection,
+        should_return_navigation, split_workspace_header, state_emoji,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
     };
-    use crate::classifier::SessionState;
+    use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::storage::WorkspaceRecord;
     use crate::tmux::{TmuxClient, TmuxPane};
     use ratatui::layout::Rect;
@@ -1933,6 +2035,33 @@ mod tests {
     #[test]
     fn formats_short_age() {
         assert_eq!(format_age(Duration::from_secs(65)), "01:05");
+    }
+
+    #[test]
+    fn detects_codex_candidate_node_panes_without_guessing_opencode_titles() {
+        assert!(is_codex_candidate_pane(&sample_tmux_pane(
+            "node",
+            "Action Required | demo"
+        )));
+        assert!(!is_codex_candidate_pane(&sample_tmux_pane(
+            "node",
+            "OC | demo"
+        )));
+    }
+
+    #[test]
+    fn codex_screen_detection_uses_screen_anchors_or_signals() {
+        assert!(is_codex_screen("│ >_ OpenAI Codex (v0.128.0) │", &[]));
+        assert!(is_codex_screen("› hello\n  tab to queue message", &[]));
+        assert!(is_codex_screen(
+            "gpt-5.5 high · ~/Projects/botctl · gpt-5.5 · main · Ready · Context 100% left · Context 0% used",
+            &[]
+        ));
+        assert!(is_codex_screen(
+            "plain",
+            &[String::from(SIGNAL_CODEX_KEYWORDS)]
+        ));
+        assert!(!is_codex_screen("plain node output", &[]));
     }
 
     #[test]
@@ -2484,6 +2613,14 @@ mod tests {
             workspace_group_key: String::from("/tmp/demo/project"),
             workspace_group_label: String::from("project  (/tmp/demo/project)"),
             ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        }
+    }
+
+    fn sample_tmux_pane(command: &str, title: &str) -> TmuxPane {
+        TmuxPane {
+            current_command: command.to_string(),
+            pane_title: title.to_string(),
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
         }
     }
 

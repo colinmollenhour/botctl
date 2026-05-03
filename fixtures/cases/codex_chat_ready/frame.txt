@@ -1,0 +1,15 @@
+╭─────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                              │
+│                                                         │
+│ model:     gpt-5.5 high   /model to change              │
+│ directory: ~/.local/share/opencode/worktree/…/dragonfly │
+╰─────────────────────────────────────────────────────────╯
+
+  Tip: Switch models or reasoning effort quickly with /model.
+
+⚠ Under-development features enabled: goals. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set
+  `suppress_unstable_features_warning = true` in /home/colin/.codex/config.toml.
+
+› /goal
+
+  gpt-5.5 high · ~/.local/share/opencode/worktree/7685f98c70023eaf4f7784327430f360a55d2a47/dragonfly

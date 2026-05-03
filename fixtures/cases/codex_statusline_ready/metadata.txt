@@ -1,0 +1,3 @@
+source=user-provided codex /statusline example
+expected_state=ChatReady
+note=Codex statusline includes run-state=Ready
