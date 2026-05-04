@@ -25,7 +25,7 @@ Canonical command names:
 - `reject-permission` remains a compatibility alias for `reject`.
 - Commands marked advanced are supported, but intended for diagnostics, fixtures, prompt plumbing, or low-level automation.
 
-If you just want the useful commands first, start here:
+For the most useful commands, start here:
 
 ## Main commands
 
@@ -132,6 +132,21 @@ Notes:
 - Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
 - Startup bootstrapping also runs in-place schema migrations for supported older `state.db` versions.
 - `last-message` is read-only with respect to provider state; it reads transcript storage and writes only the requested Markdown export file, or stdout when `--out -` is used.
+
+## State-to-action quick reference
+
+| State | Use | Refuses or requires review |
+| --- | --- | --- |
+| `ChatReady` | `submit-prompt`; `keep-going` loop submission | direct approval/rejection commands |
+| `BusyResponding` | wait; observe with `serve` | prompt submission and approval commands |
+| `PermissionDialog` | `approve`, `reject`, YOLO, `continue-session`, `auto-unstick` | unsafe permission prompts that policy cannot approve |
+| `FolderTrustPrompt` | `approve`, `continue-session`, `auto-unstick` | `reject`; raw `Enter` is used for approval |
+| `SurveyPrompt` | `dismiss-survey`, YOLO, `continue-session`, `auto-unstick` | `approve` and `reject` |
+| `PlanApprovalPrompt` | manual review | automatic approval |
+| `DiffDialog` | manual review | `/interactions/:optionId`, guarded workflows |
+| `ExternalEditorActive` | `editor-helper` when completing a prompt handoff | general guarded automation |
+| `UserQuestionPrompt` | manual answer | automatic recovery |
+| `Unknown` | inspect with `status`, `doctor`, or `capture` | all guarded automation |
 
 ## Secondary commands
 

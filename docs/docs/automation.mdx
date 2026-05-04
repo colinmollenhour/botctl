@@ -43,12 +43,28 @@ Refusal states are part of the safety model:
 
 - `Unknown` — manual review required
 - `UserQuestionPrompt` — manual review required
+- `PlanApprovalPrompt` — manual review required
 - `DiffDialog` — manual review required
 - `ExternalEditorActive` — manual review required
 
 `FolderTrustPrompt` is a special case. Approval uses raw `Enter`, not the normal `confirm-yes` binding.
 
 `SurveyPrompt` is also special. Dismissal uses the raw `0` key, not a Claude keybinding-resolved action.
+
+## State and action matrix
+
+| State | Safe automated action | Notes |
+| --- | --- | --- |
+| `ChatReady` | `submit-prompt`; `keep-going` loop submission | Prompt submission verifies that the pane transitions after the submit sequence. |
+| `BusyResponding` | wait | `continue-session` can report the pane as already usable. |
+| `PermissionDialog` | `approve`, `reject`, YOLO | Approval is allowed only when the prompt is classified as a permission dialog and policy allows the action. |
+| `FolderTrustPrompt` | `approve`; `auto-unstick`; `keep-going` with YOLO enabled | Uses raw `Enter` because Claude's folder trust prompt confirms the selected default directly. |
+| `SurveyPrompt` | `dismiss-survey`, YOLO, `auto-unstick`, `keep-going` with YOLO enabled | Uses raw `0`. |
+| `PlanApprovalPrompt` | none | Review manually. |
+| `DiffDialog` | none | Review manually. |
+| `ExternalEditorActive` | `editor-helper` only when you are intentionally completing a prompt handoff | General automation refuses this state. |
+| `UserQuestionPrompt` | none | Answer the question manually or submit a new prompt after the pane returns to `ChatReady`. |
+| `Unknown` | none | Inspect the pane or improve classifier coverage. |
 
 ## Refusal semantics
 
@@ -62,12 +78,14 @@ Refusal states are part of the safety model:
 
 That refusal is deliberate: it is safer to stop than to guess.
 
+Refusals use exit code `2` when the command was understood but the guarded workflow intentionally declined to act. Runtime failures such as tmux, filesystem, state database, or keybinding read errors use exit code `1`.
+
 ## keep-going, auto-unstick, and yolo
 
 These commands are recovery loops, not magic fixers.
 
 - `auto-unstick` walks a pane through a bounded number of safe recovery steps.
-- `keep-going` watches a pane, submits the built-in audit prompt by default or a custom loop prompt via `--source` / `--text`, and can optionally respond to supported blockers.
+- `keep-going` watches a pane, submits the built-in audit prompt by default or a custom loop prompt through `--source` / `--text`, and can optionally respond to supported blockers.
 - `keep-going` expects each loop reply to end with exactly one terminal token: `OKIE_DOKIE`, `ALL_DONE`, or `PANIC`.
 - the built-in `keep-going` prompt tells Claude to verify completion, commit before `ALL_DONE`, push on branches other than `main`, `master`, `develop`, `dev`, `trunk`, or `release/*`, and open a PR only when the user explicitly asked for one
 - `--no-yolo` turns `PermissionDialog` and `FolderTrustPrompt` into manual-review exits.
@@ -80,6 +98,7 @@ Limits:
 - they still refuse on ambiguous or unsupported states
 - they do not bypass classifier or keybinding checks
 - `yolo` does not auto-handle `FolderTrustPrompt`
+- Codex YOLO only approves command permission dialogs; it does not submit prompts or run Claude keybinding workflows
 - `keep-going` will stop on manual-review blockers when `--no-yolo` is set
 
 ## Related docs

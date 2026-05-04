@@ -2,103 +2,228 @@
 
 Common operator failures and what they usually mean.
 
+Start with the smallest command that proves what `botctl` can see:
+
+```bash
+botctl list --all
+botctl doctor --pane %19
+botctl status --pane %19
+```
+
+Use `--json` on `list`, `doctor`, and `status` when you need structured output for a script.
+
 ## Missing keybindings
 
 Symptoms:
 
-- `doctor` reports missing or invalid bindings
-- guarded workflows fail before any keypresses are sent
-- `install-bindings` reports invalid JSON or a key conflict in the existing file
+- `doctor` reports missing or invalid bindings.
+- Guarded workflows fail before any keypresses are sent.
+- `install-bindings` reports invalid JSON or a key conflict in the existing file.
+
+Cause:
+
+`botctl` reads Claude keybindings from `~/.claude/keybindings.json`. It will not overwrite a custom file or invent a key sequence when a required action is missing.
 
 Fix:
 
-- run `botctl bindings` to inspect the recommended map
-- use `botctl install-bindings` to merge in any missing required bindings when it can
-- if install still fails, fix the conflicting or invalid JSON manually
-- re-run `doctor`
+1. Inspect the required map:
+
+   ```bash
+   botctl bindings
+   ```
+
+2. Merge missing bindings when possible:
+
+   ```bash
+   botctl install-bindings
+   ```
+
+3. If install still fails, fix the conflicting or invalid JSON manually.
+
+4. Re-run diagnostics:
+
+   ```bash
+   botctl doctor --pane %19
+   ```
 
 ## Ambiguous targets
 
 Symptoms:
 
-- a command says the target is ambiguous
-- session-only targeting finds no active pane
+- A command says the target is ambiguous.
+- Session-only targeting finds no active pane.
+
+Cause:
+
+Automation needs one exact tmux pane. Session names are only a convenience for resolving a pane.
 
 Fix:
 
-- prefer `--pane %ID`
-- if using a session target, add `--window NAME` so the active pane can be resolved safely
+```bash
+botctl list --all
+botctl status --pane %19
+```
+
+If you must use a session target, include the window:
+
+```bash
+botctl attach --session demo --window claude
+```
 
 ## Non-Claude panes
 
 Symptoms:
 
-- refusal mentions the current command is not `claude`
-- `doctor` shows `command_matches_claude=false`
+- Refusal mentions the current command is not `claude`.
+- `doctor` shows `command_matches_claude=false`.
+
+Cause:
+
+Claude-only workflows refuse shells, editors, OpenCode panes, and unrelated tmux panes. Codex support is limited to screen classification and YOLO command permission approval.
 
 Fix:
 
-- stop targeting that pane
-- find the actual Claude pane first
-- never force automation into shells, editors, or unrelated tmux panes
+1. List all panes:
+
+   ```bash
+   botctl list --all
+   ```
+
+2. Target the actual Claude pane for Claude automation.
+
+3. Use the dashboard for passive OpenCode visibility or Codex screen-classified visibility:
+
+   ```bash
+   botctl dashboard
+   ```
 
 ## Stale observation
 
 Symptoms:
 
-- `status` or `serve` reports `Unknown` unexpectedly
-- the visible UI and captured text disagree
+- `status` or `serve` reports `Unknown` unexpectedly.
+- The visible UI and captured text disagree.
+
+Cause:
+
+Live classification still depends on `capture-pane` text plus a recent-lines heuristic. Stale scrollback can hide the current UI.
 
 Fix:
 
-- wait for the next reconcile/capture
-- increase history lines if the relevant text is off-screen
-- re-run `doctor` or `status` on the explicit pane
+1. Re-run status with more history:
+
+   ```bash
+   botctl status --pane %19 --history-lines 240
+   ```
+
+2. Re-run diagnostics on the explicit pane:
+
+   ```bash
+   botctl doctor --pane %19
+   ```
+
+3. If you need continuous reconciliation, use `serve`:
+
+   ```bash
+   botctl serve --session demo --pane %19
+   ```
 
 ## `submit-prompt` fails
 
 Symptoms:
 
-- submission reports that no prompt-submission transition was observed
-- the pane is not `ChatReady`
+- Submission reports that no prompt-submission transition was observed.
+- The pane is not `ChatReady`.
+
+Cause:
+
+`submit-prompt` only submits from `ChatReady`, except for supported preflight recovery such as survey dismissal. It verifies that the pane transitions after submission.
 
 Fix:
 
-- confirm the pane is Claude-owned
-- confirm the state is `ChatReady`
-- check keybindings with `doctor`
-- if Claude is in `ExternalEditorActive` or `DiffDialog`, review manually first
+```bash
+botctl doctor --pane %19
+botctl status --pane %19
+```
 
-## Yolo already active
+Then:
+
+- If the state is `ChatReady`, retry `submit-prompt`.
+- If the state is `SurveyPrompt`, run `dismiss-survey` or retry `submit-prompt` and let preflight handle it.
+- If the state is `ExternalEditorActive`, finish the editor handoff manually or with `editor-helper`.
+- If the state is `DiffDialog`, review the diff manually.
+
+## YOLO already active
 
 Symptoms:
 
-- starting `yolo` reports an existing yolo registration or tracked pane
+- Starting `yolo` reports an existing YOLO registration or tracked pane.
+
+Cause:
+
+YOLO registrations are stored in the botctl state database. A previous loop may still be registered for the same pane or workspace.
 
 Fix:
 
-- stop the existing yolo registration in `state.db` first
-- then restart it for the same pane
+```bash
+botctl yolo stop --pane %19
+botctl yolo --pane %19
+```
+
+For workspace-scoped loops:
+
+```bash
+botctl yolo stop --all --workspace .
+botctl yolo --all --workspace .
+```
 
 ## tmux problems
 
 Symptoms:
 
-- pane lookup fails
-- capture or send-keys errors mention tmux
+- Pane lookup fails.
+- Capture or send-keys errors mention tmux.
+
+Cause:
+
+The pane, window, or session may have been renamed or destroyed, or `botctl` may be looking at a different tmux server.
 
 Fix:
 
-- verify tmux is running
-- confirm the pane id still exists
-- make sure the session was not renamed or destroyed
+```bash
+tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_current_path}'
+botctl list --all
+```
+
+If the pane ID changed, rerun the `botctl` command with the new pane ID.
+
+## HTTP API browser request fails
+
+Symptoms:
+
+- Browser requests to `serve --http` fail with `403`.
+- A non-browser `curl` request works.
+
+Cause:
+
+Browser access is allowed only for exact origins passed with `--allowed-origin URL`.
+
+Fix:
+
+```bash
+botctl serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
+```
+
+Use the exact scheme, host, and port that the browser sends in the `Origin` header.
 
 ## When to stop and review manually
 
 Always review manually when the state is:
 
 - `Unknown`
+- `PlanApprovalPrompt`
 - `DiffDialog`
 - `ExternalEditorActive`
+- `UserQuestionPrompt`
 
-Those states are refusals, not invitation to guess.
+Those states are refusals, not an invitation to guess.

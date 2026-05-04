@@ -9,40 +9,59 @@ slug: /
 
 Claude Code panes get the full guarded automation path. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status.
 
-The fun part is not the implementation details. The fun part is that you can:
+Use `botctl` when you want to:
 
-- open a live `dashboard` and immediately see what your Claude Code, screen-detected Codex CLI, and resolvable OpenCode panes are doing
-- turn on `yolo` and let `botctl` babysit the boring confirmation flows
-- run `serve` and get a live event stream when you want to watch or integrate the session externally
+- open a live `dashboard` and see what Claude Code, screen-detected Codex CLI, and resolvable OpenCode panes are doing
+- turn on `yolo` for guarded permission approval
+- run `serve` for a foreground event stream or localhost HTTP API
+- export the latest persisted assistant reply with `last-message`
 
-Also, yes, it is written in Rust. Legally, I believe, all new CLIs must be.
+## Choose a command
 
-## The three cool commands
+| Need | Start with | Then read |
+| --- | --- | --- |
+| Watch all known panes and toggle YOLO | `botctl dashboard` | [Workflows](./workflows.mdx) |
+| Babysit one pane or workspace | `botctl yolo --pane %19` | [Automation](./automation.mdx) |
+| Stream live observations | `botctl serve --session demo --format jsonl` | [Serve mode](./serve-mode.mdx) |
+| Submit or stage a prompt | `botctl submit-prompt ...` | [Prompt handoff](./prompt-handoff.mdx) |
+| Recover from a blocker | `botctl approve --pane %19` | [Troubleshooting](./troubleshooting.mdx) |
+| Export the latest assistant reply | `botctl last-message --pane %19` | [Command reference](./command-reference.mdx#last-message) |
+
+## Provider support
+
+| Provider | Dashboard | Classification | YOLO | Prompt submission | `last-message` |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | yes | yes | yes | yes | yes |
+| Codex CLI | yes, from screen capture | yes, from screen capture | command permission approval only | no | yes |
+| OpenCode | yes, after safe title plus cwd resolution | limited passive state from SQLite | no | no | yes |
+
+## Main commands
 
 ### `dashboard`
 
-The command you open first.
+Use this first when you have multiple tmux panes open.
 
-- see Claude Code panes, screen-detected Codex CLI panes, and passive OpenCode pane visibility across workspaces in one place
-- spot blocked or waiting sessions quickly
-- jump straight into a pane
-- toggle YOLO without hunting around in tmux
+- Shows Claude Code panes, screen-detected Codex CLI panes, and passively resolvable OpenCode panes across workspaces.
+- Shows state, age, branch, recent context, and safe actions.
+- Lets you jump into a pane and toggle YOLO for Claude Code and Codex panes.
+- Can run persistently inside a tmux popup.
 
 ### `yolo`
 
-The command that removes tedious operator babysitting.
+Use this when a pane is safe to babysit.
 
-- handle common safe confirmation flows automatically
-- scope automation to one pane or one workspace
-- keep the guardrails on instead of blindly mashing keys
+- Acts only after classification finds a supported state.
+- Scopes automation to one pane, all panes, or one workspace.
+- Approves Claude permission dialogs, dismisses Claude surveys, and approves Codex command permission dialogs.
+- Refuses ambiguous targets and unsupported states.
 
 ### `serve`
 
-The command for live observation.
+Use this when another tool needs live state.
 
-- stream what is happening in a session as it happens
-- use human output for watching, or JSONL for tooling
-- keep a long-running foreground observer attached to one tmux session
+- Streams human-readable or JSONL events for one tmux session.
+- Can expose a localhost HTTP API while the foreground process runs.
+- Persists event tapes and summaries under the botctl state root.
 
 ## Start here
 

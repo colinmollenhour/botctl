@@ -8,17 +8,16 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 
 ## Learn these first
 
-Most users only need three commands:
+Most users only need a few commands:
 
 - `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode visibility
 - `yolo` for automated babysitting and recovery
 - `serve` for a long-lived observation stream
+- `last-message` when you need the full latest assistant reply instead of the visible terminal excerpt
 
 For direct blocker recovery, use the canonical names `approve`, `reject`, and `dismiss-survey`. The longer `approve-permission` and `reject-permission` names still work as compatibility aliases.
 
-Everything else is support around setup, diagnostics, prompt handoff, and lower-level recovery.
-
-If you just want to get value quickly, install it, open `dashboard`, then try `yolo` or `serve`.
+Everything else supports setup, diagnostics, prompt handoff, and lower-level recovery.
 
 ## Requirements
 
@@ -34,43 +33,64 @@ If you just want to get value quickly, install it, open `dashboard`, then try `y
 cargo install botctl
 ```
 
-## Fastest useful path
-
-Open the dashboard across Claude Code, screen-detected Codex CLI, and resolvable OpenCode panes:
+Verify the binary is on your `PATH`:
 
 ```bash
-botctl dashboard
+botctl --version
+botctl help
 ```
 
-Start YOLO on one pane:
+## First useful run
 
-```bash
-botctl yolo --pane 0:6.0
-```
+1. Open at least one Claude Code, Codex CLI, or OpenCode pane inside `tmux`.
 
-Stream live session events:
+2. Open the dashboard:
 
-```bash
-botctl serve --session demo --format jsonl
-```
+   ```bash
+   botctl dashboard
+   ```
+
+3. Select a pane in the dashboard and press `Enter` to jump to it.
+
+4. If the pane is a Claude Code or Codex pane blocked on a supported permission dialog, enable YOLO from the dashboard or target the pane directly:
+
+   ```bash
+   botctl yolo --pane 0:6.0
+   ```
+
+5. If you need machine-readable observation for a tmux session, run:
+
+   ```bash
+   botctl serve --session demo --format jsonl
+   ```
+
+Use `botctl help <command>` when you need terminal-local syntax.
 
 ## First session
 
-Start a managed Claude session:
+Use this path when you want `botctl` to launch Claude Code for you.
 
-```bash
-botctl start --session demo --cwd /path/to/project
-```
+1. Start a managed Claude session:
 
-Then check what `botctl` sees:
+   ```bash
+   botctl start --session demo --cwd /path/to/project
+   ```
 
-```bash
-botctl list
-botctl doctor --session demo
-botctl status --pane %19
-```
+2. Check what `botctl` sees:
 
-Use `--plain` on `attach`, `list`, `status`, and `doctor` when scripts need the current line-oriented output contract.
+   ```bash
+   botctl list
+   botctl doctor --session demo
+   botctl status --pane %19
+   ```
+
+3. Attach with tmux when you want the full terminal UI:
+
+   ```bash
+   tmux attach -t demo
+   ```
+
+Use `--plain` on `attach`, `list`, `status`, and `doctor` when scripts need the line-oriented output contract.
 
 For scripts, use JSON on one-shot inspection commands:
 
@@ -80,18 +100,10 @@ botctl status --pane %19 --json
 botctl doctor --session demo --json
 ```
 
-Use `botctl --version`, `botctl help`, or `botctl help status` for terminal-local reference.
-
 Pane-targeted commands also accept tmux's explicit pane syntax:
 
 ```bash
 botctl status --pane 0:2.3
-```
-
-Attach with tmux when you want the full terminal UI:
-
-```bash
-tmux attach -t demo
 ```
 
 ## If Claude is already running in tmux
@@ -109,6 +121,12 @@ If you already know the tmux pane target, you can use it directly:
 botctl attach --pane 0:2.3
 ```
 
+## Pane targets
+
+Prefer raw tmux pane IDs such as `%19` for automation. They identify one pane directly.
+
+`botctl` also accepts tmux's explicit `session:window.pane` syntax, such as `0:2.3`, when that target identifies exactly one pane. Session names are useful for setup and inspection, but guarded workflows are safest when you pass an explicit pane target.
+
 ## Dashboard and YOLO
 
 Open the cross-workspace dashboard TUI:
@@ -117,18 +135,20 @@ Open the cross-workspace dashboard TUI:
 botctl dashboard
 ```
 
-The dashboard uses one emoji per pane to show the current classified state at a glance:
+The dashboard uses one emoji per pane to show the current classified state at a glance.
 
-- `💤` `ChatReady`: idle and ready for a new prompt
-- `🤔` `UserQuestionPrompt`: Claude's latest visible reply appears to be asking for a decision or follow-up
-- `⚙️` `BusyResponding`: Claude is still working
-- `🔐` `PermissionDialog`: waiting on a permission approval or rejection
-- `❓` `PlanApprovalPrompt`: waiting on operator confirmation for a proposed plan
-- `📁` `FolderTrustPrompt`: waiting on folder trust confirmation
-- `📝` `SurveyPrompt`: waiting on a feedback/survey prompt
-- `✏️` `ExternalEditorActive`: paused for an external editor flow
-- `🧾` `DiffDialog`: waiting on a diff review choice
-- `❔` `Unknown`: classifier could not identify the current surface safely
+| Emoji | State | Meaning | Automation |
+| --- | --- | --- | --- |
+| `💤` | `ChatReady` | Ready for input | `submit-prompt` can run |
+| `🤔` | `UserQuestionPrompt` | Waiting for an operator decision or follow-up | manual review |
+| `⚙️` | `BusyResponding` | Still working | wait |
+| `🔐` | `PermissionDialog` | Waiting on permission approval or rejection | `approve`, `reject`, or YOLO when safe |
+| `❓` | `PlanApprovalPrompt` | Waiting on plan approval | manual review |
+| `📁` | `FolderTrustPrompt` | Waiting on folder trust confirmation | `approve` sends raw `Enter` |
+| `📝` | `SurveyPrompt` | Waiting on a feedback prompt | `dismiss-survey` or YOLO |
+| `✏️` | `ExternalEditorActive` | Waiting on an external editor flow | manual review |
+| `🧾` | `DiffDialog` | Waiting on a diff review choice | manual review |
+| `❔` | `Unknown` | Not classified safely | inspect before acting |
 
 OpenCode panes can appear in the same dashboard without terminal capture or keypress automation. They are included only when the tmux command is `opencode`, the pane title is `OC | <session title>`, and OpenCode's SQLite database has exactly one `session` row whose `directory` matches the pane cwd and whose `title` matches the stripped pane title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. If that match is missing, duplicated, ambiguous, or unreadable, the pane is ignored rather than guessed. Resolved OpenCode panes show a bounded recent-message excerpt from SQLite `message`/`part` rows and can show `PermissionDialog` when a running file/glob tool targets an absolute path outside the session directory. OpenCode panes are navigable and contribute window-title emojis, but YOLO and recovery actions are not enabled for OpenCode.
 
@@ -213,6 +233,8 @@ botctl serve --session demo --format jsonl
 - Claude ownership is validated before automation runs.
 - `Unknown` is a refusal state, not a guess.
 - Folder trust approval is special and uses raw `Enter`.
+- Codex YOLO is limited to command permission dialogs.
+- OpenCode support is passive dashboard and status visibility.
 
 For blocker recovery, prompt handoff, and recovery examples, see [workflows](./workflows.mdx) and [prompt handoff](./prompt-handoff.mdx).
 
@@ -220,4 +242,4 @@ For blocker recovery, prompt handoff, and recovery examples, see [workflows](./w
 
 - live classification is still built around `capture-pane`, with `serve` using a best-effort merged stream model when that helps break `Unknown` states
 - the classifier is conservative and keyword-based
-- `serve` is currently a foreground observer, not the full daemon/API system yet
+- `serve` is a foreground observer, not the full daemon/API system yet

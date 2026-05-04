@@ -88,17 +88,29 @@ Run a single test by name:
 cargo test resolves_custom_binding_keys_for_actions
 ```
 
-## Start Here
+## Start here
 
-If you just want the useful path quickly:
+For a first useful run, open a tmux pane that is running Claude Code, Codex CLI, or OpenCode, then run:
 
 ```bash
-cargo run -- dashboard
-cargo run -- yolo --pane 0:6.0
-cargo run -- serve --session demo --format jsonl
+botctl dashboard
 ```
 
-## Core Workflows
+From there:
+
+- Use `yolo` for one Claude Code or Codex pane that is blocked on a supported permission dialog.
+- Use `serve` when you need a foreground event stream or localhost HTTP API.
+- Use `last-message` when you need the full latest assistant reply as Markdown.
+
+```bash
+botctl yolo --pane 0:6.0
+botctl serve --session demo --format jsonl
+botctl last-message --pane 0:6.0 --out -
+```
+
+Use `cargo run -- ...` instead of `botctl ...` when running from a source checkout without installing the binary.
+
+## Core workflows
 
 Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
 
@@ -114,7 +126,7 @@ Keep the dashboard alive in a dedicated tmux-backed popup session:
 cargo run -- dashboard --persistent
 ```
 
-Quick and easy tmux popup binding:
+Quick tmux popup binding:
 
 ```tmux
 bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
@@ -311,12 +323,13 @@ git push && git push origin vX.Y.Z
 
 ## Current State Model
 
-The classifier currently recognizes:
+The classifier recognizes:
 
 - `ChatReady`
 - `UserQuestionPrompt`
 - `BusyResponding`
 - `PermissionDialog`
+- `PlanApprovalPrompt`
 - `FolderTrustPrompt`
 - `SurveyPrompt`
 - `ExternalEditorActive`
@@ -327,7 +340,7 @@ Recap is auxiliary metadata, not a primary state. Strong anchors like `while you
 
 `approve` accepts both `PermissionDialog` and `FolderTrustPrompt`. For `FolderTrustPrompt`, `botctl` sends raw `Enter` because that flow must confirm the default selected option directly. `approve-permission` remains an alias for older scripts.
 
-## Current Limits
+## Current limits
 
 - Live classification is still built around `capture-pane`, with `serve` using a best-effort merged stream model when that helps break `Unknown` states.
 - The classifier is keyword-based and intentionally conservative.

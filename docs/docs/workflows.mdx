@@ -1,6 +1,6 @@
 # Workflows
 
-This guide collects the operator flows that are currently shipped.
+This guide collects the shipped operator flows.
 
 For command syntax, see [command reference](./command-reference.mdx). For prompt handoff details, see [prompt handoff](./prompt-handoff.mdx).
 
@@ -13,6 +13,7 @@ For most real use, the loop is:
 1. Open `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, and passively resolvable OpenCode panes.
 2. Use `yolo` on the pane or workspace you want babysat.
 3. Use `serve` when you need a live event stream or machine-readable observation.
+4. Use `last-message` when the visible pane excerpt is not enough.
 
 Typical commands:
 
@@ -20,7 +21,19 @@ Typical commands:
 botctl dashboard
 botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
+botctl last-message --pane 0:6.0 --out -
 ```
+
+## Choose a workflow
+
+| Situation | Workflow |
+| --- | --- |
+| You want `botctl` to launch Claude Code | [Managed session flow](#managed-session-flow) |
+| Claude Code is already running in tmux | [Resolve an existing pane](#resolve-an-existing-pane) |
+| A pane is blocked on a known prompt | [Blocker recovery flow](#blocker-recovery-flow) |
+| You need to stage or submit prompt text | [Prompt flow overview](#prompt-flow-overview) |
+| You need a durable event stream | [Observe versus serve](#observe-versus-serve) |
+| You need the full latest assistant reply | [Export the last assistant message](#export-the-last-assistant-message) |
 
 ## Managed session flow
 
@@ -29,15 +42,15 @@ Use this when `botctl` launches Claude for you.
 1. Start the managed session:
 
    ```bash
-    botctl start --session demo --cwd /path/to/project
+   botctl start --session demo --cwd /path/to/project
    ```
 
 2. Find the pane and inspect the session:
 
    ```bash
-    botctl list
-    botctl doctor --session demo
-    botctl status --pane %19
+   botctl list
+   botctl doctor --session demo
+   botctl status --pane %19
    ```
 
 3. Attach with tmux when you want the terminal UI:
@@ -57,26 +70,26 @@ Codex CLI panes are screen-classified from captured terminal text. The dashboard
 1. List panes, including non-managed ones:
 
    ```bash
-    botctl list --all
+   botctl list --all
    ```
 
 2. Resolve only a specific explicit pane:
 
    ```bash
-    botctl attach --pane %19
+   botctl attach --pane %19
    ```
 
    Or, if tmux already gave you the pane target:
 
    ```bash
-    botctl attach --pane 0:2.3
+   botctl attach --pane 0:2.3
    ```
 
 3. Verify the pane before acting:
 
    ```bash
-    botctl doctor --pane %19
-    botctl status --pane %19
+   botctl doctor --pane %19
+   botctl status --pane %19
    ```
 
 ## Export the last assistant message
@@ -102,10 +115,14 @@ Use `--out -` to stream the raw Markdown body to stdout for piping. Claude reads
 
 Use the direct pane-targeted actions only when the classified state matches the flow.
 
-- permission dialog: `approve` or `reject`
-- survey prompt: `dismiss-survey`
-- blocked but usable session: `continue-session`
-- repeated prompt recovery: `auto-unstick`
+| Classified state | Command | Notes |
+| --- | --- | --- |
+| `PermissionDialog` | `approve` or `reject` | `approve` uses the user's Claude confirmation binding for Claude panes; Codex YOLO sends raw `y` only for Codex command permission dialogs. |
+| `FolderTrustPrompt` | `approve` | Sends raw `Enter`, not the user's `confirm-yes` binding. |
+| `SurveyPrompt` | `dismiss-survey` | Sends raw `0`. |
+| `ChatReady` or `BusyResponding` after a pause | `continue-session` | Refuses unsupported states. |
+| Repeated safe blockers | `auto-unstick` | Bounded recovery loop; stops rather than guessing. |
+| `PlanApprovalPrompt`, `DiffDialog`, `ExternalEditorActive`, `UserQuestionPrompt`, or `Unknown` | manual review | No safe automatic recovery is defined. |
 
 `approve` and `reject` are the canonical names. `approve-permission` and `reject-permission` remain compatibility aliases for older scripts.
 
@@ -132,6 +149,7 @@ There are two prompt paths today:
 
 1. **One-shot submission** — pass `--text` or `--source` directly to `submit-prompt`.
 2. **Manual staging** — use `prepare-prompt`, then `editor-helper` when Claude requests an external editor target.
+3. **Loop submission** — use `keep-going` when you want `botctl` to keep asking Claude to audit the current task until Claude reports a terminal token.
 
 Manual staging now keeps the session's pending prompt in `<state-root>/state.db` under a workspace-scoped placeholder instance rather than a separate prompt file.
 
@@ -154,6 +172,16 @@ Workspace example:
 botctl prepare-prompt --session demo --workspace . --text "Summarize the current repo"
 botctl yolo start --all --workspace .
 ```
+
+Loop example:
+
+```bash
+botctl keep-going --pane %19
+botctl keep-going --pane %19 --no-yolo
+botctl keep-going --pane %19 --source ./prompts/review-loop.txt
+```
+
+The default `keep-going` prompt expects Claude to end each loop response with `OKIE_DOKIE`, `ALL_DONE`, or `PANIC`. Custom prompts must preserve that token contract.
 
 For the editor-helper, survey preflight, and state-dir variants, see [prompt handoff](./prompt-handoff.mdx).
 
