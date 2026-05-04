@@ -9,6 +9,7 @@ pub enum Command {
     Attach(AttachArgs),
     ListPanes(ListPanesArgs),
     Capture(CaptureArgs),
+    LastMessage(LastMessageArgs),
     Status(StatusArgs),
     Doctor(DoctorArgs),
     Observe(ObserveArgs),
@@ -95,6 +96,12 @@ pub struct KeepGoingArgs {
 pub struct CaptureArgs {
     pub pane_id: String,
     pub history_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct LastMessageArgs {
+    pub pane_id: String,
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +300,7 @@ where
         "attach" => with_command_context(parse_attach(rest), "attach"),
         "list" => with_command_context(parse_list_panes(rest), "list"),
         "capture" => with_command_context(parse_capture(rest), "capture"),
+        "last-message" => with_command_context(parse_last_message(rest), "last-message"),
         "status" => with_command_context(parse_status(rest), "status"),
         "doctor" => with_command_context(parse_doctor(rest), "doctor"),
         "observe" => with_command_context(parse_observe(rest), "observe"),
@@ -439,6 +447,7 @@ fn usage_with_color(color: bool) -> String {
     out.push('\n');
     for line in [
         "status --pane %ID|session:window.pane [--history-lines N] [--json | --plain]",
+        "last-message --pane %ID|session:window.pane [--out PATH]",
         "doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH] [--json | --plain]",
         "continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)",
         "auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]",
@@ -534,6 +543,7 @@ fn closest_command(command: &str) -> Option<&'static str> {
         "attach",
         "list",
         "capture",
+        "last-message",
         "status",
         "doctor",
         "observe",
@@ -587,6 +597,7 @@ fn command_from_error(message: &str) -> Option<&'static str> {
         "attach",
         "list",
         "capture",
+        "last-message",
         "status",
         "doctor",
         "observe",
@@ -715,6 +726,18 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             &["--all", "--json", "--plain", "--no-color"][..],
             "Default and --plain output are line-oriented. --json emits a one-shot object on stdout.",
+        ),
+        "last-message" => (
+            "last-message",
+            "Dump the latest persisted assistant message from a pane transcript.",
+            "botctl last-message --pane %ID|session:window.pane [--out PATH]",
+            &[
+                "botctl last-message --pane %19",
+                "botctl last-message --pane 0:2.3 --out last-agent-message.md",
+                "botctl last-message --pane %19 --out -",
+            ][..],
+            &["--pane TARGET", "--out PATH", "--no-color"][..],
+            "Reads provider transcript storage for Claude, Codex, and OpenCode. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout.",
         ),
         "status" => (
             "status",
@@ -859,6 +882,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "attach" => "botctl attach (--pane TARGET | --session NAME [--window NAME]) [--plain]",
         "list" => "botctl list [--all] [--json | --plain]",
         "capture" => "botctl capture --pane TARGET [--history-lines N]",
+        "last-message" => "botctl last-message --pane TARGET [--out PATH]",
         "observe" => {
             "botctl observe --session NAME [--pane TARGET] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]"
         }
@@ -897,6 +921,9 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "replay" => "Advanced: replay and compare a saved fixture case.",
         "send-action" => "Advanced plumbing: send one named automation action to a pane.",
         "dismiss-survey" => "Dismiss a survey prompt. Canonical name: dismiss-survey.",
+        "last-message" => {
+            "Dump the latest persisted assistant message for a Claude, Codex, or OpenCode pane."
+        }
         "editor-helper" => {
             "Advanced prompt plumbing: generate an editor target file for prompt handoff."
         }
@@ -1088,6 +1115,31 @@ fn parse_capture(args: Vec<String>) -> AppResult<Command> {
         pane_id,
         history_lines,
     }))
+}
+
+fn parse_last_message(args: Vec<String>) -> AppResult<Command> {
+    let mut pane_id = None;
+    let mut out = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => {
+                pane_id = Some(read_value(&args, &mut i, "--pane")?);
+            }
+            "--out" => {
+                out = Some(PathBuf::from(read_value(&args, &mut i, "--out")?));
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown last-message flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+
+    let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+
+    Ok(Command::LastMessage(LastMessageArgs { pane_id, out }))
 }
 
 fn parse_status(args: Vec<String>) -> AppResult<Command> {
@@ -2210,6 +2262,48 @@ mod tests {
                 .to_string()
                 .contains("attach requires --session NAME when --window NAME is provided")
         );
+    }
+
+    #[test]
+    fn parses_last_message_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("last-message"),
+            String::from("--pane"),
+            String::from("0:4.1"),
+            String::from("--out"),
+            String::from("agent.md"),
+        ])
+        .expect("last-message command should parse");
+
+        match command {
+            Command::LastMessage(args) => {
+                assert_eq!(args.pane_id, "0:4.1");
+                assert_eq!(args.out, Some(PathBuf::from("agent.md")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_last_message_stdout_output() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("last-message"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--out"),
+            String::from("-"),
+        ])
+        .expect("last-message stdout command should parse");
+
+        match command {
+            Command::LastMessage(args) => {
+                assert_eq!(args.pane_id, "%7");
+                assert_eq!(args.out, Some(PathBuf::from("-")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

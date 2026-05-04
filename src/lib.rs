@@ -5,6 +5,7 @@ pub mod cli;
 pub mod dashboard;
 pub mod fixtures;
 pub mod http_api;
+pub mod last_message;
 pub mod observe;
 pub mod opencode;
 pub mod prompt;

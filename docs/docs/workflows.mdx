@@ -79,6 +79,25 @@ Codex CLI panes are screen-classified from captured terminal text. The dashboard
     botctl status --pane %19
    ```
 
+## Export the last assistant message
+
+Use `last-message` when the visible pane capture is too short and you need the latest assistant reply as Markdown:
+
+```bash
+botctl last-message --pane %19
+botctl last-message --pane 0:4.1 --out review.md
+botctl last-message --pane 0:4.1 --out -
+```
+
+Without `--out`, the export is written in the current directory as `MESSAGE_<provider-session-id>.md`. The command prints only the line count and file path:
+
+```text
+Dumped last message of 951 lines out to file:
+MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
+```
+
+Use `--out -` to stream the raw Markdown body to stdout for piping. Claude reads `~/.claude/projects`, Codex reads `~/.codex/sessions`, and OpenCode reads the latest assistant text parts from its SQLite storage after resolving the pane title and cwd. The export contains assistant-visible text, not tool calls or transcript metadata.
+
 ## Blocker recovery flow
 
 Use the direct pane-targeted actions only when the classified state matches the flow.

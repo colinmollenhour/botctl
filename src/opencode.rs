@@ -22,6 +22,12 @@ pub struct OpenCodeSession {
     pub context: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeLastMessage {
+    pub session_id: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 struct OpenCodeSessionRow {
     id: String,
@@ -33,6 +39,15 @@ struct OpenCodeSessionRow {
 pub fn resolve_opencode_session_for_pane(pane: &TmuxPane) -> Option<OpenCodeSession> {
     let title = pane_opencode_title(pane)?;
     resolve_opencode_session(default_opencode_db_path(), &pane.current_path, title)
+}
+
+pub fn latest_assistant_message_for_pane(
+    pane: &TmuxPane,
+) -> crate::app::AppResult<Option<OpenCodeLastMessage>> {
+    let Some(title) = pane_opencode_title(pane) else {
+        return Ok(None);
+    };
+    latest_assistant_message(default_opencode_db_path(), &pane.current_path, title)
 }
 
 pub fn pane_opencode_title(pane: &TmuxPane) -> Option<&str> {
@@ -89,6 +104,68 @@ fn resolve_opencode_session(
         has_questions,
         context,
     })
+}
+
+fn latest_assistant_message(
+    db_path: impl AsRef<Path>,
+    directory: &str,
+    title: &str,
+) -> crate::app::AppResult<Option<OpenCodeLastMessage>> {
+    let connection =
+        match Connection::open_with_flags(db_path.as_ref(), OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(connection) => connection,
+            Err(_) => return Ok(None),
+        };
+    let _ = connection.busy_timeout(Duration::from_millis(50));
+
+    let rows = resolve_opencode_session_rows(&connection, directory, title).unwrap_or_default();
+    if rows.len() != 1 {
+        return Ok(None);
+    }
+    let session_id = rows[0].id.clone();
+    let Some(message_id) = latest_message_id(&connection, &session_id, "assistant") else {
+        return Ok(None);
+    };
+    let text = assistant_message_text(&connection, &session_id, &message_id)?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(OpenCodeLastMessage { session_id, text }))
+}
+
+fn assistant_message_text(
+    connection: &Connection,
+    session_id: &str,
+    message_id: &str,
+) -> crate::app::AppResult<String> {
+    let mut statement = connection.prepare(
+        "SELECT data \
+         FROM part \
+         WHERE session_id = ?1 AND message_id = ?2 \
+         ORDER BY time_created, id",
+    )?;
+    let parts = statement
+        .query_map(params![session_id, message_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let text = parts
+        .iter()
+        .filter_map(|data| opencode_text_part_text(data))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(text)
+}
+
+fn opencode_text_part_text(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    value
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn opencode_session_state(
@@ -712,6 +789,53 @@ mod tests {
                 .context
                 .contains("assistant: Implemented and verified.")
         );
+    }
+
+    #[test]
+    fn latest_assistant_message_returns_full_text_parts() {
+        let db = test_db();
+        insert_session(&db, "one", "/tmp/project", "Build feature", None);
+        insert_completed_message(&db, "msg-assistant-old", "one", 10, "assistant");
+        insert_part(
+            &db,
+            "part-assistant-old",
+            "msg-assistant-old",
+            "one",
+            11,
+            r#"{"type":"text","text":"Old response"}"#,
+        );
+        insert_completed_message(&db, "msg-assistant-new", "one", 20, "assistant");
+        insert_part(
+            &db,
+            "part-assistant-new-a",
+            "msg-assistant-new",
+            "one",
+            21,
+            r#"{"type":"text","text":"New response"}"#,
+        );
+        insert_part(
+            &db,
+            "part-tool",
+            "msg-assistant-new",
+            "one",
+            22,
+            r#"{"type":"tool","tool":"bash","state":{"status":"completed"}}"#,
+        );
+        insert_part(
+            &db,
+            "part-assistant-new-b",
+            "msg-assistant-new",
+            "one",
+            23,
+            r#"{"type":"text","text":"Second part"}"#,
+        );
+
+        let message = super::latest_assistant_message(&db, "/tmp/project", "Build feature")
+            .expect("query should succeed")
+            .expect("message should resolve");
+
+        assert_eq!(message.session_id, "one");
+        assert_eq!(message.text, "New response\n\nSecond part");
     }
 
     #[test]

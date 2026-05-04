@@ -25,13 +25,16 @@ use crate::classifier::{
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
-    KeepGoingArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
-    RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
-    SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
+    KeepGoingArgs, LastMessageArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs,
+    PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs,
+    StatusArgs, SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::http_api::spawn_http_server;
+use crate::last_message::{
+    default_output_path, line_count, load_last_agent_message, output_path_is_stdout,
+};
 use crate::observe::{CollectedObservation, ObserveRequest, collect_observation};
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
@@ -137,6 +140,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Attach(args) => run_attach(args),
         Command::ListPanes(args) => run_list_panes(args),
         Command::Capture(args) => run_capture(args),
+        Command::LastMessage(args) => run_last_message(args),
         Command::Status(args) => run_status(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Observe(args) => run_observe(args),
@@ -427,6 +431,34 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
     client.capture_pane(&pane.pane_id, args.history_lines)
+}
+
+fn run_last_message(args: LastMessageArgs) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
+    let message = load_last_agent_message(&pane)?;
+    if args.out.as_deref().is_some_and(output_path_is_stdout) {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(message.text.as_bytes())?;
+        stdout.flush()?;
+        return Ok(String::new());
+    }
+
+    let output_path = args
+        .out
+        .unwrap_or_else(|| default_output_path(&message.session_id));
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output_path, &message.text)?;
+    Ok(format!(
+        "Dumped last message of {} lines out to file:\n{}",
+        line_count(&message.text),
+        output_path.display()
+    ))
 }
 
 fn run_status(args: StatusArgs) -> AppResult<String> {

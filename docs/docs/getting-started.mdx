@@ -134,6 +134,25 @@ OpenCode panes can appear in the same dashboard without terminal capture or keyp
 
 Codex CLI panes can also appear in the same dashboard. They are included only after `botctl` captures a likely Codex pane and sees Codex screen text such as the OpenAI Codex header, Codex approval prompt language, or a `/statusline` with `run-state`. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex panes are navigable and classified from their screen, and Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`. Broader recovery actions remain Claude-only.
 
+## Dump the latest assistant message
+
+Use `last-message` when you need the full latest assistant text as Markdown instead of a bounded screen capture or dashboard excerpt:
+
+```bash
+botctl last-message --pane 0:4.1
+botctl last-message --pane 0:4.1 --out last-agent-message.md
+botctl last-message --pane 0:4.1 --out -
+```
+
+Without `--out`, botctl writes `MESSAGE_<provider-session-id>.md` in the current directory and prints:
+
+```text
+Dumped last message of 951 lines out to file:
+MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
+```
+
+Use `--out -` to stream the raw Markdown body to stdout instead of writing a file. The command supports Claude, Codex, and OpenCode transcript storage. Claude is resolved from `~/.claude/projects`, Codex from `~/.codex/sessions`, and OpenCode from its SQLite `message`/`part` rows after the same pane title plus cwd resolution used by the dashboard. It writes assistant-visible text only; tool calls and provider metadata are not included.
+
 If you use tmux, this is the recommended way to launch the dashboard as a popup and keep it alive:
 
 ```tmux

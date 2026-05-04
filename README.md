@@ -4,6 +4,8 @@
 
 It can launch and safely drive Claude Code panes, classify Codex CLI panes from tmux screen captures with narrow YOLO approval for command permission dialogs, and passively discover OpenCode panes for dashboard visibility, recent-message context, state classification, and tmux window status.
 
+It can also dump the latest persisted assistant message from a Claude, Codex, or OpenCode pane to a Markdown file with `last-message`.
+
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
 ## Install
@@ -31,6 +33,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 These are the commands that matter most in day-to-day use:
 
 - `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes, grouped by workspace, with state, age, and YOLO controls for Claude and Codex
+- `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
 
@@ -46,6 +49,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - list panes and inspect tmux metadata
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude Code or Codex CLI pane
+- dump the latest persisted assistant message from Claude, Codex, or OpenCode to `MESSAGE_<provider-session-id>.md` or a path passed with `--out`
 - run `serve` as a foreground long-lived observer for one tmux session
 - run `dashboard` as a popup-sized TUI across Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes, grouped by workspace with per-pane YOLO controls for Claude and Codex
 - record and replay fixture cases for classifier regression tests
@@ -126,6 +130,14 @@ Run the long-lived observer for one tmux session:
 
 ```bash
 cargo run -- serve --session demo
+```
+
+Dump the latest assistant message from a pane transcript:
+
+```bash
+cargo run -- last-message --pane 0:4.1
+cargo run -- last-message --pane 0:4.1 --out last-agent-message.md
+cargo run -- last-message --pane 0:4.1 --out -
 ```
 
 Run the observer and a localhost HTTP API for a web UI:

@@ -16,6 +16,7 @@ Global conventions:
 - Usage errors point at focused help instead of dumping global help.
 - `--json` is available on one-shot inspection commands where documented; JSON is printed to stdout.
 - `--plain` preserves current line-oriented output for `attach`, `list`, `status`, and `doctor`; it cannot be combined with `--json`.
+- `last-message` writes the latest persisted assistant message as raw Markdown, or writes the Markdown body to stdout with `--out -`.
 
 Canonical command names:
 
@@ -130,6 +131,7 @@ Notes:
 - Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and yolo registrations now both use SQLite-backed records there.
 - Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
 - Startup bootstrapping also runs in-place schema migrations for supported older `state.db` versions.
+- `last-message` is read-only with respect to provider state; it reads transcript storage and writes only the requested Markdown export file, or stdout when `--out -` is used.
 
 ## Secondary commands
 
@@ -225,6 +227,41 @@ Example:
 ```bash
 botctl capture --pane 0:2.3 --history-lines 80
 ```
+
+### `last-message`
+
+Purpose: dump the latest persisted assistant message for one Claude Code, Codex CLI, or OpenCode pane as raw Markdown.
+
+Syntax:
+```bash
+botctl last-message --pane %ID|session:window.pane [--out PATH]
+```
+
+Flags:
+- `--pane %ID|session:window.pane` (required)
+- `--out PATH` (default: `MESSAGE_<provider-session-id>.md` in the current directory)
+- `--out -` (write the raw Markdown message body to stdout instead of a file)
+
+Targeting: explicit pane only.
+
+Output:
+```text
+Dumped last message of 951 lines out to file:
+MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
+```
+
+Examples:
+```bash
+botctl last-message --pane 0:4.1
+botctl last-message --pane %19 --out review.md
+botctl last-message --pane %19 --out - | pbcopy
+```
+
+Provider notes:
+- Claude reads the pane's Claude transcript under `~/.claude/projects`, preferring the transcript opened by the pane process and falling back to the newest transcript for the pane cwd.
+- Codex reads `~/.codex/sessions`, preferring an open transcript file descriptor and falling back to the newest session whose `session_meta.cwd` matches the pane cwd.
+- OpenCode resolves the pane by `OC | <session title>` plus cwd, then reads the latest assistant `text` parts from OpenCode's SQLite `message`/`part` rows.
+- Tool calls, reasoning, and provider metadata are not exported; only assistant-visible text is written.
 
 ### `status`
 
