@@ -2666,7 +2666,7 @@ pub(crate) fn extract_permission_prompt_details(
         if is_permission_ignored_line(line) {
             continue;
         }
-        content_lines.push(line.to_string());
+        content_lines.push(normalize_permission_content_line(line));
     }
 
     if question.is_none() {
@@ -2800,7 +2800,7 @@ fn is_permission_question_line(line: &str) -> bool {
 
 fn is_permission_ignored_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.starts_with("❯")
+    split_numbered_option_line(line).is_some()
         || lower.starts_with("1.")
         || lower.starts_with("2.")
         || lower.starts_with("allow once")
@@ -2812,6 +2812,26 @@ fn is_permission_ignored_line(line: &str) -> bool {
         || lower.starts_with("esc ")
         || lower.starts_with("tab ")
         || lower.starts_with("ctrl+")
+}
+
+fn normalize_permission_content_line(line: &str) -> String {
+    line.trim_start_matches(['❯', '›']).trim_start().to_string()
+}
+
+fn permission_prompt_has_active_chat_input(inspected: &InspectedPane) -> bool {
+    permission_prompt_lines(inspected)
+        .unwrap_or_else(|| {
+            inspected
+                .focused_source
+                .lines()
+                .map(|line| line.to_string())
+                .collect()
+        })
+        .iter()
+        .skip_while(|line| !is_permission_question_line(line.trim()))
+        .skip(1)
+        .map(|line| line.trim())
+        .any(is_chat_input_line_for_yolo)
 }
 
 fn is_permission_annotation_line(line: &str) -> bool {
@@ -2871,17 +2891,7 @@ pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
 
     details.question.is_some()
         && details.command.is_some()
-        && !permission_prompt_lines(inspected)
-            .unwrap_or_else(|| {
-                inspected
-                    .focused_source
-                    .lines()
-                    .map(|line| line.to_string())
-                    .collect()
-            })
-            .iter()
-            .map(|line| line.trim())
-            .any(is_chat_input_line_for_yolo)
+        && !permission_prompt_has_active_chat_input(inspected)
 }
 
 fn is_codex_permission_prompt_safe_to_approve(inspected: &InspectedPane) -> bool {
@@ -5190,6 +5200,73 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
             raw_source: String::from(
                 "Bash command (unsandboxed)\nmake generate 2>&1 | tail -40\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ Here's some of the output:",
+            ),
+        };
+
+        assert!(!is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_allows_permission_prompt_with_cursor_marked_command_line() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                r#"Bash command (unsandboxed)
+❯ OPENCODE_SERVER_HOST=seamus OPENCODE_SERVER_PORT=4095 occtl run --model openai/gpt-5.4 --variant xhigh --title "ultra-review 250d41d runtime/GPT-5.4" --file
+   .tmp/ultra-review-250d41d/diff.patch --out .tmp/ultra-review-250d41d/results/runtime-gpt54.out
+   GPT-5.4 runtime review via OpenCode
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+Esc to cancel · Tab to amend · ctrl+e to explain"#,
+            ),
+            raw_source: String::from(
+                r#"Bash command (unsandboxed)
+❯ OPENCODE_SERVER_HOST=seamus OPENCODE_SERVER_PORT=4095 occtl run --model openai/gpt-5.4 --variant xhigh --title "ultra-review 250d41d runtime/GPT-5.4" --file
+   .tmp/ultra-review-250d41d/diff.patch --out .tmp/ultra-review-250d41d/results/runtime-gpt54.out
+   GPT-5.4 runtime review via OpenCode
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+Esc to cancel · Tab to amend · ctrl+e to explain"#,
+            ),
+        };
+
+        let details = extract_permission_prompt_details(&inspected).expect("details should parse");
+        assert_eq!(details.prompt_type, "Bash command");
+        assert_eq!(details.sandbox_mode.as_deref(), Some("unsandboxed"));
+        assert!(
+            details
+                .command
+                .as_deref()
+                .is_some_and(|command| command.starts_with("OPENCODE_SERVER_HOST=seamus"))
+        );
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_still_refuses_chat_input_after_permission_question() {
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![String::from("permission-keywords")],
+            },
+            focused_source: String::from(
+                "Bash command (unsandboxed)\nmake generate\nRegenerate manifests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ explain why first",
+            ),
+            raw_source: String::from(
+                "Bash command (unsandboxed)\nmake generate\nRegenerate manifests\nDo you want to proceed?\n❯ 1. Yes\n2. No\n❯ explain why first",
             ),
         };
 
