@@ -2002,6 +2002,8 @@ fn is_codex_screen(frame: &str, signals: &[String]) -> bool {
         || normalized.contains(">_ openai codex")
         || normalized.contains("pursuing goal")
         || normalized.contains("tab to queue message")
+        || (normalized.contains("yes, proceed")
+            && normalized.contains("press enter to confirm or esc to cancel"))
         || normalized.contains("suppress_unstable_features_warning")
         || normalized.lines().any(is_codex_statusline_line)
         || normalized.lines().any(is_codex_footer_line)
@@ -2085,6 +2087,10 @@ mod tests {
         assert!(is_codex_screen(
             "plain",
             &[String::from(SIGNAL_CODEX_KEYWORDS)]
+        ));
+        assert!(is_codex_screen(
+            "› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel",
+            &[]
         ));
         assert!(!is_codex_screen("plain node output", &[]));
     }

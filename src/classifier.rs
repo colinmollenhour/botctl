@@ -145,6 +145,8 @@ impl Classifier {
                 ">_ openai codex",
                 "/model to change",
                 "tell codex what to do differently",
+                "yes, proceed",
+                "press enter to confirm or esc to cancel",
                 "approved codex to always run commands",
                 "pursuing goal",
                 "tab to queue message",
@@ -1381,6 +1383,19 @@ mod tests {
                 .signals
                 .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
         );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_approval_dialog_with_wrapped_live_option() {
+        let frame = "Would you like to run the following command?\n\nReason: Do you want to allow GitLab API access to resolve the MR discussions fixed by the pushed commit?\n\n$ for id in 5cf55fa44199ab62367120fafe4b6a6e068b6f0e 0a9b528478cd34c81a9d3f88ba5771cedd4018ec; do glab api -X PUT \"projects/:fullpath/merge_requests/12/discussions/$id\" -f resolved=true --silent || exit 1; done\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `for id in 5cf55fa44199ab62367120fafe4b6a6e068b6f0e\n     0a9b528478cd34c81a9d3f88ba5771cedd4018ec; do glab api -X PUT \"projects/:fullpath/merge_requests/12/discussions/$id\" -f resolved=true --silent || exit 1; done` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
         assert!(
             result
                 .signals

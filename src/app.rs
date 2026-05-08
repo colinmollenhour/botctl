@@ -3580,8 +3580,9 @@ fn normalize_dashboard_window_name(client: &TmuxClient, pane: &TmuxPane) -> AppR
 }
 
 fn strip_dashboard_window_prefixes(value: &str) -> String {
-    const DASHBOARD_STATE_EMOJIS: &[&str] =
-        &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+    const DASHBOARD_STATE_EMOJIS: &[&str] = &[
+        "⚙️", "💬", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔",
+    ];
     const DASHBOARD_YOLO_MARKER: &str = "ʸ";
     const LEGACY_YOLO_PREFIX_CHARS: &[&str] = &["🤠", "\u{200D}"];
 
