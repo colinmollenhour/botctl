@@ -182,7 +182,9 @@ impl Classifier {
                 "allow claude to edit its own settings",
             ],
         );
-        let mentions_sensitive_claude_path = contains_sensitive_claude_path(&normalized);
+        let mentions_sensitive_claude_path = contains_sensitive_claude_path(
+            &active_permission_sensitive_source(&lines, &normalized, has_codex_keywords),
+        );
         let has_survey_prompt = has_survey_prompt(&normalized, &lines);
 
         let has_busy_interrupt_hint = contains_any(
@@ -542,6 +544,36 @@ fn contains_sensitive_claude_path(normalized: &str) -> bool {
             ".claude/settings",
         ],
     )
+}
+
+fn active_permission_sensitive_source(
+    lines: &[&str],
+    normalized: &str,
+    has_codex_keywords: bool,
+) -> String {
+    if !has_codex_keywords {
+        return normalized.to_string();
+    }
+
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| {
+            line.trim()
+                .eq_ignore_ascii_case("would you like to run the following command?")
+        })
+        .or_else(|| {
+            has_codex_permission_options_at_live_tail(lines).then(|| lines.len().saturating_sub(6))
+        })
+    else {
+        return normalized.to_string();
+    };
+
+    lines[start..]
+        .iter()
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase()
 }
 
 fn has_diff_dialog_keywords(frame_text: &str) -> bool {
@@ -985,6 +1017,29 @@ mod tests {
             result
                 .signals
                 .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_permission_ignores_stale_sensitive_claude_path_before_prompt() {
+        let frame = "• Ran git show --stat --oneline --name-status fe2dfa8\n  └ M    .claude/settings.local.json\n\n• Running git merge --no-edit OPS-124_SaaS-Portal-Custom-Billing-System_Part6\n\nWould you like to run the following command?\nReason: Do you want to allow merging the fixed Part6 branch into the Part7 work branch?\n$ git merge --no-edit OPS-124_SaaS-Portal-Custom-Billing-System_Part6\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `git merge` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_SENSITIVE_CLAUDE_PATH))
         );
     }
 
