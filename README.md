@@ -330,6 +330,7 @@ git push && git push origin vX.Y.Z
 The classifier recognizes:
 
 - `ChatReady`
+- `PromptEditing`
 - `UserQuestionPrompt`
 - `BusyResponding`
 - `PermissionDialog`

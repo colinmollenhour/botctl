@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     ChatReady,
+    PromptEditing,
     UserQuestionPrompt,
     BusyResponding,
     PermissionDialog,
@@ -16,6 +17,7 @@ impl SessionState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ChatReady => "ChatReady",
+            Self::PromptEditing => "PromptEditing",
             Self::UserQuestionPrompt => "UserQuestionPrompt",
             Self::BusyResponding => "BusyResponding",
             Self::PermissionDialog => "PermissionDialog",
@@ -31,6 +33,7 @@ impl SessionState {
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "ChatReady" => Some(Self::ChatReady),
+            "PromptEditing" => Some(Self::PromptEditing),
             "UserQuestionPrompt" => Some(Self::UserQuestionPrompt),
             "BusyResponding" => Some(Self::BusyResponding),
             "PermissionDialog" => Some(Self::PermissionDialog),
@@ -121,6 +124,7 @@ impl Classifier {
         let has_chat_input = lines.iter().copied().any(is_chat_keyword_line)
             || lines.iter().copied().any(is_chat_input_line)
             || lines.iter().copied().any(is_codex_chat_input_line);
+        let has_live_prompt_editing = has_live_prompt_editing(&lines);
         let has_plain_chat_input = lines.iter().copied().any(is_plain_chat_input_line)
             || lines.iter().copied().any(is_codex_plain_chat_input_line);
         let has_claude_footer = lines.iter().copied().any(is_claude_footer_line);
@@ -254,7 +258,11 @@ impl Classifier {
         } else if has_codex_ready_statusline {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
-            SessionState::ChatReady
+            if has_live_prompt_editing {
+                SessionState::PromptEditing
+            } else {
+                SessionState::ChatReady
+            }
         } else if has_survey_prompt {
             signals.push(String::from(SIGNAL_SURVEY_KEYWORDS));
             SessionState::SurveyPrompt
@@ -295,7 +303,11 @@ impl Classifier {
             if has_codex_keywords {
                 signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
             }
-            SessionState::ChatReady
+            if has_live_prompt_editing {
+                SessionState::PromptEditing
+            } else {
+                SessionState::ChatReady
+            }
         } else if has_unanchored_permission_words {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
             if has_codex_keywords {
@@ -331,7 +343,11 @@ impl Classifier {
             if has_codex_keywords {
                 signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
             }
-            SessionState::ChatReady
+            if has_live_prompt_editing {
+                SessionState::PromptEditing
+            } else {
+                SessionState::ChatReady
+            }
         } else {
             SessionState::Unknown
         };
@@ -793,6 +809,89 @@ fn is_codex_chat_input_line(line: &str) -> bool {
     };
     let rest = rest.trim();
     !rest.is_empty() && !starts_with_numbered_option(rest)
+}
+
+fn has_live_prompt_editing(lines: &[&str]) -> bool {
+    let Some(input_idx) = lines
+        .iter()
+        .rposition(|line| is_prompt_editing_line(line.trim()))
+    else {
+        return false;
+    };
+
+    if lines[..input_idx]
+        .iter()
+        .copied()
+        .any(is_session_feedback_prompt_line)
+    {
+        return false;
+    }
+
+    let input_line = lines[input_idx].trim();
+    if input_line.starts_with('❯') {
+        return claude_prompt_editing_tail_is_live(&lines[input_idx + 1..]);
+    }
+
+    if input_line.starts_with('›')
+        && !lines[input_idx + 1..]
+            .iter()
+            .copied()
+            .any(is_codex_prompt_editing_hint_line)
+    {
+        return false;
+    }
+
+    lines[input_idx + 1..]
+        .iter()
+        .copied()
+        .filter(|line| !line.trim().is_empty())
+        .all(is_prompt_editing_tail_chrome)
+}
+
+fn claude_prompt_editing_tail_is_live(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .copied()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| {
+            let trimmed = line.trim();
+            is_prompt_editing_tail_chrome(trimmed)
+                || (!trimmed.starts_with('●')
+                    && !trimmed.starts_with('⎿')
+                    && !is_busy_status_line(trimmed)
+                    && !is_permission_choice_line(trimmed))
+        })
+}
+
+fn is_prompt_editing_line(line: &str) -> bool {
+    is_prefixed_prompt_editing_line(line, '❯') || is_prefixed_prompt_editing_line(line, '›')
+}
+
+fn is_prefixed_prompt_editing_line(line: &str, prefix: char) -> bool {
+    let Some(rest) = line.trim().strip_prefix(prefix) else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !starts_with_numbered_option(rest)
+}
+
+fn is_session_feedback_prompt_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.contains("how is claude doing this session")
+        || lower.contains("how likely are you to recommend claude code")
+}
+
+fn is_codex_prompt_editing_hint_line(line: &str) -> bool {
+    line.trim().eq_ignore_ascii_case("tab to queue message")
+}
+
+fn is_prompt_editing_tail_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    is_terminal_status_line(trimmed)
+        || is_codex_footer_line(trimmed)
+        || is_codex_statusline_line(trimmed)
+        || lower == "tab to queue message"
 }
 
 fn is_codex_statusline_line(line: &str) -> bool {
@@ -1337,6 +1436,29 @@ mod tests {
     }
 
     #[test]
+    fn classifies_codex_prompt_editing() {
+        let frame = "● Previous answer is complete.\n› Write a regression test for this\n  tab to queue message\n\ngpt-5.5 high · ~/Projects/botctl · main · Ready · Context 18% used";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PromptEditing);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_busy_statusline_wins_over_prompt_editing() {
+        let frame = "● Previous answer is complete.\n› Write a regression test for this\n  tab to queue message\n\ngpt-5.5 high · ~/Projects/botctl · main · Working · Context 18% used";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
     fn codex_busy_footer_wins_over_stale_test_output() {
         let frame = "test classifier::tests::classifies_survey_prompt ... ok\nstate=SurveyPrompt\n• Waiting for background terminal (9m 42s • esc to interrupt)\n› Explain this codebase\n  tab to queue message";
         let result = Classifier.classify("test", frame);
@@ -1703,6 +1825,49 @@ mod tests {
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::BusyResponding);
         assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn classifies_claude_prompt_editing() {
+        let frame = "● Previous answer is complete.\n────────────────────────────────────────────────────────────────\n❯ Add a status for unsubmitted input\n────────────────────────────────────────────────────────────────\n~/Projects/botctl (main)\n🧠 Opus 4.7 (1M context) │ Ctx: 18%";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PromptEditing);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+    }
+
+    #[test]
+    fn classifies_wrapped_claude_prompt_editing() {
+        let frame = "● Previous answer is complete.\n────────────────────────────────────────────────────────────────\n❯ Based on the steps you took, write a Claude skill\n  into .claude/skills/explainer for merge request explainers\n  and release notes explainers.\n────────────────────────────────────────────────────────────────\n~/Projects/botctl (main)\n🧠 Opus 4.7 (1M context) │ Ctx: 18%";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PromptEditing);
+        assert!(result.signals.contains(&String::from(SIGNAL_CHAT_KEYWORDS)));
+    }
+
+    #[test]
+    fn claude_busy_spinner_wins_over_prompt_editing() {
+        let frame = "✻ Thinking… (57s · ↓ 3.3k tokens)\n❯ Add a status for unsubmitted input\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn empty_chat_prompt_is_not_prompt_editing() {
+        let frame = "● Previous answer is complete.\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn submitted_prompt_in_scrollback_is_not_prompt_editing() {
+        let frame = "❯ Add a status for unsubmitted input\n● I added the status and tests.\n❯\n~/Projects/botctl (main)";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
     }
 
     #[test]

@@ -1,0 +1,6 @@
+● Previous answer is complete.
+────────────────────────────────────────────────────────────────
+❯ Add a status for unsubmitted input
+────────────────────────────────────────────────────────────────
+~/Projects/botctl (main)
+🧠 Opus 4.7 (1M context) │ Ctx: 18%

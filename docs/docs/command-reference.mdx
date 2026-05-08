@@ -138,6 +138,7 @@ Notes:
 | State | Use | Refuses or requires review |
 | --- | --- | --- |
 | `ChatReady` | `submit-prompt`; `keep-going` loop submission | direct approval/rejection commands |
+| `PromptEditing` | manual submit or clear | `submit-prompt`, because it could replace unsubmitted input |
 | `BusyResponding` | wait; observe with `serve` | prompt submission and approval commands |
 | `PermissionDialog` | `approve`, `reject`, YOLO, `continue-session`, `auto-unstick` | unsafe permission prompts that policy cannot approve |
 | `FolderTrustPrompt` | `approve`, `continue-session`, `auto-unstick` | `reject`; raw `Enter` is used for approval |

@@ -1489,7 +1489,9 @@ fn prompt_submission_started(
         | SessionState::FolderTrustPrompt
         | SessionState::SurveyPrompt
         | SessionState::DiffDialog => return true,
-        SessionState::ExternalEditorActive | SessionState::Unknown => return false,
+        SessionState::PromptEditing
+        | SessionState::ExternalEditorActive
+        | SessionState::Unknown => return false,
         SessionState::ChatReady => {}
     }
 
@@ -2409,6 +2411,7 @@ enum YoloAction {
 fn yolo_action_for_state(state: SessionState) -> YoloAction {
     match state {
         SessionState::ChatReady
+        | SessionState::PromptEditing
         | SessionState::UserQuestionPrompt
         | SessionState::BusyResponding
         | SessionState::PlanApprovalPrompt
@@ -3385,6 +3388,9 @@ enum RecoveryAction {
 fn recovery_action_for_state(state: SessionState) -> AppResult<Option<RecoveryAction>> {
     match state {
         SessionState::ChatReady | SessionState::BusyResponding => Ok(None),
+        SessionState::PromptEditing => Err(AppError::new(
+            "no safe automatic recovery is defined for PromptEditing; submit or clear the prompt manually",
+        )),
         SessionState::UserQuestionPrompt => Err(AppError::new(
             "no safe automatic recovery is defined for UserQuestionPrompt; review the pane manually",
         )),
@@ -3718,6 +3724,7 @@ pub(crate) fn render_next_safe_action(
     }
     match classification.state {
         SessionState::ChatReady => String::from("safe-action: submit-prompt"),
+        SessionState::PromptEditing => String::from("manual-review: prompt has unsubmitted input"),
         SessionState::UserQuestionPrompt => {
             String::from("manual-review: Claude is asking an operator question")
         }

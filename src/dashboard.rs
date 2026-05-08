@@ -60,8 +60,9 @@ const TABLE_GAP: &str = "  ";
 const ICON_GAP: &str = " ";
 const DASHBOARD_LEFT_PANE_PERCENT: u16 = 58;
 const DASHBOARD_LEFT_PANE_MAX_WIDTH: u16 = 80;
-const DASHBOARD_STATE_EMOJIS: &[&str] =
-    &["⚙️", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔"];
+const DASHBOARD_STATE_EMOJIS: &[&str] = &[
+    "⚙️", "💬", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔",
+];
 const DASHBOARD_YOLO_MARKER: &str = "ʸ";
 const LEGACY_YOLO_PREFIX_CHARS: &[&str] = &["🤠", "\u{200D}"];
 
@@ -1447,6 +1448,7 @@ fn split_workspace_header(label: &str) -> Option<(&str, &str)> {
 fn detail_body_kind(pane: &PaneEntry) -> DetailBodyKind {
     match pane.state {
         SessionState::PermissionDialog
+        | SessionState::PromptEditing
         | SessionState::UserQuestionPrompt
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
@@ -1865,7 +1867,10 @@ fn abbreviate_home_path(path: &str) -> String {
 fn is_waiting_state(state: SessionState) -> bool {
     matches!(
         state,
-        SessionState::ChatReady | SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+        SessionState::ChatReady
+            | SessionState::PromptEditing
+            | SessionState::PermissionDialog
+            | SessionState::FolderTrustPrompt
     )
 }
 
@@ -1873,6 +1878,7 @@ fn is_attention_state(state: SessionState) -> bool {
     matches!(
         state,
         SessionState::PermissionDialog
+            | SessionState::PromptEditing
             | SessionState::UserQuestionPrompt
             | SessionState::PlanApprovalPrompt
             | SessionState::FolderTrustPrompt
@@ -1923,6 +1929,7 @@ fn yolo_marker(enabled: bool) -> &'static str {
 fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
     match state {
         SessionState::BusyResponding => "⚙️",
+        SessionState::PromptEditing => "💬",
         SessionState::UserQuestionPrompt => "🤔",
         SessionState::ChatReady if has_questions => "🤔",
         SessionState::ChatReady => "💤",
@@ -2091,6 +2098,7 @@ mod tests {
     fn maps_states_to_emojis() {
         assert_eq!(state_emoji(SessionState::PermissionDialog, false), "🔐");
         assert_eq!(state_emoji(SessionState::PlanApprovalPrompt, false), "❓");
+        assert_eq!(state_emoji(SessionState::PromptEditing, false), "💬");
         assert_eq!(state_emoji(SessionState::ChatReady, true), "🤔");
     }
 
@@ -2489,6 +2497,7 @@ mod tests {
             strip_dashboard_emoji_prefixes("\u{2699}\u{fe0f}\u{02b8}\u{1f4a4} project"),
             "project"
         );
+        assert_eq!(strip_dashboard_emoji_prefixes("💬 project"), "project");
     }
 
     #[test]

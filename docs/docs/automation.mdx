@@ -56,6 +56,7 @@ Refusal states are part of the safety model:
 | State | Safe automated action | Notes |
 | --- | --- | --- |
 | `ChatReady` | `submit-prompt`; `keep-going` loop submission | Prompt submission verifies that the pane transitions after the submit sequence. |
+| `PromptEditing` | none | Submit or clear the unsubmitted prompt manually. `submit-prompt` refuses this state because it could replace typed input. |
 | `BusyResponding` | wait | `continue-session` can report the pane as already usable. |
 | `PermissionDialog` | `approve`, `reject`, YOLO | Approval is allowed only when the prompt is classified as a permission dialog and policy allows the action. |
 | `FolderTrustPrompt` | `approve`; `auto-unstick`; `keep-going` with YOLO enabled | Uses raw `Enter` because Claude's folder trust prompt confirms the selected default directly. |
