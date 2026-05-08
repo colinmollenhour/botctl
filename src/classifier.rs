@@ -212,7 +212,7 @@ impl Classifier {
                 "waiting",
             ],
         );
-        let has_busy_status_banner = lines.iter().copied().any(is_busy_status_line);
+        let has_busy_status_banner = has_live_busy_status(&lines);
 
         let mut state = if contains_any(
             &normalized,
@@ -847,6 +847,35 @@ fn is_busy_status_line(line: &str) -> bool {
         || lower.contains("waiting for task (esc to give additional instructions)")
         || lower.contains(" monitor still running")
         || lower.contains(" monitors still running")
+}
+
+fn has_live_busy_status(lines: &[&str]) -> bool {
+    lines.iter().enumerate().any(|(idx, line)| {
+        is_busy_status_line(line) && !busy_status_is_superseded(line, &lines[idx + 1..])
+    })
+}
+
+fn busy_status_is_superseded(busy_line: &str, later_lines: &[&str]) -> bool {
+    if is_claude_spinner_status_line(busy_line.trim(), &busy_line.to_ascii_lowercase()) {
+        return false;
+    }
+
+    later_lines.iter().copied().any(|line| {
+        let trimmed = line.trim();
+        is_recap_anchor(trimmed)
+            || is_claude_completed_status_line(trimmed)
+            || trimmed.starts_with("● Monitor event:")
+    })
+}
+
+fn is_claude_completed_status_line(trimmed: &str) -> bool {
+    let Some(stripped) = trimmed.strip_prefix(|ch| matches!(ch, '·' | '✻' | '✽' | '✶' | '✳' | '✢'))
+    else {
+        return false;
+    };
+
+    let lower_status = stripped.trim_start().to_ascii_lowercase();
+    lower_status.starts_with("worked for") || lower_status.starts_with("brewed for")
 }
 
 fn is_claude_spinner_status_line(trimmed: &str, _lower: &str) -> bool {
@@ -1851,6 +1880,16 @@ mod tests {
         assert_eq!(result.state, SessionState::BusyResponding);
         assert!(!result.has_questions);
         assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn stale_monitor_status_is_cleared_by_later_monitor_event_and_prompt() {
+        let frame = "Want me to commit these and push, or hold?\n✻ Brewed for 8m 53s · 1 monitor still running\n● Monitor event: \"Cypress smoke run progress\"\n● Stale monitor from the earlier run — no action needed. Holding for your call on the commit split.\n✻ Worked for 11s\n※ recap: Need your call on whether to commit as one or two commits.\n────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────\n~/Projects/shipstream/tests/cypress\n🧠 Opus 4.7 (1M context) │ Ctx: 20%";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
+        assert!(!result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
     }
 
     #[test]
