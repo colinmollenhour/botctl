@@ -79,6 +79,8 @@ const PERMISSION_KEYWORDS: &[&str] = &[
 
 const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "esc"];
 const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to cancel";
+const CODEX_PERMISSION_OPTION_YES: &str = "yes, proceed";
+const CODEX_PERMISSION_OPTION_NO: &str = "no, and tell codex what to do differently";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
@@ -125,6 +127,7 @@ impl Classifier {
         let has_codex_footer = lines.iter().copied().any(is_codex_footer_line);
         let has_codex_permission_confirm_footer =
             has_codex_permission_confirm_footer_at_live_tail(&lines);
+        let has_codex_permission_options = has_codex_permission_options_at_live_tail(&lines);
         let has_codex_keywords = contains_any(
             &normalized,
             &[
@@ -140,15 +143,18 @@ impl Classifier {
             ],
         ) || has_codex_statusline
             || has_codex_footer
-            || has_codex_permission_confirm_footer;
+            || has_codex_permission_confirm_footer
+            || has_codex_permission_options;
         let has_permission_words = contains_any(&normalized, PERMISSION_KEYWORDS)
             && contains_any(&normalized, PERMISSION_CONFIRM_KEYWORDS);
         let has_permission_anchor = lines
             .iter()
             .copied()
             .any(|line| is_permission_anchor_line(line.trim()))
-            || has_codex_permission_confirm_footer;
-        let has_permission_keywords = has_permission_words && has_permission_anchor;
+            || has_codex_permission_confirm_footer
+            || has_codex_permission_options;
+        let has_permission_keywords =
+            has_permission_words && has_permission_anchor || has_codex_permission_options;
         let has_unanchored_permission_words = has_permission_words && !has_permission_anchor;
         let has_plain_chat_prompt_after_permission =
             has_permission_keywords && has_plain_chat_prompt_after_permission(&lines);
@@ -649,6 +655,28 @@ fn is_codex_permission_confirm_footer(line: &str) -> bool {
         .eq_ignore_ascii_case(CODEX_PERMISSION_CONFIRM_FOOTER)
 }
 
+fn has_codex_permission_options_at_live_tail(lines: &[&str]) -> bool {
+    let tail = lines
+        .iter()
+        .rev()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_ascii_lowercase())
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+
+    if tail.is_empty() {
+        return false;
+    }
+
+    tail.iter()
+        .any(|line| line.contains(CODEX_PERMISSION_OPTION_YES))
+        && tail
+            .iter()
+            .any(|line| line.contains(CODEX_PERMISSION_OPTION_NO))
+}
+
 fn is_permission_choice_line(line: &str) -> bool {
     let trimmed = line
         .trim()
@@ -929,6 +957,23 @@ mod tests {
     #[test]
     fn classifies_codex_approval_dialog_from_live_confirm_footer() {
         let frame = "› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `tmux list-panes` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_approval_dialog_from_live_option_block() {
+        let frame = "  Verification:\n  - `pnpm test:unit tests/unit/server/qbo-sync.spec.ts` passed.\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)";
         let result = Classifier.classify("test", frame);
         assert_eq!(result.state, SessionState::PermissionDialog);
         assert!(

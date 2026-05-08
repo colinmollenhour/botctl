@@ -2953,7 +2953,8 @@ fn codex_permission_prompt_source_is_safe(source: &str) -> bool {
             .iter()
             .copied()
             .any(|line| line.eq_ignore_ascii_case("would you like to run the following command?"))
-            || codex_permission_confirm_footer_is_live_tail(prompt_lines))
+            || codex_permission_confirm_footer_is_live_tail(prompt_lines)
+            || codex_permission_options_are_live_tail(prompt_lines))
         && !prompt_lines
             .iter()
             .copied()
@@ -2964,7 +2965,9 @@ fn latest_codex_permission_prompt_start(lines: &[&str]) -> Option<usize> {
     let prompt_header = lines.iter().rposition(|line| {
         line.eq_ignore_ascii_case("would you like to run the following command?")
     });
-    if codex_permission_confirm_footer_is_live_tail(lines) {
+    if codex_permission_confirm_footer_is_live_tail(lines)
+        || codex_permission_options_are_live_tail(lines)
+    {
         return prompt_header.or_else(|| {
             lines
                 .iter()
@@ -2972,6 +2975,24 @@ fn latest_codex_permission_prompt_start(lines: &[&str]) -> Option<usize> {
         });
     }
     prompt_header
+}
+
+fn codex_permission_options_are_live_tail(lines: &[&str]) -> bool {
+    let tail = lines
+        .iter()
+        .rev()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_ascii_lowercase())
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+
+    !tail.is_empty()
+        && tail.iter().any(|line| line.contains("yes, proceed"))
+        && tail
+            .iter()
+            .any(|line| line.contains("no, and tell codex what to do differently"))
 }
 
 fn codex_permission_confirm_footer_is_live_tail(lines: &[&str]) -> bool {
@@ -5472,6 +5493,28 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             raw_source: String::from(
                 "Bash command (unsandboxed)\nfor f in /repo/.claude/commands/colin/*.md /repo/.claude/commands/coolify.md; do head -20 \"$f\"; done\nRead command headers\nUnhandled node type: string\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain",
             ),
+        };
+
+        assert!(is_yolo_safe_to_approve(&inspected));
+    }
+
+    #[test]
+    fn yolo_allows_codex_live_option_only_prompt() {
+        let source = "  Verification:\n  - `pnpm test:unit tests/unit/server/qbo-sync.spec.ts` passed.\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)";
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: vec![
+                    String::from("permission-keywords"),
+                    String::from(SIGNAL_CODEX_KEYWORDS),
+                ],
+            },
+            focused_source: String::from(source),
+            raw_source: String::from(source),
         };
 
         assert!(is_yolo_safe_to_approve(&inspected));
