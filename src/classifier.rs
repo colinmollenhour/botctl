@@ -121,6 +121,12 @@ impl Classifier {
         let has_chat_input = lines.iter().copied().any(is_chat_keyword_line)
             || lines.iter().copied().any(is_chat_input_line)
             || lines.iter().copied().any(is_codex_chat_input_line);
+        let has_plain_chat_input = lines.iter().copied().any(is_plain_chat_input_line)
+            || lines.iter().copied().any(is_codex_plain_chat_input_line);
+        let has_claude_footer = lines.iter().copied().any(is_claude_footer_line);
+        let has_claude_streaming_output = has_claude_footer
+            && !has_plain_chat_input
+            && has_assistant_output_after_latest_input(&lines);
         let has_codex_statusline = lines.iter().copied().any(is_codex_statusline_line);
         let has_codex_ready_statusline = lines.iter().copied().any(is_codex_ready_statusline_line);
         let has_codex_busy_statusline = lines.iter().copied().any(is_codex_busy_statusline_line);
@@ -311,7 +317,10 @@ impl Classifier {
         } else if has_diff_dialog_keywords(frame_text) {
             signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
-        } else if has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords) {
+        } else if has_busy_status_banner
+            || (has_busy_interrupt_hint && has_busy_keywords)
+            || has_claude_streaming_output
+        {
             signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
             if has_codex_keywords {
                 signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
@@ -752,8 +761,25 @@ fn is_submitted_chat_input_line(line: &str) -> bool {
     !rest.is_empty() && !starts_with_numbered_option(rest)
 }
 
+fn has_assistant_output_after_latest_input(lines: &[&str]) -> bool {
+    let start = lines
+        .iter()
+        .rposition(|line| is_submitted_chat_input_line(line))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+
+    lines[start..]
+        .iter()
+        .copied()
+        .any(|line| line.trim_start().starts_with('●'))
+}
+
 fn is_plain_chat_input_line(line: &str) -> bool {
     matches!(line.trim(), ">" | "❯")
+}
+
+fn is_codex_plain_chat_input_line(line: &str) -> bool {
+    line.trim() == "›"
 }
 
 fn is_codex_chat_input_line(line: &str) -> bool {
@@ -780,6 +806,11 @@ fn is_codex_statusline_line(line: &str) -> bool {
 fn is_codex_footer_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("gpt-") && lower.contains("·") && !lower.contains("claude")
+}
+
+fn is_claude_footer_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("🧠 ") || trimmed.starts_with("MCP:")
 }
 
 fn is_codex_ready_statusline_line(line: &str) -> bool {
@@ -811,7 +842,216 @@ fn is_busy_status_line(line: &str) -> bool {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
     let stripped = lower.trim_start_matches(|ch: char| !ch.is_ascii_alphanumeric());
-    stripped.starts_with("thinking...") || stripped.starts_with("thinking…")
+    is_claude_spinner_status_line(trimmed, &lower)
+        || stripped.starts_with("waiting for task")
+        || lower.contains("waiting for task (esc to give additional instructions)")
+        || lower.contains(" monitor still running")
+        || lower.contains(" monitors still running")
+}
+
+fn is_claude_spinner_status_line(trimmed: &str, _lower: &str) -> bool {
+    let Some(stripped) = trimmed.strip_prefix(|ch| matches!(ch, '·' | '✻' | '✽' | '✶' | '✳' | '✢'))
+    else {
+        return false;
+    };
+
+    let lower_status = stripped.trim_start().to_ascii_lowercase();
+    busy_status_verbs().iter().any(|verb| {
+        lower_status.starts_with(&format!("{verb}..."))
+            || lower_status.starts_with(&format!("{verb}…"))
+    })
+}
+
+fn busy_status_verbs() -> &'static [&'static str] {
+    &[
+        "accomplishing",
+        "actioning",
+        "actualizing",
+        "architecting",
+        "baking",
+        "beaming",
+        "beboppin'",
+        "befuddling",
+        "billowing",
+        "blanching",
+        "bloviating",
+        "boogieing",
+        "boondoggling",
+        "booping",
+        "bootstrapping",
+        "brewing",
+        "bunning",
+        "burrowing",
+        "calculating",
+        "canoodling",
+        "caramelizing",
+        "cascading",
+        "catapulting",
+        "cerebrating",
+        "channeling",
+        "channelling",
+        "choreographing",
+        "churning",
+        "clauding",
+        "coalescing",
+        "cogitating",
+        "combobulating",
+        "composing",
+        "computing",
+        "concocting",
+        "considering",
+        "contemplating",
+        "cooking",
+        "crafting",
+        "creating",
+        "crunching",
+        "crystallizing",
+        "cultivating",
+        "deciphering",
+        "deliberating",
+        "determining",
+        "dilly-dallying",
+        "discombobulating",
+        "doing",
+        "doodling",
+        "drizzling",
+        "ebbing",
+        "effecting",
+        "elucidating",
+        "embellishing",
+        "enchanting",
+        "envisioning",
+        "evaporating",
+        "fermenting",
+        "fiddle-faddling",
+        "finagling",
+        "flambéing",
+        "flibbertigibbeting",
+        "flowing",
+        "flummoxing",
+        "fluttering",
+        "forging",
+        "forming",
+        "frolicking",
+        "frosting",
+        "gallivanting",
+        "galloping",
+        "garnishing",
+        "generating",
+        "gesticulating",
+        "germinating",
+        "gitifying",
+        "grooving",
+        "gusting",
+        "harmonizing",
+        "hashing",
+        "hatching",
+        "herding",
+        "honking",
+        "hullaballooing",
+        "hyperspacing",
+        "ideating",
+        "imagining",
+        "improvising",
+        "incubating",
+        "inferring",
+        "infusing",
+        "ionizing",
+        "jitterbugging",
+        "julienning",
+        "kneading",
+        "leavening",
+        "levitating",
+        "lollygagging",
+        "manifesting",
+        "marinating",
+        "meandering",
+        "metamorphosing",
+        "misting",
+        "moonwalking",
+        "moseying",
+        "mulling",
+        "mustering",
+        "musing",
+        "nebulizing",
+        "nesting",
+        "newspapering",
+        "noodling",
+        "nucleating",
+        "orbiting",
+        "orchestrating",
+        "osmosing",
+        "perambulating",
+        "percolating",
+        "perusing",
+        "philosophising",
+        "photosynthesizing",
+        "pollinating",
+        "pondering",
+        "pontificating",
+        "pouncing",
+        "precipitating",
+        "prestidigitating",
+        "processing",
+        "proofing",
+        "propagating",
+        "puttering",
+        "puzzling",
+        "quantumizing",
+        "razzle-dazzling",
+        "razzmatazzing",
+        "recombobulating",
+        "reticulating",
+        "roosting",
+        "ruminating",
+        "sautéing",
+        "scampering",
+        "schlepping",
+        "scurrying",
+        "seasoning",
+        "shenaniganing",
+        "shimmying",
+        "simmering",
+        "skedaddling",
+        "sketching",
+        "slithering",
+        "smooshing",
+        "sock-hopping",
+        "spelunking",
+        "spinning",
+        "sprouting",
+        "stewing",
+        "sublimating",
+        "swirling",
+        "swooping",
+        "symbioting",
+        "synthesizing",
+        "tempering",
+        "thinking",
+        "thundering",
+        "tinkering",
+        "tomfoolering",
+        "topsy-turvying",
+        "transfiguring",
+        "transmuting",
+        "twisting",
+        "undulating",
+        "unfurling",
+        "unravelling",
+        "vibing",
+        "waddling",
+        "wandering",
+        "warping",
+        "whatchamacalliting",
+        "whirlpooling",
+        "whirring",
+        "whisking",
+        "wibbling",
+        "working",
+        "wrangling",
+        "zesting",
+        "zigzagging",
+    ]
 }
 
 fn chat_ready_has_questions(frame_text: &str) -> bool {
@@ -1437,6 +1677,16 @@ mod tests {
     }
 
     #[test]
+    fn classifies_streaming_response_without_ready_prompt_as_busy() {
+        let frame = "❯ implement the parser fix\n● The issue is in the option parser. I am updating the failing path now.\n\nFirst, I changed the argument scan to skip a bare separator.\n🧠 Opus 4.7 (1M context) │ Ctx: 18% │ Commits: │ +4/-1\nMCP:0/0 │ Cache: 100% hit";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(!result.has_questions);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
     fn classifies_external_editor_active() {
         let frame = "Open in your editor\nClose the editor to continue";
         let result = Classifier.classify("test", frame);
@@ -1581,5 +1831,64 @@ mod tests {
 
         assert_eq!(result.state, SessionState::ChatReady);
         assert!(!result.has_questions);
+    }
+
+    #[test]
+    fn classifies_claude_task_waiting_status_as_busy_despite_stale_questions() {
+        let frame = "Want me to commit, or hold for review?\n※ recap: Next: confirm whether to commit.\n❯ see if you can get this running locally\n● Bash(cd /repo && bash tests/cypress/run.sh --pool-min=2 --warm-buffer=1 --skip-update -- run)\n  ⎿  Running in the background (↓ to manage)\n● Task Output b0npcgm2n\n   Re-run with -- run pattern\n     Waiting for task (esc to give additional instructions)\n\n✶ Considering… (5m 17s · ↓ 13.3k tokens · thought for 1s)\n────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────\n~/Projects/shipstream/tests/cypress\n🧠 Opus 4.7 (1M context) │ Ctx: 18% │ Commits: │ +329/-58\n⏵⏵ auto mode on · 1 shell, 2 monitors";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(!result.has_questions);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn classifies_active_monitor_footer_as_busy_even_with_prompt_visible() {
+        let frame = "Want me to commit these and push, or hold?\n✻ Brewed for 8m 53s · 1 monitor still running\n────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────\n~/Projects/shipstream/tests/cypress\n🧠 Opus 4.7 (1M context) │ Ctx: 18% │ Commits: │ +329/-58";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert!(!result.has_questions);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn classifies_claude_spinner_verbs_as_busy() {
+        for (spinner, verb) in [
+            ('·', "Brewing"),
+            ('✻', "Flambéing"),
+            ('✽', "Razzle-dazzling"),
+            ('✶', "Zigzagging"),
+            ('✳', "Working"),
+            ('✢', "Thinking"),
+        ] {
+            let frame = format!("{spinner} {verb}… (2m 4s · ↓ 1.2k tokens)\n❯\n~/Projects/botctl");
+            let result = Classifier.classify("test", &frame);
+
+            assert_eq!(
+                result.state,
+                SessionState::BusyResponding,
+                "spinner={spinner} verb={verb}"
+            );
+            assert!(!result.has_questions, "spinner={spinner} verb={verb}");
+        }
+    }
+
+    #[test]
+    fn spinner_verbs_without_spinner_prefix_do_not_classify_as_busy() {
+        let frame = "Brewing… this is mentioned in regular output\n❯\n~/Projects/botctl";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn completed_past_tense_footer_does_not_match_spinner_verbs() {
+        let frame = "Want me to commit these and push, or hold?\n✻ Brewed for 8m 53s\n────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────\n~/Projects/botctl";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
+        assert!(result.has_questions);
     }
 }
