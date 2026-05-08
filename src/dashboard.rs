@@ -57,6 +57,7 @@ const FOOTER_COLUMN_GAP: &str = "    ";
 const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
 const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
+const ICON_GAP: &str = " ";
 const DASHBOARD_LEFT_PANE_PERCENT: u16 = 58;
 const DASHBOARD_LEFT_PANE_MAX_WIDTH: u16 = 80;
 const DASHBOARD_STATE_EMOJIS: &[&str] =
@@ -1032,7 +1033,9 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     let mut header_text = String::new();
     header_text.push(' ');
     header_text.push_str(&pad_display("", columns.state_width));
-    header_text.push_str(TABLE_GAP);
+    header_text.push_str(ICON_GAP);
+    header_text.push_str(&pad_display("", columns.agent_width));
+    header_text.push_str(ICON_GAP);
     header_text.push_str(&pad_display("", columns.yolo_width));
     header_text.push_str(TABLE_GAP);
     header_text.push_str(&pad_display("Pane", columns.pane_width));
@@ -1070,7 +1073,9 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                             state_emoji(pane.state, pane.has_questions),
                             columns.state_width,
                         )),
-                        Span::raw(TABLE_GAP),
+                        Span::raw(ICON_GAP),
+                        Span::raw(pad_display(agent_emoji(pane), columns.agent_width)),
+                        Span::raw(ICON_GAP),
                         Span::styled(
                             pad_display(yolo_marker(pane.yolo_enabled), columns.yolo_width),
                             Style::default().fg(if pane.yolo_enabled {
@@ -1243,7 +1248,10 @@ fn pane_list_content_area(area: Rect) -> Rect {
 fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> bool {
     let columns = pane_list_columns(app);
     let x = column.saturating_sub(list_area.x) as usize;
-    let yolo_start = columns.state_width + UnicodeWidthStr::width(TABLE_GAP);
+    let yolo_start = columns.state_width
+        + UnicodeWidthStr::width(ICON_GAP)
+        + columns.agent_width
+        + UnicodeWidthStr::width(ICON_GAP);
     let yolo_end = yolo_start + columns.yolo_width;
     x >= yolo_start && x < yolo_end
 }
@@ -1326,6 +1334,7 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 struct PaneListColumns {
     state_width: usize,
     yolo_width: usize,
+    agent_width: usize,
     pane_width: usize,
     uptime_width: usize,
     wait_width: usize,
@@ -1337,6 +1346,7 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
     PaneListColumns {
         state_width: 2,
         yolo_width: 2,
+        agent_width: 2,
         pane_width: app
             .panes
             .iter()
@@ -1822,6 +1832,14 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
     }
 }
 
+fn agent_emoji(pane: &PaneEntry) -> &'static str {
+    match pane.source {
+        PaneSource::Claude => "❋",
+        PaneSource::Codex => "🧌",
+        PaneSource::OpenCode { .. } => "⧈",
+    }
+}
+
 fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
     match &pane.source {
         PaneSource::Claude => pane.claude_session_id.as_deref(),
@@ -2012,16 +2030,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, PERSISTENT_DASHBOARD_SESSION,
-        PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource, SavedSelection, TABLE_GAP,
-        abbreviate_home_path, context_lines_above_input, current_base_window_name,
-        dashboard_body_sections, dashboard_display_state, dashboard_selection_path,
-        derive_base_window_name, detail_body_kind, detail_current_path, detail_workspace_label,
-        details_panel_height, footer_column_widths, footer_help_line, footer_lines, format_age,
-        is_codex_candidate_pane, is_codex_screen, load_saved_selection, pad_display_right,
-        pane_list_columns, pane_list_content_area, pane_window_prefix, recap_lines, rect_contains,
-        render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        should_return_navigation, split_workspace_header, state_emoji,
+        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
+        PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
+        SavedSelection, abbreviate_home_path, agent_emoji, context_lines_above_input,
+        current_base_window_name, dashboard_body_sections, dashboard_display_state,
+        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
+        detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
+        footer_lines, format_age, is_codex_candidate_pane, is_codex_screen, load_saved_selection,
+        pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
+        recap_lines, rect_contains, render_workspace_header_line, repo_root_from_repo_key,
+        save_selection, should_return_navigation, split_workspace_header, state_emoji,
         strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
     };
@@ -2074,6 +2092,26 @@ mod tests {
         assert_eq!(state_emoji(SessionState::PermissionDialog, false), "🔐");
         assert_eq!(state_emoji(SessionState::PlanApprovalPrompt, false), "❓");
         assert_eq!(state_emoji(SessionState::ChatReady, true), "🤔");
+    }
+
+    #[test]
+    fn maps_sources_to_agent_emojis() {
+        let claude = sample_pane_entry(SessionState::ChatReady, false, false, "");
+        let codex = PaneEntry {
+            source: PaneSource::Codex,
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        };
+        let opencode = PaneEntry {
+            source: PaneSource::OpenCode {
+                session_id: String::from("ses_1"),
+                title: String::from("demo"),
+            },
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        };
+
+        assert_eq!(agent_emoji(&claude), "❋");
+        assert_eq!(agent_emoji(&opencode), "⧈");
+        assert_eq!(agent_emoji(&codex), "🧌");
     }
 
     #[test]
@@ -2533,8 +2571,11 @@ mod tests {
             height: 10,
         };
         let columns = pane_list_columns(&app);
-        let yolo_x =
-            list_area.x + columns.state_width as u16 + UnicodeWidthStr::width(TABLE_GAP) as u16;
+        let yolo_x = list_area.x
+            + columns.state_width as u16
+            + UnicodeWidthStr::width(ICON_GAP) as u16
+            + columns.agent_width as u16
+            + UnicodeWidthStr::width(ICON_GAP) as u16;
         assert!(yolo_column_contains(&app, list_area, yolo_x));
         assert!(!yolo_column_contains(&app, list_area, list_area.x));
     }
