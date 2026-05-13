@@ -389,10 +389,13 @@ fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
             _ => String::from("-"),
         };
         out.push_str(&format!(
-            "{}\tsession={}\twindow={}\tactive={}\tprovider={}\tcommand={}\tcwd={}\tcursor={}\n",
+            "{}\tsession={}\twindow={}\tpid={}\tactive={}\tprovider={}\tcommand={}\tcwd={}\tcursor={}\n",
             pane.pane_id,
             pane.session_name,
             pane.window_name,
+            pane.pane_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| String::from("-")),
             pane.pane_active,
             pane_provider_label(pane),
             pane.current_command,
@@ -412,6 +415,7 @@ fn render_list_panes_json(panes: &[TmuxPane], include_all: bool) -> AppResult<St
                 "pane_id": pane.pane_id,
                 "session": pane.session_name,
                 "window": pane.window_name,
+                "pid": pane.pane_pid,
                 "active": pane.pane_active,
                 "provider": pane_provider_label(pane),
                 "command": pane.current_command,
@@ -4499,6 +4503,7 @@ mod tests {
     fn list_panes_defaults_to_claude_only_output() {
         let output = render_list_panes(&[sample_pane("claude"), sample_pane("bash")], false);
         assert!(output.contains("command=claude"));
+        assert!(output.contains("pid=123"));
         assert!(!output.contains("command=bash"));
     }
 

@@ -36,7 +36,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 
 These are the commands that matter most in day-to-day use:
 
-- `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes, grouped by workspace, with state, age, and YOLO controls for Claude and Codex
+- `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes, grouped by workspace, with state, PID, CPU, memory, age, and YOLO controls for Claude and Codex
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
@@ -50,7 +50,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - launch a managed Claude Code session in tmux
 - classify Codex CLI panes from captured terminal screens and approve command permission dialogs with YOLO
 - passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database
-- list panes and inspect tmux metadata
+- list panes and inspect tmux metadata, including each tracked pane PID
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude Code or Codex CLI pane
 - dump the latest persisted assistant message from Claude, Codex, or OpenCode to `MESSAGE_<provider-session-id>.md` or a path passed with `--out`
@@ -221,7 +221,7 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes by workspace, shows the current classified state and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes by workspace, shows the current classified state, pane PID, process-tree average CPU, memory, and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
 

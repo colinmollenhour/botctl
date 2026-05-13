@@ -19,7 +19,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
@@ -57,9 +57,13 @@ const FOOTER_COLUMN_GAP: &str = "    ";
 const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
 const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
 const TABLE_GAP: &str = "  ";
+const COMPACT_TABLE_GAP: &str = " ";
 const ICON_GAP: &str = " ";
 const DASHBOARD_LEFT_PANE_PERCENT: u16 = 58;
 const DASHBOARD_LEFT_PANE_MAX_WIDTH: u16 = 80;
+const RESOURCE_GAUGE_WIDTH: usize = 1;
+const RESOURCE_GAUGE_LEVELS: &[char] = &['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+const GIB_BYTES: u64 = 1024 * 1024 * 1024;
 const DASHBOARD_STATE_EMOJIS: &[&str] = &[
     "⚙️", "💬", "🤔", "💤", "🔐", "❓", "📁", "📝", "✏️", "🧾", "❔",
 ];
@@ -122,6 +126,7 @@ struct DashboardApp {
     selection: usize,
     first_seen: HashMap<String, Instant>,
     previous_frames: HashMap<String, String>,
+    cpu_samples: HashMap<String, CpuSample>,
     yes_counts: HashMap<String, u32>,
     window_names: HashMap<String, ManagedWindowName>,
     message: String,
@@ -148,6 +153,33 @@ struct PaneEntry {
     yes_count: u32,
     claude_session_id: Option<String>,
     focused_source: String,
+    resource_usage: ResourceUsage,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResourceUsage {
+    cpu_percent: Option<f64>,
+    memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSample {
+    at: Instant,
+    total_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessSnapshot {
+    pid: u32,
+    ppid: u32,
+    cpu_ticks: u64,
+    rss_pages: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessTreeUsage {
+    cpu_ticks: u64,
+    memory_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -203,6 +235,7 @@ impl DashboardApp {
             selection: 0,
             first_seen: HashMap::new(),
             previous_frames: HashMap::new(),
+            cpu_samples: HashMap::new(),
             yes_counts: HashMap::new(),
             window_names: HashMap::new(),
             message: String::new(),
@@ -260,6 +293,8 @@ impl DashboardApp {
                     .get(&yes_count_key(claude_session_id.as_deref(), &pane.pane_id))
                     .copied()
                     .unwrap_or(0);
+                let resource_usage =
+                    self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
                 next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
 
                 panes.push(PaneEntry {
@@ -279,6 +314,7 @@ impl DashboardApp {
                     yes_count,
                     claude_session_id,
                     focused_source: inspected.focused_source,
+                    resource_usage,
                 });
                 continue;
             }
@@ -301,6 +337,8 @@ impl DashboardApp {
                         .map(Instant::elapsed)
                         .unwrap_or_default()
                 });
+                let resource_usage =
+                    self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
 
                 panes.push(PaneEntry {
                     pane,
@@ -322,6 +360,7 @@ impl DashboardApp {
                     yes_count: 0,
                     claude_session_id: None,
                     focused_source: opencode_session.context,
+                    resource_usage,
                 });
                 continue;
             }
@@ -357,6 +396,7 @@ impl DashboardApp {
                 read_yolo_record(&self.state_dir, &pane.pane_id)?,
                 Some(record) if record.enabled
             );
+            let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
 
             panes.push(PaneEntry {
                 pane,
@@ -375,10 +415,13 @@ impl DashboardApp {
                 yes_count: 0,
                 claude_session_id: None,
                 focused_source: inspected.focused_source,
+                resource_usage,
             });
         }
 
         self.first_seen
+            .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
+        self.cpu_samples
             .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
         self.previous_frames = next_frames;
 
@@ -759,6 +802,36 @@ impl DashboardApp {
         *self.yes_counts.entry(key).or_insert(0) += 1;
     }
 
+    fn resource_usage_for_pane(
+        &mut self,
+        pane_id: &str,
+        pid: Option<u32>,
+        now: Instant,
+    ) -> ResourceUsage {
+        let Some(pid) = pid else {
+            self.cpu_samples.remove(pane_id);
+            return ResourceUsage::default();
+        };
+        let Some(total) = process_tree_usage(pid) else {
+            self.cpu_samples.remove(pane_id);
+            return ResourceUsage::default();
+        };
+
+        let sample = CpuSample {
+            at: now,
+            total_ticks: total.cpu_ticks,
+        };
+        let cpu_percent = self
+            .cpu_samples
+            .insert(pane_id.to_string(), sample)
+            .and_then(|previous| cpu_percent_between(previous, sample));
+
+        ResourceUsage {
+            cpu_percent,
+            memory_bytes: Some(total.memory_bytes),
+        }
+    }
+
     fn toggle_workspace_yolo(&mut self) -> AppResult<()> {
         let Some(selected) = self.selected_pane().cloned() else {
             return Ok(());
@@ -842,6 +915,15 @@ impl PaneEntry {
 
     fn supports_yolo(&self) -> bool {
         matches!(self.source, PaneSource::Claude | PaneSource::Codex)
+    }
+}
+
+impl DashboardApp {
+    fn max_memory_bytes(&self) -> Option<u64> {
+        self.panes
+            .iter()
+            .filter_map(|pane| pane.resource_usage.memory_bytes)
+            .max()
     }
 }
 
@@ -996,7 +1078,8 @@ fn handle_mouse_event(
             if !rect_contains(list_area, mouse.column, mouse.row) {
                 return Ok(None);
             }
-            let index = (mouse.row - list_area.y) as usize;
+            let index = pane_list_scroll_start(app, list_area.height as usize)
+                + (mouse.row - list_area.y) as usize;
             if yolo_column_contains(app, list_area, mouse.column)
                 && let Some(pane) = app.pane_for_row(index).cloned()
             {
@@ -1031,103 +1114,19 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         .split(body[0]);
 
     let columns = pane_list_columns(app);
-    let mut header_text = String::new();
-    header_text.push(' ');
-    header_text.push_str(&pad_display("", columns.state_width));
-    header_text.push_str(ICON_GAP);
-    header_text.push_str(&pad_display("", columns.agent_width));
-    header_text.push_str(ICON_GAP);
-    header_text.push_str(&pad_display("", columns.yolo_width));
-    header_text.push_str(TABLE_GAP);
-    header_text.push_str(&pad_display("Pane", columns.pane_width));
-    header_text.push_str(TABLE_GAP);
-    header_text.push_str(&pad_display("Uptime", columns.uptime_width));
-    header_text.push_str(TABLE_GAP);
-    header_text.push_str(&pad_display("Wait", columns.wait_width));
-    header_text.push_str(TABLE_GAP);
-    header_text.push_str(&pad_display_right("Yes", columns.yes_width));
-    header_text.push_str(TABLE_GAP);
-    header_text.push_str(&pad_display("Branch", columns.branch_width));
-    header_text.push_str(TABLE_GAP);
-    let header_width = panes_layout[0].width as usize;
-    let header_display_width = UnicodeWidthStr::width(header_text.as_str());
-    if header_display_width < header_width {
-        header_text.push_str(&" ".repeat(header_width - header_display_width));
-    }
-    let header =
-        Paragraph::new(Line::from(Span::styled(header_text, header_style()))).style(header_style());
-    frame.render_widget(header, panes_layout[0]);
-
-    let pane_list_width = rounded_block(None).inner(panes_layout[1]).width as usize;
-    let mut items = Vec::new();
-    for row in &app.rows {
-        match row {
-            RowItem::WorkspaceHeader { label } => items.push(ListItem::new(
-                render_workspace_header_line(label, pane_list_width),
-            )),
-            RowItem::Pane { pane_id } => {
-                let pane = app.panes.iter().find(|pane| &pane.pane.pane_id == pane_id);
-                if let Some(pane) = pane {
-                    let pane_target = pane_target_label(&pane.pane);
-                    items.push(ListItem::new(Line::from(vec![
-                        Span::raw(pad_display(
-                            state_emoji(pane.state, pane.has_questions),
-                            columns.state_width,
-                        )),
-                        Span::raw(ICON_GAP),
-                        Span::raw(pad_display(agent_emoji(pane), columns.agent_width)),
-                        Span::raw(ICON_GAP),
-                        Span::styled(
-                            pad_display(yolo_marker(pane.yolo_enabled), columns.yolo_width),
-                            Style::default().fg(if pane.yolo_enabled {
-                                Color::Yellow
-                            } else {
-                                Color::DarkGray
-                            }),
-                        ),
-                        Span::raw(TABLE_GAP),
-                        Span::raw(pad_display(&pane_target, columns.pane_width)),
-                        Span::raw(TABLE_GAP),
-                        Span::raw(pad_display(&format_age(pane.age), columns.uptime_width)),
-                        Span::raw(TABLE_GAP),
-                        Span::raw(pad_display(
-                            &pane.wait_duration.map(format_age).unwrap_or_default(),
-                            columns.wait_width,
-                        )),
-                        Span::raw(TABLE_GAP),
-                        Span::raw(pad_display_right(
-                            &pane.yes_count.to_string(),
-                            columns.yes_width,
-                        )),
-                        Span::raw(TABLE_GAP),
-                        Span::raw(pad_display(&pane.branch, columns.branch_width)),
-                        Span::raw(TABLE_GAP),
-                    ])));
-                }
-            }
-        }
-    }
-
-    let mut list_state = ListState::default();
-    if !app.rows.is_empty() {
-        list_state.select(Some(app.selection));
-    }
-    let list = List::new(items).block(rounded_block(None)).highlight_style(
-        Style::default()
-            .bg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, panes_layout[1], &mut list_state);
+    render_pane_list_header(frame, panes_layout[0], &columns);
+    render_pane_list(frame, app, panes_layout[1], &columns);
 
     if let Some(pane) = app.selected_pane() {
         let mut details = vec![
             Line::from(format!("Workspace: {}", detail_workspace_label(pane))),
             Line::from(format!("Provider: {}", pane_provider_label(pane))),
-            Line::from(format!("Pane: {}", pane.pane.pane_id)),
             Line::from(format!(
-                "Target: {}:{}.{}",
-                pane.pane.session_name, pane.pane.window_index, pane.pane.pane_index
+                "Pane: {} ({})",
+                pane.pane.pane_id,
+                pane_target_label(&pane.pane)
             )),
+            Line::from(format!("PID: {}", format_pid(pane.pane.pane_pid))),
             Line::from(format!(
                 "State: {} {}",
                 state_emoji(pane.state, pane.has_questions),
@@ -1143,6 +1142,14 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 }
             )),
             Line::from(format!("Age: {}", format_age(pane.age))),
+            Line::from(format!(
+                "Avg CPU: {}",
+                format_cpu_percent(pane.resource_usage.cpu_percent)
+            )),
+            Line::from(format!(
+                "Memory: {}",
+                format_memory_bytes(pane.resource_usage.memory_bytes)
+            )),
             Line::from(format!("Path: {}", detail_current_path(pane))),
         ];
         if pane.workspace.workspace_root != pane.workspace_group_key {
@@ -1248,13 +1255,8 @@ fn pane_list_content_area(area: Rect) -> Rect {
 
 fn yolo_column_contains(app: &DashboardApp, list_area: Rect, column: u16) -> bool {
     let columns = pane_list_columns(app);
-    let x = column.saturating_sub(list_area.x) as usize;
-    let yolo_start = columns.state_width
-        + UnicodeWidthStr::width(ICON_GAP)
-        + columns.agent_width
-        + UnicodeWidthStr::width(ICON_GAP);
-    let yolo_end = yolo_start + columns.yolo_width;
-    x >= yolo_start && x < yolo_end
+    let rects = pane_list_column_rects(list_area, &columns);
+    column >= rects.yolo.x && column < rects.yolo.x.saturating_add(rects.yolo.width)
 }
 
 fn render_footer() -> Paragraph<'static> {
@@ -1332,15 +1334,238 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+struct PaneListColumnRects {
+    state: Rect,
+    agent: Rect,
+    yolo: Rect,
+    cpu: Rect,
+    mem: Rect,
+    uptime: Rect,
+    wait: Rect,
+    yes: Rect,
+    branch: Rect,
+}
+
+fn render_pane_list_header(frame: &mut ratatui::Frame<'_>, area: Rect, columns: &PaneListColumns) {
+    frame.render_widget(Paragraph::new(" ").style(header_style()), area);
+    let rects = pane_list_column_rects(area, columns);
+    render_cell_right(frame, rects.cpu, "CPU", header_style());
+    render_cell_right(frame, rects.mem, "MEM", header_style());
+    render_cell(frame, rects.uptime, "Uptime", header_style());
+    render_cell(frame, rects.wait, "Wait", header_style());
+    render_cell_right(frame, rects.yes, "🤠", header_style());
+    render_cell(frame, rects.branch, "Branch", header_style());
+}
+
+fn render_pane_list(
+    frame: &mut ratatui::Frame<'_>,
+    app: &DashboardApp,
+    area: Rect,
+    columns: &PaneListColumns,
+) {
+    let block = rounded_block(None);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let start = pane_list_scroll_start(app, inner.height as usize);
+    let rects = pane_list_column_rects(inner, columns);
+
+    for (visible_row, row) in app
+        .rows
+        .iter()
+        .skip(start)
+        .take(inner.height as usize)
+        .enumerate()
+    {
+        let y = inner.y + visible_row as u16;
+        let row_area = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        let selected = start + visible_row == app.selection;
+        if selected {
+            frame.render_widget(
+                Paragraph::new(" ").style(
+                    Style::default()
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                row_area,
+            );
+        }
+        let row_style = if selected {
+            Style::default()
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        match row {
+            RowItem::WorkspaceHeader { label } => {
+                let line = render_workspace_header_line(label, inner.width as usize);
+                frame.render_widget(Paragraph::new(line).style(row_style), row_area);
+            }
+            RowItem::Pane { pane_id } => {
+                let Some(pane) = app.panes.iter().find(|pane| &pane.pane.pane_id == pane_id) else {
+                    continue;
+                };
+                render_cell(
+                    frame,
+                    rect_at_y(rects.state, y),
+                    state_emoji(pane.state, pane.has_questions),
+                    row_style,
+                );
+                render_cell(
+                    frame,
+                    rect_at_y(rects.agent, y),
+                    agent_emoji(pane),
+                    row_style,
+                );
+                render_cell(
+                    frame,
+                    rect_at_y(rects.yolo, y),
+                    yolo_marker(pane.yolo_enabled),
+                    row_style.fg(if pane.yolo_enabled {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
+                );
+                render_cell(
+                    frame,
+                    rect_at_y(rects.cpu, y),
+                    &format_cpu_gauge(pane.resource_usage.cpu_percent),
+                    row_style,
+                );
+                render_cell(
+                    frame,
+                    rect_at_y(rects.mem, y),
+                    &format_memory_gauge(pane.resource_usage.memory_bytes, app.max_memory_bytes()),
+                    row_style,
+                );
+                render_cell(
+                    frame,
+                    rect_at_y(rects.uptime, y),
+                    &format_duration_compact(pane.age),
+                    row_style,
+                );
+                render_cell(
+                    frame,
+                    rect_at_y(rects.wait, y),
+                    &pane
+                        .wait_duration
+                        .map(format_duration_compact)
+                        .unwrap_or_default(),
+                    row_style,
+                );
+                render_cell_right(
+                    frame,
+                    rect_at_y(rects.yes, y),
+                    &pane.yes_count.to_string(),
+                    row_style,
+                );
+                render_cell(frame, rect_at_y(rects.branch, y), &pane.branch, row_style);
+            }
+        }
+    }
+}
+
+fn pane_list_scroll_start(app: &DashboardApp, visible_rows: usize) -> usize {
+    if visible_rows == 0 || app.selection < visible_rows {
+        0
+    } else {
+        app.selection + 1 - visible_rows
+    }
+}
+
+fn pane_list_column_rects(area: Rect, columns: &PaneListColumns) -> PaneListColumnRects {
+    let mut x = area.x.saturating_add(1);
+    let gap = UnicodeWidthStr::width(TABLE_GAP) as u16;
+    let compact_gap = UnicodeWidthStr::width(COMPACT_TABLE_GAP) as u16;
+    let icon_gap = UnicodeWidthStr::width(ICON_GAP) as u16;
+
+    let state = take_rect(area, &mut x, columns.state_width as u16);
+    x = x.saturating_add(icon_gap);
+    let agent = take_rect(area, &mut x, columns.agent_width as u16);
+    x = x.saturating_add(icon_gap);
+    let yolo = take_rect(area, &mut x, columns.yolo_width as u16);
+    x = x.saturating_add(gap);
+    let cpu = take_rect(area, &mut x, columns.cpu_width as u16);
+    x = x.saturating_add(compact_gap);
+    let mem = take_rect(area, &mut x, columns.mem_width as u16);
+    x = x.saturating_add(gap);
+    let uptime = take_rect(area, &mut x, columns.uptime_width as u16);
+    x = x.saturating_add(gap);
+    let wait = take_rect(area, &mut x, columns.wait_width as u16);
+    x = x.saturating_add(gap);
+    let yes = take_rect(area, &mut x, columns.yes_width as u16);
+    x = x.saturating_add(gap);
+    let branch_width = area.x.saturating_add(area.width).saturating_sub(x);
+    let branch = Rect {
+        x,
+        y: area.y,
+        width: branch_width,
+        height: area.height,
+    };
+
+    PaneListColumnRects {
+        state,
+        agent,
+        yolo,
+        cpu,
+        mem,
+        uptime,
+        wait,
+        yes,
+        branch,
+    }
+}
+
+fn take_rect(area: Rect, x: &mut u16, width: u16) -> Rect {
+    let right = area.x.saturating_add(area.width);
+    let width = width.min(right.saturating_sub(*x));
+    let rect = Rect {
+        x: *x,
+        y: area.y,
+        width,
+        height: area.height,
+    };
+    *x = x.saturating_add(width);
+    rect
+}
+
+fn rect_at_y(rect: Rect, y: u16) -> Rect {
+    Rect {
+        y,
+        height: 1,
+        ..rect
+    }
+}
+
+fn render_cell(frame: &mut ratatui::Frame<'_>, area: Rect, value: &str, style: Style) {
+    frame.render_widget(
+        Paragraph::new(pad_display(value, area.width as usize)).style(style),
+        area,
+    );
+}
+
+fn render_cell_right(frame: &mut ratatui::Frame<'_>, area: Rect, value: &str, style: Style) {
+    frame.render_widget(
+        Paragraph::new(pad_display_right(value, area.width as usize)).style(style),
+        area,
+    );
+}
+
 struct PaneListColumns {
     state_width: usize,
     yolo_width: usize,
     agent_width: usize,
-    pane_width: usize,
+    cpu_width: usize,
+    mem_width: usize,
     uptime_width: usize,
     wait_width: usize,
     yes_width: usize,
-    branch_width: usize,
 }
 
 fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
@@ -1348,35 +1573,45 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
         state_width: 2,
         yolo_width: 2,
         agent_width: 2,
-        pane_width: app
+        cpu_width: RESOURCE_GAUGE_WIDTH + 5,
+        mem_width: app
             .panes
             .iter()
-            .map(|pane| UnicodeWidthStr::width(pane_target_label(&pane.pane).as_str()))
+            .map(|pane| {
+                UnicodeWidthStr::width(
+                    format_memory_gauge(pane.resource_usage.memory_bytes, app.max_memory_bytes())
+                        .as_str(),
+                )
+            })
             .max()
-            .unwrap_or(4)
-            .max(4),
+            .unwrap_or(3)
+            .max(3),
         uptime_width: app
             .panes
             .iter()
-            .map(|pane| format_age(pane.age).len())
+            .map(|pane| format_duration_compact(pane.age).len())
             .max()
             .unwrap_or(6)
             .max(6),
         wait_width: app
             .panes
             .iter()
-            .map(|pane| pane.wait_duration.map(format_age).unwrap_or_default().len())
+            .map(|pane| {
+                pane.wait_duration
+                    .map(format_duration_compact)
+                    .unwrap_or_default()
+                    .len()
+            })
             .max()
             .unwrap_or(4)
             .max(4),
-        yes_width: 3,
-        branch_width: app
+        yes_width: app
             .panes
             .iter()
-            .map(|pane| UnicodeWidthStr::width(pane.branch.as_str()))
+            .map(|pane| pane.yes_count.to_string().len())
             .max()
-            .unwrap_or(6)
-            .max(6),
+            .unwrap_or(1)
+            .max(1),
     }
 }
 
@@ -1837,8 +2072,17 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
 fn agent_emoji(pane: &PaneEntry) -> &'static str {
     match pane.source {
         PaneSource::Claude => "❋",
-        PaneSource::Codex => "🧌",
+        PaneSource::Codex => "🞇",
         PaneSource::OpenCode { .. } => "⧈",
+    }
+}
+
+#[cfg(any(test, rust_analyzer))]
+fn agent_marker(pane: &PaneEntry) -> &'static str {
+    match pane.source {
+        PaneSource::Claude => "C",
+        PaneSource::Codex => "X",
+        PaneSource::OpenCode { .. } => "O",
     }
 }
 
@@ -1923,7 +2167,25 @@ fn git_branch_for_path(path: &str) -> String {
 }
 
 fn yolo_marker(enabled: bool) -> &'static str {
-    if enabled { "🤠" } else { "  " }
+    if enabled { "🤠" } else { " " }
+}
+
+#[cfg(any(test, rust_analyzer))]
+fn state_marker(state: SessionState, has_questions: bool) -> &'static str {
+    match state {
+        SessionState::BusyResponding => "B",
+        SessionState::PromptEditing => "E",
+        SessionState::UserQuestionPrompt => "Q",
+        SessionState::ChatReady if has_questions => "Q",
+        SessionState::ChatReady => "I",
+        SessionState::PermissionDialog => "P",
+        SessionState::PlanApprovalPrompt => "A",
+        SessionState::FolderTrustPrompt => "F",
+        SessionState::SurveyPrompt => "S",
+        SessionState::ExternalEditorActive => "V",
+        SessionState::DiffDialog => "D",
+        SessionState::Unknown => "?",
+    }
 }
 
 fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
@@ -1964,6 +2226,101 @@ fn format_age(age: Duration) -> String {
     }
 }
 
+fn format_duration_compact(duration: Duration) -> String {
+    let total_minutes = duration.as_secs() / 60;
+    let days = total_minutes / (24 * 60);
+    let hours = (total_minutes % (24 * 60)) / 60;
+    let minutes = total_minutes % 60;
+
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn format_pid(pid: Option<u32>) -> String {
+    pid.map(|pid| pid.to_string())
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn format_cpu_percent(cpu_percent: Option<f64>) -> String {
+    cpu_percent
+        .map(|value| format!("{value:.0}%"))
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn format_memory_bytes(memory_bytes: Option<u64>) -> String {
+    memory_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn format_cpu_gauge(cpu_percent: Option<f64>) -> String {
+    let label = format_cpu_percent(cpu_percent);
+    let ratio = cpu_percent.map(|value| (value / 100.0).clamp(0.0, 1.0));
+    format_gauge(ratio, &label, RESOURCE_GAUGE_WIDTH)
+}
+
+fn format_memory_gauge(memory_bytes: Option<u64>, max_memory_bytes: Option<u64>) -> String {
+    let label = format_memory_bytes(memory_bytes);
+    let bar = memory_bytes
+        .map(format_memory_bar)
+        .unwrap_or_else(|| String::from(" "));
+    let width = max_memory_bytes
+        .map(format_memory_bar)
+        .map(|bar| UnicodeWidthStr::width(bar.as_str()))
+        .unwrap_or(1)
+        .max(1);
+    format!("{} {label}", pad_display(&bar, width))
+}
+
+fn format_gauge(ratio: Option<f64>, label: &str, width: usize) -> String {
+    let Some(ratio) = ratio else {
+        return format!("{} {label}", " ".repeat(width));
+    };
+
+    format!("{} {label}", resource_gauge_char(ratio))
+}
+
+fn format_memory_bar(memory_bytes: u64) -> String {
+    let full = (memory_bytes / GIB_BYTES) as usize;
+    let remainder = memory_bytes % GIB_BYTES;
+    let mut bar = "█".repeat(full);
+    if remainder > 0 || bar.is_empty() {
+        bar.push(resource_gauge_char(remainder as f64 / GIB_BYTES as f64));
+    }
+    bar
+}
+
+fn resource_gauge_char(ratio: f64) -> char {
+    let ratio = ratio.clamp(0.0, 1.0);
+    if ratio >= 1.0 {
+        return '█';
+    }
+    let units = (ratio * RESOURCE_GAUGE_LEVELS.len() as f64).round() as usize;
+    RESOURCE_GAUGE_LEVELS[units.saturating_sub(1)]
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = GIB_BYTES as f64;
+
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1}G", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.0}M", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.0}K", bytes / KIB)
+    } else {
+        format!("{bytes:.0}B")
+    }
+}
+
 fn process_age(pid: Option<u32>) -> Option<Duration> {
     let pid = pid?;
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -1980,6 +2337,106 @@ fn process_age(pid: Option<u32>) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs_f64(uptime_secs - start_secs))
+}
+
+fn cpu_percent_between(previous: CpuSample, current: CpuSample) -> Option<f64> {
+    let elapsed = current
+        .at
+        .checked_duration_since(previous.at)?
+        .as_secs_f64();
+    if elapsed <= 0.0 || current.total_ticks < previous.total_ticks {
+        return None;
+    }
+
+    let ticks_per_second = ticks_per_second()? as f64;
+    let cpu_seconds = (current.total_ticks - previous.total_ticks) as f64 / ticks_per_second;
+    Some((cpu_seconds / elapsed) * 100.0)
+}
+
+fn process_tree_usage(root_pid: u32) -> Option<ProcessTreeUsage> {
+    let snapshots = process_snapshots();
+    if snapshots.is_empty() {
+        return None;
+    }
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    let mut snapshots_by_pid = HashMap::<u32, ProcessSnapshot>::new();
+    for snapshot in snapshots {
+        children_by_parent
+            .entry(snapshot.ppid)
+            .or_default()
+            .push(snapshot.pid);
+        snapshots_by_pid.insert(snapshot.pid, snapshot);
+    }
+
+    if !snapshots_by_pid.contains_key(&root_pid) {
+        return None;
+    }
+
+    let page_size = page_size()?;
+    let mut stack = vec![root_pid];
+    let mut cpu_ticks = 0u64;
+    let mut rss_pages = 0u64;
+    while let Some(pid) = stack.pop() {
+        if let Some(snapshot) = snapshots_by_pid.get(&pid) {
+            cpu_ticks = cpu_ticks.saturating_add(snapshot.cpu_ticks);
+            rss_pages = rss_pages.saturating_add(snapshot.rss_pages);
+        }
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+
+    Some(ProcessTreeUsage {
+        cpu_ticks,
+        memory_bytes: rss_pages.saturating_mul(page_size),
+    })
+}
+
+fn process_snapshots() -> Vec<ProcessSnapshot> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(process_snapshot)
+        .collect()
+}
+
+fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_stat(pid, &stat)
+}
+
+fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessSnapshot> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let fields = fields.split_whitespace().collect::<Vec<_>>();
+    Some(ProcessSnapshot {
+        pid,
+        ppid: fields.get(1)?.parse::<u32>().ok()?,
+        cpu_ticks: fields
+            .get(11)?
+            .parse::<u64>()
+            .ok()?
+            .saturating_add(fields.get(12)?.parse::<u64>().ok()?),
+        rss_pages: fields
+            .get(21)?
+            .parse::<i64>()
+            .ok()
+            .unwrap_or_default()
+            .max(0) as u64,
+    })
+}
+
+fn ticks_per_second() -> Option<u64> {
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (ticks_per_second > 0).then_some(ticks_per_second as u64)
+}
+
+fn page_size() -> Option<u64> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (page_size > 0).then_some(page_size as u64)
 }
 
 fn is_claude_pane(pane: &TmuxPane) -> bool {
@@ -2041,14 +2498,16 @@ mod tests {
     use super::{
         DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
         PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
-        SavedSelection, abbreviate_home_path, agent_emoji, context_lines_above_input,
-        current_base_window_name, dashboard_body_sections, dashboard_display_state,
-        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
-        detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
-        footer_lines, format_age, is_codex_candidate_pane, is_codex_screen, load_saved_selection,
-        pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
-        recap_lines, rect_contains, render_workspace_header_line, repo_root_from_repo_key,
-        save_selection, should_return_navigation, split_workspace_header, state_emoji,
+        ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji, agent_marker,
+        context_lines_above_input, current_base_window_name, dashboard_body_sections,
+        dashboard_display_state, dashboard_selection_path, derive_base_window_name,
+        detail_body_kind, detail_current_path, detail_workspace_label, details_panel_height,
+        footer_column_widths, footer_help_line, footer_lines, format_age, format_cpu_gauge,
+        format_duration_compact, format_memory_bar, format_memory_gauge, is_codex_candidate_pane,
+        is_codex_screen, load_saved_selection, pad_display_right, pane_list_columns,
+        pane_list_content_area, pane_window_prefix, parse_process_stat, recap_lines, rect_contains,
+        render_workspace_header_line, repo_root_from_repo_key, save_selection,
+        should_return_navigation, split_workspace_header, state_emoji, state_marker,
         strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
     };
@@ -2101,6 +2560,20 @@ mod tests {
     }
 
     #[test]
+    fn formats_compact_dashboard_durations_without_seconds() {
+        assert_eq!(format_duration_compact(Duration::from_secs(45)), "0m");
+        assert_eq!(format_duration_compact(Duration::from_secs(65)), "1m");
+        assert_eq!(
+            format_duration_compact(Duration::from_secs(5 * 3600 + 33 * 60 + 12)),
+            "5h33m"
+        );
+        assert_eq!(
+            format_duration_compact(Duration::from_secs(2 * 86400 + 3 * 3600)),
+            "2d3h"
+        );
+    }
+
+    #[test]
     fn maps_states_to_emojis() {
         assert_eq!(state_emoji(SessionState::PermissionDialog, false), "🔐");
         assert_eq!(state_emoji(SessionState::PlanApprovalPrompt, false), "❓");
@@ -2125,7 +2598,18 @@ mod tests {
 
         assert_eq!(agent_emoji(&claude), "❋");
         assert_eq!(agent_emoji(&opencode), "⧈");
-        assert_eq!(agent_emoji(&codex), "🧌");
+        assert_eq!(agent_emoji(&codex), "🞇");
+        assert_eq!(agent_marker(&claude), "C");
+        assert_eq!(agent_marker(&opencode), "O");
+        assert_eq!(agent_marker(&codex), "X");
+    }
+
+    #[test]
+    fn table_state_markers_are_single_width() {
+        assert_eq!(state_marker(SessionState::BusyResponding, false), "B");
+        assert_eq!(state_marker(SessionState::ChatReady, true), "Q");
+        assert_eq!(state_marker(SessionState::ChatReady, false), "I");
+        assert_eq!(state_marker(SessionState::PermissionDialog, false), "P");
     }
 
     #[test]
@@ -2388,6 +2872,30 @@ mod tests {
     }
 
     #[test]
+    fn resource_gauges_render_fixed_width_bars() {
+        assert_eq!(format_cpu_gauge(Some(0.0)), "▏ 0%");
+        assert_eq!(format_cpu_gauge(Some(50.0)), "▌ 50%");
+        assert_eq!(format_cpu_gauge(Some(100.0)), "█ 100%");
+        assert_eq!(format_cpu_gauge(None), "  -");
+        assert_eq!(format_memory_gauge(Some(512 * 1024 * 1024), None), "▌ 512M");
+        assert_eq!(format_memory_bar(1536 * 1024 * 1024), "█▌");
+    }
+
+    #[test]
+    fn parses_process_stat_for_usage_fields() {
+        let snapshot = parse_process_stat(
+            123,
+            "123 (agent worker) S 7 1 1 0 -1 4194560 100 0 0 0 11 13 0 0 20 0 1 0 1000 4096 42 0 0",
+        )
+        .expect("stat should parse");
+
+        assert_eq!(snapshot.pid, 123);
+        assert_eq!(snapshot.ppid, 7);
+        assert_eq!(snapshot.cpu_ticks, 24);
+        assert_eq!(snapshot.rss_pages, 42);
+    }
+
+    #[test]
     fn yes_count_key_prefers_claude_session_id() {
         assert_eq!(yes_count_key(Some("session-123"), "%9"), "session-123");
         assert_eq!(yes_count_key(None, "%9"), "%9");
@@ -2587,6 +3095,7 @@ mod tests {
         };
         let columns = pane_list_columns(&app);
         let yolo_x = list_area.x
+            + 1
             + columns.state_width as u16
             + UnicodeWidthStr::width(ICON_GAP) as u16
             + columns.agent_width as u16
@@ -2642,6 +3151,7 @@ mod tests {
             yes_count: 0,
             claude_session_id: None,
             focused_source: focused_source.to_string(),
+            resource_usage: ResourceUsage::default(),
         }
     }
 
