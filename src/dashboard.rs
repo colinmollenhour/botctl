@@ -1225,7 +1225,11 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         frame.render_widget(details, details_layout[0]);
 
         let body_kind = detail_body_kind(pane);
-        let body_lines = detail_body_lines(pane, available_body_lines(details_layout[1]));
+        let body_lines = detail_body_lines(
+            pane,
+            available_body_lines(details_layout[1]),
+            available_body_columns(details_layout[1]),
+        );
         let body = Paragraph::new(body_lines.into_iter().map(Line::from).collect::<Vec<_>>())
             .block(rounded_block(Some(detail_body_title(body_kind))))
             .wrap(Wrap {
@@ -1755,8 +1759,12 @@ fn available_body_lines(area: ratatui::layout::Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 
-fn detail_body_lines(pane: &PaneEntry, max_lines: usize) -> Vec<String> {
-    if max_lines == 0 {
+fn available_body_columns(area: ratatui::layout::Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+fn detail_body_lines(pane: &PaneEntry, max_rows: usize, max_columns: usize) -> Vec<String> {
+    if max_rows == 0 {
         return Vec::new();
     }
 
@@ -1770,8 +1778,45 @@ fn detail_body_lines(pane: &PaneEntry, max_lines: usize) -> Vec<String> {
         return vec![String::from("<empty>")];
     }
 
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].to_vec()
+    select_tail_lines_for_rows(&lines, max_rows, max_columns)
+}
+
+fn select_tail_lines_for_rows(
+    lines: &[String],
+    max_rows: usize,
+    max_columns: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    if max_columns == 0 {
+        let start = lines.len().saturating_sub(max_rows);
+        return lines[start..].to_vec();
+    }
+
+    let mut used_rows = 0usize;
+    let mut selected = Vec::new();
+    for line in lines.iter().rev() {
+        let rows = wrapped_line_rows(line, max_columns);
+        if !selected.is_empty() && used_rows.saturating_add(rows) > max_rows {
+            break;
+        }
+        used_rows = used_rows.saturating_add(rows);
+        selected.push(line.clone());
+        if used_rows >= max_rows {
+            break;
+        }
+    }
+    selected.reverse();
+    selected
+}
+
+fn wrapped_line_rows(line: &str, max_columns: usize) -> usize {
+    if max_columns == 0 {
+        return 1;
+    }
+    let width = UnicodeWidthStr::width(line);
+    width.div_ceil(max_columns).max(1)
 }
 
 fn dialog_lines(source: &str) -> Vec<String> {
@@ -2558,8 +2603,8 @@ mod tests {
         is_codex_screen, load_saved_selection, pad_display_right, pane_list_columns,
         pane_list_content_area, pane_window_prefix, parse_process_stat, recap_lines, rect_contains,
         render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        should_return_navigation, split_workspace_header, state_emoji, state_marker,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
+        select_tail_lines_for_rows, should_return_navigation, split_workspace_header, state_emoji,
+        state_marker, strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
@@ -2723,6 +2768,28 @@ mod tests {
     fn context_lines_stop_at_chat_input() {
         let lines = context_lines_above_input("alpha\nbeta\n❯\ninput");
         assert_eq!(lines, vec![String::from("alpha"), String::from("beta")]);
+    }
+
+    #[test]
+    fn context_tail_selection_accounts_for_wrapped_rows() {
+        let lines = vec![
+            String::from("old"),
+            String::from("medium-width"),
+            String::from("new"),
+        ];
+        assert_eq!(
+            select_tail_lines_for_rows(&lines, 3, 6),
+            vec![String::from("medium-width"), String::from("new")]
+        );
+    }
+
+    #[test]
+    fn context_tail_selection_keeps_one_oversized_recent_line() {
+        let lines = vec![String::from("old"), String::from("very-long-recent-line")];
+        assert_eq!(
+            select_tail_lines_for_rows(&lines, 1, 4),
+            vec![String::from("very-long-recent-line")]
+        );
     }
 
     #[test]

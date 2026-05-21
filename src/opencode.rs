@@ -8,9 +8,7 @@ use crate::classifier::SessionState;
 use crate::tmux::TmuxPane;
 
 const OPENCODE_TITLE_PREFIX: &str = "OC | ";
-const OPENCODE_CONTEXT_PART_LIMIT: usize = 40;
-const OPENCODE_CONTEXT_LINE_LIMIT: usize = 12;
-const OPENCODE_CONTEXT_TEXT_LIMIT: usize = 240;
+const OPENCODE_CONTEXT_TEXT_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenCodeSession {
@@ -245,6 +243,7 @@ fn absolute_path_is_outside_directory(path: &str, directory: &str) -> bool {
 }
 
 struct OpenCodeMessageState {
+    id: String,
     role: String,
     completed: bool,
 }
@@ -252,7 +251,7 @@ struct OpenCodeMessageState {
 fn latest_message_state(connection: &Connection, session_id: &str) -> Option<OpenCodeMessageState> {
     connection
         .query_row(
-            "SELECT json_extract(data, '$.role'), json_extract(data, '$.time.completed') IS NOT NULL \
+            "SELECT id, json_extract(data, '$.role'), json_extract(data, '$.time.completed') IS NOT NULL \
              FROM message \
              WHERE session_id = ?1 \
              ORDER BY time_created DESC, id DESC \
@@ -260,8 +259,9 @@ fn latest_message_state(connection: &Connection, session_id: &str) -> Option<Ope
             params![session_id],
             |row| {
                 Ok(OpenCodeMessageState {
-                    role: row.get(0)?,
-                    completed: row.get(1)?,
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    completed: row.get(2)?,
                 })
             },
         )
@@ -370,41 +370,15 @@ fn escape_sql_like(value: &str) -> String {
 }
 
 fn latest_session_context(connection: &Connection, session_id: &str) -> Option<String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT json_extract(message.data, '$.role'), part.data \
-             FROM part \
-             JOIN message ON message.id = part.message_id \
-             WHERE part.session_id = ?1 \
-             ORDER BY part.time_created DESC, part.id DESC \
-             LIMIT ?2",
-        )
-        .ok()?;
-    let mut rows = statement
-        .query_map(
-            params![session_id, OPENCODE_CONTEXT_PART_LIMIT as i64],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
-        )
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    rows.reverse();
-
-    let lines = rows
-        .into_iter()
-        .filter_map(|(role, data)| opencode_part_context(role.as_deref(), &data))
-        .rev()
-        .take(OPENCODE_CONTEXT_LINE_LIMIT)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
+    let latest = latest_message_state(connection, session_id)?;
+    if latest.role != "assistant" {
+        return None;
     }
+
+    assistant_message_text(connection, session_id, &latest.id)
+        .ok()
+        .map(|text| clean_context_text(&text))
+        .filter(|text| !text.is_empty())
 }
 
 fn latest_assistant_message_has_question(
@@ -460,59 +434,6 @@ fn opencode_text_part_has_question(data: &str) -> bool {
         .get("text")
         .and_then(Value::as_str)
         .is_some_and(|text| text.contains('?'))
-}
-
-fn opencode_part_context(role: Option<&str>, data: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(data).ok()?;
-    match value.get("type")?.as_str()? {
-        "text" => {
-            let text = clean_context_text(value.get("text")?.as_str()?);
-            if text.is_empty() {
-                None
-            } else {
-                Some(format!("{}: {text}", role.unwrap_or("message")))
-            }
-        }
-        "reasoning" => {
-            let text = clean_context_text(value.get("text")?.as_str()?);
-            if text.is_empty() {
-                None
-            } else {
-                Some(format!("reasoning: {text}"))
-            }
-        }
-        "tool" => opencode_tool_context(&value),
-        _ => None,
-    }
-}
-
-fn opencode_tool_context(value: &Value) -> Option<String> {
-    let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
-    let state = value.get("state")?;
-    let status = state
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let title = state
-        .get("title")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            state
-                .get("metadata")
-                .and_then(|metadata| metadata.get("description"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            state
-                .get("input")
-                .and_then(|input| input.get("description"))
-                .and_then(Value::as_str)
-        })
-        .map(clean_context_text)
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| String::from("running tool"));
-
-    Some(format!("tool {tool}: {title} ({status})"))
 }
 
 fn clean_context_text(value: &str) -> String {
@@ -745,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn includes_recent_text_and_tool_context() {
+    fn context_includes_latest_assistant_text_only_without_prefix() {
         let db = test_db();
         insert_session(&db, "one", "/tmp/project", "Build feature", None);
         insert_message(&db, "msg-user", "one", 10, "user");
@@ -760,35 +681,77 @@ mod tests {
         insert_completed_message(&db, "msg-assistant", "one", 20, "assistant");
         insert_part(
             &db,
-            "part-tool",
+            "part-reasoning",
             "msg-assistant",
             "one",
             21,
+            r#"{"type":"reasoning","text":"Internal chain of thought."}"#,
+        );
+        insert_part(
+            &db,
+            "part-tool",
+            "msg-assistant",
+            "one",
+            22,
             r#"{"type":"tool","tool":"bash","state":{"status":"completed","title":"Runs tests"}}"#,
         );
         insert_part(
             &db,
-            "part-assistant",
+            "part-assistant-a",
             "msg-assistant",
             "one",
-            22,
+            23,
             r#"{"type":"text","text":"Implemented and verified."}"#,
+        );
+        insert_part(
+            &db,
+            "part-assistant-b",
+            "msg-assistant",
+            "one",
+            24,
+            r#"{"type":"text","text":"Second text part."}"#,
         );
 
         let session = resolve_opencode_session(&db, "/tmp/project", "Build feature")
             .expect("unique session should resolve");
 
-        assert!(session.context.contains("user: Can you wire this up?"));
-        assert!(
-            session
-                .context
-                .contains("tool bash: Runs tests (completed)")
+        assert_eq!(
+            session.context,
+            "Implemented and verified. Second text part."
         );
-        assert!(
-            session
-                .context
-                .contains("assistant: Implemented and verified.")
+        assert!(!session.context.contains("assistant:"));
+        assert!(!session.context.contains("Can you wire this up?"));
+        assert!(!session.context.contains("Internal chain of thought."));
+        assert!(!session.context.contains("Runs tests"));
+    }
+
+    #[test]
+    fn context_is_empty_when_latest_message_is_not_assistant() {
+        let db = test_db();
+        insert_session(&db, "one", "/tmp/project", "Build feature", None);
+        insert_completed_message(&db, "msg-assistant", "one", 10, "assistant");
+        insert_part(
+            &db,
+            "part-assistant",
+            "msg-assistant",
+            "one",
+            11,
+            r#"{"type":"text","text":"Earlier answer."}"#,
         );
+        insert_message(&db, "msg-user", "one", 20, "user");
+        insert_part(
+            &db,
+            "part-user",
+            "msg-user",
+            "one",
+            21,
+            r#"{"type":"text","text":"Follow-up question?"}"#,
+        );
+
+        let session = resolve_opencode_session(&db, "/tmp/project", "Build feature")
+            .expect("unique session should resolve");
+
+        assert_eq!(session.context, "No OpenCode message context found.");
     }
 
     #[test]

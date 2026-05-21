@@ -10,8 +10,8 @@ use crate::tmux::TmuxPane;
 
 const PI_AGENT_DIR: &str = ".pi/agent";
 const PI_SESSION_DIR_NAME: &str = "sessions";
-const PI_CONTEXT_LINE_LIMIT: usize = 12;
-const PI_CONTEXT_TEXT_LIMIT: usize = 240;
+const PI_CONTEXT_LINE_LIMIT: usize = 80;
+const PI_CONTEXT_TEXT_LIMIT: usize = 4000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiSession {
