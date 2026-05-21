@@ -37,6 +37,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 These are the commands that matter most in day-to-day use:
 
 - `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace, with state, PID, CPU, memory, age, and YOLO controls for Claude and Codex
+- `prompt` to run a one-shot prompt through a new interactive Claude TUI in tmux and print only the final assistant text to stdout
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
@@ -58,6 +59,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - run `dashboard` as a popup-sized TUI across Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace with per-pane YOLO controls for Claude and Codex
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
+- run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
 
 ## Docs
@@ -105,8 +107,11 @@ From there:
 - Use `yolo` for one Claude Code or Codex pane that is blocked on a supported permission dialog.
 - Use `serve` when you need a foreground event stream or localhost HTTP API.
 - Use `last-message` when you need the full latest assistant reply as Markdown.
+- Use `prompt` when you want `botctl` to launch Claude, submit one prompt, wait for the reply, and print only assistant text.
 
 ```bash
+botctl prompt --text "Summarize this repo"
+cat prompt.md | botctl prompt --stdin --cwd /path/to/project
 botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
 botctl last-message --pane 0:6.0 --out -
@@ -155,6 +160,16 @@ cargo run -- last-message --pane 0:4.1
 cargo run -- last-message --pane 0:4.1 --out last-agent-message.md
 cargo run -- last-message --pane 0:4.1 --out -
 ```
+
+Run a one-shot prompt through an interactive Claude TUI in a new tmux session:
+
+```bash
+cargo run -- prompt --text "Say exactly hello"
+cargo run -- prompt --source task.md --append-system-prompt rules.md
+printf 'Summarize this input' | cargo run -- prompt --stdin
+```
+
+`prompt` does not use `claude -p` or `--prompt`; it waits for `ChatReady`, submits through the existing guarded external-editor/keybinding handoff, leaves the tmux session running, sends progress to stderr, and prints assistant text only on stdout.
 
 Run the observer and a localhost HTTP API for a web UI:
 

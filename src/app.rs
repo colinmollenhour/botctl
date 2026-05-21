@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -26,8 +26,8 @@ use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
     KeepGoingArgs, LastMessageArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs,
-    PreparePromptArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs, StartArgs,
-    StatusArgs, SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
+    PreparePromptArgs, PromptRunArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs,
+    StartArgs, StatusArgs, SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
@@ -164,6 +164,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::ContinueSession(args) => run_continue_session(args),
         Command::AutoUnstick(args) => run_auto_unstick(args),
         Command::KeepGoing(args) => run_keep_going(args),
+        Command::Prompt(args) => run_prompt(args),
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
@@ -1730,6 +1731,430 @@ fn is_keep_going_chat_input_line(line: &str) -> bool {
 fn keep_going_starts_with_numbered_option(line: &str) -> bool {
     let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digits > 0 && line[digits..].starts_with('.')
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPromptRunInput {
+    temp_file: Option<PathBuf>,
+    submitted_text: String,
+}
+
+fn run_prompt(args: PromptRunArgs) -> AppResult<String> {
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let session_name = args
+        .session_name
+        .clone()
+        .unwrap_or_else(default_prompt_session_name);
+    let resolved_input = resolve_prompt_run_input(&args, &state_dir, &session_name)?;
+    let result = run_prompt_with_resolved_input(&args, &state_dir, &session_name, &resolved_input);
+    cleanup_prompt_temp(&resolved_input, args.keep_temp);
+    result
+}
+
+fn run_prompt_with_resolved_input(
+    args: &PromptRunArgs,
+    state_dir: &Path,
+    session_name: &str,
+    resolved_input: &ResolvedPromptRunInput,
+) -> AppResult<String> {
+    let cwd = match args.cwd.clone() {
+        Some(cwd) => cwd,
+        None => std::env::current_dir()?,
+    };
+    let client = TmuxClient::default();
+    let request = StartSessionRequest {
+        session_name: session_name.to_string(),
+        window_name: args.window_name.clone(),
+        cwd,
+        command: args.command.clone(),
+    };
+
+    eprintln!("prompt: starting tmux session {session_name}");
+    client.start_session(&request)?;
+    let mut pane = client
+        .active_pane_for_window(session_name, &args.window_name)?
+        .ok_or_else(|| {
+            AppError::with_exit_code(
+                format!(
+                    "no active pane found for prompt session {} window {}",
+                    session_name, args.window_name
+                ),
+                2,
+            )
+        })?;
+
+    eprintln!(
+        "prompt: waiting for Claude pane {} to become ready",
+        pane.pane_id
+    );
+    wait_for_prompt_pane_ready(
+        &client,
+        &pane,
+        args,
+        Duration::from_millis(args.ready_timeout_ms),
+    )?;
+    pane = resolve_pane_by_id(&client, &pane.pane_id)?;
+    ensure_pane_owned_by_claude(&pane)
+        .map_err(|error| AppError::with_exit_code(error.to_string(), 2))?;
+    let pre_submit_message = load_last_agent_message(&pane).ok();
+    submit_prompt_for_pane(
+        &client,
+        &pane,
+        session_name,
+        Some(state_dir),
+        args.workspace.as_deref(),
+        &resolved_input.submitted_text,
+        args.submit_delay_ms,
+    )?;
+    eprintln!("prompt: submitted prompt to pane {}", pane.pane_id);
+    wait_for_prompt_response_start(
+        &client,
+        &pane,
+        args,
+        Duration::from_millis(args.idle_timeout_ms),
+    )?;
+    eprintln!("prompt: waiting for assistant response");
+    wait_for_prompt_completion(
+        &client,
+        &pane,
+        args,
+        Duration::from_millis(args.idle_timeout_ms),
+    )?;
+    let message = wait_for_fresh_last_message(
+        &pane,
+        pre_submit_message.as_ref(),
+        Duration::from_millis(args.ready_timeout_ms.min(args.idle_timeout_ms)),
+    )?;
+
+    Ok(message.text)
+}
+
+fn cleanup_prompt_temp(resolved_input: &ResolvedPromptRunInput, keep_temp: bool) {
+    if let Some(temp_file) = &resolved_input.temp_file {
+        if keep_temp {
+            eprintln!(
+                "prompt: kept large prompt instructions at {}",
+                temp_file.display()
+            );
+            return;
+        }
+        if let Err(error) = fs::remove_file(temp_file)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "prompt: warning: failed to remove temp file {}: {}",
+                temp_file.display(),
+                error
+            );
+        }
+        if let Some(parent) = temp_file.parent()
+            && let Err(error) = fs::remove_dir(parent)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "prompt: warning: failed to remove temp directory {}: {}",
+                parent.display(),
+                error
+            );
+        }
+    }
+}
+
+fn default_prompt_session_name() -> String {
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&format_description!(
+            "[hour][minute][second]-[subsecond digits:3]"
+        ))
+        .unwrap_or_else(|_| String::from("now"));
+    format!("botctl-prompt-{}-{timestamp}", std::process::id())
+}
+
+fn resolve_prompt_run_input(
+    args: &PromptRunArgs,
+    state_dir: &Path,
+    session_name: &str,
+) -> AppResult<ResolvedPromptRunInput> {
+    let combined = compose_prompt_run_content(args)?;
+    if combined.len() <= args.large_prompt_threshold {
+        return Ok(ResolvedPromptRunInput {
+            temp_file: None,
+            submitted_text: combined,
+        });
+    }
+
+    let temp_file = write_prompt_instruction_temp_file(state_dir, session_name, &combined)?;
+    eprintln!(
+        "prompt: wrote large prompt instructions to {}",
+        temp_file.display()
+    );
+    let submitted_text = format!(
+        "Follow the instructions in this UTF-8 text file, then respond normally in this chat:\n\n{}",
+        temp_file.display()
+    );
+    Ok(ResolvedPromptRunInput {
+        temp_file: Some(temp_file),
+        submitted_text,
+    })
+}
+
+fn compose_prompt_run_content(args: &PromptRunArgs) -> AppResult<String> {
+    let mut sections = Vec::new();
+    for path in &args.append_system_prompts {
+        sections.push(format!(
+            "--- system prompt: {} ---\n{}",
+            path.display(),
+            fs::read_to_string(path)?
+        ));
+    }
+
+    let mut user_parts = Vec::new();
+    for path in &args.sources {
+        user_parts.push((
+            format!("source: {}", path.display()),
+            fs::read_to_string(path)?,
+        ));
+    }
+    if let Some(text) = &args.text {
+        user_parts.push((String::from("text"), text.clone()));
+    }
+    let should_read_stdin = args.stdin || (user_parts.is_empty() && !io::stdin().is_terminal());
+    if should_read_stdin {
+        if io::stdin().is_terminal() {
+            return Err(AppError::with_exit_code(
+                "prompt --stdin cannot read from an interactive terminal; pipe data or use --text/--source",
+                2,
+            ));
+        }
+        let mut stdin_text = String::new();
+        io::stdin().read_to_string(&mut stdin_text)?;
+        user_parts.push((String::from("stdin"), stdin_text));
+    }
+    if user_parts
+        .iter()
+        .all(|(_, content)| content.trim().is_empty())
+    {
+        return Err(AppError::with_exit_code(
+            "prompt input must not be empty",
+            2,
+        ));
+    }
+    if user_parts.is_empty() {
+        return Err(AppError::with_exit_code(
+            "prompt input requires --source, --text, --stdin, or piped stdin",
+            2,
+        ));
+    }
+
+    if user_parts.len() == 1 {
+        sections.push(format!("--- user prompt ---\n{}", user_parts.remove(0).1));
+    } else {
+        for (label, content) in user_parts {
+            sections.push(format!("--- user prompt: {label} ---\n{content}"));
+        }
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn write_prompt_instruction_temp_file(
+    state_dir: &Path,
+    session_name: &str,
+    content: &str,
+) -> AppResult<PathBuf> {
+    let run_id = new_artifact_id("prompt", session_name, None)?;
+    let dir = state_dir.join("prompt-runs").join(run_id);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("instructions.md");
+    let mut file = private_create_file(&path)?;
+    writeln!(file, "# botctl prompt instruction file\n")?;
+    writeln!(file, "Session: {session_name}")?;
+    writeln!(file, "Generated: {}\n", current_babysit_timestamp())?;
+    file.write_all(content.as_bytes())?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn private_create_file(path: &Path) -> AppResult<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn private_create_file(path: &Path) -> AppResult<File> {
+    Ok(fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?)
+}
+
+fn wait_for_prompt_pane_ready(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    args: &PromptRunArgs,
+    timeout: Duration,
+) -> AppResult<Classification> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current_pane = resolve_pane_by_id(client, &pane.pane_id)?;
+        if !is_pane_command_claude(&current_pane) {
+            if Instant::now() >= deadline {
+                return Err(AppError::with_exit_code(
+                    format!(
+                        "timed out waiting for prompt pane {} to run claude; last command {}",
+                        pane.pane_id, current_pane.current_command
+                    ),
+                    2,
+                ));
+            }
+            thread::sleep(Duration::from_millis(args.poll_ms));
+            continue;
+        }
+        let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+        if inspected.classification.state == SessionState::ChatReady {
+            return Ok(inspected.classification);
+        }
+        prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
+        if Instant::now() >= deadline {
+            return Err(AppError::new(format!(
+                "timed out waiting for pane {} to become ChatReady; last state {}",
+                pane.pane_id,
+                inspected.classification.state.as_str()
+            )));
+        }
+        thread::sleep(Duration::from_millis(args.poll_ms));
+    }
+}
+
+fn wait_for_prompt_response_start(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    args: &PromptRunArgs,
+    timeout: Duration,
+) -> AppResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+        if inspected.classification.state != SessionState::ChatReady {
+            prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::new(format!(
+                "timed out waiting for pane {} to leave ChatReady after prompt submission",
+                pane.pane_id
+            )));
+        }
+        thread::sleep(Duration::from_millis(args.poll_ms));
+    }
+}
+
+fn wait_for_prompt_completion(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    args: &PromptRunArgs,
+    timeout: Duration,
+) -> AppResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+        if inspected.classification.state == SessionState::ChatReady {
+            return Ok(());
+        }
+        prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
+        if Instant::now() >= deadline {
+            return Err(AppError::new(format!(
+                "timed out waiting for assistant response in pane {}; last state {}",
+                pane.pane_id,
+                inspected.classification.state.as_str()
+            )));
+        }
+        thread::sleep(Duration::from_millis(args.poll_ms));
+    }
+}
+
+fn prompt_wait_step(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    inspected: &InspectedPane,
+    no_yolo: bool,
+) -> AppResult<()> {
+    match inspected.classification.state {
+        SessionState::BusyResponding => Ok(()),
+        SessionState::SurveyPrompt if !no_yolo => {
+            execute_classified_workflow(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::DismissSurvey,
+                &inspected.classification,
+            )?;
+            Ok(())
+        }
+        SessionState::FolderTrustPrompt if !no_yolo => {
+            execute_classified_workflow(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::ApprovePermission,
+                &inspected.classification,
+            )?;
+            Ok(())
+        }
+        SessionState::PermissionDialog if !no_yolo && is_yolo_safe_to_approve(inspected) => {
+            execute_classified_workflow(
+                client,
+                &pane.pane_id,
+                GuardedWorkflow::ApprovePermission,
+                &inspected.classification,
+            )?;
+            Ok(())
+        }
+        state => Err(AppError::with_exit_code(
+            format!(
+                "prompt refused to continue from pane {} state {}; review manually{}",
+                pane.pane_id,
+                state.as_str(),
+                if no_yolo { " (--no-yolo)" } else { "" }
+            ),
+            2,
+        )),
+    }
+}
+
+fn wait_for_fresh_last_message(
+    pane: &TmuxPane,
+    prior: Option<&crate::last_message::LastAgentMessage>,
+    timeout: Duration,
+) -> AppResult<crate::last_message::LastAgentMessage> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        match load_last_agent_message(pane) {
+            Ok(message)
+                if prior
+                    .map(|old| old.session_id != message.session_id || old.text != message.text)
+                    .unwrap_or(true) =>
+            {
+                return Ok(message);
+            }
+            Ok(_) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::new(match last_error {
+                Some(error) if prior.is_none() => {
+                    format!(
+                        "Claude became ready but no assistant transcript message was found: {error}"
+                    )
+                }
+                _ => String::from(
+                    "Claude became ready but no new assistant transcript message was found; refusing to print stale output",
+                ),
+            }));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
@@ -3979,9 +4404,9 @@ mod tests {
         DASHBOARD_TARGET_TMUX_SOCKET_ENV, DashboardArgs, InspectedPane,
         KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
         ObserveArtifactPaths, RecoveryAction, YoloAction, artifact_state_dir_result,
-        cleanup_babysit_record, ensure_pane_owned_by_claude, ensure_state_transition,
-        extract_keep_going_response, extract_permission_prompt_details, focused_frame_source,
-        is_usable_state, is_yolo_safe_to_approve, keep_going_no_yolo_blocker,
+        cleanup_babysit_record, compose_prompt_run_content, ensure_pane_owned_by_claude,
+        ensure_state_transition, extract_keep_going_response, extract_permission_prompt_details,
+        focused_frame_source, is_usable_state, is_yolo_safe_to_approve, keep_going_no_yolo_blocker,
         parse_env_value_from_environ_bytes, permission_manual_review_reason,
         persistent_dashboard_child_command_with_target_socket, prompt_submission_started,
         raw_key_for_workflow, recovery_action_for_state, render_babysit_action_event,
@@ -3989,15 +4414,16 @@ mod tests {
         render_guarded_workflow_output, render_keep_going_wait_message, render_list_panes,
         render_next_safe_action, render_observe_command_output, render_screen_excerpt,
         render_serve_event_payload, render_status_report, resolve_keep_going_prompt,
-        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
-        submit_prompt_preflight_workflow, tmux_socket_path_from_value, yolo_action_for_state,
+        resolve_prompt_run_input, run_prepare_prompt, shell_escape,
+        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
+        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
         Classification, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
         SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
     };
-    use crate::cli::PreparePromptArgs;
+    use crate::cli::{PreparePromptArgs, PromptRunArgs};
     use crate::prompt::pending_prompt_text;
     use crate::serve::{ServeEvent, ServeRequest};
     use crate::storage::{CURRENT_SCHEMA_VERSION, resolve_workspace_for_path, state_db_path};
@@ -4030,6 +4456,108 @@ mod tests {
             status,
             missing_bindings: vec![],
         }
+    }
+
+    fn prompt_args_for_test() -> PromptRunArgs {
+        PromptRunArgs {
+            session_name: None,
+            window_name: String::from("claude"),
+            cwd: None,
+            command: String::from("claude"),
+            sources: Vec::new(),
+            text: Some(String::from("hello")),
+            stdin: false,
+            append_system_prompts: Vec::new(),
+            poll_ms: 1000,
+            submit_delay_ms: 250,
+            ready_timeout_ms: 30_000,
+            idle_timeout_ms: 600_000,
+            state_dir: None,
+            workspace: None,
+            large_prompt_threshold: 8192,
+            keep_temp: false,
+            no_yolo: false,
+        }
+    }
+
+    #[test]
+    fn prompt_run_combines_system_and_user_sources() {
+        let root = unique_temp_dir("prompt-run-combine");
+        fs::create_dir_all(&root).expect("temp dir should exist");
+        let rules = root.join("rules.md");
+        let source = root.join("source.md");
+        fs::write(&rules, "be brief\n").expect("rules should write");
+        fs::write(&source, "from file\n").expect("source should write");
+        let mut args = prompt_args_for_test();
+        args.append_system_prompts = vec![rules.clone()];
+        args.sources = vec![source.clone()];
+        args.text = Some(String::from("inline"));
+
+        let content = compose_prompt_run_content(&args).expect("content should compose");
+
+        assert!(content.contains(&format!("--- system prompt: {} ---", rules.display())));
+        assert!(content.contains("be brief"));
+        assert!(content.contains(&format!(
+            "--- user prompt: source: {} ---",
+            source.display()
+        )));
+        assert!(content.contains("from file"));
+        assert!(content.contains("--- user prompt: text ---\ninline"));
+    }
+
+    #[test]
+    fn prompt_run_rejects_empty_user_prompt() {
+        let mut args = prompt_args_for_test();
+        args.text = Some(String::from("  \n\t"));
+
+        let error = compose_prompt_run_content(&args).expect_err("empty input should fail");
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("prompt input must not be empty"));
+    }
+
+    #[test]
+    fn prompt_run_uses_temp_file_above_threshold() {
+        let root = unique_temp_dir("prompt-run-temp");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).expect("state dir should exist");
+        let mut args = prompt_args_for_test();
+        args.text = Some(String::from("this prompt is intentionally long"));
+        args.large_prompt_threshold = 4;
+
+        let resolved = resolve_prompt_run_input(&args, &state_dir, "demo/session")
+            .expect("large prompt should resolve through temp file");
+        let temp_file = resolved.temp_file.expect("temp file should exist");
+
+        assert!(temp_file.starts_with(state_dir.join("prompt-runs")));
+        assert!(temp_file.ends_with("instructions.md"));
+        assert!(
+            resolved
+                .submitted_text
+                .contains(&temp_file.display().to_string())
+        );
+        assert!(!resolved.submitted_text.contains("intentionally long"));
+        assert!(
+            fs::read_to_string(temp_file)
+                .expect("temp should read")
+                .contains("intentionally long")
+        );
+    }
+
+    #[test]
+    fn prompt_instruction_temp_file_sanitizes_session_path() {
+        let root = unique_temp_dir("prompt-run-temp-path");
+        fs::create_dir_all(&root).expect("temp dir should exist");
+        let path = write_prompt_instruction_temp_file(&root, "demo/session:%1", "hello")
+            .expect("temp instruction should write");
+
+        assert!(path.starts_with(root.join("prompt-runs")));
+        assert!(!path.display().to_string().contains("demo/session"));
+        assert!(
+            fs::read_to_string(path)
+                .expect("temp should read")
+                .contains("hello")
+        );
     }
 
     #[test]

@@ -153,6 +153,38 @@ Then:
 - If the state is `ExternalEditorActive`, finish the editor handoff manually or with `editor-helper`.
 - If the state is `DiffDialog`, review the diff manually.
 
+## `prompt` fails or prints no answer
+
+Symptoms:
+
+- `prompt --stdin` says stdin is interactive.
+- `prompt` refuses `Unknown`, `PlanApprovalPrompt`, `DiffDialog`, `ExternalEditorActive`, or an unsafe permission prompt.
+- `prompt` reports that Claude became ready but no new assistant transcript message was found.
+
+Cause:
+
+`prompt` is a guarded TUI workflow, not a headless `claude -p` wrapper. It needs real input, a Claude-owned pane, safe classified states, working Claude keybindings, and a fresh transcript message before it will print to stdout.
+
+Fix:
+
+```bash
+botctl prompt --text "Say exactly hello"
+printf 'Say exactly hello' | botctl prompt --stdin
+botctl prompt --text "Say exactly hello" --no-yolo
+```
+
+Then inspect the left-running tmux session if needed:
+
+```bash
+botctl list --all
+botctl doctor --pane %19
+```
+
+- Use `--text` or pipe data when stdin is a terminal.
+- Run `botctl doctor` if keybindings are missing.
+- Review unsafe blockers manually; `--no-yolo` makes supported blockers fail instead of auto-recovering.
+- If stale/no transcript output persists, attach to the tmux session and verify Claude wrote a response in the same workspace.
+
 ## YOLO already active
 
 Symptoms:

@@ -11,6 +11,7 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 Most users only need a few commands:
 
 - `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode visibility
+- `prompt` for one-shot Claude prompts that still run through an inspectable tmux TUI
 - `yolo` for automated babysitting and recovery
 - `serve` for a long-lived observation stream
 - `last-message` when you need the full latest assistant reply instead of the visible terminal excerpt
@@ -65,6 +66,15 @@ botctl help
    ```
 
 Use `botctl help <command>` when you need terminal-local syntax.
+
+For a one-shot prompt that launches Claude in a new tmux session, submits through the guarded TUI path, and prints only the assistant answer to stdout:
+
+```bash
+botctl prompt --text "Summarize this repo"
+printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
+```
+
+Progress is written to stderr; the tmux session remains available for inspection.
 
 ## First session
 
