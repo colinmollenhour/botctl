@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::app::{AppError, AppResult};
 use crate::opencode;
+use crate::pi;
 use crate::tmux::TmuxPane;
 
 const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
@@ -27,6 +28,10 @@ pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
         return load_opencode_last_message(pane);
     }
 
+    if pane.current_command.eq_ignore_ascii_case("pi") {
+        return load_pi_last_message(pane);
+    }
+
     if pane.current_command.eq_ignore_ascii_case("codex")
         || (pane.current_command.eq_ignore_ascii_case("node")
             && !pane.pane_title.starts_with("OC | "))
@@ -35,7 +40,7 @@ pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
     }
 
     Err(AppError::new(format!(
-        "last-message supports Claude, Codex, and OpenCode panes; pane {} is running {}",
+        "last-message supports Claude, Codex, OpenCode, and Pi panes; pane {} is running {}",
         pane.pane_id, pane.current_command
     )))
 }
@@ -74,6 +79,22 @@ fn load_opencode_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
         .ok_or_else(|| AppError::new("no OpenCode session resolved for pane"))?;
     Ok(LastAgentMessage {
         provider: "OpenCode",
+        session_id: message.session_id,
+        text: message.text,
+    })
+}
+
+fn load_pi_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
+    let session = pi::resolve_pi_session_for_pane(pane)?
+        .ok_or_else(|| AppError::new("no Pi session resolved for pane"))?;
+    let message = pi::latest_assistant_message_for_pane(pane)?.ok_or_else(|| {
+        AppError::new(format!(
+            "no assistant text message found in Pi transcript {}",
+            session.path.display()
+        ))
+    })?;
+    Ok(LastAgentMessage {
+        provider: "Pi",
         session_id: message.session_id,
         text: message.text,
     })

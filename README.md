@@ -1,10 +1,10 @@
 # botctl
 
-`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, and OpenCode sessions visible and controlled inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, and Pi sessions visible and controlled inside `tmux`.
 
-It can launch and safely drive Claude Code panes, classify Codex CLI panes from tmux screen captures with narrow YOLO approval for command permission dialogs, and passively discover OpenCode panes for dashboard visibility, recent-message context, state classification, and tmux window status.
+It can launch and safely drive Claude Code panes, classify Codex CLI panes from tmux screen captures with narrow YOLO approval for command permission dialogs, passively discover OpenCode panes, and discover Pi panes from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status.
 
-It can also dump the latest persisted assistant message from a Claude, Codex, or OpenCode pane to a Markdown file with `last-message`.
+It can also dump the latest persisted assistant message from a Claude, Codex, OpenCode, or Pi pane to a Markdown file with `last-message`.
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
@@ -36,7 +36,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 
 These are the commands that matter most in day-to-day use:
 
-- `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes, grouped by workspace, with state, PID, CPU, memory, age, and YOLO controls for Claude and Codex
+- `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace, with state, PID, CPU, memory, age, and YOLO controls for Claude and Codex
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
@@ -49,13 +49,13 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 
 - launch a managed Claude Code session in tmux
 - classify Codex CLI panes from captured terminal screens and approve command permission dialogs with YOLO
-- passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database
+- passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database, and Pi panes by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions`
 - list panes and inspect tmux metadata, including each tracked pane PID
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude Code or Codex CLI pane
-- dump the latest persisted assistant message from Claude, Codex, or OpenCode to `MESSAGE_<provider-session-id>.md` or a path passed with `--out`
+- dump the latest persisted assistant message from Claude, Codex, OpenCode, or Pi to `MESSAGE_<provider-session-id>.md` or a path passed with `--out`
 - run `serve` as a foreground long-lived observer for one tmux session
-- run `dashboard` as a popup-sized TUI across Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes, grouped by workspace with per-pane YOLO controls for Claude and Codex
+- run `dashboard` as a popup-sized TUI across Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace with per-pane YOLO controls for Claude and Codex
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
@@ -118,7 +118,7 @@ Use `cargo run -- ...` instead of `botctl ...` when running from a source checko
 
 Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
 
-Open the live dashboard across Claude Code and resolvable OpenCode panes:
+Open the live dashboard across Claude Code, Codex, OpenCode, and Pi panes:
 
 ```bash
 cargo run -- dashboard
@@ -221,13 +221,13 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups Claude Code panes, screen-detected Codex CLI panes, and resolvable OpenCode panes by workspace, shows the current classified state, pane PID, process-tree average CPU, memory, and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes by workspace, shows the current classified state, pane PID, process-tree average CPU, memory, and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
-The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
+The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode and Pi support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
 
 Codex CLI panes are included by capturing likely Codex terminal panes and requiring Codex screen text such as the OpenAI Codex header, Codex-specific prompt/approval language, or a `/statusline` that includes the `run-state` field. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; broader prompt submission and keybinding-based automation remain Claude-only.
 
-Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude Code and resolvable OpenCode panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
+Persistent mode creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket. It then attaches to that session, so if you launch it from `tmux display-popup`, tmux keeps control of popup size and closing the popup only detaches from the persistent dashboard. When launched from tmux, the persistent dashboard captures the outer tmux socket first and continues inspecting that outer server's Claude Code panes, resolvable OpenCode panes, and Pi panes instead of its own dedicated dashboard pane. Inside persistent mode, pressing `q` also detaches instead of stopping the dashboard process.
 
 ## Recovery And Prompt Work
 

@@ -1,8 +1,8 @@
 # Getting started
 
-`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, and OpenCode sessions visible and controlled inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, and Pi sessions visible and controlled inside `tmux`.
 
-Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status.
+Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively from their SQLite database. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status.
 
 For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
@@ -151,7 +151,7 @@ The dashboard uses one emoji per pane to show the current classified state at a 
 | `🧾` | `DiffDialog` | Waiting on a diff review choice | manual review |
 | `❔` | `Unknown` | Not classified safely | inspect before acting |
 
-OpenCode panes can appear in the same dashboard without terminal capture or keypress automation. They are included only when the tmux command is `opencode`, the pane title is `OC | <session title>`, and OpenCode's SQLite database has exactly one `session` row whose `directory` matches the pane cwd and whose `title` matches the stripped pane title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. If that match is missing, duplicated, ambiguous, or unreadable, the pane is ignored rather than guessed. Resolved OpenCode panes show a bounded recent-message excerpt from SQLite `message`/`part` rows and can show `PermissionDialog` when a running file/glob tool targets an absolute path outside the session directory. OpenCode panes are navigable and contribute window-title emojis, but YOLO and recovery actions are not enabled for OpenCode.
+OpenCode panes can appear in the same dashboard without terminal capture or keypress automation. They are included only when the tmux command is `opencode`, the pane title is `OC | <session title>`, and OpenCode's SQLite database has exactly one `session` row whose `directory` matches the pane cwd and whose `title` matches the stripped pane title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. If that match is missing, duplicated, ambiguous, or unreadable, the pane is ignored rather than guessed. Resolved OpenCode panes show a bounded recent-message excerpt from SQLite `message`/`part` rows and can show `PermissionDialog` when a running file/glob tool targets an absolute path outside the session directory. OpenCode and Pi panes are navigable and contribute window-title emojis, but YOLO and recovery actions are not enabled for them.
 
 Codex CLI panes can also appear in the same dashboard. They are included only after `botctl` captures a likely Codex pane and sees Codex screen text such as the OpenAI Codex header, Codex approval prompt language, or a `/statusline` with `run-state`. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex panes are navigable and classified from their screen, and Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`. Broader recovery actions remain Claude-only.
 
@@ -172,7 +172,7 @@ Dumped last message of 951 lines out to file:
 MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
 ```
 
-Use `--out -` to stream the raw Markdown body to stdout instead of writing a file. The command supports Claude, Codex, and OpenCode transcript storage. Claude is resolved from `~/.claude/projects`, Codex from `~/.codex/sessions`, and OpenCode from its SQLite `message`/`part` rows after the same pane title plus cwd resolution used by the dashboard. It writes assistant-visible text only; tool calls and provider metadata are not included.
+Use `--out -` to stream the raw Markdown body to stdout instead of writing a file. The command supports Claude, Codex, OpenCode, and Pi transcript storage. Claude is resolved from `~/.claude/projects`, Codex from `~/.codex/sessions`, OpenCode from its SQLite `message`/`part` rows after the same pane title plus cwd resolution used by the dashboard, and Pi from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`). It writes assistant-visible text only; tool calls and provider metadata are not included.
 
 If you use tmux, this is the recommended way to launch the dashboard as a popup and keep it alive:
 

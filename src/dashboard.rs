@@ -30,6 +30,7 @@ use crate::automation::GuardedWorkflow;
 use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
 use crate::opencode::resolve_opencode_session_for_pane;
+use crate::pi::resolve_pi_session_for_pane;
 use crate::prompt::resolve_state_dir;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
@@ -187,6 +188,7 @@ enum PaneSource {
     Claude,
     Codex,
     OpenCode { session_id: String, title: String },
+    Pi { session_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +316,51 @@ impl DashboardApp {
                     yes_count,
                     claude_session_id,
                     focused_source: inspected.focused_source,
+                    resource_usage,
+                });
+                continue;
+            }
+
+            if let Some(pi_session) = resolve_pi_session_for_pane(&pane)? {
+                seen_pane_ids.insert(pane.pane_id.clone());
+                self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
+
+                let workspace =
+                    resolve_workspace_for_path(&self.state_dir, Path::new(&pane.current_path))?;
+                let workspace_group_key = workspace_group_key(&workspace);
+                let workspace_group_label = workspace_group_label(&workspace_group_key);
+                let branch = branch_by_path
+                    .entry(pane.current_path.clone())
+                    .or_insert_with(|| git_branch_for_path(&pane.current_path))
+                    .clone();
+                let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+                    self.first_seen
+                        .get(&pane.pane_id)
+                        .map(Instant::elapsed)
+                        .unwrap_or_default()
+                });
+                let resource_usage =
+                    self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+
+                panes.push(PaneEntry {
+                    pane,
+                    source: PaneSource::Pi {
+                        session_id: pi_session.id,
+                    },
+                    workspace,
+                    workspace_group_key,
+                    workspace_group_label,
+                    branch,
+                    state: pi_session.state,
+                    has_questions: pi_session.has_questions,
+                    recap_present: false,
+                    recap_excerpt: None,
+                    yolo_enabled: false,
+                    age,
+                    wait_duration: None,
+                    yes_count: 0,
+                    claude_session_id: None,
+                    focused_source: pi_session.context,
                     resource_usage,
                 });
                 continue;
@@ -2066,6 +2113,7 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
         PaneSource::Claude => "Claude",
         PaneSource::Codex => "Codex",
         PaneSource::OpenCode { .. } => "OpenCode",
+        PaneSource::Pi { .. } => "Pi",
     }
 }
 
@@ -2074,6 +2122,7 @@ fn agent_emoji(pane: &PaneEntry) -> &'static str {
         PaneSource::Claude => "❋",
         PaneSource::Codex => "🞇",
         PaneSource::OpenCode { .. } => "⧈",
+        PaneSource::Pi { .. } => "π",
     }
 }
 
@@ -2083,6 +2132,7 @@ fn agent_marker(pane: &PaneEntry) -> &'static str {
         PaneSource::Claude => "C",
         PaneSource::Codex => "X",
         PaneSource::OpenCode { .. } => "O",
+        PaneSource::Pi { .. } => "P",
     }
 }
 
@@ -2091,6 +2141,7 @@ fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
         PaneSource::Claude => pane.claude_session_id.as_deref(),
         PaneSource::Codex => None,
         PaneSource::OpenCode { session_id, .. } => Some(session_id.as_str()),
+        PaneSource::Pi { session_id } => Some(session_id.as_str()),
     }
 }
 
@@ -2595,13 +2646,21 @@ mod tests {
             },
             ..sample_pane_entry(SessionState::ChatReady, false, false, "")
         };
+        let pi = PaneEntry {
+            source: PaneSource::Pi {
+                session_id: String::from("session-one"),
+            },
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        };
 
         assert_eq!(agent_emoji(&claude), "❋");
         assert_eq!(agent_emoji(&opencode), "⧈");
         assert_eq!(agent_emoji(&codex), "🞇");
+        assert_eq!(agent_emoji(&pi), "π");
         assert_eq!(agent_marker(&claude), "C");
         assert_eq!(agent_marker(&opencode), "O");
         assert_eq!(agent_marker(&codex), "X");
+        assert_eq!(agent_marker(&pi), "P");
     }
 
     #[test]

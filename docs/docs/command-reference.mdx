@@ -2,7 +2,7 @@
 
 This page is the current CLI reference for shipped commands and aliases.
 
-`botctl` supports Claude Code as an actively guarded automation target, Codex CLI as a screen-classified target with narrow YOLO permission approval, and OpenCode as a passively discovered dashboard target. Codex panes are visible when captured terminal text identifies a Codex screen; Codex YOLO can send `y` for `Yes, proceed` on command permission dialogs. OpenCode panes are visible when their tmux title and cwd can be matched safely to OpenCode's SQLite session database. Broader keybinding automation remains Claude-only.
+`botctl` supports Claude Code as an actively guarded automation target, Codex CLI as a screen-classified target with narrow YOLO permission approval, OpenCode as a passively discovered dashboard target, and Pi as a passively discovered dashboard/last-message target. Codex panes are visible when captured terminal text identifies a Codex screen; Codex YOLO can send `y` for `Yes, proceed` on command permission dialogs. OpenCode panes are visible when their tmux title and cwd can be matched safely to OpenCode's SQLite session database. Pi panes are visible when a `pi` tmux command can be matched to a Pi JSONL session under `~/.pi/agent/sessions`. Broader keybinding automation remains Claude-only.
 
 Global conventions:
 
@@ -58,7 +58,7 @@ Notes:
 
 ### `dashboard`
 
-Purpose: open the live TUI for Claude Code panes, screen-detected Codex CLI panes, and passively resolvable OpenCode panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude and Codex.
+Purpose: open the live TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Pi panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude and Codex.
 
 Syntax:
 ```bash
@@ -83,9 +83,10 @@ Notes:
 - also scans OpenCode panes when the tmux pane title is `OC | <session title>` and exactly one OpenCode SQLite `session` row matches the pane cwd plus that title
 - accepts OpenCode titles truncated with `...` as a prefix only when that prefix is unique within the same cwd
 - shows a bounded recent-message excerpt for resolved OpenCode panes from SQLite `message`/`part` rows
+- scans Pi panes by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`) and shows assistant text context
 - maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
 - ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
-- Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode support is visibility-only, and broader guarded automation remains Claude-only
+- Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode and Pi support is visibility-only, and broader guarded automation remains Claude-only
 - shows current classified state, wait time, branch, and workspace grouping
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
@@ -275,6 +276,7 @@ botctl last-message --pane %19 --out - | pbcopy
 
 Provider notes:
 - Claude reads the pane's Claude transcript under `~/.claude/projects`, preferring the transcript opened by the pane process and falling back to the newest transcript for the pane cwd.
+- Pi reads JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`), preferring a transcript opened by the pane process tree and falling back to the newest session for the pane cwd.
 - Codex reads `~/.codex/sessions`, preferring an open transcript file descriptor and falling back to the newest session whose `session_meta.cwd` matches the pane cwd.
 - OpenCode resolves the pane by `OC | <session title>` plus cwd, then reads the latest assistant `text` parts from OpenCode's SQLite `message`/`part` rows.
 - Tool calls, reasoning, and provider metadata are not exported; only assistant-visible text is written.
@@ -335,7 +337,7 @@ botctl doctor --session demo --plain
 
 ### `dashboard`
 
-Purpose: open the live dashboard TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Claude/Codex YOLO toggles.
+Purpose: open the live dashboard TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, Pi panes, and Claude/Codex YOLO toggles.
 
 Syntax:
 ```bash
@@ -349,7 +351,7 @@ Flags:
 - `--exit-on-navigate` (optional; exit after jumping to a pane)
 - `--persistent` (optional; keep the dashboard alive in a dedicated tmux session and attach to it)
 
-Targeting: no explicit pane target; scans all Claude Code panes, likely Codex CLI panes with visible Codex screen text, and passively resolvable OpenCode panes.
+Targeting: no explicit pane target; scans all Claude Code panes, likely Codex CLI panes with visible Codex screen text, passively resolvable OpenCode panes, and Pi panes.
 
 Safety:
 - rejects `--poll-ms 0`
