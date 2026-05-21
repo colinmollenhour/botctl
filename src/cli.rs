@@ -501,7 +501,7 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Prompt Workflow:"));
     out.push('\n');
     for line in [
-        "prompt [--text TEXT | --source PATH ... | --stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo]",
+        "prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo]",
         "prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]",
         "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET  [advanced]",
         "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]",
@@ -964,7 +964,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
             "botctl keep-going (--pane TARGET | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]"
         }
         "prompt" => {
-            "botctl prompt [--text TEXT | --source PATH ... | --stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo]"
+            "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo]"
         }
         "prepare-prompt" => {
             "botctl prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]"
@@ -1851,7 +1851,8 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
 
 fn reject_prompt_mode_claude_command(command: &str) -> AppResult<()> {
     let mut saw_claude = false;
-    for token in command.split_whitespace() {
+    let tokens = shell_like_command_tokens(command)?;
+    for token in tokens {
         if saw_claude && (token == "-p" || token == "--prompt" || token.starts_with("--prompt=")) {
             return Err(AppError::new(
                 "prompt --command must launch the interactive Claude TUI; do not use claude -p/--prompt",
@@ -1862,6 +1863,49 @@ fn reject_prompt_mode_claude_command(command: &str) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+fn shell_like_command_tokens(command: &str) -> AppResult<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) if ch == '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push(ch);
+                }
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if let Some(q) = quote {
+        return Err(AppError::new(format!(
+            "prompt --command contains an unterminated {q} quote"
+        )));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
 }
 
 fn parse_u64_flag(args: &[String], index: &mut usize, flag: &str) -> AppResult<u64> {
@@ -3118,6 +3162,42 @@ mod tests {
             .expect_err("prompt should reject zero numeric flags");
 
             assert!(error.to_string().contains(flag));
+        }
+    }
+
+    #[test]
+    fn rejects_prompt_command_prompt_mode_with_shell_quotes() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("prompt"),
+            String::from("--text"),
+            String::from("hi"),
+            String::from("--command"),
+            String::from("/opt/Claude Code/bin/claude --prompt 'hi there'"),
+        ])
+        .expect_err("prompt should reject quoted claude prompt-mode commands");
+
+        assert!(error.to_string().contains("do not use claude -p/--prompt"));
+    }
+
+    #[test]
+    fn accepts_prompt_command_paths_with_spaces() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("prompt"),
+            String::from("--text"),
+            String::from("hi"),
+            String::from("--command"),
+            String::from("'/opt/Claude Code/bin/claude' --dangerously-skip-permissions"),
+        ])
+        .expect("quoted interactive Claude command should parse");
+
+        match command {
+            Command::Prompt(args) => assert_eq!(
+                args.command,
+                "'/opt/Claude Code/bin/claude' --dangerously-skip-permissions"
+            ),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 

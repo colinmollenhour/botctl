@@ -1815,7 +1815,7 @@ fn run_prompt_with_resolved_input(
     let message = wait_for_fresh_last_message(
         &pane,
         pre_submit_message.as_ref(),
-        Duration::from_millis(args.ready_timeout_ms.min(args.idle_timeout_ms)),
+        Duration::from_millis(args.idle_timeout_ms),
     )?;
 
     Ok(message.text)
@@ -1969,18 +1969,18 @@ fn compose_prompt_run_content(args: &PromptRunArgs) -> AppResult<String> {
         io::stdin().read_to_string(&mut stdin_text)?;
         user_parts.push((String::from("stdin"), stdin_text));
     }
+    if user_parts.is_empty() {
+        return Err(AppError::with_exit_code(
+            "prompt input requires --source, --text, --stdin, or piped stdin",
+            2,
+        ));
+    }
     if user_parts
         .iter()
         .all(|(_, content)| content.trim().is_empty())
     {
         return Err(AppError::with_exit_code(
             "prompt input must not be empty",
-            2,
-        ));
-    }
-    if user_parts.is_empty() {
-        return Err(AppError::with_exit_code(
-            "prompt input requires --source, --text, --stdin, or piped stdin",
             2,
         ));
     }
@@ -2132,6 +2132,12 @@ fn prompt_wait_step(
                 GuardedWorkflow::DismissSurvey,
                 &inspected.classification,
             )?;
+            let after = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+            ensure_state_transition(
+                &inspected.classification,
+                &after.classification,
+                "dismiss-survey",
+            )?;
             Ok(())
         }
         SessionState::FolderTrustPrompt if !no_yolo => {
@@ -2141,6 +2147,12 @@ fn prompt_wait_step(
                 GuardedWorkflow::ApprovePermission,
                 &inspected.classification,
             )?;
+            let after = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+            ensure_state_transition(
+                &inspected.classification,
+                &after.classification,
+                "approve-folder-trust",
+            )?;
             Ok(())
         }
         SessionState::PermissionDialog if !no_yolo && is_yolo_safe_to_approve(inspected) => {
@@ -2149,6 +2161,12 @@ fn prompt_wait_step(
                 &pane.pane_id,
                 GuardedWorkflow::ApprovePermission,
                 &inspected.classification,
+            )?;
+            let after = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+            ensure_state_transition(
+                &inspected.classification,
+                &after.classification,
+                "approve-permission",
             )?;
             Ok(())
         }

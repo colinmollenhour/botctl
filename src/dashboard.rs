@@ -2490,12 +2490,16 @@ fn process_descendants<'a>(
             .or_default()
             .push(snapshot);
     }
+    let snapshots_by_pid = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.pid, snapshot))
+        .collect::<HashMap<_, _>>();
 
     let mut descendants = Vec::new();
     let mut stack = vec![root_pid];
     while let Some(pid) = stack.pop() {
-        if let Some(snapshot) = snapshots.iter().find(|snapshot| snapshot.pid == pid) {
-            descendants.push(snapshot);
+        if let Some(snapshot) = snapshots_by_pid.get(&pid) {
+            descendants.push(*snapshot);
         }
         if let Some(children) = children_by_parent.get(&pid) {
             stack.extend(children.iter().map(|snapshot| snapshot.pid));
