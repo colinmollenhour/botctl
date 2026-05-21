@@ -316,7 +316,8 @@ impl TmuxClient {
             buffer_name.clone(),
             String::from("--"),
             text.to_string(),
-        ])?;
+        ])
+        .map_err(|_| AppError::new("tmux set-buffer failed while staging prompt text"))?;
         self.run_status(vec![
             String::from("paste-buffer"),
             String::from("-d"),

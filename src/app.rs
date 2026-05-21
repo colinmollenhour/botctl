@@ -1802,6 +1802,7 @@ fn run_prompt_with_resolved_input(
         &client,
         &pane,
         &resolved_input.submitted_text,
+        &load_automation_keybindings(None)?,
         args.submit_delay_ms,
     )?;
     eprintln!("prompt: submitted prompt to pane {}", pane.pane_id);
@@ -1825,11 +1826,18 @@ fn submit_prompt_text_direct(
     client: &TmuxClient,
     pane: &TmuxPane,
     prompt_text: &str,
+    bindings: &ResolvedKeybindings,
     submit_delay_ms: u64,
 ) -> AppResult<()> {
     client.paste_text(&pane.pane_id, prompt_text)?;
     thread::sleep(Duration::from_millis(submit_delay_ms));
-    client.send_keys(&pane.pane_id, &["Enter"])
+    send_actions(
+        client,
+        &pane.pane_id,
+        &[AutomationAction::Submit],
+        bindings,
+        submit_delay_ms,
+    )
 }
 
 fn cleanup_prompt_temp(resolved_input: &ResolvedPromptRunInput, keep_temp: bool) {
@@ -2126,47 +2134,29 @@ fn prompt_wait_step(
     match inspected.classification.state {
         SessionState::BusyResponding => Ok(()),
         SessionState::SurveyPrompt if !no_yolo => {
-            execute_classified_workflow(
+            execute_keep_going_yolo_action(
                 client,
                 &pane.pane_id,
                 GuardedWorkflow::DismissSurvey,
                 &inspected.classification,
             )?;
-            let after = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-            ensure_state_transition(
-                &inspected.classification,
-                &after.classification,
-                "dismiss-survey",
-            )?;
             Ok(())
         }
         SessionState::FolderTrustPrompt if !no_yolo => {
-            execute_classified_workflow(
+            execute_keep_going_yolo_action(
                 client,
                 &pane.pane_id,
                 GuardedWorkflow::ApprovePermission,
                 &inspected.classification,
-            )?;
-            let after = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-            ensure_state_transition(
-                &inspected.classification,
-                &after.classification,
-                "approve-folder-trust",
             )?;
             Ok(())
         }
         SessionState::PermissionDialog if !no_yolo && is_yolo_safe_to_approve(inspected) => {
-            execute_classified_workflow(
+            execute_keep_going_yolo_action(
                 client,
                 &pane.pane_id,
                 GuardedWorkflow::ApprovePermission,
                 &inspected.classification,
-            )?;
-            let after = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-            ensure_state_transition(
-                &inspected.classification,
-                &after.classification,
-                "approve-permission",
             )?;
             Ok(())
         }

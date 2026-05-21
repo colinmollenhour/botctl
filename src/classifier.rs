@@ -776,7 +776,9 @@ fn is_submitted_chat_input_line(line: &str) -> bool {
         return false;
     };
     let rest = rest.trim();
-    !rest.is_empty() && !starts_with_numbered_option(rest) && !is_claude_suggested_prompt(rest)
+    !rest.is_empty()
+        && !starts_with_numbered_option(rest)
+        && !is_claude_suggested_prompt_line(trimmed)
 }
 
 fn is_claude_suggested_prompt(rest: &str) -> bool {
@@ -784,10 +786,11 @@ fn is_claude_suggested_prompt(rest: &str) -> bool {
 }
 
 fn is_claude_suggested_prompt_line(line: &str) -> bool {
-    let Some(rest) = line.trim().strip_prefix('❯') else {
-        return false;
-    };
-    is_claude_suggested_prompt(rest.trim())
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix("❯ ")
+        .or_else(|| trimmed.strip_prefix("› "))
+        .is_some_and(|rest| is_claude_suggested_prompt(rest.trim()))
 }
 
 fn has_assistant_output_after_latest_input(lines: &[&str]) -> bool {
@@ -885,7 +888,7 @@ fn is_prefixed_prompt_editing_line(line: &str, prefix: char) -> bool {
         return false;
     };
     let rest = rest.trim();
-    !rest.is_empty() && !starts_with_numbered_option(rest) && !is_claude_suggested_prompt(rest)
+    !rest.is_empty() && !starts_with_numbered_option(rest) && !is_claude_suggested_prompt_line(line)
 }
 
 fn is_session_feedback_prompt_line(line: &str) -> bool {
@@ -1895,6 +1898,14 @@ mod tests {
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn typed_try_prompt_without_suggestion_chrome_is_prompt_editing() {
+        let frame = "Welcome back Colin!\n❯Try \"how does app.rs work?\"";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PromptEditing);
     }
 
     #[test]
