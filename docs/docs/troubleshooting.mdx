@@ -163,7 +163,7 @@ Symptoms:
 
 Cause:
 
-`prompt` is a guarded TUI workflow, not a headless `claude -p` wrapper. It needs real input, a Claude-owned pane, safe classified states, working Claude keybindings, and a fresh transcript message before it will print to stdout.
+`prompt` is a guarded TUI workflow, not a headless `claude -p` wrapper. It needs real input, a Claude-owned pane, safe classified states, working tmux paste/send-keys support, and a fresh transcript message before it will print to stdout.
 
 Fix:
 
@@ -181,7 +181,7 @@ botctl doctor --pane %19
 ```
 
 - Use `--text` or pipe data when stdin is a terminal.
-- Run `botctl doctor` if keybindings are missing.
+- Run `botctl status --pane <session:window.pane>` to inspect the classified state.
 - Review unsafe blockers manually; `--no-yolo` makes supported blockers fail instead of auto-recovering.
 - If stale/no transcript output persists, attach to the tmux session and verify Claude wrote a response in the same workspace.
 

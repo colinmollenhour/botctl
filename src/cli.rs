@@ -881,7 +881,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--no-yolo",
                 "--no-color",
             ][..],
-            "Launches Claude in a detached tmux session, submits via guarded keybinding/editor handoff, prints only the latest assistant text to stdout, and writes progress to stderr. Safe blockers may be handled unless --no-yolo is set.",
+            "Launches Claude in a detached tmux session, pastes the resolved prompt into the interactive TUI through tmux, prints only the latest assistant text to stdout, and writes progress to stderr. Safe blockers may be handled unless --no-yolo is set.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {

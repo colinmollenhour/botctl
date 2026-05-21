@@ -308,6 +308,25 @@ impl TmuxClient {
         self.run_status(args)
     }
 
+    pub fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()> {
+        let buffer_name = format!("botctl-prompt-{}", std::process::id());
+        self.run_status(vec![
+            String::from("set-buffer"),
+            String::from("-b"),
+            buffer_name.clone(),
+            String::from("--"),
+            text.to_string(),
+        ])?;
+        self.run_status(vec![
+            String::from("paste-buffer"),
+            String::from("-d"),
+            String::from("-b"),
+            buffer_name,
+            String::from("-t"),
+            pane_id.to_string(),
+        ])
+    }
+
     pub fn select_window(&self, target: &str) -> AppResult<()> {
         self.run_status(vec![
             String::from("select-window"),

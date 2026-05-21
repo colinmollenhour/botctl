@@ -1,14 +1,14 @@
 # Prompt handoff
 
-`botctl` stages prompts in SQLite first, then hands them off through Claude's external-editor flow.
+`botctl` supports both direct TUI prompt execution and SQLite-backed prompt handoff through Claude's external-editor flow.
 
 ## Prompt paths
 
 There are four supported paths:
 
 1. **TUI-backed one-shot execution**
-   - `prompt` launches Claude in a new detached tmux session, waits for `ChatReady`, submits via the same guarded external-editor/keybinding handoff, waits for the reply, and prints only assistant text to stdout.
-   - Small inputs are submitted directly through pending prompt storage; inputs larger than `--large-prompt-threshold` are written to a state-dir instruction file and Claude receives a short prompt pointing at that file.
+   - `prompt` launches Claude in a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for the reply, and prints only assistant text to stdout.
+   - Small inputs are pasted directly; inputs larger than `--large-prompt-threshold` are written to a state-dir instruction file and Claude receives a short prompt pointing at that file.
 
 2. **Manual staging**
    - `prepare-prompt` writes the prompt text to a workspace-scoped placeholder instance in the state database.
@@ -39,7 +39,7 @@ The external editor target that Claude requests is still a regular file, but the
 
 `prompt` accepts repeated `--source`, one `--text`, explicit `--stdin`, implicit piped stdin, and repeated `--append-system-prompt`. It combines those inputs before launching Claude so input and filesystem errors fail early.
 
-For large combined prompts, it creates `<state-dir>/prompt-runs/.../instructions.md` and submits a short file-pointer prompt through the normal handoff path. Unless `--keep-temp` is set, the temp instruction file is removed after a successful response; with `--keep-temp`, the path is reported on stderr for debugging.
+For large combined prompts, it creates `<state-dir>/prompt-runs/.../instructions.md` and pastes a short file-pointer prompt into Claude. Unless `--keep-temp` is set, the temp instruction file is removed after a successful response; with `--keep-temp`, the path is reported on stderr for debugging.
 
 ## `prepare-prompt`
 

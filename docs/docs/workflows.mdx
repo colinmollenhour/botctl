@@ -165,7 +165,7 @@ botctl prompt --source task.md --append-system-prompt rules.md
 printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
 ```
 
-`prompt` launches a new detached tmux session, waits for `ChatReady`, submits through the existing external-editor/keybinding handoff, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for the final assistant reply, and prints only assistant text to stdout. Use `submit-prompt` instead when you already have an existing pane you want to target.
+`prompt` launches a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for the final assistant reply, and prints only assistant text to stdout. Use `submit-prompt` instead when you already have an existing pane you want to target.
 
 Existing-pane one-shot example:
 

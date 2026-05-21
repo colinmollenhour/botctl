@@ -1761,12 +1761,13 @@ fn run_prompt_with_resolved_input(
         Some(cwd) => cwd,
         None => std::env::current_dir()?,
     };
+    let launch_command = prompt_launch_command(args, state_dir, session_name)?;
     let client = TmuxClient::default();
     let request = StartSessionRequest {
         session_name: session_name.to_string(),
         window_name: args.window_name.clone(),
         cwd,
-        command: args.command.clone(),
+        command: launch_command,
     };
 
     eprintln!("prompt: starting tmux session {session_name}");
@@ -1797,22 +1798,13 @@ fn run_prompt_with_resolved_input(
     ensure_pane_owned_by_claude(&pane)
         .map_err(|error| AppError::with_exit_code(error.to_string(), 2))?;
     let pre_submit_message = load_last_agent_message(&pane).ok();
-    submit_prompt_for_pane(
+    submit_prompt_text_direct(
         &client,
         &pane,
-        session_name,
-        Some(state_dir),
-        args.workspace.as_deref(),
         &resolved_input.submitted_text,
         args.submit_delay_ms,
     )?;
     eprintln!("prompt: submitted prompt to pane {}", pane.pane_id);
-    wait_for_prompt_response_start(
-        &client,
-        &pane,
-        args,
-        Duration::from_millis(args.idle_timeout_ms),
-    )?;
     eprintln!("prompt: waiting for assistant response");
     wait_for_prompt_completion(
         &client,
@@ -1827,6 +1819,17 @@ fn run_prompt_with_resolved_input(
     )?;
 
     Ok(message.text)
+}
+
+fn submit_prompt_text_direct(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    prompt_text: &str,
+    submit_delay_ms: u64,
+) -> AppResult<()> {
+    client.paste_text(&pane.pane_id, prompt_text)?;
+    thread::sleep(Duration::from_millis(submit_delay_ms));
+    client.send_keys(&pane.pane_id, &["Enter"])
 }
 
 fn cleanup_prompt_temp(resolved_input: &ResolvedPromptRunInput, keep_temp: bool) {
@@ -1857,6 +1860,43 @@ fn cleanup_prompt_temp(resolved_input: &ResolvedPromptRunInput, keep_temp: bool)
                 error
             );
         }
+    }
+}
+
+fn prompt_launch_command(
+    args: &PromptRunArgs,
+    state_dir: &Path,
+    session_name: &str,
+) -> AppResult<String> {
+    let exe = std::env::current_exe()?;
+    let state_dir = absolute_prompt_path(state_dir)?;
+    let mut editor_parts = vec![
+        shell_escape(exe.to_string_lossy().as_ref()),
+        String::from("editor-helper"),
+        String::from("--session"),
+        shell_escape(session_name),
+        String::from("--state-dir"),
+        shell_escape(state_dir.to_string_lossy().as_ref()),
+        String::from("--keep-pending"),
+    ];
+    if let Some(workspace) = &args.workspace {
+        editor_parts.push(String::from("--workspace"));
+        editor_parts.push(shell_escape(workspace));
+    }
+    let editor = editor_parts.join(" ");
+    Ok(format!(
+        "EDITOR={} VISUAL={} {}",
+        shell_escape(&editor),
+        shell_escape(&editor),
+        args.command
+    ))
+}
+
+fn absolute_prompt_path(path: &Path) -> AppResult<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
     }
 }
 
@@ -2016,35 +2056,23 @@ fn wait_for_prompt_pane_ready(
         if inspected.classification.state == SessionState::ChatReady {
             return Ok(inspected.classification);
         }
+        if inspected.classification.state == SessionState::Unknown {
+            if Instant::now() >= deadline {
+                return Err(AppError::new(format!(
+                    "timed out waiting for pane {} to become ChatReady; last state {}",
+                    pane.pane_id,
+                    inspected.classification.state.as_str()
+                )));
+            }
+            thread::sleep(Duration::from_millis(args.poll_ms));
+            continue;
+        }
         prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
         if Instant::now() >= deadline {
             return Err(AppError::new(format!(
                 "timed out waiting for pane {} to become ChatReady; last state {}",
                 pane.pane_id,
                 inspected.classification.state.as_str()
-            )));
-        }
-        thread::sleep(Duration::from_millis(args.poll_ms));
-    }
-}
-
-fn wait_for_prompt_response_start(
-    client: &TmuxClient,
-    pane: &TmuxPane,
-    args: &PromptRunArgs,
-    timeout: Duration,
-) -> AppResult<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-        if inspected.classification.state != SessionState::ChatReady {
-            prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(AppError::new(format!(
-                "timed out waiting for pane {} to leave ChatReady after prompt submission",
-                pane.pane_id
             )));
         }
         thread::sleep(Duration::from_millis(args.poll_ms));
@@ -2062,6 +2090,20 @@ fn wait_for_prompt_completion(
         let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
         if inspected.classification.state == SessionState::ChatReady {
             return Ok(());
+        }
+        if matches!(
+            inspected.classification.state,
+            SessionState::PromptEditing | SessionState::Unknown
+        ) {
+            if Instant::now() >= deadline {
+                return Err(AppError::new(format!(
+                    "timed out waiting for assistant response in pane {}; last state {}",
+                    pane.pane_id,
+                    inspected.classification.state.as_str()
+                )));
+            }
+            thread::sleep(Duration::from_millis(args.poll_ms));
+            continue;
         }
         prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
         if Instant::now() >= deadline {

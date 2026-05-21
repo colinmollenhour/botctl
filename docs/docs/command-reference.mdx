@@ -73,7 +73,7 @@ Output and safety:
 - stdout contains only the latest assistant message text on success.
 - progress, temp paths, cleanup warnings, and wait status go to stderr.
 - the tmux session is left running for inspection.
-- submission waits for `ChatReady`, uses the same keybinding/external-editor handoff as `submit-prompt`, waits for final `ChatReady`, and refuses to print stale transcript output.
+- submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 
 ### `yolo`
