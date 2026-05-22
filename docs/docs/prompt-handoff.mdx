@@ -1,19 +1,23 @@
 # Prompt handoff
 
-`botctl` stages prompts in SQLite first, then hands them off through Claude's external-editor flow.
+`botctl` supports both direct TUI prompt execution and SQLite-backed prompt handoff through Claude's external-editor flow.
 
 ## Prompt paths
 
-There are three supported paths:
+There are four supported paths:
 
-1. **Manual staging**
+1. **TUI-backed one-shot execution**
+   - `prompt` launches Claude in a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for the reply, and prints only assistant text to stdout. Pass `--verbose` for launch/wait progress on stderr. Arguments after `--` pass through to Claude.
+   - Small inputs are pasted directly; inputs larger than `--large-prompt-threshold` are written to a state-dir instruction file and Claude receives a short prompt pointing at that file.
+
+2. **Manual staging**
    - `prepare-prompt` writes the prompt text to a workspace-scoped placeholder instance in the state database.
    - `editor-helper` reads that pending prompt from SQLite and writes it into the editor target path that Claude requested.
 
-2. **One-shot submission**
+3. **One-shot submission to an existing pane**
    - `submit-prompt --text ...` or `submit-prompt --source ...` resolves the prompt text itself, stages it in the state database, and submits it.
 
-3. **Loop submission**
+4. **Loop submission**
    - `keep-going` uses the built-in audit loop prompt by default.
    - `keep-going --source ...` or `keep-going --text ...` stages a custom loop prompt in SQLite instead.
 
@@ -30,6 +34,12 @@ Prompt handoff now uses the `pending_prompts` table inside `<state-dir>/state.db
 Commands that support `--workspace PATH|UUID` accept either a botctl workspace id or a path. Path values may be absolute or relative; Git-backed paths collapse to the canonical worktree root, while non-Git paths use the resolved path itself as the workspace root.
 
 The external editor target that Claude requests is still a regular file, but the staged prompt itself is no longer stored under a separate prompt path.
+
+## `prompt`
+
+`prompt` accepts repeated `--source`, one `--text`, explicit `--stdin`, implicit piped stdin, and repeated `--append-system-prompt`. It combines those inputs before launching Claude so input and filesystem errors fail early.
+
+For large combined prompts, it creates `<state-dir>/prompt-runs/.../instructions.md` and pastes a short file-pointer prompt into Claude. Unless `--keep-temp` is set, the temp instruction file is removed after a successful response; with `--keep-temp`, the path is reported on stderr for debugging.
 
 ## `prepare-prompt`
 

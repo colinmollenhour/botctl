@@ -37,6 +37,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 These are the commands that matter most in day-to-day use:
 
 - `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace, with state, PID, CPU, memory, age, and YOLO controls for Claude and Codex
+- `prompt` to run a one-shot prompt through a new interactive Claude TUI in tmux and print only the final assistant text to stdout
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
@@ -58,6 +59,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - run `dashboard` as a popup-sized TUI across Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace with per-pane YOLO controls for Claude and Codex
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
+- run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
 
 ## Docs
@@ -105,8 +107,11 @@ From there:
 - Use `yolo` for one Claude Code or Codex pane that is blocked on a supported permission dialog.
 - Use `serve` when you need a foreground event stream or localhost HTTP API.
 - Use `last-message` when you need the full latest assistant reply as Markdown.
+- Use `prompt` when you want `botctl` to launch Claude, submit one prompt, wait for the reply, and print only assistant text.
 
 ```bash
+botctl prompt --text "Summarize this repo"
+cat prompt.md | botctl prompt --stdin --cwd /path/to/project
 botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
 botctl last-message --pane 0:6.0 --out -
@@ -155,6 +160,17 @@ cargo run -- last-message --pane 0:4.1
 cargo run -- last-message --pane 0:4.1 --out last-agent-message.md
 cargo run -- last-message --pane 0:4.1 --out -
 ```
+
+Run a one-shot prompt through an interactive Claude TUI in a new tmux session:
+
+```bash
+cargo run -- prompt --text "Say exactly hello"
+cargo run -- prompt --source task.md --append-system-prompt rules.md
+printf 'Summarize this input' | cargo run -- prompt --stdin
+cargo run -- prompt --text "Say hi" -- --model sonnet --name "Just testing"
+```
+
+`prompt` does not use `claude -p` or `--prompt`; it waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, leaves the tmux session running, and prints assistant text only on stdout. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
 
 Run the observer and a localhost HTTP API for a web UI:
 
@@ -221,7 +237,7 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes by workspace, shows the current classified state, pane PID, process-tree average CPU, memory, and age for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes by workspace, shows the current classified state, pane PID, process-tree average CPU, memory, and foreground agent uptime for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode and Pi support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
 

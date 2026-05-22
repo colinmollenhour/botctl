@@ -169,10 +169,15 @@ struct CpuSample {
     total_ticks: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProcessSnapshot {
     pid: u32,
     ppid: u32,
+    pgrp: i32,
+    tpgid: i32,
+    command: String,
+    cmdline_basenames: Vec<String>,
+    start_ticks: u64,
     cpu_ticks: u64,
     rss_pages: u64,
 }
@@ -253,6 +258,7 @@ impl DashboardApp {
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
         let mut next_frames = HashMap::new();
+        let process_age_snapshots = process_snapshots_with_cmdlines();
 
         for pane in self.client.list_panes()? {
             if is_claude_pane(&pane) {
@@ -275,7 +281,7 @@ impl DashboardApp {
                     .or_insert_with(|| git_branch_for_path(&pane.current_path))
                     .clone();
                 let yolo_enabled = matches!(read_yolo_record(&self.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
-                let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+                let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
                     self.first_seen
                         .get(&pane.pane_id)
                         .map(Instant::elapsed)
@@ -333,7 +339,7 @@ impl DashboardApp {
                     .entry(pane.current_path.clone())
                     .or_insert_with(|| git_branch_for_path(&pane.current_path))
                     .clone();
-                let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+                let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
                     self.first_seen
                         .get(&pane.pane_id)
                         .map(Instant::elapsed)
@@ -378,7 +384,7 @@ impl DashboardApp {
                     .entry(pane.current_path.clone())
                     .or_insert_with(|| git_branch_for_path(&pane.current_path))
                     .clone();
-                let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+                let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
                     self.first_seen
                         .get(&pane.pane_id)
                         .map(Instant::elapsed)
@@ -432,7 +438,7 @@ impl DashboardApp {
                 .entry(pane.current_path.clone())
                 .or_insert_with(|| git_branch_for_path(&pane.current_path))
                 .clone();
-            let age = process_age(pane.pane_pid).unwrap_or_else(|| {
+            let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
                 self.first_seen
                     .get(&pane.pane_id)
                     .map(Instant::elapsed)
@@ -2417,11 +2423,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn process_age(pid: Option<u32>) -> Option<Duration> {
-    let pid = pid?;
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, fields) = stat.rsplit_once(") ")?;
-    let start_ticks = fields.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+fn pane_process_age(pane: &TmuxPane, snapshots: &[ProcessSnapshot]) -> Option<Duration> {
+    let root_pid = pane.pane_pid?;
+    let snapshot = select_agent_process(root_pid, &pane.current_command, snapshots)?;
+    process_age_from_start_ticks(snapshot.start_ticks)
+}
+
+fn process_age_from_start_ticks(start_ticks: u64) -> Option<Duration> {
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if ticks_per_second <= 0 {
         return None;
@@ -2433,6 +2441,94 @@ fn process_age(pid: Option<u32>) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs_f64(uptime_secs - start_secs))
+}
+
+fn select_agent_process<'a>(
+    root_pid: u32,
+    current_command: &str,
+    snapshots: &'a [ProcessSnapshot],
+) -> Option<&'a ProcessSnapshot> {
+    let root = snapshots.iter().find(|snapshot| snapshot.pid == root_pid)?;
+    let descendants = process_descendants(root_pid, snapshots);
+    let foreground_pgrp = (root.tpgid > 0).then_some(root.tpgid);
+
+    foreground_pgrp
+        .and_then(|pgrp| {
+            oldest_matching_process(descendants.iter().copied().filter(|snapshot| {
+                snapshot.pgrp == pgrp && process_matches_command(snapshot, current_command)
+            }))
+        })
+        .or_else(|| {
+            oldest_matching_process(
+                descendants
+                    .iter()
+                    .copied()
+                    .filter(|snapshot| process_matches_command(snapshot, current_command)),
+            )
+        })
+        .or_else(|| {
+            foreground_pgrp.and_then(|pgrp| {
+                oldest_matching_process(
+                    descendants
+                        .iter()
+                        .copied()
+                        .filter(|snapshot| snapshot.pgrp == pgrp),
+                )
+            })
+        })
+        .or(Some(root))
+}
+
+fn process_descendants<'a>(
+    root_pid: u32,
+    snapshots: &'a [ProcessSnapshot],
+) -> Vec<&'a ProcessSnapshot> {
+    let mut children_by_parent = HashMap::<u32, Vec<&ProcessSnapshot>>::new();
+    for snapshot in snapshots {
+        children_by_parent
+            .entry(snapshot.ppid)
+            .or_default()
+            .push(snapshot);
+    }
+    let snapshots_by_pid = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.pid, snapshot))
+        .collect::<HashMap<_, _>>();
+
+    let mut descendants = Vec::new();
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        if let Some(snapshot) = snapshots_by_pid.get(&pid) {
+            descendants.push(*snapshot);
+        }
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children.iter().map(|snapshot| snapshot.pid));
+        }
+    }
+    descendants
+}
+
+fn oldest_matching_process<'a, I>(snapshots: I) -> Option<&'a ProcessSnapshot>
+where
+    I: Iterator<Item = &'a ProcessSnapshot>,
+{
+    snapshots.min_by_key(|snapshot| snapshot.start_ticks)
+}
+
+fn process_matches_command(snapshot: &ProcessSnapshot, command: &str) -> bool {
+    let command = command_basename(command);
+    if command.is_empty() {
+        return false;
+    }
+    snapshot.command == command
+        || snapshot
+            .cmdline_basenames
+            .iter()
+            .any(|name| name == command)
+}
+
+fn command_basename(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
 }
 
 fn cpu_percent_between(previous: CpuSample, current: CpuSample) -> Option<f64> {
@@ -2489,6 +2585,14 @@ fn process_tree_usage(root_pid: u32) -> Option<ProcessTreeUsage> {
 }
 
 fn process_snapshots() -> Vec<ProcessSnapshot> {
+    process_snapshots_with_options(false)
+}
+
+fn process_snapshots_with_cmdlines() -> Vec<ProcessSnapshot> {
+    process_snapshots_with_options(true)
+}
+
+fn process_snapshots_with_options(include_cmdline: bool) -> Vec<ProcessSnapshot> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -2496,21 +2600,31 @@ fn process_snapshots() -> Vec<ProcessSnapshot> {
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter_map(process_snapshot)
+        .filter_map(|pid| process_snapshot(pid, include_cmdline))
         .collect()
 }
 
-fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
+fn process_snapshot(pid: u32, include_cmdline: bool) -> Option<ProcessSnapshot> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_process_stat(pid, &stat)
+    let mut snapshot = parse_process_stat(pid, &stat)?;
+    if include_cmdline {
+        snapshot.cmdline_basenames = process_cmdline_basenames(pid);
+    }
+    Some(snapshot)
 }
 
 fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessSnapshot> {
-    let (_, fields) = stat.rsplit_once(") ")?;
+    let (prefix, fields) = stat.rsplit_once(") ")?;
+    let command = prefix.split_once('(')?.1.to_string();
     let fields = fields.split_whitespace().collect::<Vec<_>>();
     Some(ProcessSnapshot {
         pid,
         ppid: fields.get(1)?.parse::<u32>().ok()?,
+        pgrp: fields.get(2)?.parse::<i32>().ok()?,
+        tpgid: fields.get(5)?.parse::<i32>().ok()?,
+        command,
+        cmdline_basenames: Vec::new(),
+        start_ticks: fields.get(19)?.parse::<u64>().ok()?,
         cpu_ticks: fields
             .get(11)?
             .parse::<u64>()
@@ -2523,6 +2637,20 @@ fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessSnapshot> {
             .unwrap_or_default()
             .max(0) as u64,
     })
+}
+
+fn process_cmdline_basenames(pid: u32) -> Vec<String> {
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return Vec::new();
+    };
+    cmdline
+        .split(|byte| *byte == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter(|part| !part.is_empty())
+        .map(command_basename)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn ticks_per_second() -> Option<u64> {
@@ -2594,8 +2722,8 @@ mod tests {
     use super::{
         DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
         PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
-        ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji, agent_marker,
-        context_lines_above_input, current_base_window_name, dashboard_body_sections,
+        ProcessSnapshot, ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji,
+        agent_marker, context_lines_above_input, current_base_window_name, dashboard_body_sections,
         dashboard_display_state, dashboard_selection_path, derive_base_window_name,
         detail_body_kind, detail_current_path, detail_workspace_label, details_panel_height,
         footer_column_widths, footer_help_line, footer_lines, format_age, format_cpu_gauge,
@@ -2603,9 +2731,10 @@ mod tests {
         is_codex_screen, load_saved_selection, pad_display_right, pane_list_columns,
         pane_list_content_area, pane_window_prefix, parse_process_stat, recap_lines, rect_contains,
         render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        select_tail_lines_for_rows, should_return_navigation, split_workspace_header, state_emoji,
-        state_marker, strip_dashboard_emoji_prefixes, tmux_object_id_order, workspace_group_key,
-        workspace_group_label, yes_count_key, yolo_column_contains,
+        select_agent_process, select_tail_lines_for_rows, should_return_navigation,
+        split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
+        tmux_object_id_order, workspace_group_key, workspace_group_label, yes_count_key,
+        yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::storage::WorkspaceRecord;
@@ -3017,8 +3146,52 @@ mod tests {
 
         assert_eq!(snapshot.pid, 123);
         assert_eq!(snapshot.ppid, 7);
+        assert_eq!(snapshot.pgrp, 1);
+        assert_eq!(snapshot.tpgid, -1);
+        assert_eq!(snapshot.command, "agent worker");
+        assert_eq!(snapshot.start_ticks, 1000);
         assert_eq!(snapshot.cpu_ticks, 24);
         assert_eq!(snapshot.rss_pages, 42);
+    }
+
+    #[test]
+    fn agent_process_selection_prefers_foreground_matching_child() {
+        let snapshots = vec![
+            test_process_snapshot(10, 1, 10, 20, "bash", 100, &[]),
+            test_process_snapshot(20, 10, 20, 20, "claude", 900, &["node", "claude"]),
+            test_process_snapshot(21, 20, 20, 20, "node", 950, &[]),
+        ];
+
+        let selected = select_agent_process(10, "claude", &snapshots)
+            .expect("foreground claude process should be selected");
+
+        assert_eq!(selected.pid, 20);
+    }
+
+    #[test]
+    fn agent_process_selection_falls_back_to_matching_descendant() {
+        let snapshots = vec![
+            test_process_snapshot(10, 1, 10, 30, "bash", 100, &[]),
+            test_process_snapshot(20, 10, 20, 20, "claude", 900, &[]),
+        ];
+
+        let selected = select_agent_process(10, "claude", &snapshots)
+            .expect("matching descendant should be selected");
+
+        assert_eq!(selected.pid, 20);
+    }
+
+    #[test]
+    fn agent_process_selection_falls_back_to_root_when_no_match_exists() {
+        let snapshots = vec![
+            test_process_snapshot(10, 1, 10, 10, "bash", 100, &[]),
+            test_process_snapshot(20, 10, 20, 20, "worker", 900, &[]),
+        ];
+
+        let selected = select_agent_process(10, "claude", &snapshots)
+            .expect("root process should remain a safe fallback");
+
+        assert_eq!(selected.pid, 10);
     }
 
     #[test]
@@ -3313,6 +3486,31 @@ mod tests {
             current_command: command.to_string(),
             pane_title: title.to_string(),
             ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
+        }
+    }
+
+    fn test_process_snapshot(
+        pid: u32,
+        ppid: u32,
+        pgrp: i32,
+        tpgid: i32,
+        command: &str,
+        start_ticks: u64,
+        cmdline_basenames: &[&str],
+    ) -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid,
+            ppid,
+            pgrp,
+            tpgid,
+            command: command.to_string(),
+            cmdline_basenames: cmdline_basenames
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            start_ticks,
+            cpu_ticks: 0,
+            rss_pages: 0,
         }
     }
 

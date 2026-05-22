@@ -776,7 +776,23 @@ fn is_submitted_chat_input_line(line: &str) -> bool {
         return false;
     };
     let rest = rest.trim();
-    !rest.is_empty() && !starts_with_numbered_option(rest)
+    !rest.is_empty()
+        && !starts_with_numbered_option(rest)
+        && !is_claude_suggested_prompt_line(trimmed)
+}
+
+fn is_claude_suggested_prompt(rest: &str) -> bool {
+    rest.starts_with("Try \"") && rest.ends_with('"')
+}
+
+fn is_claude_suggested_prompt_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars();
+    let Some(prefix @ ('❯' | '›')) = chars.next() else {
+        return false;
+    };
+    let rest = &trimmed[prefix.len_utf8()..];
+    rest.chars().next().is_some_and(char::is_whitespace) && is_claude_suggested_prompt(rest.trim())
 }
 
 fn has_assistant_output_after_latest_input(lines: &[&str]) -> bool {
@@ -874,7 +890,7 @@ fn is_prefixed_prompt_editing_line(line: &str, prefix: char) -> bool {
         return false;
     };
     let rest = rest.trim();
-    !rest.is_empty() && !starts_with_numbered_option(rest)
+    !rest.is_empty() && !starts_with_numbered_option(rest) && !is_claude_suggested_prompt_line(line)
 }
 
 fn is_session_feedback_prompt_line(line: &str) -> bool {
@@ -1276,6 +1292,7 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
         .copied()
         .filter(|line| !line.is_empty())
         .filter(|line| !is_plain_chat_input_line(line))
+        .filter(|line| !is_claude_suggested_prompt_line(line))
         .filter(|line| !is_chat_keyword_line(line))
         .filter(|line| !is_terminal_status_line(line))
         .map(str::to_string)
@@ -1875,6 +1892,30 @@ mod tests {
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn suggested_chat_prompt_is_not_prompt_editing() {
+        let frame = "Welcome back Colin!\n❯ Try \"how does app.rs work?\"\n⏵⏵ auto mode on";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn suggested_chat_prompt_with_nonbreaking_space_is_not_prompt_editing() {
+        let frame = "Welcome back Colin!\n❯\u{a0}Try \"fix typecheck errors\"\n⏵⏵ auto mode on";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn typed_try_prompt_without_suggestion_chrome_is_prompt_editing() {
+        let frame = "Welcome back Colin!\n❯Try \"how does app.rs work?\"";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PromptEditing);
     }
 
     #[test]

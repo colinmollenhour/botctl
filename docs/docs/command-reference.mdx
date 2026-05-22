@@ -17,6 +17,7 @@ Global conventions:
 - `--json` is available on one-shot inspection commands where documented; JSON is printed to stdout.
 - `--plain` preserves current line-oriented output for `attach`, `list`, `status`, and `doctor`; it cannot be combined with `--json`.
 - `last-message` writes the latest persisted assistant message as raw Markdown, or writes the Markdown body to stdout with `--out -`.
+- `prompt` success output is assistant text only on stdout; launch/wait/temp-file progress goes to stderr only with `--verbose`.
 
 Canonical command names:
 
@@ -28,6 +29,55 @@ Canonical command names:
 For the most useful commands, start here:
 
 ## Main commands
+
+### `prompt`
+
+Purpose: run a one-shot Claude request through an observable interactive Claude TUI in a new detached tmux session. It does not call `claude -p` or `claude --prompt`.
+
+Syntax:
+```bash
+botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] \
+  [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] \
+  [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] \
+  [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] \
+  [--keep-temp] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]
+```
+
+Examples:
+```bash
+botctl prompt --text "Summarize this repo"
+botctl prompt --source task.md --append-system-prompt rules.md
+cat prompt.md | botctl prompt --stdin --cwd /path/to/project
+botctl prompt --source big-plan.md --large-prompt-threshold 10 --keep-temp
+botctl prompt --text "Fix the failing tests" --no-yolo
+botctl prompt --text hi -- --model sonnet --name "Just testing"
+```
+
+Flags and defaults:
+
+- `--session NAME` defaults to a generated `botctl-prompt-*` session.
+- `--window NAME` defaults to `claude`.
+- `--cwd PATH` defaults to the current directory.
+- `--command CMD` defaults to `claude`; leave it as `claude` unless debugging a compatible wrapper.
+- `--source PATH` is repeatable and is concatenated in flag order.
+- `--text TEXT` may be supplied once.
+- `--stdin` reads stdin explicitly; when no input flags are present, piped stdin is read implicitly.
+- `--append-system-prompt PATH` is repeatable and is prepended as labeled text because the TUI accepts one chat prompt.
+- `--poll-ms` default `1000`; `--submit-delay-ms` default `250`.
+- `--ready-timeout-ms` default `30000`; `--idle-timeout-ms` default `600000`.
+- `--large-prompt-threshold` default `8192` bytes; larger prompts are written under the state dir and a short file-pointer prompt is submitted.
+- `--keep-temp` preserves that large-prompt instruction file and prints its path to stderr.
+- `--no-yolo` refuses permission, folder-trust, and survey blockers instead of using the safe recovery paths.
+- `--verbose` prints launch/wait/temp-file progress to stderr.
+- `-- CLAUDE_ARG ...` passes additional arguments to the interactive Claude command. Prompt/headless mode (`-p`/`--prompt`) is still refused.
+
+Output and safety:
+
+- stdout contains only the latest assistant message text on success.
+- with `--verbose`, progress, temp paths, and wait status go to stderr; cleanup warnings always go to stderr.
+- the tmux session is left running for inspection.
+- submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
+- exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 
 ### `yolo`
 
@@ -87,7 +137,7 @@ Notes:
 - maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
 - ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
 - Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode and Pi support is visibility-only, and broader guarded automation remains Claude-only
-- shows current classified state, wait time, branch, and workspace grouping
+- shows current classified state, foreground agent uptime, wait time, branch, and workspace grouping
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 
