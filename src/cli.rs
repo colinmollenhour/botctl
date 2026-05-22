@@ -113,6 +113,7 @@ pub struct PromptRunArgs {
     pub keep_temp: bool,
     pub no_yolo: bool,
     pub verbose: bool,
+    pub claude_args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -502,7 +503,7 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Prompt Workflow:"));
     out.push('\n');
     for line in [
-        "prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose]",
+        "prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]",
         "prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]",
         "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET  [advanced]",
         "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]",
@@ -855,12 +856,13 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "prompt" => (
             "prompt",
             "Run a one-shot prompt through an observable Claude TUI in tmux.",
-            "botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] [--keep-temp] [--no-yolo] [--verbose]",
+            "botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] [--keep-temp] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]",
             &[
                 "botctl prompt --text \"Summarize this repo\"",
                 "botctl prompt --source task.md --append-system-prompt rules.md",
                 "cat prompt.md | botctl prompt --stdin --cwd /path/to/project",
                 "botctl prompt --source big-plan.md --large-prompt-threshold 10 --keep-temp",
+                "botctl prompt --text hi -- --model sonnet --name \"Just testing\"",
             ][..],
             &[
                 "--session NAME (default: generated botctl-prompt-*)",
@@ -881,9 +883,10 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--keep-temp",
                 "--no-yolo",
                 "--verbose",
+                "-- CLAUDE_ARG ... (passed to the interactive Claude command)",
                 "--no-color",
             ][..],
-            "Launches Claude in a detached tmux session, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. Use --verbose for launch/wait progress on stderr. Safe blockers may be handled unless --no-yolo is set.",
+            "Launches Claude in a detached tmux session, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {
@@ -966,7 +969,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
             "botctl keep-going (--pane TARGET | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]"
         }
         "prompt" => {
-            "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose]"
+            "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]"
         }
         "prepare-prompt" => {
             "botctl prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]"
@@ -1772,10 +1775,15 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
     let mut keep_temp = false;
     let mut no_yolo = false;
     let mut verbose = false;
+    let mut claude_args = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--" => {
+                claude_args.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             "--session" => session_name = Some(read_value(&args, &mut i, "--session")?),
             "--window" => window_name = read_value(&args, &mut i, "--window")?,
             "--cwd" => cwd = Some(PathBuf::from(read_value(&args, &mut i, "--cwd")?)),
@@ -1830,7 +1838,7 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
             "prompt requires --large-prompt-threshold to be at least 1",
         ));
     }
-    reject_prompt_mode_claude_command(&command)?;
+    reject_prompt_mode_claude_command(&command, &claude_args)?;
 
     Ok(Command::Prompt(PromptRunArgs {
         session_name,
@@ -1851,10 +1859,19 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
         keep_temp,
         no_yolo,
         verbose,
+        claude_args,
     }))
 }
 
-fn reject_prompt_mode_claude_command(command: &str) -> AppResult<()> {
+fn reject_prompt_mode_claude_command(command: &str, claude_args: &[String]) -> AppResult<()> {
+    if claude_args
+        .iter()
+        .any(|arg| arg == "-p" || arg == "--prompt" || arg.starts_with("--prompt="))
+    {
+        return Err(AppError::new(
+            "prompt must launch the interactive Claude TUI; do not pass claude -p/--prompt",
+        ));
+    }
     let mut saw_claude = false;
     let tokens = shell_like_command_tokens(command)?;
     for token in tokens {
@@ -3113,6 +3130,7 @@ mod tests {
                 assert_eq!(args.large_prompt_threshold, 8192);
                 assert!(!args.no_yolo);
                 assert!(!args.verbose);
+                assert!(args.claude_args.is_empty());
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3145,9 +3163,50 @@ mod tests {
                 assert!(args.stdin);
                 assert!(args.no_yolo);
                 assert!(args.verbose);
+                assert!(args.claude_args.is_empty());
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_prompt_claude_args_after_separator() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("prompt"),
+            String::from("--text"),
+            String::from("hi"),
+            String::from("--"),
+            String::from("--model"),
+            String::from("sonnet"),
+            String::from("--name"),
+            String::from("Just testing"),
+        ])
+        .expect("prompt should parse Claude passthrough args");
+
+        match command {
+            Command::Prompt(args) => assert_eq!(
+                args.claude_args,
+                vec!["--model", "sonnet", "--name", "Just testing"]
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_prompt_mode_in_claude_passthrough_args() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("prompt"),
+            String::from("--text"),
+            String::from("hi"),
+            String::from("--"),
+            String::from("--prompt"),
+            String::from("hi"),
+        ])
+        .expect_err("prompt should reject prompt mode passthrough args");
+
+        assert!(error.to_string().contains("do not pass claude -p/--prompt"));
     }
 
     #[test]

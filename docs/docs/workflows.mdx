@@ -163,9 +163,10 @@ Use `prompt` when you want command-line one-shot behavior but still want the saf
 botctl prompt --text "Summarize this repo"
 botctl prompt --source task.md --append-system-prompt rules.md
 printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
+botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
-`prompt` launches a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for the final assistant reply, and prints only assistant text to stdout. Pass `--verbose` for launch/wait progress on stderr. Use `submit-prompt` instead when you already have an existing pane you want to target.
+`prompt` launches a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for the final assistant reply, and prints only assistant text to stdout. Pass `--verbose` for launch/wait progress on stderr. Arguments after `--` pass through to Claude. Use `submit-prompt` instead when you already have an existing pane you want to target.
 
 Existing-pane one-shot example:
 

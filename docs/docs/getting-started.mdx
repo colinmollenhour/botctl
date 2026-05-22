@@ -72,9 +72,10 @@ For a one-shot prompt that launches Claude in a new tmux session, submits throug
 ```bash
 botctl prompt --text "Summarize this repo"
 printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
+botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
-By default, stdout contains only the assistant answer. Pass `--verbose` to write launch/wait progress to stderr. The tmux session remains available for inspection.
+By default, stdout contains only the assistant answer. Pass `--verbose` to write launch/wait progress to stderr. Arguments after `--` pass through to Claude. The tmux session remains available for inspection.
 
 ## First session
 

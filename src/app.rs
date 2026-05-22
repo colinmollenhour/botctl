@@ -1901,11 +1901,22 @@ fn prompt_launch_command(
         editor_parts.push(shell_escape(workspace));
     }
     let editor = editor_parts.join(" ");
+    let claude_args = args
+        .claude_args
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = if claude_args.is_empty() {
+        args.command.clone()
+    } else {
+        format!("{} {}", args.command, claude_args)
+    };
     Ok(format!(
         "EDITOR={} VISUAL={} {}",
         shell_escape(&editor),
         shell_escape(&editor),
-        args.command
+        command
     ))
 }
 
@@ -4475,14 +4486,15 @@ mod tests {
         focused_frame_source, is_prompt_completion_state, is_usable_state, is_yolo_safe_to_approve,
         keep_going_no_yolo_blocker, parse_env_value_from_environ_bytes,
         permission_manual_review_reason, persistent_dashboard_child_command_with_target_socket,
-        prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
-        render_babysit_action_event, render_babysit_output, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_observe_command_output,
-        render_screen_excerpt, render_serve_event_payload, render_status_report,
-        resolve_keep_going_prompt, resolve_prompt_run_input, run_prepare_prompt, shell_escape,
-        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
-        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
+        prompt_launch_command, prompt_submission_started, raw_key_for_workflow,
+        recovery_action_for_state, render_babysit_action_event, render_babysit_output,
+        render_babysit_start_event, render_babysit_wait_event, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
+        render_status_report, resolve_keep_going_prompt, resolve_prompt_run_input,
+        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
+        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
+        write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -4544,6 +4556,7 @@ mod tests {
             keep_temp: false,
             no_yolo: false,
             verbose: false,
+            claude_args: Vec::new(),
         }
     }
 
@@ -4589,6 +4602,22 @@ mod tests {
         assert!(is_prompt_completion_state(SessionState::UserQuestionPrompt));
         assert!(!is_prompt_completion_state(SessionState::PermissionDialog));
         assert!(!is_prompt_completion_state(SessionState::BusyResponding));
+    }
+
+    #[test]
+    fn prompt_launch_command_appends_escaped_claude_args() {
+        let mut args = prompt_args_for_test();
+        args.claude_args = vec![
+            String::from("--model"),
+            String::from("sonnet"),
+            String::from("--name"),
+            String::from("Just testing"),
+        ];
+
+        let command = prompt_launch_command(&args, Path::new("/tmp/botctl-state"), "demo")
+            .expect("launch command should render");
+
+        assert!(command.ends_with("claude --model sonnet --name 'Just testing'"));
     }
 
     #[test]

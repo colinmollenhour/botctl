@@ -7,7 +7,7 @@
 There are four supported paths:
 
 1. **TUI-backed one-shot execution**
-   - `prompt` launches Claude in a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for the reply, and prints only assistant text to stdout. Pass `--verbose` for launch/wait progress on stderr.
+   - `prompt` launches Claude in a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for the reply, and prints only assistant text to stdout. Pass `--verbose` for launch/wait progress on stderr. Arguments after `--` pass through to Claude.
    - Small inputs are pasted directly; inputs larger than `--large-prompt-threshold` are written to a state-dir instruction file and Claude receives a short prompt pointing at that file.
 
 2. **Manual staging**

@@ -40,7 +40,7 @@ botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] \
   [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] \
   [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] \
   [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] \
-  [--keep-temp] [--no-yolo] [--verbose]
+  [--keep-temp] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]
 ```
 
 Examples:
@@ -50,6 +50,7 @@ botctl prompt --source task.md --append-system-prompt rules.md
 cat prompt.md | botctl prompt --stdin --cwd /path/to/project
 botctl prompt --source big-plan.md --large-prompt-threshold 10 --keep-temp
 botctl prompt --text "Fix the failing tests" --no-yolo
+botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
 Flags and defaults:
@@ -68,6 +69,7 @@ Flags and defaults:
 - `--keep-temp` preserves that large-prompt instruction file and prints its path to stderr.
 - `--no-yolo` refuses permission, folder-trust, and survey blockers instead of using the safe recovery paths.
 - `--verbose` prints launch/wait/temp-file progress to stderr.
+- `-- CLAUDE_ARG ...` passes additional arguments to the interactive Claude command. Prompt/headless mode (`-p`/`--prompt`) is still refused.
 
 Output and safety:
 
