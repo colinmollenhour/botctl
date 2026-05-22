@@ -17,7 +17,7 @@ Global conventions:
 - `--json` is available on one-shot inspection commands where documented; JSON is printed to stdout.
 - `--plain` preserves current line-oriented output for `attach`, `list`, `status`, and `doctor`; it cannot be combined with `--json`.
 - `last-message` writes the latest persisted assistant message as raw Markdown, or writes the Markdown body to stdout with `--out -`.
-- `prompt` success output is assistant text only on stdout; launch/wait/temp-file progress goes to stderr.
+- `prompt` success output is assistant text only on stdout; launch/wait/temp-file progress goes to stderr only with `--verbose`.
 
 Canonical command names:
 
@@ -40,7 +40,7 @@ botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] \
   [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] \
   [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] \
   [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] \
-  [--keep-temp] [--no-yolo]
+  [--keep-temp] [--no-yolo] [--verbose]
 ```
 
 Examples:
@@ -67,11 +67,12 @@ Flags and defaults:
 - `--large-prompt-threshold` default `8192` bytes; larger prompts are written under the state dir and a short file-pointer prompt is submitted.
 - `--keep-temp` preserves that large-prompt instruction file and prints its path to stderr.
 - `--no-yolo` refuses permission, folder-trust, and survey blockers instead of using the safe recovery paths.
+- `--verbose` prints launch/wait/temp-file progress to stderr.
 
 Output and safety:
 
 - stdout contains only the latest assistant message text on success.
-- progress, temp paths, cleanup warnings, and wait status go to stderr.
+- with `--verbose`, progress, temp paths, and wait status go to stderr; cleanup warnings always go to stderr.
 - the tmux session is left running for inspection.
 - submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.

@@ -169,7 +169,7 @@ cargo run -- prompt --source task.md --append-system-prompt rules.md
 printf 'Summarize this input' | cargo run -- prompt --stdin
 ```
 
-`prompt` does not use `claude -p` or `--prompt`; it waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, leaves the tmux session running, sends progress to stderr, and prints assistant text only on stdout.
+`prompt` does not use `claude -p` or `--prompt`; it waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, leaves the tmux session running, and prints assistant text only on stdout. Pass `--verbose` to send launch/wait progress to stderr.
 
 Run the observer and a localhost HTTP API for a web UI:
 

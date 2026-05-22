@@ -1770,7 +1770,7 @@ fn run_prompt_with_resolved_input(
         command: launch_command,
     };
 
-    eprintln!("prompt: starting tmux session {session_name}");
+    prompt_verbose(args, format_args!("starting tmux session {session_name}"));
     client.start_session(&request)?;
     let mut pane = client
         .active_pane_for_window(session_name, &args.window_name)?
@@ -1784,9 +1784,9 @@ fn run_prompt_with_resolved_input(
             )
         })?;
 
-    eprintln!(
-        "prompt: waiting for Claude pane {} to become ready",
-        pane.pane_id
+    prompt_verbose(
+        args,
+        format_args!("waiting for Claude pane {} to become ready", pane.pane_id),
     );
     wait_for_prompt_pane_ready(
         &client,
@@ -1805,8 +1805,11 @@ fn run_prompt_with_resolved_input(
         &load_automation_keybindings(None)?,
         args.submit_delay_ms,
     )?;
-    eprintln!("prompt: submitted prompt to pane {}", pane.pane_id);
-    eprintln!("prompt: waiting for assistant response");
+    prompt_verbose(
+        args,
+        format_args!("submitted prompt to pane {}", pane.pane_id),
+    );
+    prompt_verbose(args, format_args!("waiting for assistant response"));
     wait_for_prompt_completion(
         &client,
         &pane,
@@ -1820,6 +1823,12 @@ fn run_prompt_with_resolved_input(
     )?;
 
     Ok(message.text)
+}
+
+fn prompt_verbose(args: &PromptRunArgs, message: std::fmt::Arguments<'_>) {
+    if args.verbose {
+        eprintln!("prompt: {message}");
+    }
 }
 
 fn submit_prompt_text_direct(
@@ -1931,9 +1940,9 @@ fn resolve_prompt_run_input(
     }
 
     let temp_file = write_prompt_instruction_temp_file(state_dir, session_name, &combined)?;
-    eprintln!(
-        "prompt: wrote large prompt instructions to {}",
-        temp_file.display()
+    prompt_verbose(
+        args,
+        format_args!("wrote large prompt instructions to {}", temp_file.display()),
     );
     let submitted_text = format!(
         "Follow the instructions in this UTF-8 text file, then respond normally in this chat:\n\n{}",
@@ -4534,6 +4543,7 @@ mod tests {
             large_prompt_threshold: 8192,
             keep_temp: false,
             no_yolo: false,
+            verbose: false,
         }
     }
 

@@ -112,6 +112,7 @@ pub struct PromptRunArgs {
     pub large_prompt_threshold: usize,
     pub keep_temp: bool,
     pub no_yolo: bool,
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -501,7 +502,7 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Prompt Workflow:"));
     out.push('\n');
     for line in [
-        "prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo]",
+        "prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose]",
         "prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]",
         "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET  [advanced]",
         "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]",
@@ -854,7 +855,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "prompt" => (
             "prompt",
             "Run a one-shot prompt through an observable Claude TUI in tmux.",
-            "botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] [--keep-temp] [--no-yolo]",
+            "botctl prompt [--session NAME] [--window NAME] [--cwd PATH] [--command CMD] [--source PATH ...] [--text TEXT] [--stdin] [--append-system-prompt PATH ...] [--poll-ms N] [--submit-delay-ms N] [--ready-timeout-ms N] [--idle-timeout-ms N] [--state-dir PATH] [--workspace PATH|UUID] [--large-prompt-threshold BYTES] [--keep-temp] [--no-yolo] [--verbose]",
             &[
                 "botctl prompt --text \"Summarize this repo\"",
                 "botctl prompt --source task.md --append-system-prompt rules.md",
@@ -879,9 +880,10 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--large-prompt-threshold BYTES (default: 8192)",
                 "--keep-temp",
                 "--no-yolo",
+                "--verbose",
                 "--no-color",
             ][..],
-            "Launches Claude in a detached tmux session, pastes the resolved prompt into the interactive TUI through tmux, prints only the latest assistant text to stdout, and writes progress to stderr. Safe blockers may be handled unless --no-yolo is set.",
+            "Launches Claude in a detached tmux session, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. Use --verbose for launch/wait progress on stderr. Safe blockers may be handled unless --no-yolo is set.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {
@@ -964,7 +966,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
             "botctl keep-going (--pane TARGET | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]"
         }
         "prompt" => {
-            "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo]"
+            "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose]"
         }
         "prepare-prompt" => {
             "botctl prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]"
@@ -1769,6 +1771,7 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
     let mut large_prompt_threshold = 8192usize;
     let mut keep_temp = false;
     let mut no_yolo = false;
+    let mut verbose = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1812,6 +1815,7 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
             }
             "--keep-temp" => keep_temp = true,
             "--no-yolo" => no_yolo = true,
+            "--verbose" => verbose = true,
             flag => return Err(AppError::new(format!("unknown prompt flag: {flag}"))),
         }
         i += 1;
@@ -1846,6 +1850,7 @@ fn parse_prompt_run(args: Vec<String>) -> AppResult<Command> {
         large_prompt_threshold,
         keep_temp,
         no_yolo,
+        verbose,
     }))
 }
 
@@ -3107,6 +3112,7 @@ mod tests {
                 assert_eq!(args.idle_timeout_ms, 600_000);
                 assert_eq!(args.large_prompt_threshold, 8192);
                 assert!(!args.no_yolo);
+                assert!(!args.verbose);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3125,6 +3131,7 @@ mod tests {
             String::from("rules.md"),
             String::from("--stdin"),
             String::from("--no-yolo"),
+            String::from("--verbose"),
         ])
         .expect("prompt command should parse repeated inputs");
 
@@ -3137,6 +3144,7 @@ mod tests {
                 assert_eq!(args.append_system_prompts, vec![PathBuf::from("rules.md")]);
                 assert!(args.stdin);
                 assert!(args.no_yolo);
+                assert!(args.verbose);
             }
             other => panic!("unexpected command: {other:?}"),
         }
