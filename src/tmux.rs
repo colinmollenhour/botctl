@@ -321,6 +321,7 @@ impl TmuxClient {
         self.run_status(vec![
             String::from("paste-buffer"),
             String::from("-d"),
+            String::from("-p"),
             String::from("-b"),
             buffer_name,
             String::from("-t"),
