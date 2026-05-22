@@ -787,10 +787,12 @@ fn is_claude_suggested_prompt(rest: &str) -> bool {
 
 fn is_claude_suggested_prompt_line(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed
-        .strip_prefix("❯ ")
-        .or_else(|| trimmed.strip_prefix("› "))
-        .is_some_and(|rest| is_claude_suggested_prompt(rest.trim()))
+    let mut chars = trimmed.chars();
+    let Some(prefix @ ('❯' | '›')) = chars.next() else {
+        return false;
+    };
+    let rest = &trimmed[prefix.len_utf8()..];
+    rest.chars().next().is_some_and(char::is_whitespace) && is_claude_suggested_prompt(rest.trim())
 }
 
 fn has_assistant_output_after_latest_input(lines: &[&str]) -> bool {
@@ -1895,6 +1897,14 @@ mod tests {
     #[test]
     fn suggested_chat_prompt_is_not_prompt_editing() {
         let frame = "Welcome back Colin!\n❯ Try \"how does app.rs work?\"\n⏵⏵ auto mode on";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+    }
+
+    #[test]
+    fn suggested_chat_prompt_with_nonbreaking_space_is_not_prompt_editing() {
+        let frame = "Welcome back Colin!\n❯\u{a0}Try \"fix typecheck errors\"\n⏵⏵ auto mode on";
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::ChatReady);
