@@ -172,6 +172,11 @@ impl Classifier {
             has_permission_keywords && has_plain_chat_prompt_after_permission(&lines);
         let has_conflicting_chat_after_permission =
             has_permission_keywords && has_chat_indicators_after_permission(&lines);
+        let has_active_codex_permission_prompt = has_permission_keywords
+            && has_codex_keywords
+            && !has_plain_chat_prompt_after_permission
+            && !has_conflicting_chat_after_permission
+            && codex_permission_prompt_is_after_latest_statusline(&lines);
         let has_plan_approval_keywords = contains_any(
             &normalized,
             &[
@@ -250,6 +255,16 @@ impl Classifier {
         } else if has_plan_approval_keywords {
             signals.push(String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS));
             SessionState::PlanApprovalPrompt
+        } else if has_active_codex_permission_prompt {
+            signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
+            signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            if mentions_self_settings_language {
+                signals.push(String::from(SIGNAL_SELF_SETTINGS_LANGUAGE));
+            }
+            if mentions_sensitive_claude_path {
+                signals.push(String::from(SIGNAL_SENSITIVE_CLAUDE_PATH));
+            }
+            SessionState::PermissionDialog
         } else if has_codex_busy_statusline
             || (has_codex_keywords
                 && (has_busy_status_banner || (has_busy_interrupt_hint && has_busy_keywords)))
@@ -661,6 +676,20 @@ fn has_plain_chat_prompt_after_permission(lines: &[&str]) -> bool {
         .skip(last_permission_anchor + 1)
         .copied()
         .any(|line| is_plain_chat_input_line(line) || is_codex_chat_input_line(line))
+}
+
+fn codex_permission_prompt_is_after_latest_statusline(lines: &[&str]) -> bool {
+    let Some(last_permission_anchor) = lines
+        .iter()
+        .rposition(|line| is_permission_anchor_line(line.trim()))
+    else {
+        return false;
+    };
+
+    lines
+        .iter()
+        .rposition(|line| is_codex_statusline_line(line.trim()))
+        .is_none_or(|last_statusline| last_permission_anchor > last_statusline)
 }
 
 fn is_chat_keyword_line(line: &str) -> bool {
@@ -1549,6 +1578,24 @@ mod tests {
             !result
                 .signals
                 .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn codex_live_permission_wins_over_stale_working_statusline() {
+        let frame = "• Working (11m 16s • esc to interrupt)\n› Run /review on my current changes\n  gpt-5.5 xhigh · ~/Projects/shipstream/bloodraven · main · Working · Context 29% used\n\n• Running kubectl --request-timeout=20s -n bloodraven-playground logs deploy/bloodraven --since=30m | rg -i \"rollout|emergency|\n  │ REPLTAKEOVER|REPLICAOF NO ONE|Promotion|promotion|stale-master|configured replica|status patch\"\n\nWould you like to run the following command?\n\nReason: Allow kubectl logs network access to filter the operator log for Dragonfly rollout and promotion attempts.\n\n$ kubectl --request-timeout=20s -n bloodraven-playground logs deploy/bloodraven --since=30m | rg -i\n\"rollout|emergency|REPLTAKEOVER|REPLICAOF NO ONE|Promotion|promotion|stale-master|configured replica|status patch\"\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `rg -i 'rollout|emergency|REPLTAKEOVER|REPLICAOF NO ONE|Promotion|\n     promotion|stale-master|configured replica|status patch'` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::PermissionDialog);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
         );
     }
 

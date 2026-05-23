@@ -36,7 +36,7 @@ use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
     sync_tmux_wait_state,
 };
-use crate::tmux::{TmuxClient, TmuxPane};
+use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const FOOTER_LINE1: &[(&str, &str)] = &[
@@ -746,6 +746,25 @@ impl DashboardApp {
             }
         }
 
+        self.cleanup_stale_window_name_prefixes(&active_window_ids)?;
+
+        Ok(())
+    }
+
+    fn cleanup_stale_window_name_prefixes(
+        &self,
+        active_window_ids: &HashSet<String>,
+    ) -> AppResult<()> {
+        for window in self.client.list_windows()? {
+            if active_window_ids.contains(&window.window_id) {
+                continue;
+            }
+            let cleaned_name = cleanup_dashboard_window_name(&window);
+            if cleaned_name != window.window_name {
+                self.client
+                    .rename_window(&window_target(&window), &cleaned_name)?;
+            }
+        }
         Ok(())
     }
 
@@ -2017,6 +2036,19 @@ fn strip_dashboard_emoji_prefixes(value: &str) -> &str {
     rest
 }
 
+fn cleanup_dashboard_window_name(window: &TmuxWindow) -> String {
+    let cleaned = strip_dashboard_emoji_prefixes(&window.window_name);
+    if cleaned.is_empty() {
+        window.window_name.clone()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn window_target(window: &TmuxWindow) -> String {
+    format!("{}:{}", window.session_name, window.window_index)
+}
+
 fn dashboard_display_state(
     classified_state: SessionState,
     previous_frame: Option<&String>,
@@ -2723,22 +2755,22 @@ mod tests {
         DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
         PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
         ProcessSnapshot, ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji,
-        agent_marker, context_lines_above_input, current_base_window_name, dashboard_body_sections,
-        dashboard_display_state, dashboard_selection_path, derive_base_window_name,
-        detail_body_kind, detail_current_path, detail_workspace_label, details_panel_height,
-        footer_column_widths, footer_help_line, footer_lines, format_age, format_cpu_gauge,
-        format_duration_compact, format_memory_bar, format_memory_gauge, is_codex_candidate_pane,
-        is_codex_screen, load_saved_selection, pad_display_right, pane_list_columns,
-        pane_list_content_area, pane_window_prefix, parse_process_stat, recap_lines, rect_contains,
-        render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        select_agent_process, select_tail_lines_for_rows, should_return_navigation,
-        split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
-        tmux_object_id_order, workspace_group_key, workspace_group_label, yes_count_key,
-        yolo_column_contains,
+        agent_marker, cleanup_dashboard_window_name, context_lines_above_input,
+        current_base_window_name, dashboard_body_sections, dashboard_display_state,
+        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
+        detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
+        footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
+        format_memory_gauge, is_codex_candidate_pane, is_codex_screen, load_saved_selection,
+        pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
+        parse_process_stat, recap_lines, rect_contains, render_workspace_header_line,
+        repo_root_from_repo_key, save_selection, select_agent_process, select_tail_lines_for_rows,
+        should_return_navigation, split_workspace_header, state_emoji, state_marker,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order, window_target, workspace_group_key,
+        workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::storage::WorkspaceRecord;
-    use crate::tmux::{TmuxClient, TmuxPane};
+    use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
@@ -3323,6 +3355,31 @@ mod tests {
             strip_dashboard_emoji_prefixes("\u{2699}\u{fe0f}\u{1f920} project"),
             "project"
         );
+    }
+
+    #[test]
+    fn cleanup_dashboard_window_name_strips_botctl_prefixes() {
+        let window = TmuxWindow {
+            session_name: String::from("work"),
+            window_id: String::from("@7"),
+            window_index: 3,
+            window_name: String::from("⚙️ʸ💬 bloodraven"),
+        };
+
+        assert_eq!(cleanup_dashboard_window_name(&window), "bloodraven");
+        assert_eq!(window_target(&window), "work:3");
+    }
+
+    #[test]
+    fn cleanup_dashboard_window_name_ignores_empty_cleaned_name() {
+        let window = TmuxWindow {
+            session_name: String::from("work"),
+            window_id: String::from("@7"),
+            window_index: 3,
+            window_name: String::from("⚙️ʸ"),
+        };
+
+        assert_eq!(cleanup_dashboard_window_name(&window), "⚙️ʸ");
     }
 
     #[test]

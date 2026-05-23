@@ -1,0 +1,192 @@
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get mysqlfailovergroup playground -o yaml
+  └ apiVersion: shipstream.io/v1alpha1
+    kind: MysqlFailoverGroup
+    … +182 lines (ctrl + t to view transcript)
+        name: pdx
+        state: writable
+
+• Explored
+  └ Read info.go
+    Search func CandidateSyncReady|CandidateSyncReady in dragonfly
+    Read siterole.go
+
+• Ran which nc
+  └ (no output)
+
+• Ran which redis-cli
+  └ (no output)
+
+• Waited for background terminal · ./bin/playground-chaos run 27-dragonfly-rolling-image-update
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• The controller appears to be waiting for CandidateSyncReady before promoting the updated replica. I’m going to query Dragonfly’s INFO
+  replication directly through port-forwards to see which readiness gate is false.
+
+• Ran printf '*2\r\n$4\r\nINFO\r\n$11\r\nreplication\r\n' >/dev/tcp/127.0.0.1/6380
+  └ /usr/bin/bash: socket: Operation not permitted
+    /usr/bin/bash: line 1: /dev/tcp/127.0.0.1/6380: Operation not permitted
+
+• Ran printf '*2\r\n$4\r\nINFO\r\n$11\r\nreplication\r\n' >/dev/tcp/127.0.0.1/6381
+  └ /usr/bin/bash: socket: Operation not permitted
+    /usr/bin/bash: line 1: /dev/tcp/127.0.0.1/6381: Operation not permitted
+
+• Context compacted
+
+• Waited for background terminal · ./bin/playground-chaos run 27-dragonfly-rolling-image-update
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• I’m picking up from the latest-code rebuild. Scenario 27 was still in progress at compaction, so I’ll first let that runner report its
+  real result, then I’ll inspect the Dragonfly state before changing code.
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get pod playground-dragonfly-iad-0 playground-dragonfly-pdx-0 -o
+  │ jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\t"}{.status.phase}{"\t"}{range .status.conditions[?
+  │ (@.type=="Ready")]}{.status}{end}{"\n"}{end}'
+  └ playground-dragonfly-iad-0
+    docker.dragonflydb.io/dragonflydb/dragonfly@sha256:243bf004df5e137d9432c35367d7c86e6d2b5bcb6700be4b6397fcb9306b794b    Running
+    True
+    playground-dragonfly-pdx-0    docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.0    Running    True
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get mfg playground -o jsonpath='{.metadata.generation}{"\t"}
+  │ {.status.conditions[?(@.type=="Ready")].observedGeneration}{"\t"}{.status.dragonfly.activeSite}{"\t"}{.status.dragonfly.phase}
+  │ {"\t"}{range .status.dragonfly.sites[*]}{.site}:{.role}:{.linkStatus}:{.ready}:{.reachable} {end}{"\n"}'
+  └ error: the server doesn't have a resource type "mfg"
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get sts playground-dragonfly-iad playground-dragonfly-pdx -o
+  │ jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\t"}{.status.readyReplicas}{"/"}
+  │ {.status.replicas}{"\t"}{.status.updateRevision}{"\t"}{.status.currentRevision}{"\n"}{end}'
+  └ playground-dragonfly-iad
+    docker.dragonflydb.io/dragonflydb/dragonfly@sha256:243bf004df5e137d9432c35367d7c86e6d2b5bcb6700be4b6397fcb9306b794b    1/1
+    playground-dragonfly-iad-c65948bc7    playground-dragonfly-iad-c65948bc7
+    playground-dragonfly-pdx    docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.0    1/1    playground-dragonfly-pdx-856c4b9d8d
+    playground-dragonfly-pdx-856c4b9d8d
+
+• Waited for background terminal · ./bin/playground-chaos run 27-dragonfly-rolling-image-update
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• The runner is still waiting, and Kubernetes shows the classic half-rolled state: IAD has the digest image, PDX is still on the tag,
+  both pods are Ready. I’ll query the CR using the full resource name and then inspect Dragonfly replication info directly.
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get mysqlfailovergroup playground -o jsonpath='{.metadata.generation}{"\t"}
+  │ {.status.conditions[?(@.type=="Ready")].observedGeneration}{"\t"}{.status.dragonfly.activeSite}{"\t"}{.status.dragonfly.phase}
+  │ {"\t"}{range .status.dragonfly.sites[*]}{.site}:{.role}:{.linkStatus}:{.ready}:{.reachable}:{.replicationState} {end}{"\n"}'
+  └ 11    10    pdx    Ready    :replica:up:true:true:slave :master::true:true:master
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get events --sort-by=.lastTimestamp | rg -i 'dragonfly|bloodraven' | tail
+  │ -60
+  └ Unable to connect to the server: dial tcp 0.0.0.0:35707: socket: operation not permitted
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground logs deploy/bloodraven --since=20m | rg -i 'dragonfly|rollout|promot|stale|
+  │ reconfig|replica'
+  └ Unable to connect to the server: dial tcp 0.0.0.0:35707: socket: operation not permitted
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get events --sort-by=.lastTimestamp
+  └ LAST SEEN   TYPE      REASON                         OBJECT                                         MESSAGE
+    5m12s       Normal    Scheduled                      pod/bloodraven-8649ccf79d-m5prg                Successfully assigned
+    … +38 lines (ctrl + t to view transcript)
+    4m21s       Warning   DragonflyStaleMasterDetected   mysqlfailovergroup/playground                  stale Dragonfly master detected
+    on site "iad" (active="pdx"); auto-rejoin attempted only when connected_slaves=0 AND master_repl_offset=0
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground get mysqlfailovergroup playground -o yaml
+  └ apiVersion: shipstream.io/v1alpha1
+    kind: MysqlFailoverGroup
+    … +182 lines (ctrl + t to view transcript)
+        name: pdx
+        state: writable
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground logs deploy/bloodraven --since=20m
+  └ {"time":"2026-05-22T07:53:30.182088536Z","level":"INFO","msg":"starting bloodraven manager"}
+    {"level":"info","ts":"2026-05-22T07:53:30Z","msg":"Starting
+    … +457 lines (ctrl + t to view transcript)
+    {"name":"playground","namespace":"bloodraven-playground"},"namespace":"bloodraven-playground","name":"playground","reconcileID":"c67
+    e3ed8-a4f1-491c-8f5a-2d19a0de1010","name":"playground"}
+
+• Waited for background terminal · ./bin/playground-chaos run 27-dragonfly-rolling-image-update
+
+• Waited for background terminal · kubectl --request-timeout=10s -n bloodraven-playground port-forward svc/playground-dragonfly-iad
+6380:6379
+
+• Running bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6380; printf "*2\r\n\$4\r\nINFO\r\n\$11\r\nreplication\r\n" >&3; timeout 2 cat <&3'
+
+• Running bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6381; printf "*2\r\n\$4\r\nINFO\r\n\$11\r\nreplication\r\n" >&3; timeout 2 cat <&3'
+
+• Ran ./bin/playground-chaos run 27-dragonfly-rolling-image-update
+  └ time=2026-05-22T08:00:17.448Z level=ERROR msg="step failed" phase=observe name="Dragonfly rollout stays one pod at a time"
+    elapsed=6m0.001s err="get MysqlFailoverGroup: client rate limiter Wait returned an error: context deadline exceeded"
+    … +10 lines (ctrl + t to view transcript)
+           get MysqlFailoverGroup: client rate limiter Wait returned an error: context deadline exceeded
+           forensics: playground/chaos-results/20260522T075417Z/27-dragonfly-rolling-image-update
+
+✔ You approved codex to always run commands that start with exec 3<>/dev/tcp/127.0.0.1/6380; printf "*2\r\n\$4\r\nINFO\r\n\
+  $11\r\nreplica...
+
+• Ran bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6380; printf "*2\r\n\$4\r\nINFO\r\n\$11\r\nreplication\r\n" >&3; timeout 2 cat <&3'
+  └ (no output)
+
+• Ran kubectl --request-timeout=10s -n bloodraven-playground port-forward svc/playground-dragonfly-iad 6380:6379
+  └ Handling connection for 6380
+    E0522 08:08:11.047858 2306923 portforward.go:522] "Unhandled Error" err="an error occurred forwarding 6380 -> 6379: error forwarding
+    port 6379 to pod 047b0f74610028643f4bd8c25d855796c3e22c3becb1d15fd54ee088a826c576, uid : failed to find sandbox
+    \"047b0f74610028643f4bd8c25d855796c3e22c3becb1d15fd54ee088a826c576\" in store: not found"
+    error: lost connection to pod
+
+✔ You approved codex to always run commands that start with exec 3<>/dev/tcp/127.0.0.1/6380; printf "*2\r\n\$4\r\nINFO\r\n\
+  $11\r\npersist...
+
+• Ran bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6380; printf "*2\r\n\$4\r\nINFO\r\n\$11\r\npersistence\r\n" >&3; timeout 2 cat <&3'
+  └ bash: connect: Connection refused
+    bash: line 1: /dev/tcp/127.0.0.1/6380: Connection refused
+    bash: line 1: 3: Bad file descriptor
+    bash: line 1: 3: Bad file descriptor
+
+✔ You approved codex to always run commands that start with exec 3<>/dev/tcp/127.0.0.1/6381; printf "*2\r\n\$4\r\nINFO\r\n\
+  $11\r\nreplica...
+
+• Ran bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6381; printf "*2\r\n\$4\r\nINFO\r\n\$11\r\nreplication\r\n" >&3; timeout 2 cat <&3'
+  └ (no output)
+
+• Waited for background terminal · kubectl --request-timeout=10s -n bloodraven-playground port-forward svc/playground-dragonfly-pdx
+6381:6379
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• The rerun on latest code did fail in the same place: scenario 27 timed out after 6 minutes with only the replica updated. I’m going
+  into the rollout controller path now; the failure is reproducible after rebuild, so this is back to a code fix rather than stale-
+  local-code cleanup.
+
+• Explored
+  └ Read SKILL.md (chaos-engineer skill)
+    Search 27-dragonfly|29-dragonfly|rolling image|snapshot|Dragonfly rollout in PLANS-Dragonfly-Chaos-Scenarios.md
+    Read dragonfly_resources.go
+    Search CandidateSyncReady|dragonflyRolloutCandidateSyncReady|promoteDragonflyForRollout|lastIOSecondsAgo|MasterLastIO in internal
+    Read siterole.go, dragonfly_upgrade.go, dragonfly_resources_test.go, info.go, planned_failover_df.go
+    Search type fakeDragonfly|func newFakeConnector|TryEmergencyPromote|SetDragonfly in *test.go
+    Read dragonfly_test_helpers_test.go, dragonfly_topology_test.go, dragonfly_topology.go
+    Search func \(.*TryEmergencyPromote|TryEmergencyPromote|setDragonflyRole|ReplicaOfNoOne|ReplTakeover in dragonfly_topology.go
+    Read dragonfly_topology.go
+    Search dragonfly|Dragonfly|promot|takeover|rollout|stale|replica|READY|Degraded in 27-dragonfly-rolling-image-update
+    List 27-dragonfly-rolling-image-update
+    Read scenario.log, dragonfly_topology.go
+    Search func effectiveDragonflyMasterSite|effectiveDragonflyMasterSite|activeDragonflySiteFromObservation in controller
+    Read dragonfly_resources.go, dragonfly_topology.go
+
+• Running kubectl --request-timeout=20s -n bloodraven-playground logs deploy/bloodraven --since=30m | rg -i "rollout|emergency|
+  │ REPLTAKEOVER|REPLICAOF NO ONE|Promotion|promotion|stale-master|configured replica|status patch"
+
+ 
+  Would you like to run the following command?
+ 
+  Reason: Allow kubectl logs network access to filter the operator log for Dragonfly rollout and promotion attempts.
+ 
+  $ kubectl --request-timeout=20s -n bloodraven-playground logs deploy/bloodraven --since=30m | rg -i
+  "rollout|emergency|REPLTAKEOVER|REPLICAOF NO ONE|Promotion|promotion|stale-master|configured replica|status patch"
+ 
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `rg -i 'rollout|emergency|REPLTAKEOVER|REPLICAOF NO ONE|Promotion|
+     promotion|stale-master|configured replica|status patch'` (p)
+  3. No, and tell Codex what to do differently (esc)
+ 
+  Press enter to confirm or esc to cancel                                                                                               

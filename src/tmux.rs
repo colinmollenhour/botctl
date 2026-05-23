@@ -40,6 +40,14 @@ pub struct TmuxPane {
     pub cursor_y: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxWindow {
+    pub session_name: String,
+    pub window_id: String,
+    pub window_index: u16,
+    pub window_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxCommandPlan {
     pub program: String,
@@ -143,6 +151,16 @@ impl TmuxClient {
 
     pub fn list_panes(&self) -> AppResult<Vec<TmuxPane>> {
         self.list_panes_for_target(None)
+    }
+
+    pub fn list_windows(&self) -> AppResult<Vec<TmuxWindow>> {
+        let output = self.run_output(vec![
+            String::from("list-windows"),
+            String::from("-a"),
+            String::from("-F"),
+            String::from("#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}"),
+        ])?;
+        Ok(output.lines().filter_map(parse_window_line).collect())
     }
 
     pub fn list_panes_for_target(&self, target: Option<&str>) -> AppResult<Vec<TmuxPane>> {
@@ -561,6 +579,20 @@ fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     })
 }
 
+fn parse_window_line(line: &str) -> Option<TmuxWindow> {
+    let parts = line.split('\t').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return None;
+    }
+
+    Some(TmuxWindow {
+        session_name: parts[0].to_string(),
+        window_id: parts[1].to_string(),
+        window_index: parts[2].parse::<u16>().ok()?,
+        window_name: parts[3].to_string(),
+    })
+}
+
 fn parse_cursor(value: &str) -> Option<u16> {
     if value.is_empty() {
         None
@@ -620,7 +652,7 @@ mod tests {
 
     use super::{
         StartSessionRequest, TmuxClient, TmuxCommandPlan, parse_explicit_pane_target_line,
-        parse_pane_line, select_explicit_pane_target,
+        parse_pane_line, parse_window_line, select_explicit_pane_target,
     };
 
     #[test]
@@ -700,6 +732,15 @@ mod tests {
         assert!(pane.pane_active);
         assert_eq!(pane.cursor_x, Some(12));
         assert_eq!(pane.cursor_y, Some(4));
+    }
+
+    #[test]
+    fn parses_window_listing() {
+        let window = parse_window_line("work\t@4\t2\t⚙️ bloodraven").expect("window should parse");
+        assert_eq!(window.session_name, "work");
+        assert_eq!(window.window_id, "@4");
+        assert_eq!(window.window_index, 2);
+        assert_eq!(window.window_name, "⚙️ bloodraven");
     }
 
     #[test]
