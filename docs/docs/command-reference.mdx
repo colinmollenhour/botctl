@@ -32,7 +32,7 @@ For the most useful commands, start here:
 
 ### `prompt`
 
-Purpose: run a one-shot Claude request through an observable interactive Claude TUI in a new detached tmux session. It does not call `claude -p` or `claude --prompt`.
+Purpose: run a one-shot Claude request through an observable interactive Claude TUI in a new detached tmux window. It does not call `claude -p` or `claude --prompt`.
 
 Syntax:
 ```bash
@@ -55,8 +55,8 @@ botctl prompt --text hi -- --model sonnet --name "Just testing"
 
 Flags and defaults:
 
-- `--session NAME` defaults to a generated `botctl-prompt-*` session.
-- `--window NAME` defaults to `claude`.
+- `--session NAME` defaults to the shared `botctl` tmux session, which is created automatically when needed.
+- `--window NAME` defaults to `claude`; each prompt run creates a new window in the owning session.
 - `--cwd PATH` defaults to the current directory.
 - `--command CMD` defaults to `claude`; leave it as `claude` unless debugging a compatible wrapper.
 - `--source PATH` is repeatable and is concatenated in flag order.
@@ -75,7 +75,8 @@ Output and safety:
 
 - stdout contains only the latest assistant message text on success.
 - with `--verbose`, progress, temp paths, and wait status go to stderr; cleanup warnings always go to stderr.
-- the tmux session is left running for inspection.
+- successful runs load a fresh assistant message first, then kill only the captured prompt window.
+- failed prompt windows are left alive for inspection.
 - submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 

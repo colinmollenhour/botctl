@@ -37,7 +37,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 These are the commands that matter most in day-to-day use:
 
 - `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace, with state, PID, CPU, memory, age, and YOLO controls for Claude and Codex
-- `prompt` to run a one-shot prompt through a new interactive Claude TUI in tmux and print only the final assistant text to stdout
+- `prompt` to run a one-shot prompt through a new interactive Claude TUI window in tmux and print only the final assistant text to stdout
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to babysit one pane or a scoped set of panes automatically
 - `serve` to stream live observation data for one tmux session in human or JSONL form
@@ -161,7 +161,7 @@ cargo run -- last-message --pane 0:4.1 --out last-agent-message.md
 cargo run -- last-message --pane 0:4.1 --out -
 ```
 
-Run a one-shot prompt through an interactive Claude TUI in a new tmux session:
+Run a one-shot prompt through an interactive Claude TUI in a new tmux window:
 
 ```bash
 cargo run -- prompt --text "Say exactly hello"
@@ -170,7 +170,7 @@ printf 'Summarize this input' | cargo run -- prompt --stdin
 cargo run -- prompt --text "Say hi" -- --model sonnet --name "Just testing"
 ```
 
-`prompt` does not use `claude -p` or `--prompt`; it waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, leaves the tmux session running, and prints assistant text only on stdout. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
+`prompt` does not use `claude -p` or `--prompt`; it creates a new window in the owning tmux session, creates that session first when needed, waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, waits for a fresh final assistant message, kills only that captured prompt window on success, and prints assistant text only on stdout. The owning session defaults to `botctl`; pass `--session NAME` to override it. Failed prompt windows stay alive for inspection. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
 
 Run the observer and a localhost HTTP API for a web UI:
 
