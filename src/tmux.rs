@@ -22,6 +22,23 @@ pub struct StartedSession {
 }
 
 #[derive(Debug, Clone)]
+pub struct StartWindowRequest {
+    pub session_name: String,
+    pub window_name: String,
+    pub cwd: PathBuf,
+    pub command: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartedWindow {
+    pub session_name: String,
+    pub window_name: String,
+    pub cwd: PathBuf,
+    pub pane_id: String,
+    pub window_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct TmuxPane {
     pub pane_id: String,
     pub pane_tty: String,
@@ -129,6 +146,46 @@ impl TmuxClient {
         }
     }
 
+    pub fn plan_start_window(&self, request: &StartWindowRequest) -> TmuxCommandPlan {
+        TmuxCommandPlan {
+            program: self.program.clone(),
+            args: self.with_socket_args(vec![
+                String::from("new-window"),
+                String::from("-d"),
+                String::from("-t"),
+                request.session_name.clone(),
+                String::from("-n"),
+                request.window_name.clone(),
+                String::from("-c"),
+                request.cwd.display().to_string(),
+                String::from("-P"),
+                String::from("-F"),
+                String::from("#{pane_id}\t#{window_id}"),
+                request.command.clone(),
+            ]),
+        }
+    }
+
+    pub fn plan_start_window_as_session(&self, request: &StartWindowRequest) -> TmuxCommandPlan {
+        TmuxCommandPlan {
+            program: self.program.clone(),
+            args: self.with_socket_args(vec![
+                String::from("new-session"),
+                String::from("-d"),
+                String::from("-s"),
+                request.session_name.clone(),
+                String::from("-n"),
+                request.window_name.clone(),
+                String::from("-c"),
+                request.cwd.display().to_string(),
+                String::from("-P"),
+                String::from("-F"),
+                String::from("#{pane_id}\t#{window_id}"),
+                request.command.clone(),
+            ]),
+        }
+    }
+
     pub fn plan_kill_session(&self, target_session: &str) -> TmuxCommandPlan {
         TmuxCommandPlan {
             program: self.program.clone(),
@@ -146,6 +203,52 @@ impl TmuxClient {
             session_name: request.session_name.clone(),
             window_name: request.window_name.clone(),
             cwd: request.cwd.clone(),
+        })
+    }
+
+    pub fn start_window(&self, request: &StartWindowRequest) -> AppResult<StartedWindow> {
+        let output = self.run_output(self.plan_start_window(request).args)?;
+        Self::started_window_from_output(request, &output)
+    }
+
+    pub fn start_window_as_session(
+        &self,
+        request: &StartWindowRequest,
+    ) -> AppResult<StartedWindow> {
+        let output = self.run_output(self.plan_start_window_as_session(request).args)?;
+        Self::started_window_from_output(request, &output)
+    }
+
+    pub fn start_window_in_session(
+        &self,
+        request: &StartWindowRequest,
+    ) -> AppResult<StartedWindow> {
+        match self.start_window(request) {
+            Ok(started) => Ok(started),
+            Err(first_error) => match self.start_window_as_session(request) {
+                Ok(started) => Ok(started),
+                Err(second_error) => match self.start_window(request) {
+                    Ok(started) => Ok(started),
+                    Err(retry_error) => Err(AppError::new(format!(
+                        "tmux window start failed: first attempt: {first_error}; fallback session creation: {second_error}; final retry: {retry_error}"
+                    ))),
+                },
+            },
+        }
+    }
+
+    fn started_window_from_output(
+        request: &StartWindowRequest,
+        output: &str,
+    ) -> AppResult<StartedWindow> {
+        let (pane_id, window_id) = parse_created_pane_window(&output)
+            .ok_or_else(|| AppError::new("tmux launch did not return pane_id and window_id"))?;
+        Ok(StartedWindow {
+            session_name: request.session_name.clone(),
+            window_name: request.window_name.clone(),
+            cwd: request.cwd.clone(),
+            pane_id,
+            window_id,
         })
     }
 
@@ -393,6 +496,14 @@ impl TmuxClient {
         self.run_status(self.plan_kill_session(target_session).args)
     }
 
+    pub fn kill_window(&self, target_window: &str) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("kill-window"),
+            String::from("-t"),
+            target_window.to_string(),
+        ])
+    }
+
     pub fn attach_session(&self, target_session: &str) -> AppResult<()> {
         self.run_status(vec![
             String::from("attach-session"),
@@ -593,6 +704,16 @@ fn parse_window_line(line: &str) -> Option<TmuxWindow> {
     })
 }
 
+fn parse_created_pane_window(output: &str) -> Option<(String, String)> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let parts = line.split('\t').collect::<Vec<_>>();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return None;
+    }
+
+    Some((parts[0].to_string(), parts[1].to_string()))
+}
+
 fn parse_cursor(value: &str) -> Option<u16> {
     if value.is_empty() {
         None
@@ -651,8 +772,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        StartSessionRequest, TmuxClient, TmuxCommandPlan, parse_explicit_pane_target_line,
-        parse_pane_line, parse_window_line, select_explicit_pane_target,
+        StartSessionRequest, StartWindowRequest, TmuxClient, TmuxCommandPlan,
+        parse_created_pane_window, parse_explicit_pane_target_line, parse_pane_line,
+        parse_window_line, select_explicit_pane_target,
     };
 
     #[test]
@@ -684,6 +806,38 @@ mod tests {
         let rendered = plan.render();
         assert!(rendered.contains("-L botctl-dashboard"));
         assert!(rendered.contains("new-session"));
+    }
+
+    #[test]
+    fn renders_start_window_plan() {
+        let client = TmuxClient::default();
+        let plan = client.plan_start_window(&StartWindowRequest {
+            session_name: String::from("botctl"),
+            window_name: String::from("claude"),
+            cwd: PathBuf::from("/tmp/demo"),
+            command: String::from("claude"),
+        });
+
+        let rendered = plan.render();
+        assert!(rendered.contains("new-window"));
+        assert!(rendered.contains("-t botctl"));
+        assert!(rendered.contains("'#{pane_id}\t#{window_id}'"));
+    }
+
+    #[test]
+    fn renders_start_window_as_session_plan() {
+        let client = TmuxClient::default();
+        let plan = client.plan_start_window_as_session(&StartWindowRequest {
+            session_name: String::from("botctl"),
+            window_name: String::from("claude"),
+            cwd: PathBuf::from("/tmp/demo"),
+            command: String::from("claude"),
+        });
+
+        let rendered = plan.render();
+        assert!(rendered.contains("new-session"));
+        assert!(rendered.contains("-s botctl"));
+        assert!(rendered.contains("'#{pane_id}\t#{window_id}'"));
     }
 
     #[test]
@@ -741,6 +895,14 @@ mod tests {
         assert_eq!(window.window_id, "@4");
         assert_eq!(window.window_index, 2);
         assert_eq!(window.window_name, "⚙️ bloodraven");
+    }
+
+    #[test]
+    fn parses_created_pane_window_ids() {
+        let parsed = parse_created_pane_window("%21\t@7\n").expect("ids should parse");
+
+        assert_eq!(parsed.0, "%21");
+        assert_eq!(parsed.1, "@7");
     }
 
     #[test]

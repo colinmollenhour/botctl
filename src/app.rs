@@ -46,7 +46,7 @@ use crate::storage::{
     resolve_workspace, resolve_workspace_for_path, state_db_path,
     store_pending_prompt_for_tmux_instance, tape_artifact_path,
 };
-use crate::tmux::{StartSessionRequest, TmuxClient, TmuxPane};
+use crate::tmux::{StartSessionRequest, StartWindowRequest, StartedWindow, TmuxClient, TmuxPane};
 use crate::yolo::{
     YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
 };
@@ -64,6 +64,7 @@ const DASHBOARD_PERSISTENT_SESSION: &str = "botctl-dashboard";
 const DASHBOARD_PERSISTENT_WINDOW: &str = "dashboard";
 const DASHBOARD_PERSISTENT_CHILD_ENV: &str = "BOTCTL_DASHBOARD_PERSISTENT_CHILD";
 const DASHBOARD_TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_DASHBOARD_TARGET_TMUX_SOCKET";
+const DEFAULT_PROMPT_SESSION: &str = "botctl";
 const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
 
 Check: every deliverable produced (not just described), every file actually written, every stated acceptance criterion met, every test/build you committed to actually run and passing, no unresolved TODOs or stubs in code you just wrote.
@@ -1744,10 +1745,11 @@ fn run_prompt(args: PromptRunArgs) -> AppResult<String> {
     let session_name = args
         .session_name
         .clone()
-        .unwrap_or_else(default_prompt_session_name);
-    let resolved_input = resolve_prompt_run_input(&args, &state_dir, &session_name)?;
+        .unwrap_or_else(|| String::from(DEFAULT_PROMPT_SESSION));
+    let prompt_run_id = default_prompt_run_id();
+    let resolved_input = resolve_prompt_run_input(&args, &state_dir, &prompt_run_id)?;
     let result = run_prompt_with_resolved_input(&args, &state_dir, &session_name, &resolved_input);
-    cleanup_prompt_temp(&resolved_input, args.keep_temp);
+    cleanup_prompt_temp(&resolved_input, args.keep_temp || result.is_err());
     result
 }
 
@@ -1763,26 +1765,26 @@ fn run_prompt_with_resolved_input(
     };
     let launch_command = prompt_launch_command(args, state_dir, session_name)?;
     let client = TmuxClient::default();
-    let request = StartSessionRequest {
-        session_name: session_name.to_string(),
-        window_name: args.window_name.clone(),
+    prompt_verbose(
+        args,
+        format_args!("starting prompt window in tmux session {session_name}"),
+    );
+    let started = start_prompt_window(
+        &client,
+        session_name,
+        &args.window_name,
         cwd,
-        command: launch_command,
-    };
-
-    prompt_verbose(args, format_args!("starting tmux session {session_name}"));
-    client.start_session(&request)?;
-    let mut pane = client
-        .active_pane_for_window(session_name, &args.window_name)?
-        .ok_or_else(|| {
-            AppError::with_exit_code(
-                format!(
-                    "no active pane found for prompt session {} window {}",
-                    session_name, args.window_name
-                ),
-                2,
-            )
-        })?;
+        launch_command,
+    )?;
+    let mut pane = client.pane_by_id(&started.pane_id)?.ok_or_else(|| {
+        AppError::with_exit_code(
+            format!(
+                "no pane found for prompt window {} pane {}",
+                started.window_id, started.pane_id
+            ),
+            2,
+        )
+    })?;
 
     prompt_verbose(
         args,
@@ -1821,14 +1823,67 @@ fn run_prompt_with_resolved_input(
         pre_submit_message.as_ref(),
         Duration::from_millis(args.idle_timeout_ms),
     )?;
+    cleanup_prompt_window(&client, &started);
 
     Ok(message.text)
+}
+
+fn start_prompt_window(
+    client: &TmuxClient,
+    session_name: &str,
+    window_name: &str,
+    cwd: PathBuf,
+    command: String,
+) -> AppResult<StartedWindow> {
+    client.start_window_in_session(&StartWindowRequest {
+        session_name: session_name.to_string(),
+        window_name: window_name.to_string(),
+        cwd,
+        command,
+    })
+}
+
+fn cleanup_prompt_window(client: &TmuxClient, started: &StartedWindow) {
+    match client.pane_by_id(&started.pane_id) {
+        Ok(Some(pane)) if pane.window_id == started.window_id => {
+            if let Err(error) = client.kill_window(&started.window_id) {
+                prompt_warning(format_args!(
+                    "failed to kill prompt window {}: {}",
+                    started.window_id, error
+                ));
+            }
+        }
+        Ok(Some(pane)) => {
+            prompt_warning(format_args!(
+                "refused to kill prompt window {}; pane {} now belongs to window {}",
+                started.window_id, started.pane_id, pane.window_id
+            ));
+        }
+        Ok(None) => {
+            if let Err(error) = client.kill_window(&started.window_id) {
+                prompt_warning(format_args!(
+                    "prompt pane {} disappeared and killing window {} failed: {}",
+                    started.pane_id, started.window_id, error
+                ));
+            }
+        }
+        Err(error) => {
+            prompt_warning(format_args!(
+                "failed to verify prompt pane {} before cleanup: {}",
+                started.pane_id, error
+            ));
+        }
+    }
 }
 
 fn prompt_verbose(args: &PromptRunArgs, message: std::fmt::Arguments<'_>) {
     if args.verbose {
         eprintln!("prompt: {message}");
     }
+}
+
+fn prompt_warning(message: std::fmt::Arguments<'_>) {
+    eprintln!("prompt: warning: {message}");
 }
 
 fn submit_prompt_text_direct(
@@ -1928,7 +1983,7 @@ fn absolute_prompt_path(path: &Path) -> AppResult<PathBuf> {
     }
 }
 
-fn default_prompt_session_name() -> String {
+fn default_prompt_run_id() -> String {
     let timestamp = OffsetDateTime::now_utc()
         .format(&format_description!(
             "[hour][minute][second]-[subsecond digits:3]"
@@ -1940,7 +1995,7 @@ fn default_prompt_session_name() -> String {
 fn resolve_prompt_run_input(
     args: &PromptRunArgs,
     state_dir: &Path,
-    session_name: &str,
+    prompt_run_id: &str,
 ) -> AppResult<ResolvedPromptRunInput> {
     let combined = compose_prompt_run_content(args)?;
     if combined.len() <= args.large_prompt_threshold {
@@ -1950,7 +2005,7 @@ fn resolve_prompt_run_input(
         });
     }
 
-    let temp_file = write_prompt_instruction_temp_file(state_dir, session_name, &combined)?;
+    let temp_file = write_prompt_instruction_temp_file(state_dir, prompt_run_id, &combined)?;
     prompt_verbose(
         args,
         format_args!("wrote large prompt instructions to {}", temp_file.display()),
@@ -2025,16 +2080,16 @@ fn compose_prompt_run_content(args: &PromptRunArgs) -> AppResult<String> {
 
 fn write_prompt_instruction_temp_file(
     state_dir: &Path,
-    session_name: &str,
+    prompt_run_id: &str,
     content: &str,
 ) -> AppResult<PathBuf> {
-    let run_id = new_artifact_id("prompt", session_name, None)?;
+    let run_id = new_artifact_id("prompt", prompt_run_id, None)?;
     let dir = state_dir.join("prompt-runs").join(run_id);
     fs::create_dir_all(&dir)?;
     let path = dir.join("instructions.md");
     let mut file = private_create_file(&path)?;
     writeln!(file, "# botctl prompt instruction file\n")?;
-    writeln!(file, "Session: {session_name}")?;
+    writeln!(file, "Run ID: {prompt_run_id}")?;
     writeln!(file, "Generated: {}\n", current_babysit_timestamp())?;
     file.write_all(content.as_bytes())?;
     Ok(path)

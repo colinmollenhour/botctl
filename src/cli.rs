@@ -865,8 +865,8 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "botctl prompt --text hi -- --model sonnet --name \"Just testing\"",
             ][..],
             &[
-                "--session NAME (default: generated botctl-prompt-*)",
-                "--window NAME (default: claude)",
+                "--session NAME (default: botctl)",
+                "--window NAME (default: claude; each run creates a new window)",
                 "--cwd PATH (default: current directory)",
                 "--command CMD (default: claude; not claude -p/--prompt)",
                 "--source PATH (repeatable)",
@@ -886,7 +886,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "-- CLAUDE_ARG ... (passed to the interactive Claude command)",
                 "--no-color",
             ][..],
-            "Launches Claude in a detached tmux session, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
+            "Launches Claude in a new detached tmux window in the owning session, creating that session first when needed, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. The default owning session is botctl; --session overrides it. On success, botctl loads a fresh assistant message before killing only the captured prompt window. Failed prompt windows are left alive for inspection. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {

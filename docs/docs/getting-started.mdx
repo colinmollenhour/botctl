@@ -67,7 +67,7 @@ botctl help
 
 Use `botctl help <command>` when you need terminal-local syntax.
 
-For a one-shot prompt that launches Claude in a new tmux session, submits through the guarded TUI path, and prints only the assistant answer to stdout:
+For a one-shot prompt that launches Claude in a new tmux window, submits through the guarded TUI path, and prints only the assistant answer to stdout:
 
 ```bash
 botctl prompt --text "Summarize this repo"
@@ -75,7 +75,7 @@ printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
 botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
-By default, stdout contains only the assistant answer. Pass `--verbose` to write launch/wait progress to stderr. Arguments after `--` pass through to Claude. The tmux session remains available for inspection.
+By default, stdout contains only the assistant answer. `prompt` uses the shared `botctl` tmux session unless `--session NAME` overrides it, creates that session automatically when needed, creates one new window per run, and kills only that captured window after loading a fresh assistant answer. Failed prompt windows remain available for inspection. Pass `--verbose` to write launch/wait progress to stderr. Arguments after `--` pass through to Claude.
 
 ## First session
 

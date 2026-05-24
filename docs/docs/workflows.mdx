@@ -166,7 +166,7 @@ printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
 botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
-`prompt` launches a new detached tmux session, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for the final assistant reply, and prints only assistant text to stdout. Pass `--verbose` for launch/wait progress on stderr. Arguments after `--` pass through to Claude. Use `submit-prompt` instead when you already have an existing pane you want to target.
+`prompt` launches a new detached tmux window in the owning session, creates that session automatically when needed, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for a fresh final assistant reply, and prints only assistant text to stdout. The owning session defaults to the shared `botctl` session; pass `--session NAME` to override it. Successful runs kill only the captured prompt window after loading the fresh assistant message. Failed prompt windows stay alive for inspection. Pass `--verbose` for launch/wait progress on stderr. Arguments after `--` pass through to Claude. Use `submit-prompt` instead when you already have an existing pane you want to target.
 
 Existing-pane one-shot example:
 
