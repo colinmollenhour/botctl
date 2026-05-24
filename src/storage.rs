@@ -10,7 +10,7 @@ use crate::app::{AppError, AppResult};
 use crate::tmux::TmuxPane;
 use crate::workspace::resolve_workspace_locator;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -61,6 +61,9 @@ pub struct InstanceRuntimeState {
     pub wait_started_at_unix_ms: Option<i64>,
     pub claude_session_id: Option<String>,
     pub claude_session_checked_at_unix_ms: Option<i64>,
+    pub cook_accumulated_ms: i64,
+    pub cook_started_at_unix_ms: Option<i64>,
+    pub cook_process_key: Option<String>,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -166,6 +169,7 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
             0 => migrate_to_v1(&tx)?,
             1 => migrate_to_v2(&tx)?,
             2 => migrate_to_v3(&tx)?,
+            3 => migrate_to_v4(&tx)?,
             other => {
                 return Err(AppError::new(format!(
                     "no state.db migration path from version {} to {}",
@@ -192,6 +196,7 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
         1 => migrate_to_v1(connection),
         2 => ensure_v2_tables(connection),
         3 => ensure_v3_tables(connection),
+        4 => ensure_v4_tables(connection),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -221,6 +226,14 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
                 "instance_runtime_state",
                 "claude_session_checked_at_unix_ms",
             )?),
+        4 => Ok(schema_layout_matches_version(connection, 3)?
+            && table_has_column(connection, "instance_runtime_state", "cook_accumulated_ms")?
+            && table_has_column(
+                connection,
+                "instance_runtime_state",
+                "cook_started_at_unix_ms",
+            )?
+            && table_has_column(connection, "instance_runtime_state", "cook_process_key")?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -452,6 +465,11 @@ fn migrate_to_v3(connection: &Connection) -> AppResult<()> {
     ensure_v3_tables(connection)
 }
 
+fn migrate_to_v4(connection: &Connection) -> AppResult<()> {
+    ensure_v3_tables(connection)?;
+    ensure_v4_tables(connection)
+}
+
 fn ensure_v2_prompt_and_babysit_tables(connection: &Connection) -> AppResult<()> {
     connection.execute(
         "CREATE TABLE IF NOT EXISTS pending_prompts (\
@@ -499,6 +517,33 @@ fn ensure_v3_tables(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn ensure_v4_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v3_tables(connection)?;
+    if !table_has_column(connection, "instance_runtime_state", "cook_accumulated_ms")? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN cook_accumulated_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(
+        connection,
+        "instance_runtime_state",
+        "cook_started_at_unix_ms",
+    )? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN cook_started_at_unix_ms INTEGER",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "instance_runtime_state", "cook_process_key")? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN cook_process_key TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn sync_tmux_wait_state(
     state_dir: &Path,
     workspace_id: &str,
@@ -523,13 +568,17 @@ pub fn sync_tmux_wait_state(
     connection.execute(
         "INSERT INTO instance_runtime_state (\
             instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
-            claude_session_checked_at_unix_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5) \
+            claude_session_checked_at_unix_ms, cook_accumulated_ms, cook_started_at_unix_ms, \
+            cook_process_key\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(instance_id) DO UPDATE SET \
              last_state = excluded.last_state, \
              wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
              claude_session_id = excluded.claude_session_id, \
-             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms",
+             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms, \
+             cook_accumulated_ms = excluded.cook_accumulated_ms, \
+             cook_started_at_unix_ms = excluded.cook_started_at_unix_ms, \
+             cook_process_key = excluded.cook_process_key",
         params![
             instance.id,
             state,
@@ -544,6 +593,16 @@ pub fn sync_tmux_wait_state(
             existing
                 .as_ref()
                 .and_then(|row| row.claude_session_checked_at_unix_ms),
+            existing
+                .as_ref()
+                .map(|row| row.cook_accumulated_ms)
+                .unwrap_or(0),
+            existing
+                .as_ref()
+                .and_then(|row| row.cook_started_at_unix_ms),
+            existing
+                .as_ref()
+                .and_then(|row| row.cook_process_key.clone()),
         ],
     )?;
 
@@ -554,6 +613,103 @@ pub fn sync_tmux_wait_state(
     } else {
         Ok(None)
     }
+}
+
+/// Synchronizes observed active dashboard work time for one tmux pane.
+///
+/// Cook time is intentionally observation-based: it starts accumulating only
+/// after the dashboard first sees a pane in an active state and may be off by
+/// roughly one poll interval around state transitions. The accumulator stores a
+/// durable baseline plus an optional active-start timestamp, so steady active
+/// refreshes can return a live duration without rewriting the SQLite row every
+/// tick. A changed process key resets the baseline to avoid carrying cook time
+/// across a replacement process in the same pane.
+pub fn sync_tmux_cook_state(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+    cooking: bool,
+) -> AppResult<Duration> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let instance = find_or_create_tmux_instance_with_connection(&connection, workspace_id, pane)?;
+    let existing = load_instance_runtime_state_with_connection(&connection, &instance.id)?;
+    let now_ms = current_unix_ms()?;
+    let process_key = tmux_cook_process_key(pane);
+
+    let process_changed = existing
+        .as_ref()
+        .and_then(|row| row.cook_process_key.as_deref())
+        != Some(process_key.as_str());
+    let mut accumulated_ms = if process_changed {
+        0
+    } else {
+        existing
+            .as_ref()
+            .map(|row| row.cook_accumulated_ms.max(0))
+            .unwrap_or(0)
+    };
+    let mut started_at = if process_changed {
+        None
+    } else {
+        existing
+            .as_ref()
+            .and_then(|row| row.cook_started_at_unix_ms)
+    };
+
+    let live_ms = if cooking {
+        let start = started_at.unwrap_or(now_ms);
+        started_at = Some(start);
+        accumulated_ms.saturating_add(now_ms.saturating_sub(start))
+    } else {
+        if let Some(start) = started_at.take() {
+            accumulated_ms = accumulated_ms.saturating_add(now_ms.saturating_sub(start));
+        }
+        accumulated_ms
+    };
+
+    let needs_write = process_changed
+        || existing.is_none()
+        || existing.as_ref().is_some_and(|row| {
+            row.cook_accumulated_ms.max(0) != accumulated_ms
+                || row.cook_started_at_unix_ms != started_at
+                || row.cook_process_key.as_deref() != Some(process_key.as_str())
+        });
+
+    if needs_write {
+        connection.execute(
+            "INSERT INTO instance_runtime_state (\
+                instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
+                claude_session_checked_at_unix_ms, cook_accumulated_ms, cook_started_at_unix_ms, \
+                cook_process_key\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(instance_id) DO UPDATE SET \
+                 last_state = excluded.last_state, \
+                 wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
+                 claude_session_id = excluded.claude_session_id, \
+                 claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms, \
+                 cook_accumulated_ms = excluded.cook_accumulated_ms, \
+                 cook_started_at_unix_ms = excluded.cook_started_at_unix_ms, \
+                 cook_process_key = excluded.cook_process_key",
+            params![
+                instance.id,
+                existing.as_ref().and_then(|row| row.last_state.clone()),
+                existing
+                    .as_ref()
+                    .and_then(|row| row.wait_started_at_unix_ms),
+                existing
+                    .as_ref()
+                    .and_then(|row| row.claude_session_id.clone()),
+                existing
+                    .as_ref()
+                    .and_then(|row| row.claude_session_checked_at_unix_ms),
+                accumulated_ms,
+                started_at,
+                Some(process_key),
+            ],
+        )?;
+    }
+
+    Ok(Duration::from_millis(live_ms.max(0) as u64))
 }
 
 pub fn sync_tmux_claude_session_id(
@@ -578,13 +734,17 @@ pub fn sync_tmux_claude_session_id(
     connection.execute(
         "INSERT INTO instance_runtime_state (\
             instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
-            claude_session_checked_at_unix_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5) \
+            claude_session_checked_at_unix_ms, cook_accumulated_ms, cook_started_at_unix_ms, \
+            cook_process_key\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(instance_id) DO UPDATE SET \
              last_state = excluded.last_state, \
              wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
              claude_session_id = excluded.claude_session_id, \
-             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms",
+             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms, \
+             cook_accumulated_ms = excluded.cook_accumulated_ms, \
+             cook_started_at_unix_ms = excluded.cook_started_at_unix_ms, \
+             cook_process_key = excluded.cook_process_key",
         params![
             instance.id,
             existing.as_ref().and_then(|row| row.last_state.clone()),
@@ -593,6 +753,16 @@ pub fn sync_tmux_claude_session_id(
                 .and_then(|row| row.wait_started_at_unix_ms),
             claude_session_id,
             Some(now_ms),
+            existing
+                .as_ref()
+                .map(|row| row.cook_accumulated_ms)
+                .unwrap_or(0),
+            existing
+                .as_ref()
+                .and_then(|row| row.cook_started_at_unix_ms),
+            existing
+                .as_ref()
+                .and_then(|row| row.cook_process_key.clone()),
         ],
     )?;
     Ok(claude_session_id)
@@ -1085,7 +1255,8 @@ fn load_instance_runtime_state_with_connection(
     Ok(connection
         .query_row(
             "SELECT instance_id, last_state, wait_started_at_unix_ms, \
-                claude_session_id, claude_session_checked_at_unix_ms \
+                claude_session_id, claude_session_checked_at_unix_ms, cook_accumulated_ms, \
+                cook_started_at_unix_ms, cook_process_key \
              FROM instance_runtime_state WHERE instance_id = ?1",
             params![instance_id],
             |row| {
@@ -1095,10 +1266,24 @@ fn load_instance_runtime_state_with_connection(
                     wait_started_at_unix_ms: row.get(2)?,
                     claude_session_id: row.get(3)?,
                     claude_session_checked_at_unix_ms: row.get(4)?,
+                    cook_accumulated_ms: row.get(5)?,
+                    cook_started_at_unix_ms: row.get(6)?,
+                    cook_process_key: row.get(7)?,
                 })
             },
         )
         .optional()?)
+}
+
+fn tmux_cook_process_key(pane: &TmuxPane) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        pane.session_id,
+        pane.window_id,
+        pane.pane_id,
+        pane.pane_pid.unwrap_or(0),
+        pane.current_command
+    )
 }
 
 fn resolve_claude_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<String>> {
@@ -1319,7 +1504,8 @@ mod tests {
         load_pending_prompt, migrate_state_db, open_state_db, read_session_id_from_transcript,
         resolve_workspace, resolve_workspace_for_path, runtime_artifacts_root, state_db_path,
         store_babysit_registration, store_pending_prompt, store_pending_prompt_for_tmux_instance,
-        sync_tmux_claude_session_id, sync_tmux_wait_state, table_exists, tape_artifact_path,
+        sync_tmux_claude_session_id, sync_tmux_cook_state, sync_tmux_wait_state, table_exists,
+        table_has_column, tape_artifact_path,
     };
     use crate::tmux::TmuxPane;
 
@@ -1361,6 +1547,22 @@ mod tests {
         assert!(
             table_exists(&connection, "instance_runtime_state")
                 .expect("instance runtime state should exist")
+        );
+        assert!(
+            table_has_column(&connection, "instance_runtime_state", "cook_accumulated_ms")
+                .expect("cook accumulated column should exist")
+        );
+        assert!(
+            table_has_column(
+                &connection,
+                "instance_runtime_state",
+                "cook_started_at_unix_ms"
+            )
+            .expect("cook started column should exist")
+        );
+        assert!(
+            table_has_column(&connection, "instance_runtime_state", "cook_process_key")
+                .expect("cook process key column should exist")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -1530,6 +1732,183 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_dir);
         let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn sync_tmux_cook_state_accumulates_busy_time() {
+        let state_dir = unique_temp_dir("storage-cook-state");
+        let workspace_root = unique_temp_dir("workspace-cook-state");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let pane = sample_pane();
+
+        let first = sync_tmux_cook_state(&state_dir, &workspace.id, &pane, true)
+            .expect("first cook sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let second = sync_tmux_cook_state(&state_dir, &workspace.id, &pane, true)
+            .expect("second cook sync should succeed");
+        let connection = open_state_db(&state_dir).expect("db should reopen");
+        let persisted_active: (i64, Option<i64>) = connection
+            .query_row(
+                "SELECT cook_accumulated_ms, cook_started_at_unix_ms FROM instance_runtime_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cook row should exist");
+        std::thread::sleep(Duration::from_millis(20));
+        let stopped = sync_tmux_cook_state(&state_dir, &workspace.id, &pane, false)
+            .expect("stop cook sync should succeed");
+
+        assert!(first <= Duration::from_millis(5));
+        assert!(second > first);
+        assert_eq!(persisted_active.0, 0);
+        assert!(persisted_active.1.is_some());
+        assert!(stopped >= second);
+
+        let connection = open_state_db(&state_dir).expect("db should reopen");
+        let persisted_stopped: (i64, Option<i64>) = connection
+            .query_row(
+                "SELECT cook_accumulated_ms, cook_started_at_unix_ms FROM instance_runtime_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cook row should exist");
+        assert!(persisted_stopped.0 > 0);
+        assert!(persisted_stopped.1.is_none());
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn sync_tmux_cook_state_restarts_after_idle_and_resets_on_process_change() {
+        let state_dir = unique_temp_dir("storage-cook-reset");
+        let workspace_root = unique_temp_dir("workspace-cook-reset");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let mut pane = sample_pane();
+
+        sync_tmux_cook_state(&state_dir, &workspace.id, &pane, true)
+            .expect("cook sync should start");
+        std::thread::sleep(Duration::from_millis(20));
+        let accumulated = sync_tmux_cook_state(&state_dir, &workspace.id, &pane, false)
+            .expect("cook sync should stop");
+        std::thread::sleep(Duration::from_millis(5));
+        let restarted = sync_tmux_cook_state(&state_dir, &workspace.id, &pane, true)
+            .expect("cook sync should restart");
+        pane.pane_pid = Some(999);
+        let reset = sync_tmux_cook_state(&state_dir, &workspace.id, &pane, true)
+            .expect("cook sync should reset for new process");
+
+        assert!(accumulated > Duration::from_millis(0));
+        assert!(
+            restarted >= accumulated,
+            "accumulated time should not be lost on restart"
+        );
+        assert!(
+            restarted < accumulated + Duration::from_millis(50),
+            "inactive-to-active restart should not inflate beyond the prior baseline"
+        );
+        assert!(reset <= Duration::from_millis(5));
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn runtime_state_syncs_preserve_cook_fields() {
+        let state_dir = unique_temp_dir("storage-cook-preserve");
+        let workspace_root = unique_temp_dir("workspace-cook-preserve");
+        let home_dir = unique_temp_dir("storage-cook-preserve-home");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        fs::create_dir_all(&home_dir).expect("home should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let pane = sample_pane();
+        sync_tmux_cook_state(&state_dir, &workspace.id, &pane, true)
+            .expect("cook sync should start");
+
+        let before_wait = cook_fields(&state_dir);
+        sync_tmux_wait_state(&state_dir, &workspace.id, &pane, "ChatReady", true)
+            .expect("wait sync should succeed");
+        assert_eq!(cook_fields(&state_dir), before_wait);
+
+        let before_claude = cook_fields(&state_dir);
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+        sync_tmux_claude_session_id(&state_dir, &workspace.id, &pane)
+            .expect("claude sync should succeed");
+        match previous_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(cook_fields(&state_dir), before_claude);
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+        let _ = fs::remove_dir_all(&home_dir);
+    }
+
+    #[test]
+    fn migrate_v3_database_adds_cook_columns_with_zero_defaults() {
+        let state_dir = unique_temp_dir("storage-migrate-v3-cook");
+        let _ = fs::remove_dir_all(&state_dir);
+        let mut connection = open_state_db(&state_dir).expect("db should open");
+        super::migrate_to_v3(&connection).expect("v3 tables should create");
+        ensure_schema_version_table(&connection).expect("schema version should exist");
+        connection
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (?1, 3)",
+                params![SCHEMA_VERSION_ROW_ID],
+            )
+            .expect("v3 version should store");
+        connection
+            .execute(
+                "INSERT INTO workspaces (id, workspace_root) VALUES ('workspace-1', '/tmp/demo')",
+                [],
+            )
+            .expect("workspace should insert");
+        connection
+            .execute(
+                "INSERT INTO instances (id, workspace_id, session_name, pane_id, kind, active) \
+                 VALUES ('instance-1', 'workspace-1', 'demo', '%1', 'tmux-pane', 1)",
+                [],
+            )
+            .expect("instance should insert");
+        connection
+            .execute(
+                "INSERT INTO instance_runtime_state (instance_id, last_state, wait_started_at_unix_ms) \
+                 VALUES ('instance-1', 'ChatReady', 123)",
+                [],
+            )
+            .expect("runtime should insert");
+
+        migrate_state_db(&mut connection).expect("migration should succeed");
+
+        let version: i64 = connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = ?1",
+                params![SCHEMA_VERSION_ROW_ID],
+                |row| row.get(0),
+            )
+            .expect("version should read");
+        let fields: (i64, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT cook_accumulated_ms, cook_started_at_unix_ms, cook_process_key \
+                 FROM instance_runtime_state WHERE instance_id = 'instance-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("runtime should read");
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(fields, (0, None, None));
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
@@ -1746,6 +2125,17 @@ mod tests {
             cursor_x: Some(1),
             cursor_y: Some(2),
         }
+    }
+
+    fn cook_fields(state_dir: &std::path::Path) -> (i64, Option<i64>, Option<String>) {
+        let connection = open_state_db(state_dir).expect("db should reopen");
+        connection
+            .query_row(
+                "SELECT cook_accumulated_ms, cook_started_at_unix_ms, cook_process_key FROM instance_runtime_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("cook fields should load")
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
