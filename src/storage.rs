@@ -10,7 +10,7 @@ use crate::app::{AppError, AppResult};
 use crate::tmux::TmuxPane;
 use crate::workspace::resolve_workspace_locator;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -61,6 +61,15 @@ pub struct InstanceRuntimeState {
     pub wait_started_at_unix_ms: Option<i64>,
     pub claude_session_id: Option<String>,
     pub claude_session_checked_at_unix_ms: Option<i64>,
+    pub cook_accumulated_ms: i64,
+    pub cook_segment_started_at_unix_ms: Option<i64>,
+    pub cook_session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TmuxRuntimeDurations {
+    pub wait_duration: Option<Duration>,
+    pub cook_duration: Option<Duration>,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -166,6 +175,7 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
             0 => migrate_to_v1(&tx)?,
             1 => migrate_to_v2(&tx)?,
             2 => migrate_to_v3(&tx)?,
+            3 => migrate_to_v4(&tx)?,
             other => {
                 return Err(AppError::new(format!(
                     "no state.db migration path from version {} to {}",
@@ -192,6 +202,7 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
         1 => migrate_to_v1(connection),
         2 => ensure_v2_tables(connection),
         3 => ensure_v3_tables(connection),
+        4 => ensure_v4_tables(connection),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -221,6 +232,24 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
                 "instance_runtime_state",
                 "claude_session_checked_at_unix_ms",
             )?),
+        4 => Ok(table_exists(connection, "workspaces")?
+            && table_exists(connection, "instances")?
+            && table_exists(connection, "pending_prompts")?
+            && table_exists(connection, "babysit_registrations")?
+            && table_exists(connection, "instance_runtime_state")?
+            && table_has_column(connection, "instance_runtime_state", "claude_session_id")?
+            && table_has_column(
+                connection,
+                "instance_runtime_state",
+                "claude_session_checked_at_unix_ms",
+            )?
+            && table_has_column(connection, "instance_runtime_state", "cook_accumulated_ms")?
+            && table_has_column(
+                connection,
+                "instance_runtime_state",
+                "cook_segment_started_at_unix_ms",
+            )?
+            && table_has_column(connection, "instance_runtime_state", "cook_session_key")?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -499,13 +528,135 @@ fn ensure_v3_tables(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-pub fn sync_tmux_wait_state(
+fn migrate_to_v4(connection: &Connection) -> AppResult<()> {
+    ensure_v3_tables(connection)?;
+    if !table_has_column(connection, "instance_runtime_state", "cook_accumulated_ms")? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN cook_accumulated_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(
+        connection,
+        "instance_runtime_state",
+        "cook_segment_started_at_unix_ms",
+    )? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN cook_segment_started_at_unix_ms INTEGER",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "instance_runtime_state", "cook_session_key")? {
+        connection.execute(
+            "ALTER TABLE instance_runtime_state ADD COLUMN cook_session_key TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_v4_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v3_tables(connection)?;
+    if !table_has_column(connection, "instance_runtime_state", "cook_accumulated_ms")? {
+        migrate_to_v4(connection)?;
+    }
+    Ok(())
+}
+
+fn sync_cook_fields(
+    existing: Option<&InstanceRuntimeState>,
+    cooking: bool,
+    session_key: Option<&str>,
+    now_ms: i64,
+) -> (i64, Option<i64>, Option<String>, Option<Duration>) {
+    let existing_session_key = existing.and_then(|row| row.cook_session_key.as_deref());
+    let session_changed = session_key != existing_session_key;
+
+    let mut cook_accumulated_ms = if session_changed {
+        0
+    } else {
+        existing.map(|row| row.cook_accumulated_ms).unwrap_or(0)
+    };
+    let mut cook_segment_started_at_unix_ms = if session_changed {
+        None
+    } else {
+        existing.and_then(|row| row.cook_segment_started_at_unix_ms)
+    };
+
+    if cooking {
+        if cook_segment_started_at_unix_ms.is_none() {
+            cook_segment_started_at_unix_ms = Some(now_ms);
+        }
+    } else if let Some(segment_start) = cook_segment_started_at_unix_ms {
+        cook_accumulated_ms = cook_accumulated_ms.saturating_add(now_ms.saturating_sub(segment_start));
+        cook_segment_started_at_unix_ms = None;
+    }
+
+    let cook_session_key = session_key.map(str::to_string);
+    let cook_duration = if cooking {
+        let segment_start = cook_segment_started_at_unix_ms.unwrap_or(now_ms);
+        let total_ms = cook_accumulated_ms.saturating_add(now_ms.saturating_sub(segment_start));
+        Some(Duration::from_millis(total_ms as u64))
+    } else {
+        (cook_accumulated_ms > 0).then(|| Duration::from_millis(cook_accumulated_ms as u64))
+    };
+
+    (
+        cook_accumulated_ms,
+        cook_segment_started_at_unix_ms,
+        cook_session_key,
+        cook_duration,
+    )
+}
+
+fn upsert_instance_runtime_state(
+    connection: &Connection,
+    instance_id: &str,
+    last_state: Option<&str>,
+    wait_started_at_unix_ms: Option<i64>,
+    claude_session_id: Option<String>,
+    claude_session_checked_at_unix_ms: Option<i64>,
+    cook_accumulated_ms: i64,
+    cook_segment_started_at_unix_ms: Option<i64>,
+    cook_session_key: Option<String>,
+) -> AppResult<()> {
+    connection.execute(
+        "INSERT INTO instance_runtime_state (\
+            instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
+            claude_session_checked_at_unix_ms, cook_accumulated_ms, \
+            cook_segment_started_at_unix_ms, cook_session_key\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(instance_id) DO UPDATE SET \
+             last_state = excluded.last_state, \
+             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
+             claude_session_id = excluded.claude_session_id, \
+             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms, \
+             cook_accumulated_ms = excluded.cook_accumulated_ms, \
+             cook_segment_started_at_unix_ms = excluded.cook_segment_started_at_unix_ms, \
+             cook_session_key = excluded.cook_session_key",
+        params![
+            instance_id,
+            last_state,
+            wait_started_at_unix_ms,
+            claude_session_id,
+            claude_session_checked_at_unix_ms,
+            cook_accumulated_ms,
+            cook_segment_started_at_unix_ms,
+            cook_session_key,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn sync_tmux_runtime_state(
     state_dir: &Path,
     workspace_id: &str,
     pane: &TmuxPane,
     state: &str,
     waiting: bool,
-) -> AppResult<Option<Duration>> {
+    cooking: bool,
+    session_key: Option<&str>,
+) -> AppResult<TmuxRuntimeDurations> {
     let connection = open_bootstrapped_state_db(state_dir)?;
     let instance = find_or_create_tmux_instance_with_connection(&connection, workspace_id, pane)?;
     let existing = load_instance_runtime_state_with_connection(&connection, &instance.id)?;
@@ -520,40 +671,54 @@ pub fn sync_tmux_wait_state(
         0
     };
 
-    connection.execute(
-        "INSERT INTO instance_runtime_state (\
-            instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
-            claude_session_checked_at_unix_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(instance_id) DO UPDATE SET \
-             last_state = excluded.last_state, \
-             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
-             claude_session_id = excluded.claude_session_id, \
-             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms",
-        params![
-            instance.id,
-            state,
-            if waiting {
-                Some(wait_started_at_unix_ms)
-            } else {
-                None::<i64>
-            },
-            existing
-                .as_ref()
-                .and_then(|row| row.claude_session_id.clone()),
-            existing
-                .as_ref()
-                .and_then(|row| row.claude_session_checked_at_unix_ms),
-        ],
+    let (cook_accumulated_ms, cook_segment_started_at_unix_ms, cook_session_key, cook_duration) =
+        sync_cook_fields(existing.as_ref(), cooking, session_key, now_ms);
+
+    upsert_instance_runtime_state(
+        &connection,
+        &instance.id,
+        Some(state),
+        if waiting {
+            Some(wait_started_at_unix_ms)
+        } else {
+            None
+        },
+        existing
+            .as_ref()
+            .and_then(|row| row.claude_session_id.clone()),
+        existing
+            .as_ref()
+            .and_then(|row| row.claude_session_checked_at_unix_ms),
+        cook_accumulated_ms,
+        cook_segment_started_at_unix_ms,
+        cook_session_key,
     )?;
 
-    if waiting {
-        Ok(Some(Duration::from_millis(
+    let wait_duration = if waiting {
+        Some(Duration::from_millis(
             now_ms.saturating_sub(wait_started_at_unix_ms) as u64,
-        )))
+        ))
     } else {
-        Ok(None)
-    }
+        None
+    };
+
+    Ok(TmuxRuntimeDurations {
+        wait_duration,
+        cook_duration,
+    })
+}
+
+pub fn sync_tmux_wait_state(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+    state: &str,
+    waiting: bool,
+) -> AppResult<Option<Duration>> {
+    Ok(
+        sync_tmux_runtime_state(state_dir, workspace_id, pane, state, waiting, false, None)?
+            .wait_duration,
+    )
 }
 
 pub fn sync_tmux_claude_session_id(
@@ -575,25 +740,25 @@ pub fn sync_tmux_claude_session_id(
     }
 
     let claude_session_id = resolve_claude_session_id_for_pane(pane)?;
-    connection.execute(
-        "INSERT INTO instance_runtime_state (\
-            instance_id, last_state, wait_started_at_unix_ms, claude_session_id, \
-            claude_session_checked_at_unix_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(instance_id) DO UPDATE SET \
-             last_state = excluded.last_state, \
-             wait_started_at_unix_ms = excluded.wait_started_at_unix_ms, \
-             claude_session_id = excluded.claude_session_id, \
-             claude_session_checked_at_unix_ms = excluded.claude_session_checked_at_unix_ms",
-        params![
-            instance.id,
-            existing.as_ref().and_then(|row| row.last_state.clone()),
-            existing
-                .as_ref()
-                .and_then(|row| row.wait_started_at_unix_ms),
-            claude_session_id,
-            Some(now_ms),
-        ],
+    upsert_instance_runtime_state(
+        &connection,
+        &instance.id,
+        existing.as_ref().and_then(|row| row.last_state.as_deref()),
+        existing
+            .as_ref()
+            .and_then(|row| row.wait_started_at_unix_ms),
+        claude_session_id.clone(),
+        Some(now_ms),
+        existing
+            .as_ref()
+            .map(|row| row.cook_accumulated_ms)
+            .unwrap_or(0),
+        existing
+            .as_ref()
+            .and_then(|row| row.cook_segment_started_at_unix_ms),
+        existing
+            .as_ref()
+            .and_then(|row| row.cook_session_key.clone()),
     )?;
     Ok(claude_session_id)
 }
@@ -1085,7 +1250,8 @@ fn load_instance_runtime_state_with_connection(
     Ok(connection
         .query_row(
             "SELECT instance_id, last_state, wait_started_at_unix_ms, \
-                claude_session_id, claude_session_checked_at_unix_ms \
+                claude_session_id, claude_session_checked_at_unix_ms, cook_accumulated_ms, \
+                cook_segment_started_at_unix_ms, cook_session_key \
              FROM instance_runtime_state WHERE instance_id = ?1",
             params![instance_id],
             |row| {
@@ -1095,6 +1261,9 @@ fn load_instance_runtime_state_with_connection(
                     wait_started_at_unix_ms: row.get(2)?,
                     claude_session_id: row.get(3)?,
                     claude_session_checked_at_unix_ms: row.get(4)?,
+                    cook_accumulated_ms: row.get(5)?,
+                    cook_segment_started_at_unix_ms: row.get(6)?,
+                    cook_session_key: row.get(7)?,
                 })
             },
         )
@@ -1319,7 +1488,8 @@ mod tests {
         load_pending_prompt, migrate_state_db, open_state_db, read_session_id_from_transcript,
         resolve_workspace, resolve_workspace_for_path, runtime_artifacts_root, state_db_path,
         store_babysit_registration, store_pending_prompt, store_pending_prompt_for_tmux_instance,
-        sync_tmux_claude_session_id, sync_tmux_wait_state, table_exists, tape_artifact_path,
+        sync_tmux_claude_session_id, sync_tmux_runtime_state, sync_tmux_wait_state, table_exists,
+        tape_artifact_path,
     };
     use crate::tmux::TmuxPane;
 
@@ -1527,6 +1697,221 @@ mod tests {
 
         assert!(second >= first);
         assert!(cleared.is_none());
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn sync_tmux_runtime_state_accumulates_cook_while_busy() {
+        let state_dir = unique_temp_dir("storage-runtime-cook");
+        let workspace_root = unique_temp_dir("workspace-runtime-cook");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let pane = sample_pane();
+
+        sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            Some("session-a"),
+        )
+        .expect("first sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let first = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            Some("session-a"),
+        )
+        .expect("first measured sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let second = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            Some("session-a"),
+        )
+        .expect("second sync should succeed");
+
+        assert!(first.cook_duration.is_some());
+        assert!(second.cook_duration >= first.cook_duration);
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn sync_tmux_runtime_state_pauses_cook_on_chat_ready() {
+        let state_dir = unique_temp_dir("storage-runtime-cook-pause");
+        let workspace_root = unique_temp_dir("workspace-runtime-cook-pause");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let pane = sample_pane();
+
+        sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            None,
+        )
+        .expect("busy sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let busy = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            None,
+        )
+        .expect("busy measurement sync should succeed");
+        let idle = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "ChatReady",
+            true,
+            false,
+            None,
+        )
+        .expect("idle sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let idle_again = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "ChatReady",
+            true,
+            false,
+            None,
+        )
+        .expect("idle again sync should succeed");
+
+        let busy_ms = busy.cook_duration.map(|d| d.as_millis()).unwrap_or(0);
+        let idle_ms = idle.cook_duration.map(|d| d.as_millis()).unwrap_or(0);
+        let idle_again_ms = idle_again.cook_duration.map(|d| d.as_millis()).unwrap_or(0);
+        assert!(busy_ms > 0);
+        assert_eq!(idle_ms, idle_again_ms);
+        assert!(idle_ms >= busy_ms);
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn sync_tmux_runtime_state_excludes_permission_from_cook() {
+        let state_dir = unique_temp_dir("storage-runtime-cook-permission");
+        let workspace_root = unique_temp_dir("workspace-runtime-cook-permission");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let pane = sample_pane();
+
+        sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            None,
+        )
+        .expect("busy sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let busy = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            None,
+        )
+        .expect("busy measurement sync should succeed");
+        let permission = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "PermissionDialog",
+            true,
+            false,
+            None,
+        )
+        .expect("permission sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let permission_again = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "PermissionDialog",
+            true,
+            false,
+            None,
+        )
+        .expect("permission again sync should succeed");
+
+        let busy_ms = busy.cook_duration.map(|d| d.as_millis()).unwrap_or(0);
+        let permission_ms = permission.cook_duration.map(|d| d.as_millis()).unwrap_or(0);
+        let permission_again_ms = permission_again
+            .cook_duration
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        assert!(busy_ms > 0);
+        assert!(permission_ms >= busy_ms);
+        assert_eq!(permission_ms, permission_again_ms);
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn sync_tmux_runtime_state_resets_cook_on_session_change() {
+        let state_dir = unique_temp_dir("storage-runtime-cook-session");
+        let workspace_root = unique_temp_dir("workspace-runtime-cook-session");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root)
+            .expect("workspace should resolve");
+        let pane = sample_pane();
+
+        sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            Some("session-a"),
+        )
+        .expect("first session sync should succeed");
+        std::thread::sleep(Duration::from_millis(20));
+        let reset = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            Some("session-b"),
+        )
+        .expect("session change sync should succeed");
+
+        assert!(reset.cook_duration.unwrap_or_default() < Duration::from_millis(15));
 
         let _ = fs::remove_dir_all(&state_dir);
         let _ = fs::remove_dir_all(&workspace_root);
