@@ -34,7 +34,7 @@ use crate::pi::resolve_pi_session_for_pane;
 use crate::prompt::resolve_state_dir;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
-    sync_tmux_wait_state,
+    sync_tmux_runtime_state,
 };
 use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
@@ -149,7 +149,7 @@ struct PaneEntry {
     recap_present: bool,
     recap_excerpt: Option<String>,
     yolo_enabled: bool,
-    age: Duration,
+    cook_duration: Option<Duration>,
     wait_duration: Option<Duration>,
     yes_count: u32,
     claude_session_id: Option<String>,
@@ -173,11 +173,6 @@ struct CpuSample {
 struct ProcessSnapshot {
     pid: u32,
     ppid: u32,
-    pgrp: i32,
-    tpgid: i32,
-    command: String,
-    cmdline_basenames: Vec<String>,
-    start_ticks: u64,
     cpu_ticks: u64,
     rss_pages: u64,
 }
@@ -258,7 +253,6 @@ impl DashboardApp {
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
         let mut next_frames = HashMap::new();
-        let process_age_snapshots = process_snapshots_with_cmdlines();
 
         for pane in self.client.list_panes()? {
             if is_claude_pane(&pane) {
@@ -281,21 +275,19 @@ impl DashboardApp {
                     .or_insert_with(|| git_branch_for_path(&pane.current_path))
                     .clone();
                 let yolo_enabled = matches!(read_yolo_record(&self.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
-                let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
-                    self.first_seen
-                        .get(&pane.pane_id)
-                        .map(Instant::elapsed)
-                        .unwrap_or_default()
-                });
-                let wait_duration = sync_tmux_wait_state(
+                let claude_session_id =
+                    sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
+                let runtime = sync_tmux_runtime_state(
                     &self.state_dir,
                     &workspace.id,
                     &pane,
                     state.as_str(),
                     is_waiting_state(state),
+                    is_cooking_state(state),
+                    claude_session_id.as_deref(),
                 )?;
-                let claude_session_id =
-                    sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
+                let wait_duration = runtime.wait_duration;
+                let cook_duration = runtime.cook_duration;
                 let yes_count = self
                     .yes_counts
                     .get(&yes_count_key(claude_session_id.as_deref(), &pane.pane_id))
@@ -317,7 +309,7 @@ impl DashboardApp {
                     recap_present: inspected.classification.recap_present,
                     recap_excerpt: inspected.classification.recap_excerpt.clone(),
                     yolo_enabled,
-                    age,
+                    cook_duration,
                     wait_duration,
                     yes_count,
                     claude_session_id,
@@ -339,12 +331,15 @@ impl DashboardApp {
                     .entry(pane.current_path.clone())
                     .or_insert_with(|| git_branch_for_path(&pane.current_path))
                     .clone();
-                let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
-                    self.first_seen
-                        .get(&pane.pane_id)
-                        .map(Instant::elapsed)
-                        .unwrap_or_default()
-                });
+                let runtime = sync_tmux_runtime_state(
+                    &self.state_dir,
+                    &workspace.id,
+                    &pane,
+                    pi_session.state.as_str(),
+                    is_waiting_state(pi_session.state),
+                    is_cooking_state(pi_session.state),
+                    Some(pi_session.id.as_str()),
+                )?;
                 let resource_usage =
                     self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
 
@@ -362,8 +357,8 @@ impl DashboardApp {
                     recap_present: false,
                     recap_excerpt: None,
                     yolo_enabled: false,
-                    age,
-                    wait_duration: None,
+                    cook_duration: runtime.cook_duration,
+                    wait_duration: runtime.wait_duration,
                     yes_count: 0,
                     claude_session_id: None,
                     focused_source: pi_session.context,
@@ -384,12 +379,15 @@ impl DashboardApp {
                     .entry(pane.current_path.clone())
                     .or_insert_with(|| git_branch_for_path(&pane.current_path))
                     .clone();
-                let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
-                    self.first_seen
-                        .get(&pane.pane_id)
-                        .map(Instant::elapsed)
-                        .unwrap_or_default()
-                });
+                let runtime = sync_tmux_runtime_state(
+                    &self.state_dir,
+                    &workspace.id,
+                    &pane,
+                    opencode_session.state.as_str(),
+                    is_waiting_state(opencode_session.state),
+                    is_cooking_state(opencode_session.state),
+                    Some(opencode_session.id.as_str()),
+                )?;
                 let resource_usage =
                     self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
 
@@ -408,8 +406,8 @@ impl DashboardApp {
                     recap_present: false,
                     recap_excerpt: None,
                     yolo_enabled: false,
-                    age,
-                    wait_duration: None,
+                    cook_duration: runtime.cook_duration,
+                    wait_duration: runtime.wait_duration,
                     yes_count: 0,
                     claude_session_id: None,
                     focused_source: opencode_session.context,
@@ -438,17 +436,21 @@ impl DashboardApp {
                 .entry(pane.current_path.clone())
                 .or_insert_with(|| git_branch_for_path(&pane.current_path))
                 .clone();
-            let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
-                self.first_seen
-                    .get(&pane.pane_id)
-                    .map(Instant::elapsed)
-                    .unwrap_or_default()
-            });
+            let state = inspected.classification.state;
             next_frames.insert(pane.pane_id.clone(), inspected.raw_source.clone());
             let yolo_enabled = matches!(
                 read_yolo_record(&self.state_dir, &pane.pane_id)?,
                 Some(record) if record.enabled
             );
+            let runtime = sync_tmux_runtime_state(
+                &self.state_dir,
+                &workspace.id,
+                &pane,
+                state.as_str(),
+                is_waiting_state(state),
+                is_cooking_state(state),
+                None,
+            )?;
             let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
 
             panes.push(PaneEntry {
@@ -458,13 +460,13 @@ impl DashboardApp {
                 workspace_group_key,
                 workspace_group_label,
                 branch,
-                state: inspected.classification.state,
+                state,
                 has_questions: inspected.classification.has_questions,
                 recap_present: inspected.classification.recap_present,
                 recap_excerpt: inspected.classification.recap_excerpt.clone(),
                 yolo_enabled,
-                age,
-                wait_duration: None,
+                cook_duration: runtime.cook_duration,
+                wait_duration: runtime.wait_duration,
                 yes_count: 0,
                 claude_session_id: None,
                 focused_source: inspected.focused_source,
@@ -1213,7 +1215,12 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                     "disabled"
                 }
             )),
-            Line::from(format!("Age: {}", format_age(pane.age))),
+            Line::from(format!(
+                "Cook: {}",
+                pane.cook_duration
+                    .map(format_duration_compact)
+                    .unwrap_or_else(|| String::from("-"))
+            )),
             Line::from(format!(
                 "Avg CPU: {}",
                 format_cpu_percent(pane.resource_usage.cpu_percent)
@@ -1416,7 +1423,7 @@ struct PaneListColumnRects {
     yolo: Rect,
     cpu: Rect,
     mem: Rect,
-    uptime: Rect,
+    cook: Rect,
     wait: Rect,
     yes: Rect,
     branch: Rect,
@@ -1427,7 +1434,7 @@ fn render_pane_list_header(frame: &mut ratatui::Frame<'_>, area: Rect, columns: 
     let rects = pane_list_column_rects(area, columns);
     render_cell_right(frame, rects.cpu, "CPU", header_style());
     render_cell_right(frame, rects.mem, "MEM", header_style());
-    render_cell(frame, rects.uptime, "Uptime", header_style());
+    render_cell(frame, rects.cook, "Cook", header_style());
     render_cell(frame, rects.wait, "Wait", header_style());
     render_cell_right(frame, rects.yes, "🤠", header_style());
     render_cell(frame, rects.branch, "Branch", header_style());
@@ -1522,8 +1529,11 @@ fn render_pane_list(
                 );
                 render_cell(
                     frame,
-                    rect_at_y(rects.uptime, y),
-                    &format_duration_compact(pane.age),
+                    rect_at_y(rects.cook, y),
+                    &pane
+                        .cook_duration
+                        .map(format_duration_compact)
+                        .unwrap_or_default(),
                     row_style,
                 );
                 render_cell(
@@ -1571,7 +1581,7 @@ fn pane_list_column_rects(area: Rect, columns: &PaneListColumns) -> PaneListColu
     x = x.saturating_add(compact_gap);
     let mem = take_rect(area, &mut x, columns.mem_width as u16);
     x = x.saturating_add(gap);
-    let uptime = take_rect(area, &mut x, columns.uptime_width as u16);
+    let cook = take_rect(area, &mut x, columns.cook_width as u16);
     x = x.saturating_add(gap);
     let wait = take_rect(area, &mut x, columns.wait_width as u16);
     x = x.saturating_add(gap);
@@ -1591,7 +1601,7 @@ fn pane_list_column_rects(area: Rect, columns: &PaneListColumns) -> PaneListColu
         yolo,
         cpu,
         mem,
-        uptime,
+        cook,
         wait,
         yes,
         branch,
@@ -1639,7 +1649,7 @@ struct PaneListColumns {
     agent_width: usize,
     cpu_width: usize,
     mem_width: usize,
-    uptime_width: usize,
+    cook_width: usize,
     wait_width: usize,
     yes_width: usize,
 }
@@ -1662,13 +1672,20 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
             .max()
             .unwrap_or(3)
             .max(3),
-        uptime_width: app
+        cook_width: app
             .panes
             .iter()
-            .map(|pane| format_duration_compact(pane.age).len())
+            .map(|pane| {
+                UnicodeWidthStr::width(
+                    pane.cook_duration
+                        .map(format_duration_compact)
+                        .unwrap_or_default()
+                        .as_str(),
+                )
+            })
             .max()
-            .unwrap_or(6)
-            .max(6),
+            .unwrap_or(4)
+            .max(4),
         wait_width: app
             .panes
             .iter()
@@ -2252,6 +2269,10 @@ fn is_waiting_state(state: SessionState) -> bool {
     )
 }
 
+fn is_cooking_state(state: SessionState) -> bool {
+    matches!(state, SessionState::BusyResponding)
+}
+
 fn is_attention_state(state: SessionState) -> bool {
     matches!(
         state,
@@ -2345,18 +2366,6 @@ fn pane_window_prefix(state: SessionState, has_questions: bool, yolo_enabled: bo
         format!("{state}{DASHBOARD_YOLO_MARKER}")
     } else {
         state.to_string()
-    }
-}
-
-fn format_age(age: Duration) -> String {
-    let total = age.as_secs();
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let seconds = total % 60;
-    if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes:02}:{seconds:02}")
     }
 }
 
@@ -2455,114 +2464,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn pane_process_age(pane: &TmuxPane, snapshots: &[ProcessSnapshot]) -> Option<Duration> {
-    let root_pid = pane.pane_pid?;
-    let snapshot = select_agent_process(root_pid, &pane.current_command, snapshots)?;
-    process_age_from_start_ticks(snapshot.start_ticks)
-}
-
-fn process_age_from_start_ticks(start_ticks: u64) -> Option<Duration> {
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks_per_second <= 0 {
-        return None;
-    }
-    let uptime = fs::read_to_string("/proc/uptime").ok()?;
-    let uptime_secs = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
-    let start_secs = start_ticks as f64 / ticks_per_second as f64;
-    if uptime_secs < start_secs {
-        return None;
-    }
-    Some(Duration::from_secs_f64(uptime_secs - start_secs))
-}
-
-fn select_agent_process<'a>(
-    root_pid: u32,
-    current_command: &str,
-    snapshots: &'a [ProcessSnapshot],
-) -> Option<&'a ProcessSnapshot> {
-    let root = snapshots.iter().find(|snapshot| snapshot.pid == root_pid)?;
-    let descendants = process_descendants(root_pid, snapshots);
-    let foreground_pgrp = (root.tpgid > 0).then_some(root.tpgid);
-
-    foreground_pgrp
-        .and_then(|pgrp| {
-            oldest_matching_process(descendants.iter().copied().filter(|snapshot| {
-                snapshot.pgrp == pgrp && process_matches_command(snapshot, current_command)
-            }))
-        })
-        .or_else(|| {
-            oldest_matching_process(
-                descendants
-                    .iter()
-                    .copied()
-                    .filter(|snapshot| process_matches_command(snapshot, current_command)),
-            )
-        })
-        .or_else(|| {
-            foreground_pgrp.and_then(|pgrp| {
-                oldest_matching_process(
-                    descendants
-                        .iter()
-                        .copied()
-                        .filter(|snapshot| snapshot.pgrp == pgrp),
-                )
-            })
-        })
-        .or(Some(root))
-}
-
-fn process_descendants<'a>(
-    root_pid: u32,
-    snapshots: &'a [ProcessSnapshot],
-) -> Vec<&'a ProcessSnapshot> {
-    let mut children_by_parent = HashMap::<u32, Vec<&ProcessSnapshot>>::new();
-    for snapshot in snapshots {
-        children_by_parent
-            .entry(snapshot.ppid)
-            .or_default()
-            .push(snapshot);
-    }
-    let snapshots_by_pid = snapshots
-        .iter()
-        .map(|snapshot| (snapshot.pid, snapshot))
-        .collect::<HashMap<_, _>>();
-
-    let mut descendants = Vec::new();
-    let mut stack = vec![root_pid];
-    while let Some(pid) = stack.pop() {
-        if let Some(snapshot) = snapshots_by_pid.get(&pid) {
-            descendants.push(*snapshot);
-        }
-        if let Some(children) = children_by_parent.get(&pid) {
-            stack.extend(children.iter().map(|snapshot| snapshot.pid));
-        }
-    }
-    descendants
-}
-
-fn oldest_matching_process<'a, I>(snapshots: I) -> Option<&'a ProcessSnapshot>
-where
-    I: Iterator<Item = &'a ProcessSnapshot>,
-{
-    snapshots.min_by_key(|snapshot| snapshot.start_ticks)
-}
-
-fn process_matches_command(snapshot: &ProcessSnapshot, command: &str) -> bool {
-    let command = command_basename(command);
-    if command.is_empty() {
-        return false;
-    }
-    snapshot.command == command
-        || snapshot
-            .cmdline_basenames
-            .iter()
-            .any(|name| name == command)
-}
-
-fn command_basename(command: &str) -> &str {
-    command.rsplit('/').next().unwrap_or(command)
-}
-
 fn cpu_percent_between(previous: CpuSample, current: CpuSample) -> Option<f64> {
     let elapsed = current
         .at
@@ -2617,14 +2518,6 @@ fn process_tree_usage(root_pid: u32) -> Option<ProcessTreeUsage> {
 }
 
 fn process_snapshots() -> Vec<ProcessSnapshot> {
-    process_snapshots_with_options(false)
-}
-
-fn process_snapshots_with_cmdlines() -> Vec<ProcessSnapshot> {
-    process_snapshots_with_options(true)
-}
-
-fn process_snapshots_with_options(include_cmdline: bool) -> Vec<ProcessSnapshot> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -2632,31 +2525,21 @@ fn process_snapshots_with_options(include_cmdline: bool) -> Vec<ProcessSnapshot>
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter_map(|pid| process_snapshot(pid, include_cmdline))
+        .filter_map(process_snapshot)
         .collect()
 }
 
-fn process_snapshot(pid: u32, include_cmdline: bool) -> Option<ProcessSnapshot> {
+fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let mut snapshot = parse_process_stat(pid, &stat)?;
-    if include_cmdline {
-        snapshot.cmdline_basenames = process_cmdline_basenames(pid);
-    }
-    Some(snapshot)
+    parse_process_stat(pid, &stat)
 }
 
 fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessSnapshot> {
-    let (prefix, fields) = stat.rsplit_once(") ")?;
-    let command = prefix.split_once('(')?.1.to_string();
+    let (_prefix, fields) = stat.rsplit_once(") ")?;
     let fields = fields.split_whitespace().collect::<Vec<_>>();
     Some(ProcessSnapshot {
         pid,
         ppid: fields.get(1)?.parse::<u32>().ok()?,
-        pgrp: fields.get(2)?.parse::<i32>().ok()?,
-        tpgid: fields.get(5)?.parse::<i32>().ok()?,
-        command,
-        cmdline_basenames: Vec::new(),
-        start_ticks: fields.get(19)?.parse::<u64>().ok()?,
         cpu_ticks: fields
             .get(11)?
             .parse::<u64>()
@@ -2669,20 +2552,6 @@ fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessSnapshot> {
             .unwrap_or_default()
             .max(0) as u64,
     })
-}
-
-fn process_cmdline_basenames(pid: u32) -> Vec<String> {
-    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-        return Vec::new();
-    };
-    cmdline
-        .split(|byte| *byte == 0)
-        .filter_map(|part| std::str::from_utf8(part).ok())
-        .filter(|part| !part.is_empty())
-        .map(command_basename)
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn ticks_per_second() -> Option<u64> {
@@ -2754,16 +2623,16 @@ mod tests {
     use super::{
         DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
         PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
-        ProcessSnapshot, ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji,
-        agent_marker, cleanup_dashboard_window_name, context_lines_above_input,
-        current_base_window_name, dashboard_body_sections, dashboard_display_state,
-        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
-        detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
-        footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
-        format_memory_gauge, is_codex_candidate_pane, is_codex_screen, load_saved_selection,
+        ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji, agent_marker,
+        cleanup_dashboard_window_name, context_lines_above_input, current_base_window_name,
+        dashboard_body_sections, dashboard_display_state, dashboard_selection_path,
+        derive_base_window_name, detail_body_kind, detail_current_path, detail_workspace_label,
+        details_panel_height, footer_column_widths, footer_help_line, footer_lines,
+        format_cpu_gauge, format_duration_compact, format_memory_bar, format_memory_gauge,
+        is_codex_candidate_pane, is_codex_screen, is_cooking_state, load_saved_selection,
         pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
         parse_process_stat, recap_lines, rect_contains, render_workspace_header_line,
-        repo_root_from_repo_key, save_selection, select_agent_process, select_tail_lines_for_rows,
+        repo_root_from_repo_key, save_selection, select_tail_lines_for_rows,
         should_return_navigation, split_workspace_header, state_emoji, state_marker,
         strip_dashboard_emoji_prefixes, tmux_object_id_order, window_target, workspace_group_key,
         workspace_group_label, yes_count_key, yolo_column_contains,
@@ -2776,8 +2645,25 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
-    fn formats_short_age() {
-        assert_eq!(format_age(Duration::from_secs(65)), "01:05");
+    fn cooking_state_matches_only_busy_responding() {
+        for state in [
+            SessionState::ChatReady,
+            SessionState::PromptEditing,
+            SessionState::UserQuestionPrompt,
+            SessionState::BusyResponding,
+            SessionState::PermissionDialog,
+            SessionState::PlanApprovalPrompt,
+            SessionState::FolderTrustPrompt,
+            SessionState::SurveyPrompt,
+            SessionState::ExternalEditorActive,
+            SessionState::DiffDialog,
+            SessionState::Unknown,
+        ] {
+            assert_eq!(
+                is_cooking_state(state),
+                state == SessionState::BusyResponding
+            );
+        }
     }
 
     #[test]
@@ -2809,11 +2695,6 @@ mod tests {
             &[]
         ));
         assert!(!is_codex_screen("plain node output", &[]));
-    }
-
-    #[test]
-    fn formats_long_age() {
-        assert_eq!(format_age(Duration::from_secs(3665)), "01:01:05");
     }
 
     #[test]
@@ -3178,52 +3059,8 @@ mod tests {
 
         assert_eq!(snapshot.pid, 123);
         assert_eq!(snapshot.ppid, 7);
-        assert_eq!(snapshot.pgrp, 1);
-        assert_eq!(snapshot.tpgid, -1);
-        assert_eq!(snapshot.command, "agent worker");
-        assert_eq!(snapshot.start_ticks, 1000);
         assert_eq!(snapshot.cpu_ticks, 24);
         assert_eq!(snapshot.rss_pages, 42);
-    }
-
-    #[test]
-    fn agent_process_selection_prefers_foreground_matching_child() {
-        let snapshots = vec![
-            test_process_snapshot(10, 1, 10, 20, "bash", 100, &[]),
-            test_process_snapshot(20, 10, 20, 20, "claude", 900, &["node", "claude"]),
-            test_process_snapshot(21, 20, 20, 20, "node", 950, &[]),
-        ];
-
-        let selected = select_agent_process(10, "claude", &snapshots)
-            .expect("foreground claude process should be selected");
-
-        assert_eq!(selected.pid, 20);
-    }
-
-    #[test]
-    fn agent_process_selection_falls_back_to_matching_descendant() {
-        let snapshots = vec![
-            test_process_snapshot(10, 1, 10, 30, "bash", 100, &[]),
-            test_process_snapshot(20, 10, 20, 20, "claude", 900, &[]),
-        ];
-
-        let selected = select_agent_process(10, "claude", &snapshots)
-            .expect("matching descendant should be selected");
-
-        assert_eq!(selected.pid, 20);
-    }
-
-    #[test]
-    fn agent_process_selection_falls_back_to_root_when_no_match_exists() {
-        let snapshots = vec![
-            test_process_snapshot(10, 1, 10, 10, "bash", 100, &[]),
-            test_process_snapshot(20, 10, 20, 20, "worker", 900, &[]),
-        ];
-
-        let selected = select_agent_process(10, "claude", &snapshots)
-            .expect("root process should remain a safe fallback");
-
-        assert_eq!(selected.pid, 10);
     }
 
     #[test]
@@ -3502,7 +3339,7 @@ mod tests {
                 None
             },
             yolo_enabled: false,
-            age: Duration::from_secs(1),
+            cook_duration: Some(Duration::from_secs(60)),
             wait_duration: None,
             yes_count: 0,
             claude_session_id: None,
@@ -3546,30 +3383,6 @@ mod tests {
         }
     }
 
-    fn test_process_snapshot(
-        pid: u32,
-        ppid: u32,
-        pgrp: i32,
-        tpgid: i32,
-        command: &str,
-        start_ticks: u64,
-        cmdline_basenames: &[&str],
-    ) -> ProcessSnapshot {
-        ProcessSnapshot {
-            pid,
-            ppid,
-            pgrp,
-            tpgid,
-            command: command.to_string(),
-            cmdline_basenames: cmdline_basenames
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
-            start_ticks,
-            cpu_ticks: 0,
-            rss_pages: 0,
-        }
-    }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()

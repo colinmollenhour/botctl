@@ -138,7 +138,7 @@ Notes:
 - maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
 - ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
 - Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode and Pi support is visibility-only, and broader guarded automation remains Claude-only
-- shows current classified state, foreground agent uptime, wait time, branch, and workspace grouping
+- shows current classified state, cook time (active work excluding idle and permission waits, persisted across dashboard restarts), wait time, branch, and workspace grouping
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 
