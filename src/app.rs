@@ -1749,7 +1749,7 @@ fn run_prompt(args: PromptRunArgs) -> AppResult<String> {
     let prompt_run_id = default_prompt_run_id();
     let resolved_input = resolve_prompt_run_input(&args, &state_dir, &prompt_run_id)?;
     let result = run_prompt_with_resolved_input(&args, &state_dir, &session_name, &resolved_input);
-    cleanup_prompt_temp(&resolved_input, args.keep_temp);
+    cleanup_prompt_temp(&resolved_input, args.keep_temp || result.is_err());
     result
 }
 

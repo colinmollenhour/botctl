@@ -227,7 +227,12 @@ impl TmuxClient {
             Ok(started) => Ok(started),
             Err(first_error) => match self.start_window_as_session(request) {
                 Ok(started) => Ok(started),
-                Err(_) => self.start_window(request).map_err(|_| first_error),
+                Err(second_error) => match self.start_window(request) {
+                    Ok(started) => Ok(started),
+                    Err(retry_error) => Err(AppError::new(format!(
+                        "tmux window start failed: first attempt: {first_error}; fallback session creation: {second_error}; final retry: {retry_error}"
+                    ))),
+                },
             },
         }
     }
