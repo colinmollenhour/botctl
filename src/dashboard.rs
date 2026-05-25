@@ -34,7 +34,7 @@ use crate::pi::resolve_pi_session_for_pane;
 use crate::prompt::resolve_state_dir;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, resolve_workspace_for_path, sync_tmux_claude_session_id,
-    sync_tmux_wait_state,
+    sync_tmux_cook_state, sync_tmux_wait_state,
 };
 use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
 use crate::yolo::{disable_yolo_record, read_yolo_record, write_yolo_record};
@@ -150,6 +150,7 @@ struct PaneEntry {
     recap_excerpt: Option<String>,
     yolo_enabled: bool,
     age: Duration,
+    cook_duration: Duration,
     wait_duration: Option<Duration>,
     yes_count: u32,
     claude_session_id: Option<String>,
@@ -294,6 +295,12 @@ impl DashboardApp {
                     state.as_str(),
                     is_waiting_state(state),
                 )?;
+                let cook_duration = sync_tmux_cook_state(
+                    &self.state_dir,
+                    &workspace.id,
+                    &pane,
+                    is_cooking_state(state),
+                )?;
                 let claude_session_id =
                     sync_tmux_claude_session_id(&self.state_dir, &workspace.id, &pane)?;
                 let yes_count = self
@@ -318,6 +325,7 @@ impl DashboardApp {
                     recap_excerpt: inspected.classification.recap_excerpt.clone(),
                     yolo_enabled,
                     age,
+                    cook_duration,
                     wait_duration,
                     yes_count,
                     claude_session_id,
@@ -347,6 +355,12 @@ impl DashboardApp {
                 });
                 let resource_usage =
                     self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+                let cook_duration = sync_tmux_cook_state(
+                    &self.state_dir,
+                    &workspace.id,
+                    &pane,
+                    is_cooking_state(pi_session.state),
+                )?;
 
                 panes.push(PaneEntry {
                     pane,
@@ -363,6 +377,7 @@ impl DashboardApp {
                     recap_excerpt: None,
                     yolo_enabled: false,
                     age,
+                    cook_duration,
                     wait_duration: None,
                     yes_count: 0,
                     claude_session_id: None,
@@ -392,6 +407,12 @@ impl DashboardApp {
                 });
                 let resource_usage =
                     self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+                let cook_duration = sync_tmux_cook_state(
+                    &self.state_dir,
+                    &workspace.id,
+                    &pane,
+                    is_cooking_state(opencode_session.state),
+                )?;
 
                 panes.push(PaneEntry {
                     pane,
@@ -409,6 +430,7 @@ impl DashboardApp {
                     recap_excerpt: None,
                     yolo_enabled: false,
                     age,
+                    cook_duration,
                     wait_duration: None,
                     yes_count: 0,
                     claude_session_id: None,
@@ -450,6 +472,13 @@ impl DashboardApp {
                 Some(record) if record.enabled
             );
             let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+            let state = inspected.classification.state;
+            let cook_duration = sync_tmux_cook_state(
+                &self.state_dir,
+                &workspace.id,
+                &pane,
+                is_cooking_state(state),
+            )?;
 
             panes.push(PaneEntry {
                 pane,
@@ -458,12 +487,13 @@ impl DashboardApp {
                 workspace_group_key,
                 workspace_group_label,
                 branch,
-                state: inspected.classification.state,
+                state,
                 has_questions: inspected.classification.has_questions,
                 recap_present: inspected.classification.recap_present,
                 recap_excerpt: inspected.classification.recap_excerpt.clone(),
                 yolo_enabled,
                 age,
+                cook_duration,
                 wait_duration: None,
                 yes_count: 0,
                 claude_session_id: None,
@@ -1416,7 +1446,7 @@ struct PaneListColumnRects {
     yolo: Rect,
     cpu: Rect,
     mem: Rect,
-    uptime: Rect,
+    cook: Rect,
     wait: Rect,
     yes: Rect,
     branch: Rect,
@@ -1427,7 +1457,7 @@ fn render_pane_list_header(frame: &mut ratatui::Frame<'_>, area: Rect, columns: 
     let rects = pane_list_column_rects(area, columns);
     render_cell_right(frame, rects.cpu, "CPU", header_style());
     render_cell_right(frame, rects.mem, "MEM", header_style());
-    render_cell(frame, rects.uptime, "Uptime", header_style());
+    render_cell(frame, rects.cook, "Cook", header_style());
     render_cell(frame, rects.wait, "Wait", header_style());
     render_cell_right(frame, rects.yes, "🤠", header_style());
     render_cell(frame, rects.branch, "Branch", header_style());
@@ -1522,8 +1552,8 @@ fn render_pane_list(
                 );
                 render_cell(
                     frame,
-                    rect_at_y(rects.uptime, y),
-                    &format_duration_compact(pane.age),
+                    rect_at_y(rects.cook, y),
+                    &format_duration_compact(pane.cook_duration),
                     row_style,
                 );
                 render_cell(
@@ -1571,7 +1601,7 @@ fn pane_list_column_rects(area: Rect, columns: &PaneListColumns) -> PaneListColu
     x = x.saturating_add(compact_gap);
     let mem = take_rect(area, &mut x, columns.mem_width as u16);
     x = x.saturating_add(gap);
-    let uptime = take_rect(area, &mut x, columns.uptime_width as u16);
+    let cook = take_rect(area, &mut x, columns.cook_width as u16);
     x = x.saturating_add(gap);
     let wait = take_rect(area, &mut x, columns.wait_width as u16);
     x = x.saturating_add(gap);
@@ -1591,7 +1621,7 @@ fn pane_list_column_rects(area: Rect, columns: &PaneListColumns) -> PaneListColu
         yolo,
         cpu,
         mem,
-        uptime,
+        cook,
         wait,
         yes,
         branch,
@@ -1639,7 +1669,7 @@ struct PaneListColumns {
     agent_width: usize,
     cpu_width: usize,
     mem_width: usize,
-    uptime_width: usize,
+    cook_width: usize,
     wait_width: usize,
     yes_width: usize,
 }
@@ -1662,13 +1692,15 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
             .max()
             .unwrap_or(3)
             .max(3),
-        uptime_width: app
+        cook_width: app
             .panes
             .iter()
-            .map(|pane| format_duration_compact(pane.age).len())
+            .map(|pane| {
+                UnicodeWidthStr::width(format_duration_compact(pane.cook_duration).as_str())
+            })
             .max()
-            .unwrap_or(6)
-            .max(6),
+            .unwrap_or(4)
+            .max(4),
         wait_width: app
             .panes
             .iter()
@@ -2252,6 +2284,10 @@ fn is_waiting_state(state: SessionState) -> bool {
     )
 }
 
+fn is_cooking_state(state: SessionState) -> bool {
+    matches!(state, SessionState::BusyResponding)
+}
+
 fn is_attention_state(state: SessionState) -> bool {
     matches!(
         state,
@@ -2760,13 +2796,14 @@ mod tests {
         dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
         detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
         footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
-        format_memory_gauge, is_codex_candidate_pane, is_codex_screen, load_saved_selection,
-        pad_display_right, pane_list_columns, pane_list_content_area, pane_window_prefix,
-        parse_process_stat, recap_lines, rect_contains, render_workspace_header_line,
-        repo_root_from_repo_key, save_selection, select_agent_process, select_tail_lines_for_rows,
-        should_return_navigation, split_workspace_header, state_emoji, state_marker,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order, window_target, workspace_group_key,
-        workspace_group_label, yes_count_key, yolo_column_contains,
+        format_memory_gauge, is_codex_candidate_pane, is_codex_screen, is_cooking_state,
+        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
+        pane_window_prefix, parse_process_stat, recap_lines, rect_contains,
+        render_workspace_header_line, repo_root_from_repo_key, save_selection,
+        select_agent_process, select_tail_lines_for_rows, should_return_navigation,
+        split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
+        tmux_object_id_order, window_target, workspace_group_key, workspace_group_label,
+        yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::storage::WorkspaceRecord;
@@ -2836,6 +2873,28 @@ mod tests {
         assert_eq!(state_emoji(SessionState::PlanApprovalPrompt, false), "❓");
         assert_eq!(state_emoji(SessionState::PromptEditing, false), "💬");
         assert_eq!(state_emoji(SessionState::ChatReady, true), "🤔");
+    }
+
+    #[test]
+    fn cooking_state_is_only_busy_responding() {
+        for state in [
+            SessionState::ChatReady,
+            SessionState::PromptEditing,
+            SessionState::UserQuestionPrompt,
+            SessionState::BusyResponding,
+            SessionState::PermissionDialog,
+            SessionState::PlanApprovalPrompt,
+            SessionState::FolderTrustPrompt,
+            SessionState::SurveyPrompt,
+            SessionState::ExternalEditorActive,
+            SessionState::DiffDialog,
+            SessionState::Unknown,
+        ] {
+            assert_eq!(
+                is_cooking_state(state),
+                state == SessionState::BusyResponding
+            );
+        }
     }
 
     #[test]
@@ -3150,6 +3209,28 @@ mod tests {
     #[test]
     fn details_panel_height_includes_borders() {
         assert_eq!(details_panel_height(10), 12);
+    }
+
+    #[test]
+    fn pane_list_columns_size_cook_from_cook_duration() {
+        let mut app = DashboardApp::new(
+            TmuxClient::default(),
+            TmuxClient::default(),
+            unique_temp_dir("dashboard-cook-columns"),
+            1000,
+            120,
+            None,
+        )
+        .expect("app should initialize");
+        let mut pane = sample_pane_entry(SessionState::BusyResponding, false, false, "");
+        pane.age = Duration::from_secs(999 * 86400);
+        pane.cook_duration = Duration::from_secs(30);
+        app.panes = vec![pane];
+
+        assert_eq!(pane_list_columns(&app).cook_width, 4);
+
+        app.panes[0].cook_duration = Duration::from_secs(10 * 86400 + 12 * 3600);
+        assert_eq!(pane_list_columns(&app).cook_width, 6);
     }
 
     #[test]
@@ -3503,6 +3584,7 @@ mod tests {
             },
             yolo_enabled: false,
             age: Duration::from_secs(1),
+            cook_duration: Duration::from_secs(0),
             wait_duration: None,
             yes_count: 0,
             claude_session_id: None,
