@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{
@@ -45,7 +45,7 @@ use crate::prompt::{
     write_editor_target_from_pending,
 };
 use crate::runtime::{RuntimeClient, RuntimeServerConfig, run_runtime_server};
-use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest};
+use crate::serve::ServeRequest;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, capture_artifact_path, export_artifact_path,
     resolve_workspace, resolve_workspace_for_path, state_db_path,
@@ -494,7 +494,16 @@ fn live_runtime_leases(state_dir: &Path) -> AppResult<Vec<PathBuf>> {
 }
 
 fn process_exists(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    if pid == 0 {
+        return false;
+    }
+
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn current_unix_millis() -> AppResult<u128> {
@@ -995,113 +1004,6 @@ struct ObserveArtifactPaths {
     export_file: PathBuf,
 }
 
-#[derive(Debug)]
-struct ServeExportSummary {
-    session_name: String,
-    target_pane: Option<String>,
-    reconcile_ms: u64,
-    history_lines: usize,
-    tape_path: PathBuf,
-    started_at: String,
-    ended_at: Option<String>,
-    stopped_reason: Option<String>,
-    total_events: usize,
-    event_counts: BTreeMap<String, usize>,
-    tracked_panes: BTreeSet<String>,
-}
-
-struct ServeArtifacts {
-    tape_writer: BufWriter<File>,
-    export_path: PathBuf,
-    summary: ServeExportSummary,
-}
-
-impl ServeExportSummary {
-    fn new(
-        session_name: &str,
-        target_pane: Option<&str>,
-        reconcile_ms: u64,
-        history_lines: usize,
-        tape_path: PathBuf,
-    ) -> Self {
-        Self {
-            session_name: session_name.to_string(),
-            target_pane: target_pane.map(ToString::to_string),
-            reconcile_ms,
-            history_lines,
-            tape_path,
-            started_at: current_babysit_timestamp(),
-            ended_at: None,
-            stopped_reason: None,
-            total_events: 0,
-            event_counts: BTreeMap::new(),
-            tracked_panes: BTreeSet::new(),
-        }
-    }
-
-    fn record_event(&mut self, event: &ServeEvent) {
-        self.total_events += 1;
-
-        match event {
-            ServeEvent::Started { tracked_panes, .. } => {
-                *self
-                    .event_counts
-                    .entry(String::from("serve-start"))
-                    .or_insert(0) += 1;
-                self.tracked_panes.extend(tracked_panes.iter().cloned());
-            }
-            ServeEvent::Snapshot(snapshot) => {
-                *self
-                    .event_counts
-                    .entry(String::from("snapshot"))
-                    .or_insert(0) += 1;
-                self.tracked_panes.insert(snapshot.pane.pane_id.clone());
-            }
-            ServeEvent::Notification(_) => {
-                *self.event_counts.entry(String::from("notify")).or_insert(0) += 1;
-            }
-            ServeEvent::PaneRemoved { pane_id } => {
-                *self
-                    .event_counts
-                    .entry(String::from("pane-removed"))
-                    .or_insert(0) += 1;
-                self.tracked_panes.remove(pane_id);
-            }
-            ServeEvent::Stopped { reason } => {
-                *self
-                    .event_counts
-                    .entry(String::from("serve-stop"))
-                    .or_insert(0) += 1;
-                self.stopped_reason = Some(reason.clone());
-            }
-        }
-    }
-
-    fn finalize(&mut self) {
-        self.ended_at = Some(current_babysit_timestamp());
-    }
-
-    fn as_json(&self) -> serde_json::Value {
-        let event_counts = self.event_counts.clone();
-        let tracked_panes = self.tracked_panes.iter().cloned().collect::<Vec<_>>();
-        serde_json::json!({
-            "command": "serve",
-            "generated_at": self.started_at,
-            "session_name": self.session_name,
-            "target_pane": self.target_pane,
-            "reconcile_ms": self.reconcile_ms,
-            "history_lines": self.history_lines,
-            "tape_path": self.tape_path.display().to_string(),
-            "started_at": self.started_at,
-            "ended_at": self.ended_at,
-            "stopped_reason": self.stopped_reason,
-            "total_events": self.total_events,
-            "event_counts": event_counts,
-            "tracked_panes": tracked_panes,
-        })
-    }
-}
-
 fn run_serve(args: ServeArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let (runtime, _runtime_guard) = ensure_runtime_client(
@@ -1147,10 +1049,10 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
                 if snapshot.pane.session_name != request.session_name {
                     continue;
                 }
-                if let Some(target_pane) = request.target_pane.as_deref() {
-                    if snapshot.pane.pane_id != target_pane {
-                        continue;
-                    }
+                if let Some(target_pane) = request.target_pane.as_deref()
+                    && snapshot.pane.pane_id != target_pane
+                {
+                    continue;
                 }
             }
             let payload = serde_json::json!({
@@ -1176,31 +1078,6 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
     }
 
     Ok(String::new())
-}
-
-fn open_serve_artifacts(
-    state_dir: &Path,
-    session_name: &str,
-    pane_id: Option<&str>,
-    reconcile_ms: u64,
-    history_lines: usize,
-) -> AppResult<ServeArtifacts> {
-    let artifact_id = new_artifact_id("serve", session_name, pane_id)?;
-    let tape_path = tape_artifact_path(state_dir, &artifact_id, "events.jsonl")?;
-    let export_path = export_artifact_path(state_dir, &artifact_id, "summary.json")?;
-    let tape_file = File::create(&tape_path)?;
-
-    Ok(ServeArtifacts {
-        tape_writer: BufWriter::new(tape_file),
-        export_path,
-        summary: ServeExportSummary::new(
-            session_name,
-            pane_id,
-            reconcile_ms,
-            history_lines,
-            tape_path,
-        ),
-    })
 }
 
 fn write_observe_artifacts(
@@ -1290,19 +1167,6 @@ fn sanitize_artifact_token(input: &str) -> String {
     }
 }
 
-fn append_jsonl_event(writer: &mut BufWriter<File>, payload: &serde_json::Value) -> AppResult<()> {
-    writeln!(writer, "{}", payload)?;
-    writer.flush()?;
-    Ok(())
-}
-
-fn write_serve_summary_export(path: &Path, summary: &ServeExportSummary) -> AppResult<()> {
-    let content = serde_json::to_string_pretty(&summary.as_json())
-        .map_err(|error| AppError::new(format!("failed to encode serve summary JSON: {error}")))?;
-    fs::write(path, content)?;
-    Ok(())
-}
-
 fn render_observe_command_output(
     report: &str,
     artifact_paths: Option<&ObserveArtifactPaths>,
@@ -1348,103 +1212,6 @@ fn render_control_log_lines(lines: &[String]) -> String {
     let mut out = lines.join("\n");
     out.push('\n');
     out
-}
-
-fn render_serve_event_payload(request: &ServeRequest, event: &ServeEvent) -> serde_json::Value {
-    match event {
-        ServeEvent::Started {
-            session_name,
-            target_pane,
-            tracked_panes,
-        } => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "serve-start",
-            "session": session_name,
-            "target_pane": target_pane,
-            "tracked_panes": tracked_panes,
-            "summary": format!("Serve mode attached to session {session_name}"),
-            "details": [
-                format!("Target: {}", target_pane.as_deref().unwrap_or("all panes")),
-                format!("Reconcile interval: {}ms", request.reconcile_ms),
-                format!("History lines: {}", request.history_lines),
-                format!(
-                    "Tracked panes: {}",
-                    if tracked_panes.is_empty() {
-                        String::from("none yet")
-                    } else {
-                        tracked_panes.join(", ")
-                    }
-                )
-            ]
-        }),
-        ServeEvent::Snapshot(snapshot) => render_serve_snapshot_event_payload(snapshot),
-        ServeEvent::Notification(message) => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "notify",
-            "summary": format!("tmux notification: {message}"),
-            "details": [format!("Session: {}", request.session_name)],
-            "body_title": "Notification",
-            "body_lines": [message]
-        }),
-        ServeEvent::PaneRemoved { pane_id } => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "pane-removed",
-            "pane_id": pane_id,
-            "summary": format!("Observed pane {pane_id} disappeared"),
-            "details": [format!("Session: {}", request.session_name)]
-        }),
-        ServeEvent::Stopped { reason } => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "serve-stop",
-            "summary": format!("Serve mode stopped for session {}", request.session_name),
-            "details": [format!("Reason: {reason}")]
-        }),
-    }
-}
-
-fn render_serve_snapshot_event_payload(snapshot: &ServePaneSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "timestamp": current_babysit_timestamp(),
-        "kind": "snapshot",
-        "pane_id": snapshot.pane.pane_id,
-        "session": snapshot.pane.session_name,
-        "window": snapshot.pane.window_name,
-        "command": snapshot.pane.current_command,
-        "cwd": snapshot.pane.current_path,
-        "state": snapshot.classification.state.as_str(),
-        "signals": snapshot.classification.signals.clone(),
-        "changed": snapshot.changed,
-        "reason": snapshot.reason.as_str(),
-        "summary": if snapshot.changed {
-            serde_json::json!(format!(
-                "Pane {} changed to {} ({})",
-                snapshot.pane.pane_id,
-                snapshot.classification.state.as_str(),
-                snapshot.reason.as_str()
-            ))
-        } else {
-            serde_json::json!(format!(
-                "Pane {} reconciled at {} ({})",
-                snapshot.pane.pane_id,
-                snapshot.classification.state.as_str(),
-                snapshot.reason.as_str()
-            ))
-        },
-        "details": [
-            format!("Window: {}", snapshot.pane.window_name),
-            format!("Command: {}", snapshot.pane.current_command),
-            format!("Cwd: {}", snapshot.pane.current_path),
-            format!("Signals: {}", render_signals(&snapshot.classification)),
-            format!("Recap: {}", snapshot.classification.recap_excerpt.as_deref().unwrap_or("none")),
-            format!("Changed: {}", snapshot.changed),
-        ],
-        "body_title": if snapshot.live_excerpt.is_empty() { serde_json::Value::Null } else { serde_json::json!("Recent output") },
-        "body_lines": if snapshot.live_excerpt.is_empty() {
-            serde_json::json!([])
-        } else {
-            serde_json::json!(serve_body_lines(&snapshot.live_excerpt))
-        }
-    })
 }
 
 fn run_record_fixture(args: RecordFixtureArgs) -> AppResult<String> {
@@ -3586,18 +3353,6 @@ fn render_babysit_stop_event(
     )
 }
 
-fn serve_body_lines(input: &str) -> Vec<String> {
-    input
-        .lines()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|line| line.to_string())
-        .collect()
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct InspectedPane {
     pub(crate) classification: Classification,
@@ -4817,7 +4572,7 @@ fn classification_provider_label(classification: &Classification, pane: &TmuxPan
     }
 }
 
-fn ensure_pane_owned_by_automatable_provider(
+pub(crate) fn ensure_pane_owned_by_automatable_provider(
     pane: &TmuxPane,
     classification: &Classification,
 ) -> AppResult<()> {
@@ -4831,7 +4586,7 @@ fn ensure_pane_owned_by_automatable_provider(
     }
 }
 
-fn ensure_pane_owned_by_yolo_provider(
+pub(crate) fn ensure_pane_owned_by_yolo_provider(
     pane: &TmuxPane,
     classification: &Classification,
 ) -> AppResult<()> {
@@ -4938,11 +4693,10 @@ mod tests {
         recovery_action_for_state, render_babysit_action_event, render_babysit_output,
         render_babysit_start_event, render_babysit_wait_event, render_guarded_workflow_output,
         render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
-        render_status_report, resolve_keep_going_prompt, resolve_prompt_run_input,
-        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
-        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
-        write_prompt_instruction_temp_file, yolo_action_for_state,
+        render_observe_command_output, render_screen_excerpt, render_status_report,
+        resolve_keep_going_prompt, resolve_prompt_run_input, run_prepare_prompt, shell_escape,
+        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
+        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -4951,7 +4705,6 @@ mod tests {
     };
     use crate::cli::{PreparePromptArgs, PromptRunArgs};
     use crate::prompt::pending_prompt_text;
-    use crate::serve::{ServeEvent, ServeRequest};
     use crate::storage::{CURRENT_SCHEMA_VERSION, resolve_workspace_for_path, state_db_path};
     use crate::tmux::TmuxPane;
     use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
@@ -5281,25 +5034,6 @@ mod tests {
         assert!(rendered.contains("control_log=/tmp/control-mode.log"));
         assert!(rendered.contains("export=/tmp/report.json"));
         assert!(!rendered.contains("unavailable="));
-    }
-
-    #[test]
-    fn serve_pane_removed_events_keep_their_own_kind() {
-        let payload = render_serve_event_payload(
-            &ServeRequest {
-                session_name: String::from("demo"),
-                target_pane: None,
-                history_lines: 120,
-                reconcile_ms: 1500,
-                state_dir: None,
-                allowed_origins: Vec::new(),
-            },
-            &ServeEvent::PaneRemoved {
-                pane_id: String::from("%7"),
-            },
-        );
-
-        assert_eq!(payload["kind"], "pane-removed");
     }
 
     #[test]

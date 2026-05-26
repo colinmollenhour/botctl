@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::AppResult;
-use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
+use crate::classifier::{Classifier, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
 use crate::opencode::resolve_opencode_session_for_pane;
 use crate::pi::resolve_pi_session_for_pane;
@@ -340,6 +340,75 @@ impl DashboardApp {
                 yes_count,
                 claude_session_id: snapshot.claude_session_id.clone(),
                 focused_source: snapshot.focused_source.clone(),
+                resource_usage,
+            });
+        }
+
+        for pane in self.client.list_panes()? {
+            if seen_pane_ids.contains(&pane.pane_id) || !is_dashboard_fallback_candidate(&pane) {
+                continue;
+            }
+            let frame = self
+                .client
+                .capture_pane(&pane.pane_id, self.history_lines)?;
+            let classification =
+                Classifier.classify(&pane.pane_id, &focused_dashboard_frame(&frame));
+            if !is_dashboard_visible_non_runtime_pane(&pane, &frame, &classification.signals)? {
+                continue;
+            }
+            seen_pane_ids.insert(pane.pane_id.clone());
+            self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
+            let state = dashboard_display_state(
+                classification.state,
+                self.previous_frames.get(&pane.pane_id),
+                &frame,
+            );
+            let source = pane_source_for_non_runtime_pane(&pane, &frame, &classification.signals)?;
+            let workspace = crate::storage::resolve_workspace_for_path(
+                &self.state_dir,
+                Path::new(&pane.current_path),
+            )?;
+            let workspace_group_key = workspace_group_key(&workspace);
+            let workspace_group_label = workspace_group_label(&workspace_group_key);
+            let branch = branch_by_path
+                .entry(pane.current_path.clone())
+                .or_insert_with(|| git_branch_for_path(&pane.current_path))
+                .clone();
+            let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
+                self.first_seen
+                    .get(&pane.pane_id)
+                    .map(Instant::elapsed)
+                    .unwrap_or_default()
+            });
+            next_frames.insert(pane.pane_id.clone(), frame.clone());
+            let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+            let cook_duration = sync_tmux_cook_state(
+                &self.state_dir,
+                &workspace.id,
+                &pane,
+                is_cooking_state(state),
+            )?;
+
+            panes.push(PaneEntry {
+                pane,
+                source,
+                workspace,
+                workspace_group_key,
+                workspace_group_label,
+                branch,
+                state,
+                has_questions: classification.has_questions,
+                recap_present: classification.recap_present,
+                recap_excerpt: classification.recap_excerpt.clone(),
+                yolo_enabled: false,
+                yolo_effective: false,
+                yolo_stop_reason: None,
+                age,
+                cook_duration,
+                wait_duration: None,
+                yes_count: 0,
+                claude_session_id: None,
+                focused_source: focused_dashboard_frame(&frame),
                 resource_usage,
             });
         }
@@ -2565,6 +2634,56 @@ fn is_codex_screen(frame: &str, signals: &[String]) -> bool {
         || normalized.contains("suppress_unstable_features_warning")
         || normalized.lines().any(is_codex_statusline_line)
         || normalized.lines().any(is_codex_footer_line)
+}
+
+fn is_dashboard_fallback_candidate(pane: &TmuxPane) -> bool {
+    is_codex_candidate_pane(pane)
+        || pane.current_command.eq_ignore_ascii_case("opencode")
+        || pane.current_command.eq_ignore_ascii_case("pi")
+        || pane.pane_title.starts_with("OC | ")
+}
+
+fn is_dashboard_visible_non_runtime_pane(
+    pane: &TmuxPane,
+    frame: &str,
+    signals: &[String],
+) -> AppResult<bool> {
+    Ok(is_codex_screen(frame, signals)
+        || resolve_pi_session_for_pane(pane)?.is_some()
+        || resolve_opencode_session_for_pane(pane).is_some())
+}
+
+fn pane_source_for_non_runtime_pane(
+    pane: &TmuxPane,
+    frame: &str,
+    signals: &[String],
+) -> AppResult<PaneSource> {
+    if is_codex_screen(frame, signals) {
+        return Ok(PaneSource::Codex);
+    }
+    if let Some(pi_session) = resolve_pi_session_for_pane(pane)? {
+        return Ok(PaneSource::Pi {
+            session_id: pi_session.id,
+        });
+    }
+    if let Some(opencode_session) = resolve_opencode_session_for_pane(pane) {
+        return Ok(PaneSource::OpenCode {
+            session_id: opencode_session.id,
+            title: opencode_session.title,
+        });
+    }
+    Ok(PaneSource::Codex)
+}
+
+fn focused_dashboard_frame(frame: &str) -> String {
+    let lines = frame.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .rposition(|line| {
+            line.contains("╭") || line.contains("┌") || line.contains(">_") || line.contains("❯")
+        })
+        .unwrap_or(0);
+    lines[start..].join("\n")
 }
 
 fn is_codex_statusline_line(line: &str) -> bool {

@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{
     ACTION_GUARD_HISTORY_LINES, AppError, AppResult, ContinueOutcome, InspectedPane,
-    continue_from_classification, ensure_pane_owned_by_claude, execute_automation_action,
-    execute_classified_workflow, extract_permission_prompt_details, inspect_pane,
-    is_yolo_safe_to_approve, render_next_safe_action, render_screen_excerpt,
+    continue_from_classification, ensure_pane_owned_by_automatable_provider,
+    ensure_pane_owned_by_claude, ensure_pane_owned_by_yolo_provider, ensure_workflow_state,
+    execute_automation_action, execute_classified_workflow, extract_permission_prompt_details,
+    inspect_pane, is_yolo_safe_to_approve, render_next_safe_action, render_screen_excerpt,
     resolve_workspace_for_pane, submit_prompt_for_pane,
 };
 use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection};
@@ -35,6 +36,8 @@ use crate::yolo::{YoloRecord, disable_yolo_record, read_yolo_record, write_yolo_
 const SOCKET_FILENAME: &str = "runtime.sock";
 const TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_RUNTIME_TARGET_TMUX_SOCKET";
 const CONTROL_POLL_MS: u64 = 250;
+const SUBSCRIPTION_READ_TIMEOUT_MS: u64 = 200;
+const RUNTIME_TIMEOUT_EXIT_CODE: i32 = 408;
 const STREAM_DEBOUNCE_MS: u64 = 200;
 const MAX_LIVE_EXCERPT_LINES: usize = 20;
 
@@ -262,6 +265,7 @@ impl RuntimeClient {
                 self.socket_path.display()
             ))
         })?;
+        stream.set_read_timeout(Some(Duration::from_millis(SUBSCRIPTION_READ_TIMEOUT_MS)))?;
         write_message(&mut stream, &RuntimeRequest::Subscribe)?;
         Ok(RuntimeSubscription {
             reader: BufReader::new(stream),
@@ -294,7 +298,12 @@ pub struct RuntimeSubscription {
 
 impl RuntimeSubscription {
     pub fn recv(&mut self) -> AppResult<Option<RuntimeEvent>> {
-        match read_response(&mut self.reader)? {
+        let response = match read_response(&mut self.reader) {
+            Ok(response) => response,
+            Err(error) if error.exit_code() == RUNTIME_TIMEOUT_EXIT_CODE => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match response {
             RuntimeResponse::Event { event } => Ok(Some(event)),
             RuntimeResponse::Ok => Ok(None),
             other => Err(unexpected_response("event", &other)),
@@ -312,6 +321,17 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
     let socket_path = runtime_socket_path(&config.state_dir);
     match fs::symlink_metadata(&socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => {
+            if let Ok(client) = RuntimeClient::connect(&config.state_dir)
+                && client.get_status().is_ok()
+            {
+                return Err(AppError::with_exit_code(
+                    format!(
+                        "runtime socket is already served by a live runtime: {}",
+                        socket_path.display()
+                    ),
+                    409,
+                ));
+            }
             fs::remove_file(&socket_path)?;
         }
         Ok(_) => {
@@ -592,7 +612,8 @@ fn handle_set_yolo(
         let pane = client
             .pane_by_target(&pane_id)?
             .ok_or_else(|| AppError::new(format!("pane not found: {pane_id}")))?;
-        ensure_pane_owned_by_claude(&pane)?;
+        let inspected = inspect_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+        ensure_pane_owned_by_yolo_provider(&pane, &inspected.classification)?;
         let workspace = resolve_workspace_for_pane(state_dir, &pane, workspace.as_deref())?;
         if enabled {
             write_yolo_record(state_dir, &workspace.id, &pane)?;
@@ -624,7 +645,16 @@ fn handle_set_yolo(
                 client
                     .list_panes()?
                     .into_iter()
-                    .filter(|pane| pane.current_command.eq_ignore_ascii_case("claude"))
+                    .filter(is_yolo_candidate_pane)
+                    .filter_map(|pane| {
+                        inspect_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)
+                            .ok()
+                            .and_then(|inspected| {
+                                ensure_pane_owned_by_yolo_provider(&pane, &inspected.classification)
+                                    .ok()
+                                    .map(|_| pane)
+                            })
+                    })
                     .filter_map(|pane| {
                         resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))
                             .ok()
@@ -649,7 +679,16 @@ fn handle_set_yolo(
             client
                 .list_panes()?
                 .into_iter()
-                .filter(|pane| pane.current_command.eq_ignore_ascii_case("claude"))
+                .filter(is_yolo_candidate_pane)
+                .filter_map(|pane| {
+                    inspect_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)
+                        .ok()
+                        .and_then(|inspected| {
+                            ensure_pane_owned_by_yolo_provider(&pane, &inspected.classification)
+                                .ok()
+                                .map(|_| pane)
+                        })
+                })
                 .map(|pane| {
                     let workspace =
                         resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
@@ -686,7 +725,7 @@ fn handle_run_action(
     let client = runtime_tmux_client();
     let snapshot = get_snapshot(shared, pane_id, session_name)?;
     let current = validate_action_target(&client, &snapshot)?;
-    ensure_pane_owned_by_claude(&current)?;
+    ensure_pane_owned_by_automatable_provider(&current, &snapshot.classification)?;
     emit_shared_event(
         shared,
         Some(pane_id.to_string()),
@@ -703,7 +742,7 @@ fn handle_run_action(
         Some(snapshot.workspace_id.clone()),
         "action-executed",
         format!("{} {}", pane_id, action),
-        get_snapshot(shared, pane_id, None).ok(),
+        get_snapshot(shared, pane_id, session_name).ok(),
     );
     Ok(result)
 }
@@ -719,7 +758,7 @@ fn handle_submit_prompt(
 ) -> AppResult<RuntimeActionResult> {
     let _guard = ActionGuard::acquire(shared, pane_id)?;
     let client = runtime_tmux_client();
-    let snapshot = get_snapshot(shared, pane_id, None)?;
+    let snapshot = get_snapshot(shared, pane_id, Some(session_name))?;
     let current = validate_action_target(&client, &snapshot)?;
     ensure_pane_owned_by_claude(&current)?;
     let submitted = submit_prompt_for_pane(
@@ -762,6 +801,10 @@ fn execute_runtime_action(
     let classification = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     let after_state = match action {
         "approve-permission" => {
+            ensure_workflow_state(
+                GuardedWorkflow::ApprovePermission,
+                &classification.classification,
+            )?;
             execute_classified_workflow(
                 client,
                 &pane.pane_id,
@@ -775,6 +818,10 @@ fn execute_runtime_action(
             )
         }
         "reject-permission" => {
+            ensure_workflow_state(
+                GuardedWorkflow::RejectPermission,
+                &classification.classification,
+            )?;
             execute_classified_workflow(
                 client,
                 &pane.pane_id,
@@ -788,6 +835,10 @@ fn execute_runtime_action(
             )
         }
         "dismiss-survey" => {
+            ensure_workflow_state(
+                GuardedWorkflow::DismissSurvey,
+                &classification.classification,
+            )?;
             execute_classified_workflow(
                 client,
                 &pane.pane_id,
@@ -1086,7 +1137,7 @@ fn reconcile_all(
     let current_panes = client
         .list_panes()?
         .into_iter()
-        .filter(|pane| pane.current_command.eq_ignore_ascii_case("claude"))
+        .filter(is_runtime_discovery_candidate)
         .collect::<Vec<_>>();
     let current_ids = current_panes
         .iter()
@@ -1377,6 +1428,16 @@ fn yolo_workflow(snapshot: &RuntimePaneSnapshot) -> Option<GuardedWorkflow> {
     }
 }
 
+fn is_runtime_discovery_candidate(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("claude") || is_yolo_candidate_pane(pane)
+}
+
+fn is_yolo_candidate_pane(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("codex")
+        || (pane.current_command.eq_ignore_ascii_case("node")
+            && !pane.pane_title.starts_with("OC | "))
+}
+
 fn update_yolo_runtime_state(
     shared: &Arc<Mutex<RuntimeShared>>,
     pane_id: &str,
@@ -1537,7 +1598,22 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> AppResult<RuntimeRequest>
 
 fn read_response(reader: &mut BufReader<UnixStream>) -> AppResult<RuntimeResponse> {
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    let read = match reader.read_line(&mut line) {
+        Ok(read) => read,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(AppError::with_exit_code(
+                "runtime socket read timed out",
+                RUNTIME_TIMEOUT_EXIT_CODE,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if read == 0 {
         return Err(AppError::new("runtime socket closed unexpectedly"));
     }
     let response = serde_json::from_str::<RuntimeResponse>(line.trim_end()).map_err(|error| {

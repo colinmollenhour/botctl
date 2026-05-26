@@ -471,7 +471,7 @@ fn usage_with_color(color: bool) -> String {
     ));
     out.push_str("\n    Set central yolo policy for one pane or all panes, optionally tailing runtime events.\n\n");
     out.push_str(&featured(
-        "yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]",
+        "yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
     ));
     out.push_str("\n    Stop autonomous babysitting.\n\n");
     out.push_str(&featured(
@@ -595,6 +595,7 @@ fn closest_command(command: &str) -> Option<&'static str> {
         "status",
         "doctor",
         "observe",
+        "runtime",
         "serve",
         "dashboard",
         "record-fixture",
@@ -650,6 +651,7 @@ fn command_from_error(message: &str) -> Option<&'static str> {
         "status",
         "doctor",
         "observe",
+        "runtime",
         "serve",
         "dashboard",
         "record-fixture",
@@ -675,23 +677,47 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
     let (name, purpose, usage, examples, options, safety) = match topic {
         "dashboard" => (
             "dashboard",
-            "Open live TUI across Claude panes plus passive OpenCode visibility.",
-            "botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]",
-            &["botctl dashboard", "botctl dashboard --persistent"][..],
+            "Open live TUI across Claude, Codex, OpenCode, and Pi panes.",
+            "botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]",
+            &[
+                "botctl dashboard",
+                "botctl dashboard --persistent",
+                "botctl dashboard --unmanaged",
+            ][..],
             &[
                 "--poll-ms N (default: 1000)",
                 "--history-lines N (default: 120)",
                 "--state-dir PATH",
                 "--exit-on-navigate",
                 "--persistent",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "TUI owns terminal directly. No pane automation runs until operator chooses action.",
         ),
+        "runtime" => (
+            "runtime",
+            "Start, stop, or foreground the central local runtime.",
+            "botctl runtime [--foreground] [--reconcile-ms N] [--history-lines N] [--state-dir PATH] | botctl runtime stop [--state-dir PATH]",
+            &[
+                "botctl runtime",
+                "botctl runtime --foreground",
+                "botctl runtime stop",
+            ][..],
+            &[
+                "--foreground (run in this process instead of a managed tmux session)",
+                "--reconcile-ms N (default: 1000)",
+                "--history-lines N (default: 200)",
+                "--state-dir PATH",
+                "stop (subcommand: request the runtime to stop)",
+                "--no-color",
+            ][..],
+            "The runtime owns the Unix socket at <state-dir>/runtime.sock. Managed clients auto-start it unless they pass --unmanaged.",
+        ),
         "yolo" => (
             "yolo",
             "Start autonomous babysitting for one pane or all registered panes. Canonical name: yolo.",
-            "botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
+            "botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
             &[
                 "botctl yolo --pane %19",
                 "botctl yolo --all --workspace .",
@@ -700,11 +726,13 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             &[
                 "--pane TARGET",
                 "--all",
+                "--follow (tail matching runtime events after setting policy)",
                 "--poll-ms N (default: 1000)",
                 "--format human|jsonl (default: human)",
                 "--live-preview",
                 "--state-dir PATH",
                 "--workspace PATH|UUID",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "Uses guarded classifier states before sending keys. Unknown states wait.",
@@ -712,7 +740,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "yolo stop" => (
             "yolo stop",
             "Stop autonomous babysitting records.",
-            "botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]",
+            "botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
             &[
                 "botctl yolo stop --pane %19",
                 "botctl yolo stop --all --workspace .",
@@ -722,6 +750,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--all",
                 "--state-dir PATH",
                 "--workspace PATH|UUID",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "Does not send keys to panes; removes yolo state records.",
@@ -729,7 +758,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "serve" => (
             "serve",
             "Continuously inspect tmux session and emit events.",
-            "botctl serve --session NAME [--pane TARGET] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]",
+            "botctl serve --session NAME [--pane TARGET] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]",
             &[
                 "botctl serve --session demo",
                 "botctl serve --session demo --format jsonl",
@@ -744,6 +773,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--allowed-origin URL",
                 "--format human|jsonl (default: human)",
                 "--state-dir PATH",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "JSONL is stable machine stream on stdout. Warnings go to stderr.",
@@ -970,6 +1000,9 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "last-message" => "botctl last-message --pane TARGET [--out PATH]",
         "observe" => {
             "botctl observe --session NAME [--pane TARGET] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]"
+        }
+        "runtime" => {
+            "botctl runtime [--foreground] [--reconcile-ms N] [--history-lines N] [--state-dir PATH] | botctl runtime stop [--state-dir PATH]"
         }
         "record-fixture" => {
             "botctl record-fixture --session NAME --case NAME [--pane TARGET] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]"
