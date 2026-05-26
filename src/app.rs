@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::{self, File};
@@ -52,9 +51,8 @@ use crate::storage::{
     store_pending_prompt_for_tmux_instance, tape_artifact_path,
 };
 use crate::tmux::{StartSessionRequest, StartWindowRequest, StartedWindow, TmuxClient, TmuxPane};
-use crate::yolo::{
-    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
-};
+#[cfg(test)]
+use crate::yolo::{YoloRecord, disable_yolo_record};
 
 pub(crate) const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
@@ -2692,424 +2690,7 @@ pub(crate) fn resolve_workspace_for_pane(
     Ok(pane_workspace)
 }
 
-fn run_yolo_single(
-    client: &TmuxClient,
-    state_dir: &Path,
-    workspace_selector: Option<&str>,
-    pane_id: &str,
-    poll_ms: u64,
-    live_preview: bool,
-    format: BabysitFormat,
-    interrupted: Arc<AtomicBool>,
-) -> AppResult<String> {
-    let pane = resolve_pane_by_id(client, pane_id)?;
-    let workspace = resolve_workspace_for_pane(state_dir, &pane, workspace_selector)?;
-    if matches!(read_yolo_record(state_dir, &pane.pane_id)?, Some(record) if record.enabled) {
-        return Err(AppError::new(format!(
-            "yolo is already active for pane {}",
-            pane.pane_id
-        )));
-    }
-    let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-    ensure_pane_owned_by_yolo_provider(&pane, &inspected.classification)?;
-    if is_pane_command_claude(&pane) {
-        let bindings = load_automation_keybindings(None)?;
-        let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
-    }
-    let record_path = write_yolo_record(state_dir, &workspace.id, &pane)?;
-    let record = read_yolo_record(state_dir, &pane.pane_id)?.ok_or_else(|| {
-        AppError::new(format!(
-            "failed to reload yolo record for pane {}",
-            pane.pane_id
-        ))
-    })?;
-    let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
-    emit_babysit_output(render_babysit_start_event(
-        &pane_label,
-        &pane.pane_id,
-        poll_ms,
-        live_preview,
-        &record,
-        &record_path,
-        format,
-        supports_babysit_color(),
-    ))?;
-    loop_yolo_pane(
-        client,
-        state_dir,
-        pane,
-        record,
-        pane_label,
-        poll_ms,
-        live_preview,
-        format,
-        interrupted,
-    )
-}
-
-fn loop_yolo_pane(
-    client: &TmuxClient,
-    state_dir: &Path,
-    pane: TmuxPane,
-    record: YoloRecord,
-    pane_label: String,
-    poll_ms: u64,
-    live_preview: bool,
-    format: BabysitFormat,
-    interrupted: Arc<AtomicBool>,
-) -> AppResult<String> {
-    let mut last_state: Option<SessionState> = None;
-    let mut poll_count: usize = 0;
-    loop {
-        if interrupted.load(Ordering::SeqCst) {
-            cleanup_babysit_record(state_dir, &pane.pane_id)?;
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "sigint",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        }
-        poll_count += 1;
-        if !yolo_record_enabled(state_dir, &pane.pane_id)? {
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "disabled",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        }
-        let Some(current) = client.pane_by_id(&pane.pane_id)? else {
-            cleanup_babysit_record(state_dir, &pane.pane_id)?;
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "missing-pane",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        };
-        if !record.matches_pane(&current) {
-            cleanup_babysit_record(state_dir, &pane.pane_id)?;
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "identity-changed",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        }
-        let current_view = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-        let classification = &current_view.classification;
-        if last_state != Some(classification.state) {
-            emit_babysit_output(render_babysit_wait_event(
-                &pane_label,
-                &pane.pane_id,
-                poll_count,
-                &current_view,
-                live_preview,
-                format,
-                supports_babysit_color(),
-            ))?;
-            last_state = Some(classification.state);
-        }
-        match yolo_action_for_state(classification.state) {
-            YoloAction::ApprovePermission => {
-                if !is_yolo_safe_to_approve(&current_view) {
-                    thread::sleep(Duration::from_millis(poll_ms));
-                    continue;
-                }
-                emit_babysit_output(render_babysit_action_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &current_view,
-                    GuardedWorkflow::ApprovePermission,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                execute_classified_workflow(
-                    client,
-                    &pane.pane_id,
-                    GuardedWorkflow::ApprovePermission,
-                    classification,
-                )?;
-                thread::sleep(Duration::from_millis(poll_ms));
-                let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                emit_babysit_output(render_babysit_action_completed_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &after,
-                    GuardedWorkflow::ApprovePermission,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                last_state = Some(after.classification.state);
-            }
-            YoloAction::DismissSurvey => {
-                emit_babysit_output(render_babysit_action_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &current_view,
-                    GuardedWorkflow::DismissSurvey,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                execute_classified_workflow(
-                    client,
-                    &pane.pane_id,
-                    GuardedWorkflow::DismissSurvey,
-                    classification,
-                )?;
-                thread::sleep(Duration::from_millis(poll_ms));
-                let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                emit_babysit_output(render_babysit_action_completed_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &after,
-                    GuardedWorkflow::DismissSurvey,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                last_state = Some(after.classification.state);
-            }
-            YoloAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
-        }
-    }
-}
-
-fn run_yolo_all(
-    client: &TmuxClient,
-    state_dir: &Path,
-    workspace: Option<&WorkspaceRecord>,
-    poll_ms: u64,
-    live_preview: bool,
-    format: BabysitFormat,
-    interrupted: Arc<AtomicBool>,
-) -> AppResult<String> {
-    let mut tracked: HashMap<String, TrackedYoloPane> = HashMap::new();
-    loop {
-        if interrupted.load(Ordering::SeqCst) {
-            cleanup_all_babysit_records(state_dir, tracked.keys())?;
-            return Ok(String::new());
-        }
-        for pane in discover_yolo_supported_panes(client)? {
-            let pane_workspace =
-                resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
-            if workspace.is_some_and(|workspace| workspace.id != pane_workspace.id) {
-                continue;
-            }
-            if tracked.contains_key(&pane.pane_id) {
-                continue;
-            }
-            let record_path = write_yolo_record(state_dir, &pane_workspace.id, &pane)?;
-            let record = read_yolo_record(state_dir, &pane.pane_id)?.ok_or_else(|| {
-                AppError::new(format!(
-                    "failed to reload yolo record for pane {}",
-                    pane.pane_id
-                ))
-            })?;
-            let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
-            emit_babysit_output(render_babysit_start_event(
-                &pane_label,
-                &pane.pane_id,
-                poll_ms,
-                live_preview,
-                &record,
-                &record_path,
-                format,
-                supports_babysit_color(),
-            ))?;
-            tracked.insert(
-                pane.pane_id.clone(),
-                TrackedYoloPane {
-                    record,
-                    pane_label,
-                    last_state: None,
-                    poll_count: 0,
-                },
-            );
-        }
-        let ids = tracked.keys().cloned().collect::<Vec<_>>();
-        for pane_id in ids {
-            if interrupted.load(Ordering::SeqCst) {
-                break;
-            }
-            let Some(tracked_pane) = tracked.get_mut(&pane_id) else {
-                continue;
-            };
-            if !yolo_record_enabled(state_dir, &pane_id)? {
-                tracked.remove(&pane_id);
-                continue;
-            }
-            let Some(current) = client.pane_by_id(&pane_id)? else {
-                cleanup_babysit_record(state_dir, &pane_id)?;
-                emit_babysit_output(render_babysit_stop_event(
-                    &tracked_pane.pane_label,
-                    &pane_id,
-                    "missing-pane",
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                tracked.remove(&pane_id);
-                continue;
-            };
-            if !tracked_pane.record.matches_pane(&current) {
-                cleanup_babysit_record(state_dir, &pane_id)?;
-                emit_babysit_output(render_babysit_stop_event(
-                    &tracked_pane.pane_label,
-                    &pane_id,
-                    "identity-changed",
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                tracked.remove(&pane_id);
-                continue;
-            }
-            let current_view = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-            let classification = current_view.classification.state;
-            tracked_pane.poll_count += 1;
-            if tracked_pane.last_state != Some(classification) {
-                emit_babysit_output(render_babysit_wait_event(
-                    &tracked_pane.pane_label,
-                    &pane_id,
-                    tracked_pane.poll_count,
-                    &current_view,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                tracked_pane.last_state = Some(classification);
-            }
-            match yolo_action_for_state(classification) {
-                YoloAction::ApprovePermission => {
-                    if !is_yolo_safe_to_approve(&current_view) {
-                        continue;
-                    }
-                    emit_babysit_output(render_babysit_action_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &current_view,
-                        GuardedWorkflow::ApprovePermission,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    execute_classified_workflow(
-                        client,
-                        &pane_id,
-                        GuardedWorkflow::ApprovePermission,
-                        &current_view.classification,
-                    )?;
-                    thread::sleep(Duration::from_millis(poll_ms));
-                    let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                    emit_babysit_output(render_babysit_action_completed_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &after,
-                        GuardedWorkflow::ApprovePermission,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    tracked_pane.last_state = Some(after.classification.state);
-                }
-                YoloAction::DismissSurvey => {
-                    emit_babysit_output(render_babysit_action_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &current_view,
-                        GuardedWorkflow::DismissSurvey,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    execute_classified_workflow(
-                        client,
-                        &pane_id,
-                        GuardedWorkflow::DismissSurvey,
-                        &current_view.classification,
-                    )?;
-                    thread::sleep(Duration::from_millis(poll_ms));
-                    let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                    emit_babysit_output(render_babysit_action_completed_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &after,
-                        GuardedWorkflow::DismissSurvey,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    tracked_pane.last_state = Some(after.classification.state);
-                }
-                YoloAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
-            }
-        }
-        thread::sleep(Duration::from_millis(poll_ms));
-    }
-}
-
-fn discover_yolo_supported_panes(client: &TmuxClient) -> AppResult<Vec<TmuxPane>> {
-    let mut supported = Vec::new();
-    for pane in client.list_panes()? {
-        if is_pane_command_claude(&pane) {
-            supported.push(pane);
-            continue;
-        }
-        if !is_pane_codex_candidate(&pane) {
-            continue;
-        }
-        let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-        if is_classified_codex(&inspected.classification, &pane) {
-            supported.push(pane);
-        }
-    }
-    Ok(supported)
-}
-
-struct TrackedYoloPane {
-    record: YoloRecord,
-    pane_label: String,
-    last_state: Option<SessionState>,
-    poll_count: usize,
-}
-
-fn yolo_record_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
-    Ok(matches!(read_yolo_record(state_dir, pane_id)?, Some(record) if record.enabled))
-}
-
-fn tracked_pane_ids(state_dir: &Path, workspace_id: Option<&str>) -> AppResult<Vec<String>> {
-    list_yolo_pane_ids(state_dir, workspace_id)
-}
-
-fn cleanup_all_babysit_records<'a, I: IntoIterator<Item = &'a String>>(
-    state_dir: &Path,
-    pane_ids: I,
-) -> AppResult<()> {
-    for pane_id in pane_ids {
-        cleanup_babysit_record(state_dir, pane_id)?;
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn cleanup_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<()> {
     let _ = disable_yolo_record(state_dir, pane_id)?;
     Ok(())
@@ -3175,14 +2756,6 @@ fn pane_label_from_path(current_path: &str, fallback: &str) -> String {
         .filter(|name| !name.is_empty())
         .map(|name| name.to_string())
         .unwrap_or_else(|| fallback.to_string())
-}
-
-fn babysit_pane_label(state_dir: &std::path::Path, pane_id: &str) -> String {
-    read_yolo_record(state_dir, pane_id)
-        .ok()
-        .flatten()
-        .map(|record| pane_label_from_path(&record.current_path, pane_id))
-        .unwrap_or_else(|| pane_id.to_string())
 }
 
 fn style_babysit(text: impl AsRef<str>, code: &str, use_color: bool) -> String {
@@ -3279,6 +2852,7 @@ fn render_babysit_human(event: serde_json::Value, use_color: bool) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn babysit_prompt_json(details: Option<&PermissionPromptDetails>) -> serde_json::Value {
     match details {
         Some(details) => serde_json::json!({
@@ -3292,6 +2866,7 @@ fn babysit_prompt_json(details: Option<&PermissionPromptDetails>) -> serde_json:
     }
 }
 
+#[cfg(test)]
 fn render_babysit_start_event(
     pane_label: &str,
     pane_id: &str,
@@ -3326,28 +2901,6 @@ fn render_babysit_start_event(
                 format!("Record: {}", record_path.display()),
                 format!("Live preview: {live_preview}"),
             ],
-        }),
-        use_color,
-    )
-}
-
-fn render_babysit_stop_event(
-    pane_label: &str,
-    pane_id: &str,
-    reason: &str,
-    format: BabysitFormat,
-    use_color: bool,
-) -> String {
-    render_babysit_output(
-        format.into(),
-        serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "stop",
-            "pane_label": pane_label,
-            "pane_id": pane_id,
-            "reason": reason,
-            "summary": format!("YOLO stopped for {pane_label} (id:{pane_id})"),
-            "details": [format!("Reason: {reason}")]
         }),
         use_color,
     )
@@ -3588,6 +3141,7 @@ fn is_permission_annotation_line(line: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn render_permission_prompt_details(details: &PermissionPromptDetails) -> Vec<String> {
     let mut lines = vec![format!("Type: {}", details.prompt_type)];
     if let Some(mode) = &details.sandbox_mode {
@@ -3798,6 +3352,7 @@ fn starts_with_numbered_option_for_yolo(line: &str) -> bool {
     digits > 0 && line[digits..].starts_with('.')
 }
 
+#[cfg(test)]
 fn render_babysit_wait_event(
     pane_label: &str,
     pane_id: &str,
@@ -3841,6 +3396,7 @@ fn render_babysit_wait_event(
     )
 }
 
+#[cfg(test)]
 fn render_babysit_action_event(
     pane_label: &str,
     pane_id: &str,
@@ -3894,48 +3450,6 @@ fn render_babysit_action_event(
                 }
             ),
             "details": if format == BabysitFormat::Human { serde_json::json!(human_details) } else { json_details },
-            "body_title": body_title,
-            "body_lines": body_lines
-        }),
-        use_color,
-    )
-}
-
-fn render_babysit_action_completed_event(
-    pane_label: &str,
-    pane_id: &str,
-    poll_count: usize,
-    inspected: &InspectedPane,
-    workflow: GuardedWorkflow,
-    live_preview: bool,
-    format: BabysitFormat,
-    use_color: bool,
-) -> String {
-    let classification = &inspected.classification;
-    let _live_preview = live_preview;
-    let body_title: Option<&str> = None;
-    let body_lines: Vec<String> = Vec::new();
-    let json_details = serde_json::json!([format!("Signals: {}", render_signals(classification))]);
-    render_babysit_output(
-        format.into(),
-        serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": format!("{}d", workflow.as_str()),
-            "pane_label": pane_label,
-            "pane_id": pane_id,
-            "poll": poll_count,
-            "state": classification.state.as_str(),
-            "signals": classification.signals.clone(),
-            "summary": format!(
-                "{} for {pane_label} (id:{pane_id}) (poll #{poll_count})",
-                match workflow {
-                    GuardedWorkflow::ApprovePermission => "Approval sent",
-                    GuardedWorkflow::DismissSurvey => "Survey dismissed",
-                    GuardedWorkflow::RejectPermission => "Rejection sent",
-                    GuardedWorkflow::SubmitPrompt => "Prompt submitted",
-                }
-            ),
-            "details": if format == BabysitFormat::Human { serde_json::json!([]) } else { json_details },
             "body_title": body_title,
             "body_lines": body_lines
         }),
@@ -4009,15 +3523,6 @@ pub(crate) struct ContinueOutcome {
     pub(crate) outcome: String,
     pub(crate) after: Classification,
     pub(crate) used_permission_approval: bool,
-}
-
-pub(crate) fn try_unstick_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<String> {
-    let classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-    let outcome = continue_from_classification(client, pane, &classification)?;
-    Ok(format!(
-        "unstick {}: {} -> {}",
-        pane.pane_id, outcome.action, outcome.outcome
-    ))
 }
 
 pub(crate) fn continue_from_classification(
@@ -4536,12 +4041,6 @@ fn is_pane_command_claude(pane: &TmuxPane) -> bool {
 
 fn is_pane_likely_codex(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("codex")
-}
-
-fn is_pane_codex_candidate(pane: &TmuxPane) -> bool {
-    pane.current_command.eq_ignore_ascii_case("codex")
-        || (pane.current_command.eq_ignore_ascii_case("node")
-            && !pane.pane_title.starts_with("OC | "))
 }
 
 fn pane_provider_label(pane: &TmuxPane) -> &'static str {

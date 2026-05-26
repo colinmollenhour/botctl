@@ -165,6 +165,7 @@ impl RuntimeClient {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_socket_path(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }

@@ -877,10 +877,6 @@ impl DashboardApp {
 }
 
 impl PaneEntry {
-    fn is_claude(&self) -> bool {
-        matches!(self.source, PaneSource::Claude)
-    }
-
     fn supports_yolo(&self) -> bool {
         matches!(self.source, PaneSource::Claude | PaneSource::Codex)
     }
@@ -2150,16 +2146,6 @@ fn abbreviate_home_path(path: &str) -> String {
         return format!("~/{suffix}");
     }
     path.to_string()
-}
-
-fn is_waiting_state(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::ChatReady
-            | SessionState::PromptEditing
-            | SessionState::PermissionDialog
-            | SessionState::FolderTrustPrompt
-    )
 }
 
 fn is_cooking_state(state: SessionState) -> bool {

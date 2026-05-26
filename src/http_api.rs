@@ -9,10 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::app::{
-    AppError, AppResult, InspectedPane, extract_permission_prompt_details, keys_for_action,
-    load_automation_keybindings,
-};
+use crate::app::{AppError, AppResult, InspectedPane, keys_for_action, load_automation_keybindings};
 use crate::automation::{AutomationAction, inspect_keybindings};
 use crate::classifier::SessionState;
 use crate::runtime::{RuntimeClient, build_instance_detail_json, build_instance_summary_json};
@@ -339,45 +336,6 @@ fn run_instance_prompt(
         "after_state": submitted.after_state,
         "detail": submitted.detail,
     }))
-}
-
-fn classification_json(inspected: &InspectedPane) -> serde_json::Value {
-    json!({
-        "source": inspected.classification.source,
-        "state": inspected.classification.state.as_str(),
-        "has_questions": inspected.classification.has_questions,
-        "recap_present": inspected.classification.recap_present,
-        "recap_excerpt": inspected.classification.recap_excerpt,
-        "signals": inspected.classification.signals,
-    })
-}
-
-fn permission_prompt_json(inspected: &InspectedPane) -> serde_json::Value {
-    match extract_permission_prompt_details(inspected) {
-        Some(details) => json!({
-            "prompt_type": details.prompt_type,
-            "sandbox_mode": details.sandbox_mode,
-            "command": details.command,
-            "reason": details.reason,
-            "question": details.question,
-        }),
-        None => serde_json::Value::Null,
-    }
-}
-
-fn interaction_summary_json(inspected: &InspectedPane) -> serde_json::Value {
-    match parse_interaction_surface(inspected) {
-        Some(surface) => json!({
-            "mode": surface.mode.as_str(),
-            "selected_option": surface.selected_option,
-            "options": surface
-                .options
-                .iter()
-                .map(interaction_option_json)
-                .collect::<Vec<_>>(),
-        }),
-        None => serde_json::Value::Null,
-    }
 }
 
 fn interaction_detail_json(inspected: &InspectedPane) -> serde_json::Value {
