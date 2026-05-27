@@ -1,0 +1,14 @@
+
+      ▄▀▀▄        Antigravity CLI 1.0.2
+     ▀▀▀▀▀▀       cm525i@gmail.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (High)
+   ▄▀▀    ▀▀▄     ~/Projects/botctl
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> a long pasted block of text begins here and continues
+
+  more pasted content in the middle of the screen with no visible
+
+  bottom footer because the terminal happens to be momentarily
+  showing the user's paste overlay rather than the live input box

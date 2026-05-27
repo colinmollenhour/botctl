@@ -61,6 +61,7 @@ pub const SIGNAL_DIFF_KEYWORDS: &str = "diff-keywords";
 pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
 pub const SIGNAL_CHAT_QUESTIONS: &str = "chat-questions";
 pub const SIGNAL_CODEX_KEYWORDS: &str = "codex-keywords";
+pub const SIGNAL_AGY_KEYWORDS: &str = "agy-keywords";
 pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
 pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
 
@@ -357,6 +358,9 @@ impl Classifier {
                 signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
             }
             SessionState::BusyResponding
+        } else if crate::agy::frame_has_agy_fingerprint(frame_text) {
+            signals.push(String::from(SIGNAL_AGY_KEYWORDS));
+            crate::agy::classify_agy_state(frame_text).unwrap_or(SessionState::Unknown)
         } else if has_chat_input || contains_any(&normalized, &["claude"]) || has_codex_keywords {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             if has_codex_keywords {
@@ -371,11 +375,16 @@ impl Classifier {
             SessionState::Unknown
         };
 
-        let has_questions = matches!(
-            state,
-            SessionState::ChatReady | SessionState::UserQuestionPrompt
-        ) && (chat_ready_has_questions(frame_text)
-            || recap_has_user_question(&recap));
+        // Agy pane-scrape doesn't currently support reliable question detection;
+        // the operator-question path is Claude/Codex specific (it keys on chat
+        // input markers and recap excerpts that agy does not produce).
+        let is_agy_state = signals.iter().any(|s| s == SIGNAL_AGY_KEYWORDS);
+        let has_questions = !is_agy_state
+            && matches!(
+                state,
+                SessionState::ChatReady | SessionState::UserQuestionPrompt
+            )
+            && (chat_ready_has_questions(frame_text) || recap_has_user_question(&recap));
         if has_questions {
             signals.push(String::from(SIGNAL_CHAT_QUESTIONS));
             if state == SessionState::ChatReady {

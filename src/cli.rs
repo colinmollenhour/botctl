@@ -677,7 +677,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
     let (name, purpose, usage, examples, options, safety) = match topic {
         "dashboard" => (
             "dashboard",
-            "Open live TUI across Claude, Codex, OpenCode, and Pi panes.",
+            "Open live TUI across Claude, Codex, OpenCode, Pi, and Antigravity panes.",
             "botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]",
             &[
                 "botctl dashboard",
@@ -817,7 +817,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "botctl last-message --pane %19 --out -",
             ][..],
             &["--pane TARGET", "--out PATH", "--no-color"][..],
-            "Reads provider transcript storage for Claude, Codex, and OpenCode. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout.",
+            "Reads provider transcript storage for Claude, Codex, OpenCode, Pi, and pane-scrape for Antigravity. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout.",
         ),
         "status" => (
             "status",
@@ -1043,7 +1043,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "send-action" => "Advanced plumbing: send one named automation action to a pane.",
         "dismiss-survey" => "Dismiss a survey prompt. Canonical name: dismiss-survey.",
         "last-message" => {
-            "Dump the latest persisted assistant message for a Claude, Codex, or OpenCode pane."
+            "Dump the latest persisted assistant message for a Claude, Codex, OpenCode, Pi, or Antigravity pane."
         }
         "editor-helper" => {
             "Advanced prompt plumbing: generate an editor target file for prompt handoff."

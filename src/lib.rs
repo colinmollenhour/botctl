@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod app;
 pub mod automation;
 pub mod classifier;
@@ -9,6 +10,7 @@ pub mod last_message;
 pub mod observe;
 pub mod opencode;
 pub mod pi;
+pub mod proc_fd;
 pub mod prompt;
 pub mod runtime;
 pub mod screen_model;
