@@ -3886,7 +3886,7 @@ fn render_status_json(
     frame: &str,
     automation_ready: bool,
 ) -> AppResult<String> {
-    serde_json::to_string_pretty(&serde_json::json!({
+    let mut json = serde_json::json!({
         "pane_id": pane.pane_id,
         "session": pane.session_name,
         "window": pane.window_name,
@@ -3912,8 +3912,19 @@ fn render_status_json(
             "status": bindings.status.as_str(),
             "missing": bindings.missing_bindings.clone(),
         },
-    }))
-    .map_err(|error| AppError::new(format!("failed to encode status JSON: {error}")))
+    });
+    // "agy_model" is present (possibly null) for agy panes and absent for all
+    // others (D4=A decision from the MBOD). Use is_classified_agy (not
+    // is_pane_command_agy) so signal-fingerprinted panes — where the process
+    // name may not be "agy" yet but "provider" is already "Antigravity" — also
+    // get the key (V-3 contract fix).
+    if is_classified_agy(classification, pane) {
+        let model_value = crate::agy::extract_model_label(frame)
+            .map_or(serde_json::Value::Null, serde_json::Value::String);
+        json["agy_model"] = model_value;
+    }
+    serde_json::to_string_pretty(&json)
+        .map_err(|error| AppError::new(format!("failed to encode status JSON: {error}")))
 }
 
 pub(crate) fn render_screen_excerpt(frame: &str) -> String {
@@ -4247,7 +4258,7 @@ mod tests {
         render_babysit_action_event, render_babysit_output, render_babysit_start_event,
         render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
         render_list_panes, render_next_safe_action, render_observe_command_output,
-        render_screen_excerpt, render_status_report, resolve_keep_going_prompt,
+        render_screen_excerpt, render_status_json, render_status_report, resolve_keep_going_prompt,
         resolve_prompt_run_input, run_prepare_prompt, shell_escape,
         strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
         tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
@@ -6245,5 +6256,110 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             .expect("clock should be valid")
             .as_nanos();
         std::env::temp_dir().join(format!("botctl-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    // ── render_status_json agy_model tests ───────────────────────────────────
+
+    fn agy_footer_frame() -> &'static str {
+        // A minimal agy frame with a parseable model label in the footer.
+        "Antigravity CLI\n? for shortcuts                              Gemini 3.5 Flash (High)\n"
+    }
+
+    fn sample_classification(state: SessionState) -> Classification {
+        Classification {
+            source: String::new(),
+            state,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![],
+        }
+    }
+
+    #[test]
+    fn render_status_json_agy_pane_with_parseable_footer_has_string_agy_model() {
+        let pane = sample_pane("agy");
+        let classification = sample_classification(SessionState::ChatReady);
+        let bindings = sample_bindings(crate::automation::KeybindingsStatus::Valid);
+
+        let json_str =
+            render_status_json(&pane, &classification, &bindings, agy_footer_frame(), false)
+                .expect("render should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("json should parse");
+
+        assert!(
+            parsed.get("agy_model").is_some(),
+            "agy_model key must be present for agy pane"
+        );
+        assert_eq!(
+            parsed["agy_model"],
+            serde_json::Value::String(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn render_status_json_agy_pane_without_parseable_footer_has_null_agy_model() {
+        let pane = sample_pane("agy");
+        let classification = sample_classification(SessionState::BusyResponding);
+        let bindings = sample_bindings(crate::automation::KeybindingsStatus::Valid);
+        // Frame has no valid footer (spinner line only, no model delimiter).
+        let frame = "Antigravity CLI\n⣾ Working...\n";
+
+        let json_str = render_status_json(&pane, &classification, &bindings, frame, false)
+            .expect("render should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("json should parse");
+
+        assert!(
+            parsed.get("agy_model").is_some(),
+            "agy_model key must be present even when null"
+        );
+        assert_eq!(parsed["agy_model"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn render_status_json_non_agy_pane_omits_agy_model_key() {
+        let pane = sample_pane("claude");
+        let classification = sample_classification(SessionState::ChatReady);
+        let bindings = sample_bindings(crate::automation::KeybindingsStatus::Valid);
+        let frame = "some claude output\n";
+
+        let json_str = render_status_json(&pane, &classification, &bindings, frame, false)
+            .expect("render should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("json should parse");
+
+        assert!(
+            parsed.get("agy_model").is_none(),
+            "agy_model key must be absent for non-agy panes"
+        );
+    }
+
+    /// V-3: A signal-fingerprinted agy pane (where `current_command != "agy"` but
+    /// the classifier set SIGNAL_AGY_KEYWORDS) must still emit "agy_model" because
+    /// "provider" is already "Antigravity" for such panes.
+    #[test]
+    fn render_status_json_signal_fingerprinted_agy_pane_emits_agy_model_key() {
+        // Pane whose process name is not "agy" but the classification has the
+        // agy signal (simulating a signal-only detection path).
+        let pane = sample_pane("node"); // not literally "agy"
+        let mut classification = sample_classification(SessionState::ChatReady);
+        classification
+            .signals
+            .push(String::from(crate::classifier::SIGNAL_AGY_KEYWORDS));
+        let bindings = sample_bindings(crate::automation::KeybindingsStatus::Valid);
+        // Frame with a parseable agy footer.
+        let frame = "? for shortcuts                              Gemini 3.5 Flash (High)\n";
+
+        let json_str = render_status_json(&pane, &classification, &bindings, frame, false)
+            .expect("render should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("json should parse");
+
+        assert_eq!(
+            parsed["provider"],
+            serde_json::Value::String(String::from("Antigravity"))
+        );
+        assert!(
+            parsed.get("agy_model").is_some(),
+            "agy_model key must be present for signal-fingerprinted agy pane, got: {parsed}"
+        );
     }
 }

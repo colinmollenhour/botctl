@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::app::AppResult;
 use crate::classifier::SessionState;
-use crate::proc_fd::transcript_from_process_tree_fds;
+use crate::proc_fd::{ChildResolver, transcript_from_process_tree_fds_with_resolver_ext};
 use crate::tmux::TmuxPane;
 
 const PI_AGENT_DIR: &str = ".pi/agent";
@@ -40,11 +40,14 @@ pub fn is_pi_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("pi")
 }
 
-pub fn resolve_pi_session_for_pane(pane: &TmuxPane) -> AppResult<Option<PiSession>> {
+pub fn resolve_pi_session_for_pane(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<PiSession>> {
     if !is_pi_pane(pane) {
         return Ok(None);
     }
-    let Some((session_id, path, cwd)) = resolve_pi_transcript_for_pane(pane)? else {
+    let Some((session_id, path, cwd)) = resolve_pi_transcript_for_pane(pane, resolver)? else {
         return Ok(None);
     };
     let state = pi_session_state(&path)?.unwrap_or(SessionState::ChatReady);
@@ -66,11 +69,14 @@ pub fn resolve_pi_session_for_pane(pane: &TmuxPane) -> AppResult<Option<PiSessio
     }))
 }
 
-pub fn latest_assistant_message_for_pane(pane: &TmuxPane) -> AppResult<Option<PiLastMessage>> {
+pub fn latest_assistant_message_for_pane(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<PiLastMessage>> {
     if !is_pi_pane(pane) {
         return Ok(None);
     }
-    let Some((session_id, path, _)) = resolve_pi_transcript_for_pane(pane)? else {
+    let Some((session_id, path, _)) = resolve_pi_transcript_for_pane(pane, resolver)? else {
         return Ok(None);
     };
     let Some(text) = latest_pi_assistant_text(&path)?.filter(|text| !text.trim().is_empty()) else {
@@ -79,11 +85,19 @@ pub fn latest_assistant_message_for_pane(pane: &TmuxPane) -> AppResult<Option<Pi
     Ok(Some(PiLastMessage { session_id, text }))
 }
 
-fn resolve_pi_transcript_for_pane(pane: &TmuxPane) -> AppResult<Option<(String, PathBuf, String)>> {
+fn resolve_pi_transcript_for_pane(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<(String, PathBuf, String)>> {
     let sessions_root = default_pi_sessions_root();
 
-    if let Some(pid) = pane.pane_pid
-        && let Some(transcript) = transcript_from_process_tree_fds(pid, &sessions_root, "jsonl")?
+    if let Some(pid) = pane.pane_pid.filter(|&p| p != 0)
+        && let Some(transcript) = transcript_from_process_tree_fds_with_resolver_ext(
+            pid,
+            resolver,
+            &sessions_root,
+            "jsonl",
+        )?
         && let Some(meta) = pi_session_meta(&transcript)?
     {
         return Ok(Some((meta.id, transcript, meta.cwd)));

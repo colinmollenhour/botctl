@@ -29,6 +29,7 @@ use crate::cli::DashboardArgs;
 use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::opencode::{pane_opencode_title, resolve_opencode_session_for_pane};
 use crate::pi::resolve_pi_session_for_pane;
+use crate::proc_fd::ChildResolver;
 use crate::prompt::resolve_state_dir;
 use crate::runtime::RuntimeClient;
 use crate::storage::{WorkspaceRecord, bootstrap_state_db, sync_tmux_runtime_state};
@@ -124,6 +125,10 @@ struct DashboardApp {
     selection: usize,
     first_seen: HashMap<String, Instant>,
     previous_frames: HashMap<String, String>,
+    /// Sticky cache for agy model labels. Preserves the last successfully
+    /// parsed model label so it remains visible when the footer is temporarily
+    /// unparseable (e.g. busy spinner obscuring the footer line).
+    previous_agy_model: HashMap<String, String>,
     cpu_samples: HashMap<String, CpuSample>,
     yes_counts: HashMap<String, u32>,
     window_names: HashMap<String, ManagedWindowName>,
@@ -155,6 +160,10 @@ struct PaneEntry {
     claude_session_id: Option<String>,
     focused_source: String,
     resource_usage: ResourceUsage,
+    /// Parsed Gemini model label from the agy footer. `None` for non-agy
+    /// panes and for agy panes where the label has never been seen yet.
+    /// Populated with the sticky last-seen value on subsequent refreshes.
+    agy_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -180,6 +189,33 @@ struct ProcessSnapshot {
     start_ticks: u64,
     cpu_ticks: u64,
     rss_pages: u64,
+}
+
+/// A pre-built `ppid → children` map derived from one call to
+/// `process_snapshots_with_cmdlines()`. Implementing `ChildResolver` lets the
+/// dashboard thread a single per-refresh `/proc` scan into every
+/// `resolve_agy_session_for_pane` and `resolve_pi_session_for_pane` call
+/// without re-scanning `/proc` for each pane.
+struct ProcessTreeSnapshot {
+    children: HashMap<u32, Vec<u32>>,
+}
+
+impl ProcessTreeSnapshot {
+    /// Build the children map from an already-computed `Vec<ProcessSnapshot>`.
+    /// Does **not** re-scan `/proc`.
+    fn from_process_snapshots(snapshots: &[ProcessSnapshot]) -> Self {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for snap in snapshots {
+            children.entry(snap.ppid).or_default().push(snap.pid);
+        }
+        Self { children }
+    }
+}
+
+impl ChildResolver for ProcessTreeSnapshot {
+    fn children_of(&self, pid: u32) -> Vec<u32> {
+        self.children.get(&pid).cloned().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -252,6 +288,7 @@ impl DashboardApp {
             selection: 0,
             first_seen: HashMap::new(),
             previous_frames: HashMap::new(),
+            previous_agy_model: HashMap::new(),
             cpu_samples: HashMap::new(),
             yes_counts: HashMap::new(),
             window_names: HashMap::new(),
@@ -269,6 +306,7 @@ impl DashboardApp {
         let mut branch_by_path = HashMap::new();
         let mut next_frames = HashMap::new();
         let process_age_snapshots = process_snapshots_with_cmdlines();
+        let process_tree = ProcessTreeSnapshot::from_process_snapshots(&process_age_snapshots);
 
         for snapshot in self.runtime.list_panes(None, None)? {
             let pane = snapshot.pane.clone();
@@ -290,12 +328,13 @@ impl DashboardApp {
                 // YOLO / Claude keybindings against an agy TUI (AGENTS.md
                 // guardrail). An unresolved session id is encoded as
                 // `Agy { session_id: None }`.
-                let session_id = resolve_agy_session_for_pane(&pane, &snapshot.raw_source)?
-                    .and_then(|session| session.id);
+                let session_id =
+                    resolve_agy_session_for_pane(&pane, &snapshot.raw_source, &process_tree)?
+                        .and_then(|session| session.id);
                 PaneSource::Agy { session_id }
             } else if let Some(source) = opencode_source_for_pane(&pane) {
                 source
-            } else if let Some(pi_session) = resolve_pi_session_for_pane(&pane)? {
+            } else if let Some(pi_session) = resolve_pi_session_for_pane(&pane, &process_tree)? {
                 PaneSource::Pi {
                     session_id: pi_session.id,
                 }
@@ -352,6 +391,7 @@ impl DashboardApp {
                 ))
                 .copied()
                 .unwrap_or(0);
+            let agy_model = self.resolve_agy_model_sticky(&pane, &snapshot.raw_source);
 
             panes.push(PaneEntry {
                 pane,
@@ -374,6 +414,7 @@ impl DashboardApp {
                 claude_session_id: snapshot.claude_session_id.clone(),
                 focused_source: snapshot.focused_source.clone(),
                 resource_usage,
+                agy_model,
             });
         }
 
@@ -390,7 +431,7 @@ impl DashboardApp {
             // thread the result into both visibility and source construction
             // to avoid duplicate fd-walk + history-tail parsing.
             let agy_session = if is_agy_pane(&pane) {
-                resolve_agy_session_for_pane(&pane, &frame)?
+                resolve_agy_session_for_pane(&pane, &frame, &process_tree)?
             } else {
                 None
             };
@@ -399,6 +440,7 @@ impl DashboardApp {
                 &frame,
                 &classification.signals,
                 agy_session.as_ref(),
+                &process_tree,
             )? {
                 continue;
             }
@@ -414,6 +456,7 @@ impl DashboardApp {
                 &frame,
                 &classification.signals,
                 agy_session,
+                &process_tree,
             )?;
             let workspace = crate::storage::resolve_workspace_for_path(
                 &self.state_dir,
@@ -454,6 +497,7 @@ impl DashboardApp {
                 is_cooking_state(state),
                 session_key,
             )?;
+            let agy_model = self.resolve_agy_model_sticky(&pane, &frame);
 
             panes.push(PaneEntry {
                 pane,
@@ -476,6 +520,7 @@ impl DashboardApp {
                 claude_session_id: None,
                 focused_source: focused_dashboard_frame(&frame),
                 resource_usage,
+                agy_model,
             });
         }
 
@@ -484,6 +529,8 @@ impl DashboardApp {
         self.cpu_samples
             .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
         self.previous_frames = next_frames;
+        self.previous_agy_model
+            .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
 
         let first_window_by_workspace = panes.iter().fold(
             HashMap::<String, u32>::new(),
@@ -948,6 +995,33 @@ impl PaneEntry {
 }
 
 impl DashboardApp {
+    /// Resolve the agy model label for a pane, using the sticky cache for
+    /// resilience when the footer is temporarily unparseable.
+    ///
+    /// When the pane is no longer agy, the cache entry is evicted immediately
+    /// (V-4 fix: prevents stale labels leaking into a future agy session that
+    /// reuses the same pane_id). Returns `None` for non-agy panes.
+    fn resolve_agy_model_sticky(
+        &mut self,
+        pane: &crate::tmux::TmuxPane,
+        frame: &str,
+    ) -> Option<String> {
+        if !is_agy_pane(pane) {
+            // Pane is no longer agy — evict any stale cache entry.
+            self.previous_agy_model.remove(&pane.pane_id);
+            return None;
+        }
+        let parsed = crate::agy::extract_model_label(frame);
+        match parsed {
+            Some(label) => {
+                self.previous_agy_model
+                    .insert(pane.pane_id.clone(), label.clone());
+                Some(label)
+            }
+            None => self.previous_agy_model.get(&pane.pane_id).cloned(),
+        }
+    }
+
     fn max_memory_bytes(&self) -> Option<u64> {
         self.panes
             .iter()
@@ -1150,6 +1224,13 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         let mut details = vec![
             Line::from(format!("Workspace: {}", detail_workspace_label(pane))),
             Line::from(format!("Provider: {}", pane_provider_label(pane))),
+        ];
+        if let PaneSource::Agy { .. } = &pane.source
+            && let Some(model) = pane.agy_model.as_deref()
+        {
+            details.push(Line::from(format!("Model: {model}")));
+        }
+        details.extend([
             Line::from(format!(
                 "Pane: {} ({})",
                 pane.pane.pane_id,
@@ -1188,7 +1269,7 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 format_memory_bytes(pane.resource_usage.memory_bytes)
             )),
             Line::from(format!("Path: {}", detail_current_path(pane))),
-        ];
+        ]);
         if pane.workspace.workspace_root != pane.workspace_group_key {
             details.push(Line::from(format!(
                 "Worktree: {}",
@@ -2737,6 +2818,7 @@ fn is_dashboard_visible_non_runtime_pane_with(
     frame: &str,
     signals: &[String],
     agy_session: Option<&crate::agy::AgySession>,
+    resolver: &dyn ChildResolver,
 ) -> AppResult<bool> {
     // Mirror the short-circuit in `pane_source_for_non_runtime_pane_with`:
     // when the pane's current command is `agy` we treat it as a visible
@@ -2748,7 +2830,7 @@ fn is_dashboard_visible_non_runtime_pane_with(
     Ok(is_agy_pane(pane)
         || is_opencode_candidate_pane(pane)
         || is_codex_screen(frame, signals)
-        || resolve_pi_session_for_pane(pane)?.is_some()
+        || resolve_pi_session_for_pane(pane, resolver)?.is_some()
         || resolve_opencode_session_for_pane(pane).is_some()
         || agy_session.is_some())
 }
@@ -2758,6 +2840,7 @@ fn pane_source_for_non_runtime_pane_with(
     frame: &str,
     signals: &[String],
     agy_session: Option<crate::agy::AgySession>,
+    resolver: &dyn ChildResolver,
 ) -> AppResult<PaneSource> {
     if is_agy_pane(pane) {
         // Short-circuit on the process name. Even if `agy_session` is None
@@ -2771,7 +2854,7 @@ fn pane_source_for_non_runtime_pane_with(
     if let Some(source) = opencode_source_for_pane(pane) {
         return Ok(source);
     }
-    if let Some(pi_session) = resolve_pi_session_for_pane(pane)? {
+    if let Some(pi_session) = resolve_pi_session_for_pane(pane, resolver)? {
         return Ok(PaneSource::Pi {
             session_id: pi_session.id,
         });
@@ -2892,6 +2975,7 @@ mod tests {
             "Plan · GPT-5.5 OpenAI",
             &[String::from(SIGNAL_CODEX_KEYWORDS)],
             None,
+            &crate::proc_fd::LiveProc,
         )
         .expect("source should resolve");
 
@@ -3036,6 +3120,7 @@ mod tests {
             "frame with no fingerprint",
             &[],
             None,
+            &crate::proc_fd::LiveProc,
         )
         .expect("non-runtime source should resolve without error");
         assert!(matches!(source, PaneSource::Agy { session_id: None }));
@@ -3666,6 +3751,96 @@ mod tests {
         assert!(!yolo_column_contains(&app, list_area, list_area.x));
     }
 
+    fn make_test_app(label: &str) -> DashboardApp {
+        DashboardApp::new(
+            TmuxClient::default(),
+            TmuxClient::default(),
+            RuntimeClient::with_socket_path(
+                unique_temp_dir(&format!("{label}-sock")).join("runtime.sock"),
+            ),
+            unique_temp_dir(label),
+            1000,
+            120,
+            None,
+        )
+        .expect("app should initialize")
+    }
+
+    fn agy_tmux_pane(pane_id: &str) -> TmuxPane {
+        TmuxPane {
+            pane_id: pane_id.to_string(),
+            pane_tty: String::from("/dev/pts/1"),
+            pane_pid: None,
+            session_id: String::from("$1"),
+            session_name: String::from("demo"),
+            window_id: String::from("@1"),
+            window_index: 0,
+            window_name: String::from("agy"),
+            pane_index: 0,
+            current_command: String::from("agy"),
+            current_path: String::from("/tmp/demo"),
+            pane_title: String::new(),
+            pane_active: true,
+            cursor_x: None,
+            cursor_y: None,
+        }
+    }
+
+    #[test]
+    fn previous_agy_model_evicted_when_pane_no_longer_agy() {
+        // V-4/V-9: when resolve_agy_model_sticky is called for a pane that is
+        // no longer agy (different command), any cached label should be evicted.
+        let mut app = make_test_app("agy-model-evict");
+        let pane_id = "%evict1";
+
+        // Seed the cache as if the pane previously had a model.
+        app.previous_agy_model
+            .insert(pane_id.to_string(), String::from("Gemini 3.5 Flash (High)"));
+
+        // Now the pane's command has changed to "bash" — no longer agy.
+        let non_agy_pane = TmuxPane {
+            current_command: String::from("bash"),
+            ..agy_tmux_pane(pane_id)
+        };
+        let result = app.resolve_agy_model_sticky(&non_agy_pane, "some bash output\n");
+
+        assert!(
+            result.is_none(),
+            "non-agy pane must return None from sticky resolver"
+        );
+        assert!(
+            !app.previous_agy_model.contains_key(pane_id),
+            "cache entry must be evicted when pane is no longer agy"
+        );
+    }
+
+    #[test]
+    fn previous_agy_model_sticky_cache_returns_last_parsed_value_when_footer_absent() {
+        // V-9: when the footer is temporarily unparseable, the sticky cache
+        // serves the previous value.
+        let mut app = make_test_app("agy-model-sticky");
+        let pane_id = "%sticky1";
+        let agy_pane = agy_tmux_pane(pane_id);
+
+        // First call with a parseable footer — populates the cache.
+        let frame_with_footer = "Antigravity CLI\nesc to cancel                                Gemini 3.5 Flash (High)\n";
+        let first = app.resolve_agy_model_sticky(&agy_pane, frame_with_footer);
+        assert_eq!(
+            first,
+            Some(String::from("Gemini 3.5 Flash (High)")),
+            "should parse label from footer"
+        );
+
+        // Second call with no parseable footer — should return cached value.
+        let frame_without_footer = "Antigravity CLI\n⣾ Working...\n";
+        let second = app.resolve_agy_model_sticky(&agy_pane, frame_without_footer);
+        assert_eq!(
+            second,
+            Some(String::from("Gemini 3.5 Flash (High)")),
+            "sticky cache must serve previous value when footer is absent"
+        );
+    }
+
     fn sample_pane_entry(
         state: SessionState,
         has_questions: bool,
@@ -3717,6 +3892,7 @@ mod tests {
             claude_session_id: None,
             focused_source: focused_source.to_string(),
             resource_usage: ResourceUsage::default(),
+            agy_model: None,
         }
     }
 

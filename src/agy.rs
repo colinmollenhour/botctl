@@ -6,11 +6,17 @@
 //! workspace match second, pane-scrape last-message extraction
 //! with a strict rule-boundary contract.
 //!
-//! TODO(v2): surface the agy model line ("Gemini 3.5 Flash (High)") in the
-//! dashboard detail panel by parsing it from the captured banner once per
-//! session and caching. Deferred from v1 because the banner-parser is
-//! unverified against the live capture set and the failure mode (showing
-//! nothing) is not load-bearing for v1.
+//! ## WL-001 update: protobuf encryption blocker
+//!
+//! The original wishlist plan (AGY-001) proposed reading conversation
+//! transcripts directly from `~/.gemini/antigravity-cli/conversations/<uuid>.pb`
+//! by adding a `.proto` definition. Investigation revealed that those `.pb`
+//! files are uniformly high-entropy from byte 0 with no inline ASCII — they
+//! appear to be encrypted rather than raw protobuf. Parsing the file content
+//! is therefore blocked until the encryption layer is understood. See
+//! `WISHLIST.md` under "AGY-001" for the full finding and three follow-up
+//! paths. The FD-walk half of AGY-001 (resolving *which* `.pb` a running `agy`
+//! process has open) already works via `conversation_id_from_process_tree_fds`.
 
 use std::borrow::Cow;
 use std::fs;
@@ -18,10 +24,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::AppResult;
 use crate::classifier::SessionState;
-use crate::proc_fd::transcript_from_process_tree_fds_with;
+use crate::proc_fd::{ChildResolver, transcript_from_process_tree_fds_with_resolver};
 use crate::tmux::TmuxPane;
 
 /// Read up to this many bytes from the tail of `history.jsonl` to recover the
@@ -36,6 +43,22 @@ const HISTORY_AMBIGUITY_WINDOW_MS: u64 = 60_000;
 const SPINNER_GLYPHS: &[char] = &[
     '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '⣾', '⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽',
 ];
+
+/// Maximum display width (via `UnicodeWidthStr::width`) of an accepted Gemini
+/// model label. Generous cap; observed labels are ~24 chars
+/// (`Gemini 3.5 Flash (High)`). Anything longer is rejected as a misaligned
+/// or attacker-influenced capture.
+pub const MODEL_LABEL_MAX_WIDTH: usize = 64;
+
+/// Bottom-anchor scan window: number of non-empty lines from the end of the
+/// (ANSI-stripped) frame to consider as candidate footer lines.
+pub const MODEL_LABEL_TAIL_WINDOW: usize = 6;
+
+/// The two-space + "Gemini " gutter delimiter that separates the left-aligned
+/// footer prefix (`esc to cancel` / `? for shortcuts`) from the right-aligned
+/// model label. Using a named constant avoids repeated magic string literals
+/// and makes the offset arithmetic below self-documenting.
+pub const MODEL_LABEL_GUTTER: &str = "  Gemini ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgySession {
@@ -56,7 +79,11 @@ pub fn is_agy_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("agy")
 }
 
-pub fn resolve_agy_session_for_pane(pane: &TmuxPane, frame: &str) -> AppResult<Option<AgySession>> {
+pub fn resolve_agy_session_for_pane(
+    pane: &TmuxPane,
+    frame: &str,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<AgySession>> {
     if !is_agy_pane(pane) {
         return Ok(None);
     }
@@ -64,8 +91,8 @@ pub fn resolve_agy_session_for_pane(pane: &TmuxPane, frame: &str) -> AppResult<O
         return Ok(None);
     }
 
-    let id = if let Some(pid) = pane.pane_pid {
-        match conversation_id_from_process_tree_fds(pid)? {
+    let id = if let Some(pid) = pane.pane_pid.filter(|&p| p != 0) {
+        match conversation_id_from_process_tree_fds(pid, resolver)? {
             Some(uuid) => Some(uuid),
             None => conversation_id_from_history_jsonl(&pane.current_path)?,
         }
@@ -85,8 +112,9 @@ pub fn resolve_agy_session_for_pane(pane: &TmuxPane, frame: &str) -> AppResult<O
 pub fn latest_assistant_message_for_pane(
     pane: &TmuxPane,
     frame: &str,
+    resolver: &dyn ChildResolver,
 ) -> AppResult<Option<AgyLastMessage>> {
-    let Some(session) = resolve_agy_session_for_pane(pane, frame)? else {
+    let Some(session) = resolve_agy_session_for_pane(pane, frame, resolver)? else {
         return Ok(None);
     };
     let Some(conversation_id) = session.id else {
@@ -222,9 +250,12 @@ pub fn default_history_file() -> PathBuf {
     default_state_dir().join("history.jsonl")
 }
 
-fn conversation_id_from_process_tree_fds(pid: u32) -> AppResult<Option<String>> {
+pub(crate) fn conversation_id_from_process_tree_fds(
+    pid: u32,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<String>> {
     let conversations_root = default_state_dir().join("conversations");
-    let target = transcript_from_process_tree_fds_with(pid, |path| {
+    let target = transcript_from_process_tree_fds_with_resolver(pid, resolver, |path| {
         path.starts_with(&conversations_root)
             && path.extension().and_then(|value| value.to_str()) == Some("pb")
     })?;
@@ -544,6 +575,76 @@ pub(crate) fn extract_last_assistant_text(frame: &str) -> Option<String> {
         return None;
     }
     Some(joined)
+}
+
+/// Extract the right-aligned Gemini model label from the agy bottom footer.
+///
+/// Bottom-anchored, ANSI-stripped, control-character-rejecting (whole line,
+/// not just the label slice), width-capped.
+///
+/// Looks at the last [`MODEL_LABEL_TAIL_WINDOW`] non-empty lines of the frame.
+/// For each line (scanning bottom-up), embedded `\r` bytes are stripped first;
+/// then the whole line is checked for ASCII control characters — a control char
+/// anywhere (prefix or label) disqualifies the line. The line must start with
+/// `"esc to cancel"` or `"? for shortcuts"` (after `trim_start`), and must
+/// contain [`MODEL_LABEL_GUTTER`] as the right-most delimiter. The label is
+/// extracted starting at "Gemini" and trimmed of trailing whitespace.
+///
+/// Returns `None` when no qualifying footer line is found.
+pub fn extract_model_label(frame: &str) -> Option<String> {
+    let stripped = strip_ansi(frame);
+    // Collect the last MODEL_LABEL_TAIL_WINDOW non-empty lines bottom-up
+    // (index 0 = bottom-most line) in a single pass — no double-reverse needed.
+    let tail: Vec<&str> = stripped
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(MODEL_LABEL_TAIL_WINDOW)
+        .collect();
+
+    // Walk bottom-up — most-recent footer line wins (tail[0] is the bottom-most).
+    for raw_line in tail.iter() {
+        // Strip embedded CR bytes before any delimiter search (handles TUI
+        // redraws that emit \r before the newline).
+        let line = raw_line.replace('\r', "");
+        // Reject the whole line if it contains any ASCII control character
+        // (covers both the prefix and the label slice — consistent with the
+        // doc claim "control-character-rejecting").
+        if line.chars().any(|c| c.is_control()) {
+            continue;
+        }
+        let trimmed_start = line.trim_start().to_string();
+        if !trimmed_start.starts_with("esc to cancel")
+            && !trimmed_start.starts_with("? for shortcuts")
+        {
+            continue;
+        }
+        // Use rfind so that the rightmost gutter occurrence is used, which
+        // is the correct right-aligned label even on a line that contains
+        // the gutter string more than once.
+        let Some(idx) = line.rfind(MODEL_LABEL_GUTTER) else {
+            continue;
+        };
+        // Extract from "Gemini" (skip the two leading spaces of the gutter).
+        // The offset is derived from the constant length, not a magic number.
+        let label_start = idx + MODEL_LABEL_GUTTER.len() - "Gemini ".len();
+        let label = line[label_start..].trim_end();
+        // Reject incomplete captures: the gutter without an actual label
+        // (e.g. a footer that ends mid-render at `...  Gemini `) would
+        // otherwise leave just `Gemini` and get cached as the sticky model.
+        let Some(suffix) = label.strip_prefix("Gemini ") else {
+            continue;
+        };
+        if suffix.trim().is_empty() {
+            continue;
+        }
+        // Reject labels exceeding the display-width cap.
+        if UnicodeWidthStr::width(label) > MODEL_LABEL_MAX_WIDTH {
+            continue;
+        }
+        return Some(label.to_string());
+    }
+    None
 }
 
 pub(crate) fn strip_ansi(input: &str) -> Cow<'_, str> {
@@ -949,7 +1050,7 @@ mod tests {
         let frame = "Antigravity CLI 1.0.2\n? for shortcuts\n";
 
         // The resolved session should have id == None.
-        let session = resolve_agy_session_for_pane(&pane, frame)
+        let session = resolve_agy_session_for_pane(&pane, frame, &crate::proc_fd::LiveProc)
             .expect("resolution should not error")
             .expect("agy pane with fingerprint should yield a session");
         assert!(
@@ -960,7 +1061,7 @@ mod tests {
         // And latest_assistant_message_for_pane should return Ok(None) for this case
         // (callers in last_message.rs translate this into the no-session error).
         assert!(
-            latest_assistant_message_for_pane(&pane, frame)
+            latest_assistant_message_for_pane(&pane, frame, &crate::proc_fd::LiveProc)
                 .expect("call should not error")
                 .is_none()
         );
@@ -1048,5 +1149,228 @@ mod tests {
     fn strip_ansi_removes_color_codes() {
         let stripped = strip_ansi("\x1b[31mred\x1b[0m text");
         assert_eq!(stripped.as_ref(), "red text");
+    }
+
+    // ── extract_model_label tests ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_agy_session_skips_fd_walk_when_pid_is_zero() {
+        // V-5: pane_pid == Some(0) must be treated as "no usable pid" — the
+        // FD walk is skipped and we fall through to the history.jsonl path.
+        // With a nonexistent state dir and history file, the result is
+        // Some(session) with id == None (not a panic, not a /proc/0 access).
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let unique = format!(
+            "/tmp/agy-test-pid0-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        unsafe {
+            std::env::set_var("ANTIGRAVITY_STATE_DIR", &unique);
+            std::env::set_var(
+                "ANTIGRAVITY_HISTORY_FILE",
+                format!("{unique}/history.jsonl"),
+            );
+        }
+        // RAII guard: if the test panics partway through, the env vars are
+        // still cleared so we don't poison sibling tests.
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("ANTIGRAVITY_STATE_DIR");
+                    std::env::remove_var("ANTIGRAVITY_HISTORY_FILE");
+                }
+            }
+        }
+        let _env_reset = EnvReset;
+        let pane = TmuxPane {
+            pane_id: String::from("%5"),
+            pane_tty: String::from("/dev/pts/5"),
+            pane_pid: Some(0), // should be rejected
+            session_id: String::from("$5"),
+            session_name: String::from("demo"),
+            window_id: String::from("@5"),
+            window_index: 0,
+            window_name: String::from("agy"),
+            pane_index: 0,
+            current_command: String::from("agy"),
+            current_path: String::from("/tmp/agy-pid0-workspace"),
+            pane_title: String::new(),
+            pane_active: true,
+            cursor_x: None,
+            cursor_y: None,
+        };
+        let frame = "Antigravity CLI 1.0.2\n? for shortcuts\n";
+        // Must not panic or access /proc/0.
+        let session = resolve_agy_session_for_pane(&pane, frame, &crate::proc_fd::LiveProc)
+            .expect("should not error")
+            .expect("fingerprint present, session should resolve");
+        assert!(
+            session.id.is_none(),
+            "pid=0 skips fd walk; with no history.jsonl, id should be None"
+        );
+    }
+
+    #[test]
+    fn extract_model_label_finds_label_from_esc_to_cancel_footer() {
+        let frame = concat!(
+            "Some content\n",
+            "More content\n",
+            "esc to cancel                                          Gemini 3.5 Flash (High)\n",
+        );
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_finds_label_from_shortcuts_footer() {
+        let frame = concat!(
+            "Some content\n",
+            "? for shortcuts                                        Gemini 3.5 Flash (High)\n",
+        );
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_returns_none_when_no_footer_in_window() {
+        // No esc-to-cancel or shortcuts footer at all.
+        let frame = "Some content\nMore content\nUnrelated last line\n";
+        assert_eq!(extract_model_label(frame), None);
+    }
+
+    #[test]
+    fn extract_model_label_ignores_spinner_line_with_gemini() {
+        // A spinner line that contains "Gemini" but not the proper footer prefix
+        // and two-space gutter should not be captured.
+        let frame = "⣾ Working... Gemini 3.5 Flash (High)\n";
+        assert_eq!(extract_model_label(frame), None);
+    }
+
+    #[test]
+    fn extract_model_label_rejects_control_characters() {
+        // Label contains a control character — must be rejected.
+        let frame = "esc to cancel                                          Gemini 3.5 \x07Flash\n";
+        assert_eq!(extract_model_label(frame), None);
+    }
+
+    #[test]
+    fn extract_model_label_rejects_overlong_label() {
+        // Build a label that exceeds MODEL_LABEL_MAX_WIDTH (64 display columns).
+        let long_label = "Gemini ".to_string() + &"X".repeat(60);
+        let frame = format!("esc to cancel                            {long_label}\n");
+        // Verify the frame satisfies the delimiter condition first.
+        assert!(frame.contains("  Gemini "));
+        assert_eq!(extract_model_label(&frame), None);
+    }
+
+    #[test]
+    fn extract_model_label_strips_ansi_then_parses() {
+        // ANSI color codes surround the footer; after stripping, label must be found.
+        let frame = "\x1b[32mesc to cancel\x1b[0m                          \x1b[1mGemini 3.5 Flash (High)\x1b[0m\n";
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_picks_bottom_most_when_multiple_footers() {
+        // Two footer lines in the tail window with the *same* prefix but
+        // different labels. The bottom-most wins — an implementation that
+        // just preferred one prefix type over the other would also have to
+        // produce the correct result here.
+        let frame = concat!(
+            "esc to cancel                                          Gemini 2.0 Flash\n",
+            "Some intermediate non-empty line\n",
+            "esc to cancel                                          Gemini 3.5 Flash (High)\n",
+        );
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_picks_bottom_most_when_both_shortcuts() {
+        // Symmetric mirror of the above: both lines use `? for shortcuts`.
+        let frame = concat!(
+            "? for shortcuts                                        Gemini 2.0 Flash\n",
+            "Some intermediate non-empty line\n",
+            "? for shortcuts                                        Gemini 3.5 Flash (High)\n",
+        );
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_picks_rightmost_gemini_when_multiple_in_one_line() {
+        // V-1: rfind semantics. The line contains MODEL_LABEL_GUTTER twice;
+        // the rightmost occurrence is the actual model label.
+        let frame = "esc to cancel  Gemini API key prefix text    Gemini 3.5 Flash (High)\n";
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_rejects_incomplete_capture_with_empty_suffix() {
+        // CodeRabbit follow-up: a footer that ends mid-render at `...  Gemini ` (or
+        // `...  Gemini` with trailing whitespace) must NOT cache `Gemini` as the
+        // sticky model label. The label must contain at least one non-whitespace
+        // character after the `Gemini ` brand.
+        let frame_just_gutter = "esc to cancel                                          Gemini \n";
+        assert_eq!(extract_model_label(frame_just_gutter), None);
+        let frame_trimmed_brand = "esc to cancel                                          Gemini\n";
+        assert_eq!(extract_model_label(frame_trimmed_brand), None);
+        let frame_only_whitespace_suffix =
+            "esc to cancel                                          Gemini    \n";
+        assert_eq!(extract_model_label(frame_only_whitespace_suffix), None);
+    }
+
+    #[test]
+    fn extract_model_label_handles_cr_line_endings() {
+        // V-2: a \r embedded before the \n is stripped before delimiter search.
+        // Without stripping, the label would contain \r which is a control char
+        // and the whole line would be rejected.
+        let frame =
+            "esc to cancel                                          Gemini 3.5 Flash (High)\r\n";
+        assert_eq!(
+            extract_model_label(frame),
+            Some(String::from("Gemini 3.5 Flash (High)"))
+        );
+    }
+
+    #[test]
+    fn extract_model_label_rejects_control_char_in_prefix() {
+        // V-13: a control character in the prefix (before the gutter) disqualifies
+        // the whole line, not just the label slice.
+        let frame = "esc to cancel\x07                                  Gemini 3.5 Flash (High)\n";
+        assert_eq!(extract_model_label(frame), None);
+    }
+
+    #[test]
+    fn extract_model_label_rejects_footer_beyond_tail_window() {
+        // V-15: a valid footer placed more than MODEL_LABEL_TAIL_WINDOW (6)
+        // non-empty lines from the bottom is outside the scan window → None.
+        let valid_footer =
+            "esc to cancel                                          Gemini 3.5 Flash (High)\n";
+        // 7 non-empty trailing lines push the footer out of the 6-line window.
+        let trailing: String = (0..MODEL_LABEL_TAIL_WINDOW + 1)
+            .map(|i| format!("trailing non-empty line {i}\n"))
+            .collect();
+        let frame = format!("{valid_footer}{trailing}");
+        assert_eq!(extract_model_label(&frame), None);
     }
 }

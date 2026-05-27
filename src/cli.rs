@@ -818,7 +818,12 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "botctl last-message --pane %19 --out -",
                 "botctl last-message --pane %19 --history-lines 5000",
             ][..],
-            &["--pane TARGET", "--out PATH", "--history-lines N", "--no-color"][..],
+            &[
+                "--pane TARGET",
+                "--out PATH",
+                "--history-lines N",
+                "--no-color",
+            ][..],
             "Reads provider transcript storage for Claude, Codex, OpenCode, Pi, and pane-scrape for Antigravity. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout. --history-lines (default: 2000) widens the captured scrollback for Antigravity pane-scrape extraction; non-agy providers ignore it.",
         ),
         "status" => (
@@ -1271,7 +1276,11 @@ fn parse_last_message(args: Vec<String>) -> AppResult<Command> {
 
     let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
 
-    Ok(Command::LastMessage(LastMessageArgs { pane_id, out, history_lines }))
+    Ok(Command::LastMessage(LastMessageArgs {
+        pane_id,
+        out,
+        history_lines,
+    }))
 }
 
 fn parse_status(args: Vec<String>) -> AppResult<Command> {
