@@ -357,7 +357,8 @@ mod tests {
             counter: counter_clone,
         };
 
-        let _ = transcript_from_process_tree_fds_with_resolver(300, &cr, |_| false);
+        transcript_from_process_tree_fds_with_resolver(300, &cr, |_| false)
+            .expect("walk should not error on synthetic resolver");
         // children_of is called once per visited node: 300, 301, 302, 303
         // (4 nodes, 4 calls).
         assert_eq!(counter.load(Ordering::SeqCst), 4);

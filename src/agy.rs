@@ -628,12 +628,21 @@ pub fn extract_model_label(frame: &str) -> Option<String> {
         // Extract from "Gemini" (skip the two leading spaces of the gutter).
         // The offset is derived from the constant length, not a magic number.
         let label_start = idx + MODEL_LABEL_GUTTER.len() - "Gemini ".len();
-        let label = line[label_start..].trim_end().to_string();
-        // Reject labels exceeding the display-width cap.
-        if UnicodeWidthStr::width(label.as_str()) > MODEL_LABEL_MAX_WIDTH {
+        let label = line[label_start..].trim_end();
+        // Reject incomplete captures: the gutter without an actual label
+        // (e.g. a footer that ends mid-render at `...  Gemini `) would
+        // otherwise leave just `Gemini` and get cached as the sticky model.
+        let Some(suffix) = label.strip_prefix("Gemini ") else {
+            continue;
+        };
+        if suffix.trim().is_empty() {
             continue;
         }
-        return Some(label);
+        // Reject labels exceeding the display-width cap.
+        if UnicodeWidthStr::width(label) > MODEL_LABEL_MAX_WIDTH {
+            continue;
+        }
+        return Some(label.to_string());
     }
     None
 }
@@ -1166,6 +1175,18 @@ mod tests {
                 format!("{unique}/history.jsonl"),
             );
         }
+        // RAII guard: if the test panics partway through, the env vars are
+        // still cleared so we don't poison sibling tests.
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("ANTIGRAVITY_STATE_DIR");
+                    std::env::remove_var("ANTIGRAVITY_HISTORY_FILE");
+                }
+            }
+        }
+        let _env_reset = EnvReset;
         let pane = TmuxPane {
             pane_id: String::from("%5"),
             pane_tty: String::from("/dev/pts/5"),
@@ -1192,10 +1213,6 @@ mod tests {
             session.id.is_none(),
             "pid=0 skips fd walk; with no history.jsonl, id should be None"
         );
-        unsafe {
-            std::env::remove_var("ANTIGRAVITY_STATE_DIR");
-            std::env::remove_var("ANTIGRAVITY_HISTORY_FILE");
-        }
     }
 
     #[test]
@@ -1305,6 +1322,21 @@ mod tests {
             extract_model_label(frame),
             Some(String::from("Gemini 3.5 Flash (High)"))
         );
+    }
+
+    #[test]
+    fn extract_model_label_rejects_incomplete_capture_with_empty_suffix() {
+        // CodeRabbit follow-up: a footer that ends mid-render at `...  Gemini ` (or
+        // `...  Gemini` with trailing whitespace) must NOT cache `Gemini` as the
+        // sticky model label. The label must contain at least one non-whitespace
+        // character after the `Gemini ` brand.
+        let frame_just_gutter = "esc to cancel                                          Gemini \n";
+        assert_eq!(extract_model_label(frame_just_gutter), None);
+        let frame_trimmed_brand = "esc to cancel                                          Gemini\n";
+        assert_eq!(extract_model_label(frame_trimmed_brand), None);
+        let frame_only_whitespace_suffix =
+            "esc to cancel                                          Gemini    \n";
+        assert_eq!(extract_model_label(frame_only_whitespace_suffix), None);
     }
 
     #[test]

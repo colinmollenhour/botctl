@@ -122,8 +122,11 @@ fn load_agy_last_message(
                 state_dir = state_dir.display(),
             ))
         } else {
+            // Reached the `session.id.ok_or_else` closure, so the agy
+            // session is confirmed. The conversation_id lookup just couldn't
+            // run without a pane_pid for the FD walk.
             AppError::new(
-                "agy: no Antigravity conversation resolvable for this pane (state directory or process info unavailable; history.jsonl had no matching entry)",
+                "agy: pane confirmed as Antigravity but pane_pid is unavailable, so the open conversation file could not be verified; this usually means tmux did not report a pane process id",
             )
         }
     })?;
