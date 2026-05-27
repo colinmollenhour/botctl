@@ -758,10 +758,12 @@ impl DashboardApp {
             .runtime
             .run_action(&pane.pane.pane_id, None, "auto-unstick")?;
         self.message = format!("{} {}", result.pane_id, result.executed);
-        if matches!(
-            pane.state,
-            SessionState::PermissionDialog | SessionState::FolderTrustPrompt
-        ) {
+        if !result.executed.is_empty()
+            && matches!(
+                pane.state,
+                SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+            )
+        {
             self.increment_yes_count(&pane);
         }
         Ok(())
@@ -866,12 +868,9 @@ impl DashboardApp {
         if !pane.supports_yolo() {
             return Ok(());
         }
-        let _ = self.runtime.set_yolo(
-            Some(&pane.pane.pane_id),
-            Some(&pane.workspace.id),
-            false,
-            enabled,
-        )?;
+        let _ = self
+            .runtime
+            .set_yolo(Some(&pane.pane.pane_id), None, false, enabled)?;
         Ok(())
     }
 }

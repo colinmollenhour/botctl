@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::app::{AppError, AppResult, InspectedPane, keys_for_action, load_automation_keybindings};
+use crate::app::{
+    AppError, AppResult, InspectedPane, keys_for_action, load_automation_keybindings,
+};
 use crate::automation::{AutomationAction, inspect_keybindings};
 use crate::classifier::SessionState;
 use crate::runtime::{RuntimeClient, build_instance_detail_json, build_instance_summary_json};
@@ -207,6 +209,7 @@ fn instance_detail(
     request: &ServeRequest,
     pane_id: &str,
 ) -> AppResult<serde_json::Value> {
+    ensure_target_pane(request, pane_id)?;
     let snapshot = runtime
         .get_pane(pane_id, Some(&request.session_name))?
         .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
@@ -231,6 +234,7 @@ fn run_instance_action(
     pane_id: &str,
     action: &str,
 ) -> AppResult<serde_json::Value> {
+    ensure_target_pane(request, pane_id)?;
     let result = runtime.run_action(pane_id, Some(&request.session_name), action)?;
 
     Ok(json!({
@@ -249,6 +253,7 @@ fn run_instance_interaction(
     pane_id: &str,
     option_id: &str,
 ) -> AppResult<serde_json::Value> {
+    ensure_target_pane(request, pane_id)?;
     let snapshot = runtime
         .get_pane(pane_id, Some(&request.session_name))?
         .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
@@ -262,14 +267,12 @@ fn run_instance_interaction(
         .find(|option| option.id == option_id)
         .ok_or_else(|| AppError::with_exit_code(format!("unknown option id: {option_id}"), 404))?;
 
-    match interaction.mode {
-        InteractionMode::SurveyDigits => {
-            runtime.run_action(
-                pane_id,
-                Some(&request.session_name),
-                &format!("send-text:{}", option.id),
-            )?;
-        }
+    let result = match interaction.mode {
+        InteractionMode::SurveyDigits => runtime.run_action(
+            pane_id,
+            Some(&request.session_name),
+            &format!("send-text:{}", option.id),
+        )?,
         InteractionMode::NumberedOptions => {
             let current = interaction.selected_option.unwrap_or(1);
             let target = option
@@ -280,7 +283,7 @@ fn run_instance_interaction(
                 pane_id,
                 Some(&request.session_name),
                 &format!("select-numbered-option:{current}:{target}"),
-            )?;
+            )?
         }
         InteractionMode::Readonly => {
             return Err(AppError::with_exit_code(
@@ -288,13 +291,16 @@ fn run_instance_interaction(
                 409,
             ));
         }
-    }
+    };
 
     Ok(json!({
         "ok": true,
-        "pane_id": pane_id,
+        "pane_id": result.pane_id,
         "selected_option": interaction_option_json(option),
         "interaction_mode": interaction.mode.as_str(),
+        "executed": result.executed,
+        "after_state": result.after_state,
+        "detail": result.detail,
     }))
 }
 
@@ -304,6 +310,7 @@ fn run_instance_prompt(
     pane_id: &str,
     body: &serde_json::Value,
 ) -> AppResult<serde_json::Value> {
+    ensure_target_pane(request, pane_id)?;
     let prompt_text = body
         .get("text")
         .and_then(serde_json::Value::as_str)
@@ -336,6 +343,21 @@ fn run_instance_prompt(
         "after_state": submitted.after_state,
         "detail": submitted.detail,
     }))
+}
+
+fn ensure_target_pane(request: &ServeRequest, pane_id: &str) -> AppResult<()> {
+    if request
+        .target_pane
+        .as_deref()
+        .map(|target| target != pane_id)
+        .unwrap_or(false)
+    {
+        return Err(AppError::with_exit_code(
+            format!("pane not found: {pane_id}"),
+            404,
+        ));
+    }
+    Ok(())
 }
 
 fn interaction_detail_json(inspected: &InspectedPane) -> serde_json::Value {

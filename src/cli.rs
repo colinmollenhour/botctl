@@ -2271,15 +2271,30 @@ fn parse_runtime(args: Vec<String>) -> AppResult<Command> {
     while i < args.len() {
         match args[i].as_str() {
             "--foreground" => {
+                if stop {
+                    return Err(AppError::new(
+                        "runtime stop cannot be combined with --foreground",
+                    ));
+                }
                 foreground = true;
             }
             "--reconcile-ms" => {
+                if stop {
+                    return Err(AppError::new(
+                        "--reconcile-ms cannot be used with runtime stop",
+                    ));
+                }
                 let raw = read_value(&args, &mut i, "--reconcile-ms")?;
                 reconcile_ms = raw.parse::<u64>().map_err(|_| {
                     AppError::new(format!("invalid value for --reconcile-ms: {raw}"))
                 })?;
             }
             "--history-lines" => {
+                if stop {
+                    return Err(AppError::new(
+                        "--history-lines cannot be used with runtime stop",
+                    ));
+                }
                 let raw = read_value(&args, &mut i, "--history-lines")?;
                 history_lines = raw.parse::<usize>().map_err(|_| {
                     AppError::new(format!("invalid value for --history-lines: {raw}"))

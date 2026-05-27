@@ -737,13 +737,26 @@ fn handle_run_action(
     );
 
     let result = execute_runtime_action(&client, config, &current, action, session_name)?;
+    let refreshed = refresh_action_snapshot(
+        &client,
+        shared,
+        pane_id,
+        session_name,
+        Some(result.executed.clone()),
+    )
+    .ok();
     emit_shared_event(
         shared,
         Some(pane_id.to_string()),
-        Some(snapshot.workspace_id.clone()),
+        Some(
+            refreshed
+                .as_ref()
+                .map(|snapshot| snapshot.workspace_id.clone())
+                .unwrap_or(snapshot.workspace_id.clone()),
+        ),
         "action-executed",
         format!("{} {}", pane_id, action),
-        get_snapshot(shared, pane_id, session_name).ok(),
+        refreshed,
     );
     Ok(result)
 }
@@ -781,13 +794,26 @@ fn handle_submit_prompt(
             submitted.workspace_id, submitted.delay_ms
         )),
     };
+    let refreshed = refresh_action_snapshot(
+        &client,
+        shared,
+        pane_id,
+        Some(session_name),
+        Some(result.executed.clone()),
+    )
+    .ok();
     emit_shared_event(
         shared,
         Some(pane_id.to_string()),
-        Some(snapshot.workspace_id.clone()),
+        Some(
+            refreshed
+                .as_ref()
+                .map(|snapshot| snapshot.workspace_id.clone())
+                .unwrap_or(snapshot.workspace_id.clone()),
+        ),
         "action-executed",
         format!("{} submit-prompt", pane_id),
-        None,
+        refreshed,
     );
     Ok(result)
 }
@@ -884,6 +910,12 @@ fn execute_runtime_action(
         }
         action if action.starts_with("select-numbered-option:") => {
             let (current, target) = parse_numbered_option_action(action)?;
+            let before_navigation =
+                inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            ensure_same_numbered_option_dialog(
+                &classification.classification,
+                &before_navigation.classification,
+            )?;
             if target > current {
                 for _ in 0..(target - current) {
                     execute_automation_action(
@@ -901,6 +933,11 @@ fn execute_runtime_action(
                     )?;
                 }
             }
+            let before_enter = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            ensure_same_numbered_option_dialog(
+                &classification.classification,
+                &before_enter.classification,
+            )?;
             client.send_keys(&pane.pane_id, &["Enter"])?;
             Some(
                 inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?
@@ -951,6 +988,23 @@ fn parse_numbered_option_action(action: &str) -> AppResult<(usize, usize)> {
     Ok((current, target))
 }
 
+fn ensure_same_numbered_option_dialog(
+    expected: &Classification,
+    current: &Classification,
+) -> AppResult<()> {
+    if expected.state != current.state {
+        return Err(AppError::with_exit_code(
+            format!(
+                "refusing numbered option selection after state changed from {} to {}",
+                expected.state.as_str(),
+                current.state.as_str()
+            ),
+            409,
+        ));
+    }
+    Ok(())
+}
+
 fn spawn_observer(
     config: RuntimeServerConfig,
     shared: Arc<Mutex<RuntimeShared>>,
@@ -967,7 +1021,7 @@ fn spawn_observer(
             if let Ok(panes) = client.list_panes() {
                 for session_name in panes
                     .into_iter()
-                    .filter(|pane| pane.current_command.eq_ignore_ascii_case("claude"))
+                    .filter(is_runtime_discovery_candidate)
                     .map(|pane| pane.session_name)
                     .collect::<BTreeSet<_>>()
                 {
@@ -1494,6 +1548,41 @@ fn get_snapshot(
         ));
     }
     Ok(snapshot)
+}
+
+fn refresh_action_snapshot(
+    client: &TmuxClient,
+    shared: &Arc<Mutex<RuntimeShared>>,
+    pane_id: &str,
+    session_name: Option<&str>,
+    last_action: Option<String>,
+) -> AppResult<RuntimePaneSnapshot> {
+    let inspected = inspect_pane(client, pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let mut shared = shared.lock().unwrap();
+    let revision = next_revision(&mut shared);
+    let tracked = shared
+        .panes
+        .get_mut(pane_id)
+        .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
+    if !session_matches(&tracked.snapshot, session_name) {
+        return Err(AppError::with_exit_code(
+            format!("pane {} is not tracked for requested session", pane_id),
+            404,
+        ));
+    }
+    tracked.snapshot.classification = inspected.classification.clone();
+    tracked.snapshot.focused_source = inspected.focused_source.clone();
+    tracked.snapshot.raw_source = inspected.raw_source.clone();
+    tracked.snapshot.live_excerpt =
+        trim_visible_block(&inspected.focused_source, MAX_LIVE_EXCERPT_LINES);
+    tracked.snapshot.last_action = last_action;
+    tracked.snapshot.revision = revision;
+    tracked.snapshot.updated_at_unix_ms = now_unix_ms();
+    tracked.signature = SnapshotSignature {
+        pane: tracked.pane.clone(),
+        classification: inspected.classification,
+    };
+    Ok(tracked.snapshot.clone())
 }
 
 fn validate_action_target(

@@ -2569,7 +2569,7 @@ fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
             history_lines: 200,
         },
     )?;
-    let client = TmuxClient::default();
+    let client = managed_runtime_tmux_client();
     let updated = if args.all {
         runtime.set_yolo(None, args.workspace.as_deref(), true, true)?
     } else {
@@ -2578,7 +2578,9 @@ fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
             .ok_or_else(|| AppError::new("could not resolve yolo pane target"))?;
         runtime.set_yolo(Some(&pane.pane_id), args.workspace.as_deref(), false, true)?
     };
-    if args.follow || args.live_preview {
+    if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else if args.follow || args.live_preview {
         let interrupted = Arc::new(AtomicBool::new(false));
         install_babysit_sigint_handler(Arc::clone(&interrupted))?;
         let mut subscription = runtime.subscribe()?;
@@ -2620,8 +2622,6 @@ fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
             }
         }
         Ok(String::new())
-    } else if updated.is_empty() {
-        Ok(String::from("no panes matched yolo policy update"))
     } else {
         Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
