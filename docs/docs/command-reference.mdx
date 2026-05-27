@@ -106,6 +106,33 @@ Output and safety:
 - submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 
+### `mcp`
+
+Purpose: run the small MCP-compatible JSON-RPC server for persistent Claude sessions backed by managed tmux windows.
+
+Syntax:
+```bash
+botctl mcp stdio [--state-dir PATH]
+botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
+```
+
+Tools:
+
+- `botctl_spawn`
+- `botctl_prompt`
+- `botctl_wait`
+- `botctl_kill`
+- `botctl_snapshot`
+- `botctl_send_keys`
+
+Notes:
+
+- stdio uses newline-delimited JSON-RPC on stdin/stdout.
+- HTTP v1 is deliberately minimal JSON-RPC at `POST /mcp`; it is not full MCP Streamable HTTP.
+- sessions persist after `botctl_prompt`; use `botctl_kill` for cleanup.
+- managed IDs resolve to exact tmux pane/window IDs before any action.
+- `botctl_send_keys` is unsafe/operator-only and does not imply progress.
+
 ### `yolo`
 
 Purpose: set centralized yolo policy for one pane, all panes, or a workspace-scoped subset.

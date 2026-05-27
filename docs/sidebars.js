@@ -8,6 +8,7 @@ const sidebars = {
     'workflows',
     'architecture',
     'serve-mode',
+    'mcp',
     'api-reference',
     'command-reference',
     'automation',

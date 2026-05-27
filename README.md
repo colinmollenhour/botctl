@@ -42,6 +42,7 @@ These are the commands that matter most in day-to-day use:
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to set central YOLO policy for one pane or a scoped set of panes
 - `serve` to expose HTTP and event output as a facade over runtime state
+- `mcp` to expose persistent Claude Code sessions as a small MCP JSON-RPC tool API over stdio or minimal `POST /mcp` HTTP
 
 For recovery actions, use the canonical names `approve`, `reject`, and `dismiss-survey`. The long names `approve-permission` and `reject-permission` remain compatibility aliases.
 
@@ -63,6 +64,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - prepare prompts and hand them off through an external-editor workflow
 - run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
+- run MCP tools for persistent tmux-backed Claude sessions (`botctl_spawn`, `botctl_prompt`, `botctl_wait`, `botctl_kill`, `botctl_snapshot`, `botctl_send_keys`)
 
 ## Docs
 
@@ -73,6 +75,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - workflows: [`docs/docs/workflows.mdx`](docs/docs/workflows.mdx)
 - architecture: [`docs/docs/architecture.mdx`](docs/docs/architecture.mdx)
 - serve mode: [`docs/docs/serve-mode.mdx`](docs/docs/serve-mode.mdx)
+- MCP sessions: [`docs/docs/mcp.mdx`](docs/docs/mcp.mdx)
 
 ## Requirements
 

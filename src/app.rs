@@ -28,9 +28,10 @@ use crate::classifier::{
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
-    KeepGoingArgs, LastMessageArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs,
-    PreparePromptArgs, PromptRunArgs, RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs,
-    ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
+    KeepGoingArgs, LastMessageArgs, ListPanesArgs, McpArgs, McpTransportArgs, ObserveArgs,
+    PaneCommandArgs, PaneTargetArgs, PreparePromptArgs, PromptRunArgs, RecordFixtureArgs,
+    ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs,
+    YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
@@ -239,6 +240,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::AutoUnstick(args) => run_auto_unstick(args),
         Command::KeepGoing(args) => run_keep_going(args),
         Command::Prompt(args) => run_prompt(args),
+        Command::Mcp(args) => run_mcp(args),
         Command::PreparePrompt(args) => run_prepare_prompt(args),
         Command::EditorHelper(args) => run_editor_helper(args),
         Command::SubmitPrompt(args) => run_submit_prompt(args),
@@ -247,6 +249,16 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Version => Ok(crate::cli::version()),
         Command::Help(args) => Ok(crate::cli::usage_for(&args)),
     }
+}
+
+fn run_mcp(args: McpArgs) -> AppResult<String> {
+    match args.transport {
+        McpTransportArgs::Stdio => crate::mcp_stdio::run_stdio(args.state_dir.as_deref())?,
+        McpTransportArgs::Http { bind } => {
+            crate::mcp_http::run_http(&bind, args.state_dir.as_deref())?
+        }
+    }
+    Ok(String::new())
 }
 
 fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
