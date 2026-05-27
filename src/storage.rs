@@ -613,7 +613,9 @@ fn next_cook_fields(
     let mut accumulated_ms = if session_changed {
         0
     } else {
-        existing.map(|row| row.cook_accumulated_ms.max(0)).unwrap_or(0)
+        existing
+            .map(|row| row.cook_accumulated_ms.max(0))
+            .unwrap_or(0)
     };
     let mut segment_started_at_unix_ms = if session_changed {
         None
@@ -676,10 +678,8 @@ pub fn sync_tmux_runtime_state(
     let (cook_accumulated_ms, cook_segment_started_at_unix_ms, cook_duration) =
         next_cook_fields(existing.as_ref(), cooking, session_key, now_ms);
 
-    let last_state_changed = existing
-        .as_ref()
-        .and_then(|row| row.last_state.as_deref())
-        != Some(state);
+    let last_state_changed =
+        existing.as_ref().and_then(|row| row.last_state.as_deref()) != Some(state);
     let wait_changed = existing
         .as_ref()
         .and_then(|row| row.wait_started_at_unix_ms)
@@ -751,7 +751,10 @@ pub fn sync_tmux_claude_session_id(
             .and_then(|row| row.wait_started_at_unix_ms),
         claude_session_id.as_deref(),
         Some(now_ms),
-        existing.as_ref().map(|row| row.cook_accumulated_ms).unwrap_or(0),
+        existing
+            .as_ref()
+            .map(|row| row.cook_accumulated_ms)
+            .unwrap_or(0),
         existing
             .as_ref()
             .and_then(|row| row.cook_segment_started_at_unix_ms),
@@ -1801,16 +1804,37 @@ mod tests {
         )
         .expect("busy sync should succeed");
         std::thread::sleep(Duration::from_millis(20));
-        let busy =
-            sync_tmux_runtime_state(&state_dir, &workspace.id, &pane, "BusyResponding", false, true, None)
-                .expect("busy measurement sync should succeed");
-        let idle =
-            sync_tmux_runtime_state(&state_dir, &workspace.id, &pane, "ChatReady", true, false, None)
-                .expect("idle sync should succeed");
+        let busy = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "BusyResponding",
+            false,
+            true,
+            None,
+        )
+        .expect("busy measurement sync should succeed");
+        let idle = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "ChatReady",
+            true,
+            false,
+            None,
+        )
+        .expect("idle sync should succeed");
         std::thread::sleep(Duration::from_millis(20));
-        let idle_again =
-            sync_tmux_runtime_state(&state_dir, &workspace.id, &pane, "ChatReady", true, false, None)
-                .expect("idle again sync should succeed");
+        let idle_again = sync_tmux_runtime_state(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            "ChatReady",
+            true,
+            false,
+            None,
+        )
+        .expect("idle again sync should succeed");
 
         let busy_ms = busy.cook_duration.map(|d| d.as_millis()).unwrap_or(0);
         let idle_ms = idle.cook_duration.map(|d| d.as_millis()).unwrap_or(0);

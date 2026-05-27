@@ -6,7 +6,7 @@ sidebar_position: 11
 
 This page documents the localhost HTTP API exposed by `botctl serve`.
 
-The API exists to back polling clients such as a web UI. It is only available while a foreground `serve` process is running with `--http`.
+The API exists to back polling clients such as a web UI. It is available while a foreground `serve` process is running with `--http` and connected to a local `runtime`.
 
 ## Start the API
 
@@ -14,11 +14,14 @@ The API exists to back polling clients such as a web UI. It is only available wh
 botctl serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
 ```
 
+By default, `serve` auto-starts a managed runtime if one is not already running. Add `--unmanaged` when you want to require an existing runtime instead.
+
 Important constraints:
 
 - the API is local-only by default because `botctl` binds exactly the address you pass to `--http`
 - there is no authentication, TLS, or daemon discovery yet
 - the API is scoped to the tmux session currently served by that process
+- live pane state and actions come from the shared runtime instead of per-request tmux reinspection
 - all automation still uses the same ownership, classification, and workflow guards as the CLI
 - browser access requires explicit `--allowed-origin URL` entries; origins not on that allowlist are rejected
 
@@ -196,6 +199,7 @@ Response shape:
 - `prompt`: parsed permission prompt details when available
 - `interactions`: current visible options, if any
 - `controls`: low-level control actions currently exposed by the API
+- `runtime`: desired/effective yolo state, wait timing, revision, and other shared-runtime metadata
 
 Example response:
 

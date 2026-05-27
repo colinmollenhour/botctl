@@ -5,15 +5,16 @@ slug: /
 
 # botctl docs
 
-`botctl` helps you keep Claude Code, Codex CLI, and OpenCode sessions visible and controlled inside `tmux`.
+`botctl` helps you keep Claude Code, Codex CLI, OpenCode, and Pi sessions visible and controlled inside `tmux`.
 
-Claude Code panes get the full guarded automation path. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status.
+Claude Code panes get the full guarded automation path. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status.
 
 Use `botctl` when you want to:
 
-- open a live `dashboard` and see what Claude Code, screen-detected Codex CLI, and resolvable OpenCode panes are doing
-- turn on `yolo` for guarded permission approval
-- run `serve` for a foreground event stream or localhost HTTP API
+- start one local `runtime` that owns observation and automation
+- open a live `dashboard` and see what Claude Code, screen-detected Codex CLI, resolvable OpenCode panes, and Pi panes are doing
+- turn on `yolo` for guarded Claude and Codex permission approval
+- run `serve` for a runtime-backed foreground event stream or localhost HTTP API
 - export the latest persisted assistant reply with `last-message`
 
 ## Choose a command
@@ -34,15 +35,26 @@ Use `botctl` when you want to:
 | Claude Code | yes | yes | yes | yes | yes |
 | Codex CLI | yes, from screen capture | yes, from screen capture | command permission approval only | no | yes |
 | OpenCode | yes, after safe title plus cwd resolution | limited passive state from SQLite | no | no | yes |
+| Pi | yes, from JSONL session matching | limited passive state from JSONL | no | no | yes |
 
 ## Main commands
+
+### `runtime`
+
+The command that owns the live control plane.
+
+- holds the authoritative pane snapshots in memory
+- runs the shared observation and guarded action loop
+- supervises yolo centrally instead of letting each client invent its own view
+- listens on `<state-dir>/runtime.sock`
+- starts in a hidden tmux session by default, with `runtime stop` to shut it down and `runtime --foreground` for direct ownership
 
 ### `dashboard`
 
 Use this first when you have multiple tmux panes open.
 
-- Shows Claude Code panes, screen-detected Codex CLI panes, and passively resolvable OpenCode panes across workspaces.
-- Shows state, age, branch, recent context, and safe actions.
+- Shows Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Pi panes across workspaces.
+- Shows state, age, branch, recent context, pane PID, CPU, memory, observed `Cook` time, and safe actions.
 - Lets you jump into a pane and toggle YOLO for Claude Code and Codex panes.
 - Can run persistently inside a tmux popup.
 
@@ -61,7 +73,7 @@ Use this when another tool needs live state.
 
 - Streams human-readable or JSONL events for one tmux session.
 - Can expose a localhost HTTP API while the foreground process runs.
-- Persists event tapes and summaries under the botctl state root.
+- Reads shared runtime state instead of owning an independent observation loop.
 
 ## Start here
 
@@ -84,9 +96,11 @@ botctl yolo --pane 0:6.0
 botctl serve --session demo --format jsonl
 ```
 
+Those commands auto-start a managed runtime when needed. Use `--unmanaged` if you want them to require an existing runtime instead.
+
 ## More detail when you want it
 
-- [Serve mode](./serve-mode.mdx) — what the live observer does today
+- [Serve mode](./serve-mode.mdx) — how the runtime-backed facade behaves today
 - [HTTP API reference](./api-reference.mdx) — the localhost control surface exposed by `serve --http`
 - [Prompt handoff](./prompt-handoff.mdx) — prompt staging and editor flow
 - [Automation](./automation.mdx) — guarded workflows and keybinding behavior

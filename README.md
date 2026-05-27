@@ -36,11 +36,12 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 
 These are the commands that matter most in day-to-day use:
 
-- `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace, with state, PID, CPU, memory, observed cook time, and YOLO controls for Claude and Codex
+- `runtime` to start or stop the single local coordinator that owns live observation and automation
+- `dashboard` to see Claude Code panes, runtime-discovered panes, and supported Codex/OpenCode/Pi visibility, grouped by workspace, with state, PID, CPU, memory, observed active cook time, and YOLO controls for Claude and Codex
 - `prompt` to run a one-shot prompt through a new interactive Claude TUI window in tmux and print only the final assistant text to stdout
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
-- `yolo` to babysit one pane or a scoped set of panes automatically
-- `serve` to stream live observation data for one tmux session in human or JSONL form
+- `yolo` to set central YOLO policy for one pane or a scoped set of panes
+- `serve` to expose HTTP and event output as a facade over runtime state
 
 For recovery actions, use the canonical names `approve`, `reject`, and `dismiss-survey`. The long names `approve-permission` and `reject-permission` remain compatibility aliases.
 
@@ -49,14 +50,15 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 ## Current Features
 
 - launch a managed Claude Code session in tmux
+- run a central local runtime over a Unix socket at `<state-dir>/runtime.sock`
 - classify Codex CLI panes from captured terminal screens and approve command permission dialogs with YOLO
 - passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database, and Pi panes by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions`
 - list panes and inspect tmux metadata, including each tracked pane PID
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude Code or Codex CLI pane
 - dump the latest persisted assistant message from Claude, Codex, OpenCode, or Pi to `MESSAGE_<provider-session-id>.md` or a path passed with `--out`
-- run `serve` as a foreground long-lived observer for one tmux session
-- run `dashboard` as a popup-sized TUI across Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes, grouped by workspace with per-pane YOLO controls for Claude and Codex
+- run `serve` as a runtime-backed foreground facade for one tmux session
+- run `dashboard` as a runtime-backed popup-sized TUI grouped by workspace with per-pane YOLO controls for Claude and Codex
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files
@@ -99,8 +101,19 @@ cargo test resolves_custom_binding_keys_for_actions
 For a first useful run, open a tmux pane that is running Claude Code, Codex CLI, or OpenCode, then run:
 
 ```bash
+botctl runtime
 botctl dashboard
 ```
+
+By default, `dashboard`, `yolo`, and `serve` run in managed mode. If no runtime is available, they auto-start one in a hidden tmux session and connect to it. The runtime stays alive while managed clients still need it, and you can manage it directly with:
+
+```bash
+cargo run -- runtime
+cargo run -- runtime stop
+cargo run -- runtime --foreground
+```
+
+Use `--unmanaged` on `dashboard`, `yolo`, or `serve` when you want them to require an already-running runtime instead of auto-starting one.
 
 From there:
 
@@ -141,13 +154,19 @@ Quick tmux popup binding:
 bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 ```
 
-Start YOLO babysitting for one pane:
+Set YOLO policy for one pane:
 
 ```bash
 cargo run -- yolo --pane 0:6.0
 ```
 
-Run the long-lived observer for one tmux session:
+Tail runtime-backed YOLO events for one pane:
+
+```bash
+cargo run -- yolo --pane 0:6.0 --follow
+```
+
+Run the runtime facade for one tmux session:
 
 ```bash
 cargo run -- serve --session demo
@@ -178,13 +197,13 @@ Run the observer and a localhost HTTP API for a web UI:
 cargo run -- serve --session demo --http 127.0.0.1:8787 --allowed-origin http://localhost:3000
 ```
 
-Use machine-readable output for tooling:
+Use machine-readable runtime-backed output for tooling:
 
 ```bash
 cargo run -- serve --session demo --format jsonl
 ```
 
-The HTTP API exposes live pane state plus interactive controls such as visible prompt options. Useful endpoints include:
+The HTTP API exposes runtime-backed pane state plus interactive controls such as visible prompt options. Useful endpoints include:
 
 - `GET /instances`
 - `GET /instances/%251`
@@ -237,7 +256,7 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups Claude Code panes, screen-detected Codex CLI panes, resolvable OpenCode panes, and Pi panes by workspace, shows the current classified state, pane PID, process-tree average CPU, memory, and observed `Cook` time (active agent work; pauses on idle and permission waits, resets when the agent session changes) for each pane, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. `Cook` is observation-based and may be off by roughly one dashboard poll around state transitions. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups runtime-observed panes plus supported Codex/OpenCode/Pi visibility by workspace, shows the shared runtime state plus current pane PID, process-tree average CPU, memory, and observed active `Cook` time, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. `Cook` counts only observed busy agent work, pauses on idle and permission waits, resets when the agent session changes, and may be off by roughly one dashboard poll around state transitions. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode and Pi support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
 
@@ -285,6 +304,10 @@ Scope prompt prep or babysit work to one workspace:
 cargo run -- prepare-prompt --session demo --workspace . --text "Summarize the current repo"
 cargo run -- yolo start --all --workspace .
 ```
+
+The runtime keeps desired YOLO policy in SQLite and enforces the effective supervision state in memory. Disabling YOLO through the dashboard, CLI, or HTTP becomes visible to the other clients immediately because they all read the same runtime state.
+
+Managed clients use shared runtime leases, so a later dashboard or serve session can keep an auto-started runtime alive instead of having it torn down when an earlier client exits.
 
 Show the CLI help:
 

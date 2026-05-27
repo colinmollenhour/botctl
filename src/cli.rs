@@ -13,6 +13,7 @@ pub enum Command {
     Status(StatusArgs),
     Doctor(DoctorArgs),
     Observe(ObserveArgs),
+    Runtime(RuntimeArgs),
     Serve(ServeArgs),
     Dashboard(DashboardArgs),
     RecordFixture(RecordFixtureArgs),
@@ -164,6 +165,15 @@ pub struct ObserveArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct RuntimeArgs {
+    pub foreground: bool,
+    pub stop: bool,
+    pub reconcile_ms: u64,
+    pub history_lines: usize,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ServeArgs {
     pub session_name: String,
     pub pane_id: Option<String>,
@@ -173,6 +183,7 @@ pub struct ServeArgs {
     pub allowed_origins: Vec<String>,
     pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
+    pub unmanaged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +193,7 @@ pub struct DashboardArgs {
     pub state_dir: Option<PathBuf>,
     pub exit_on_navigate: bool,
     pub persistent: bool,
+    pub unmanaged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,9 +271,11 @@ pub struct YoloStartArgs {
     pub all: bool,
     pub poll_ms: u64,
     pub live_preview: bool,
+    pub follow: bool,
     pub format: BabysitFormat,
     pub state_dir: Option<PathBuf>,
     pub workspace: Option<String>,
+    pub unmanaged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +284,7 @@ pub struct YoloStopArgs {
     pub all: bool,
     pub state_dir: Option<PathBuf>,
     pub workspace: Option<String>,
+    pub unmanaged: bool,
 }
 
 pub fn parse_args<I>(args: I) -> AppResult<Command>
@@ -328,6 +343,7 @@ where
         "status" => with_command_context(parse_status(rest), "status"),
         "doctor" => with_command_context(parse_doctor(rest), "doctor"),
         "observe" => with_command_context(parse_observe(rest), "observe"),
+        "runtime" => with_command_context(parse_runtime(rest), "runtime"),
         "serve" => with_command_context(parse_serve(rest), "serve"),
         "dashboard" => with_command_context(parse_dashboard(rest), "dashboard"),
         "record-fixture" => with_command_context(parse_record_fixture(rest), "record-fixture"),
@@ -447,15 +463,19 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Main Commands:"));
     out.push('\n');
     out.push_str(&featured(
-        "yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
+        "runtime [--foreground] [--reconcile-ms N] [--history-lines N] [--state-dir PATH] | runtime stop [--state-dir PATH]",
     ));
-    out.push_str("\n    Start autonomous babysitting for one pane or all registered panes.\n\n");
+    out.push_str("\n    Start the central local runtime, by default in a hidden tmux session, or stop it.\n\n");
     out.push_str(&featured(
-        "yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]",
+        "yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
+    ));
+    out.push_str("\n    Set central yolo policy for one pane or all panes, optionally tailing runtime events.\n\n");
+    out.push_str(&featured(
+        "yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
     ));
     out.push_str("\n    Stop autonomous babysitting.\n\n");
     out.push_str(&featured(
-        "dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]",
+        "dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]",
     ));
     out.push_str(
         "\n    Open the TUI for live Claude panes, state, wait times, and yolo toggles.\n",
@@ -464,7 +484,7 @@ fn usage_with_color(color: bool) -> String {
         "    With --persistent, keep the dashboard alive in a dedicated tmux session and reopen it in a popup.\n\n",
     );
     out.push_str(&featured(
-        "serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]",
+        "serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]",
     ));
     out.push_str("\n    Continuously inspect a Claude session and emit babysit output.\n\n");
 
@@ -531,6 +551,7 @@ fn usage_with_color(color: bool) -> String {
     out.push_str(&section("Quick Start:"));
     out.push('\n');
     for line in [
+        "botctl runtime",
         "botctl dashboard",
         "botctl prompt --text \"Summarize this repo\"",
         "botctl yolo --pane 0:6.0",
@@ -574,6 +595,7 @@ fn closest_command(command: &str) -> Option<&'static str> {
         "status",
         "doctor",
         "observe",
+        "runtime",
         "serve",
         "dashboard",
         "record-fixture",
@@ -629,6 +651,7 @@ fn command_from_error(message: &str) -> Option<&'static str> {
         "status",
         "doctor",
         "observe",
+        "runtime",
         "serve",
         "dashboard",
         "record-fixture",
@@ -654,23 +677,47 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
     let (name, purpose, usage, examples, options, safety) = match topic {
         "dashboard" => (
             "dashboard",
-            "Open live TUI across Claude panes plus passive OpenCode visibility.",
-            "botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]",
-            &["botctl dashboard", "botctl dashboard --persistent"][..],
+            "Open live TUI across Claude, Codex, OpenCode, and Pi panes.",
+            "botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]",
+            &[
+                "botctl dashboard",
+                "botctl dashboard --persistent",
+                "botctl dashboard --unmanaged",
+            ][..],
             &[
                 "--poll-ms N (default: 1000)",
                 "--history-lines N (default: 120)",
                 "--state-dir PATH",
                 "--exit-on-navigate",
                 "--persistent",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "TUI owns terminal directly. No pane automation runs until operator chooses action.",
         ),
+        "runtime" => (
+            "runtime",
+            "Start, stop, or foreground the central local runtime.",
+            "botctl runtime [--foreground] [--reconcile-ms N] [--history-lines N] [--state-dir PATH] | botctl runtime stop [--state-dir PATH]",
+            &[
+                "botctl runtime",
+                "botctl runtime --foreground",
+                "botctl runtime stop",
+            ][..],
+            &[
+                "--foreground (run in this process instead of a managed tmux session)",
+                "--reconcile-ms N (default: 1000)",
+                "--history-lines N (default: 200)",
+                "--state-dir PATH",
+                "stop (subcommand: request the runtime to stop)",
+                "--no-color",
+            ][..],
+            "The runtime owns the Unix socket at <state-dir>/runtime.sock. Managed clients auto-start it unless they pass --unmanaged.",
+        ),
         "yolo" => (
             "yolo",
             "Start autonomous babysitting for one pane or all registered panes. Canonical name: yolo.",
-            "botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]",
+            "botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
             &[
                 "botctl yolo --pane %19",
                 "botctl yolo --all --workspace .",
@@ -679,11 +726,13 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             &[
                 "--pane TARGET",
                 "--all",
+                "--follow (tail matching runtime events after setting policy)",
                 "--poll-ms N (default: 1000)",
                 "--format human|jsonl (default: human)",
                 "--live-preview",
                 "--state-dir PATH",
                 "--workspace PATH|UUID",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "Uses guarded classifier states before sending keys. Unknown states wait.",
@@ -691,7 +740,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "yolo stop" => (
             "yolo stop",
             "Stop autonomous babysitting records.",
-            "botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]",
+            "botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]",
             &[
                 "botctl yolo stop --pane %19",
                 "botctl yolo stop --all --workspace .",
@@ -701,6 +750,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--all",
                 "--state-dir PATH",
                 "--workspace PATH|UUID",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "Does not send keys to panes; removes yolo state records.",
@@ -708,7 +758,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "serve" => (
             "serve",
             "Continuously inspect tmux session and emit events.",
-            "botctl serve --session NAME [--pane TARGET] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]",
+            "botctl serve --session NAME [--pane TARGET] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]",
             &[
                 "botctl serve --session demo",
                 "botctl serve --session demo --format jsonl",
@@ -723,6 +773,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--allowed-origin URL",
                 "--format human|jsonl (default: human)",
                 "--state-dir PATH",
+                "--unmanaged (require an already-running runtime)",
                 "--no-color",
             ][..],
             "JSONL is stable machine stream on stdout. Warnings go to stderr.",
@@ -949,6 +1000,9 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "last-message" => "botctl last-message --pane TARGET [--out PATH]",
         "observe" => {
             "botctl observe --session NAME [--pane TARGET] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]"
+        }
+        "runtime" => {
+            "botctl runtime [--foreground] [--reconcile-ms N] [--history-lines N] [--state-dir PATH] | botctl runtime stop [--state-dir PATH]"
         }
         "record-fixture" => {
             "botctl record-fixture --session NAME --case NAME [--pane TARGET] [--output-dir PATH] [--expected-state STATE] [--events N] [--idle-timeout-ms N] [--history-lines N]"
@@ -1383,6 +1437,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
     let mut http_addr: Option<String> = None;
     let mut allowed_origins = Vec::new();
     let mut state_dir = None;
+    let mut unmanaged = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1418,6 +1473,9 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
             "--allowed-origin" => {
                 allowed_origins.push(read_value(&args, &mut i, "--allowed-origin")?);
             }
+            "--unmanaged" => {
+                unmanaged = true;
+            }
             flag => {
                 return Err(AppError::new(format!("unknown serve flag: {flag}")));
             }
@@ -1442,6 +1500,7 @@ fn parse_serve(args: Vec<String>) -> AppResult<Command> {
         allowed_origins,
         format,
         state_dir,
+        unmanaged,
     }))
 }
 
@@ -1451,6 +1510,7 @@ fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
     let mut state_dir = None;
     let mut exit_on_navigate = false;
     let mut persistent = false;
+    let mut unmanaged = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1475,6 +1535,9 @@ fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
             }
             "--persistent" => {
                 persistent = true;
+            }
+            "--unmanaged" => {
+                unmanaged = true;
             }
             flag => {
                 return Err(AppError::new(format!("unknown dashboard flag: {flag}")));
@@ -1501,6 +1564,7 @@ fn parse_dashboard(args: Vec<String>) -> AppResult<Command> {
         state_dir,
         exit_on_navigate,
         persistent,
+        unmanaged,
     }))
 }
 
@@ -2188,6 +2252,88 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     }))
 }
 
+fn parse_runtime(args: Vec<String>) -> AppResult<Command> {
+    let mut foreground = false;
+    let mut stop = false;
+    let mut reconcile_ms = 1000u64;
+    let mut history_lines = 200usize;
+    let mut state_dir = None;
+
+    let start_index = match args.first().map(String::as_str) {
+        Some("stop") => {
+            stop = true;
+            1
+        }
+        _ => 0,
+    };
+
+    let mut i = start_index;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--foreground" => {
+                if stop {
+                    return Err(AppError::new(
+                        "runtime stop cannot be combined with --foreground",
+                    ));
+                }
+                foreground = true;
+            }
+            "--reconcile-ms" => {
+                if stop {
+                    return Err(AppError::new(
+                        "--reconcile-ms cannot be used with runtime stop",
+                    ));
+                }
+                let raw = read_value(&args, &mut i, "--reconcile-ms")?;
+                reconcile_ms = raw.parse::<u64>().map_err(|_| {
+                    AppError::new(format!("invalid value for --reconcile-ms: {raw}"))
+                })?;
+            }
+            "--history-lines" => {
+                if stop {
+                    return Err(AppError::new(
+                        "--history-lines cannot be used with runtime stop",
+                    ));
+                }
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&args, &mut i, "--state-dir")?));
+            }
+            flag => return Err(AppError::new(format!("unknown runtime flag: {flag}"))),
+        }
+        i += 1;
+    }
+
+    if stop && foreground {
+        return Err(AppError::new(
+            "runtime stop cannot be combined with --foreground",
+        ));
+    }
+
+    if reconcile_ms == 0 {
+        return Err(AppError::new(
+            "runtime requires --reconcile-ms to be at least 1",
+        ));
+    }
+    if history_lines == 0 {
+        return Err(AppError::new(
+            "runtime requires --history-lines to be at least 1",
+        ));
+    }
+
+    Ok(Command::Runtime(RuntimeArgs {
+        foreground,
+        stop,
+        reconcile_ms,
+        history_lines,
+        state_dir,
+    }))
+}
+
 fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
     let (mode, start_index) = match args.first().map(String::as_str) {
         Some("start") => ("start", 1),
@@ -2201,9 +2347,11 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
             let mut all = false;
             let mut poll_ms = 1000u64;
             let mut live_preview = false;
+            let mut follow = false;
             let mut format = BabysitFormat::Human;
             let mut state_dir = None;
             let mut workspace = None;
+            let mut unmanaged = false;
             let mut i = start_index;
             while i < args.len() {
                 match args[i].as_str() {
@@ -2218,6 +2366,9 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     "--live-preview" => {
                         live_preview = true;
                     }
+                    "--follow" => {
+                        follow = true;
+                    }
                     "--format" => {
                         let raw = read_value(&args, &mut i, "--format")?;
                         format = parse_human_jsonl_format(&raw)?;
@@ -2227,6 +2378,9 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     }
                     "--workspace" => {
                         workspace = Some(read_value(&args, &mut i, "--workspace")?);
+                    }
+                    "--unmanaged" => {
+                        unmanaged = true;
                     }
                     flag => {
                         return Err(AppError::new(format!("unknown yolo flag: {flag}")));
@@ -2249,9 +2403,11 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                 all,
                 poll_ms,
                 live_preview,
+                follow,
                 format,
                 state_dir,
                 workspace,
+                unmanaged,
             }))
         }
         "stop" => {
@@ -2259,6 +2415,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
             let mut all = false;
             let mut state_dir = None;
             let mut workspace = None;
+            let mut unmanaged = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -2269,6 +2426,9 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                     }
                     "--workspace" => {
                         workspace = Some(read_value(&args, &mut i, "--workspace")?);
+                    }
+                    "--unmanaged" => {
+                        unmanaged = true;
                     }
                     flag => {
                         return Err(AppError::new(format!("unknown yolo flag: {flag}")));
@@ -2286,6 +2446,7 @@ fn parse_yolo(args: Vec<String>) -> AppResult<Command> {
                 all,
                 state_dir,
                 workspace,
+                unmanaged,
             }))
         }
         _ => Err(AppError::new("yolo requires start or stop subcommand")),
@@ -2627,7 +2788,25 @@ mod tests {
                 );
                 assert_eq!(args.format, super::BabysitFormat::Jsonl);
                 assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-serve")));
+                assert!(!args.unmanaged);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_unmanaged_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("serve"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--unmanaged"),
+        ])
+        .expect("serve command should parse unmanaged flag");
+
+        match command {
+            Command::Serve(args) => assert!(args.unmanaged),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2672,7 +2851,23 @@ mod tests {
                 assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-dashboard")));
                 assert!(!args.exit_on_navigate);
                 assert!(!args.persistent);
+                assert!(!args.unmanaged);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dashboard_unmanaged_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("dashboard"),
+            String::from("--unmanaged"),
+        ])
+        .expect("dashboard command should parse unmanaged flag");
+
+        match command {
+            Command::Dashboard(args) => assert!(args.unmanaged),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -3495,6 +3690,7 @@ mod tests {
                 assert_eq!(args.poll_ms, 250);
                 assert!(!args.live_preview);
                 assert_eq!(args.format, super::BabysitFormat::Human);
+                assert!(!args.unmanaged);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3557,6 +3753,102 @@ mod tests {
             Command::YoloStart(args) => {
                 assert_eq!(args.pane_id.as_deref(), Some("%9"));
                 assert!(args.live_preview);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_yolo_follow_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--follow"),
+        ])
+        .expect("yolo follow should parse");
+
+        match command {
+            Command::YoloStart(args) => {
+                assert_eq!(args.pane_id.as_deref(), Some("%9"));
+                assert!(args.follow);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_yolo_unmanaged_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("yolo"),
+            String::from("--pane"),
+            String::from("%9"),
+            String::from("--unmanaged"),
+        ])
+        .expect("yolo should parse unmanaged flag");
+
+        match command {
+            Command::YoloStart(args) => assert!(args.unmanaged),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runtime_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("runtime"),
+            String::from("--reconcile-ms"),
+            String::from("250"),
+            String::from("--history-lines"),
+            String::from("400"),
+        ])
+        .expect("runtime command should parse");
+
+        match command {
+            Command::Runtime(args) => {
+                assert!(!args.foreground);
+                assert!(!args.stop);
+                assert_eq!(args.reconcile_ms, 250);
+                assert_eq!(args.history_lines, 400);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runtime_stop_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("runtime"),
+            String::from("stop"),
+        ])
+        .expect("runtime stop should parse");
+
+        match command {
+            Command::Runtime(args) => {
+                assert!(args.stop);
+                assert!(!args.foreground);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runtime_foreground_flag() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("runtime"),
+            String::from("--foreground"),
+        ])
+        .expect("runtime foreground should parse");
+
+        match command {
+            Command::Runtime(args) => {
+                assert!(args.foreground);
+                assert!(!args.stop);
             }
             other => panic!("unexpected command: {other:?}"),
         }
