@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     ChatReady,
     PromptEditing,
@@ -85,7 +87,7 @@ const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to 
 const CODEX_PERMISSION_OPTION_YES: &str = "yes, proceed";
 const CODEX_PERMISSION_OPTION_NO: &str = "no, and tell codex what to do differently";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Classification {
     pub source: String,
     pub state: SessionState,
@@ -708,6 +710,7 @@ fn is_permission_anchor_line(line: &str) -> bool {
             "allow for session",
             "do you want to proceed",
             "do you want to allow claude to",
+            "would you like to allow codex",
             "claude wants to",
             "don't ask again",
             "unsandboxed",

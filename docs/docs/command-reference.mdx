@@ -30,6 +30,32 @@ For the most useful commands, start here:
 
 ## Main commands
 
+### `runtime`
+
+Purpose: start the central local runtime that owns live observation, guarded actions, and yolo supervision.
+
+Syntax:
+```bash
+botctl runtime [--reconcile-ms N] [--history-lines N] [--state-dir PATH]
+botctl runtime stop [--state-dir PATH]
+botctl runtime --foreground [--reconcile-ms N] [--history-lines N] [--state-dir PATH]
+```
+
+Examples:
+```bash
+botctl runtime
+botctl runtime --state-dir /tmp/botctl-state
+```
+
+Notes:
+
+- listens on `<state-dir>/runtime.sock`
+- starts a hidden tmux-backed runtime session by default
+- `stop` shuts down the current runtime
+- `--foreground` runs the runtime in the current process instead of the hidden tmux session
+- `dashboard`, `yolo`, and `serve` connect to this process instead of running independent long-lived control loops; in managed mode they auto-start it when needed
+- one runtime should own one local state root and tmux socket at a time
+
 ### `prompt`
 
 Purpose: run a one-shot Claude request through an observable interactive Claude TUI in a new detached tmux window. It does not call `claude -p` or `claude --prompt`.
@@ -82,16 +108,16 @@ Output and safety:
 
 ### `yolo`
 
-Purpose: run autonomous babysitting for one pane, all panes, or a workspace-scoped subset.
+Purpose: set centralized yolo policy for one pane, all panes, or a workspace-scoped subset.
 
 Start syntax:
 ```bash
-botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Stop syntax:
 ```bash
-botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Examples:
@@ -103,17 +129,20 @@ botctl yolo stop --all
 
 Notes:
 
-- guarded by classified state; `yolo` will not blindly press keys
+- updates desired yolo state in SQLite and the runtime's in-memory view
+- guarded by classified state; runtime yolo will not blindly press keys
 - accepts explicit pane targets or `--all`
 - `--workspace` scopes `--all` to one workspace registration set
+- `--follow` tails matching runtime events after setting policy
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ### `dashboard`
 
-Purpose: open the live TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Pi panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude and Codex.
+Purpose: open the runtime-backed live TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Pi panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude and Codex.
 
 Syntax:
 ```bash
-botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]
+botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]
 ```
 
 Examples:
@@ -138,19 +167,21 @@ Notes:
 - maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
 - ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
 - Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode and Pi support is visibility-only, and broader guarded automation remains Claude-only
-- shows current classified state, foreground agent uptime, wait time, branch, and workspace grouping
+- shows current classified state, foreground agent uptime, wait time, branch, workspace grouping, pane PID, process-tree average CPU, memory, and observed active `Cook` time
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
+- queries the central runtime for shared pane state and yolo policy
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ### `serve`
 
-Purpose: run the live observation loop for one tmux session and stream human-readable or JSONL events.
+Purpose: expose a runtime-backed event stream and HTTP facade for one tmux session.
 
 It can also expose a localhost HTTP API for a polling web UI.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]
 ```
 
 Examples:
@@ -163,12 +194,13 @@ botctl serve --session demo --pane 0:2.3
 
 Notes:
 
-- this is the main long-lived observation path
+- requires a running `runtime` process
+- this is the main session-scoped facade over runtime state
 - `--format jsonl` is the useful mode for tooling and automation
-- `--http ADDR` starts a localhost JSON API alongside the observer
+- `--http ADDR` starts a localhost JSON API alongside the stream facade
 - repeat `--allowed-origin URL` to allow browser clients from those exact origins; browser origins are rejected when not listed
-- persists tape and summary artifacts under the state root
 - the full HTTP contract is documented in [HTTP API reference](./api-reference.mdx)
+- auto-starts a managed runtime unless `--unmanaged` is set
 
 ## Common targeting and safety rules
 
@@ -181,6 +213,7 @@ Notes:
 - Commands that store runtime state on disk default to `$XDG_STATE_HOME/botctl` when `XDG_STATE_HOME` is set and non-empty, otherwise `~/.local/state/botctl`.
 - `--state-dir PATH` overrides that default state root for commands that support it.
 - Relevant stateful commands bootstrap `<state-root>/state.db`; prompt handoff and yolo registrations now both use SQLite-backed records there.
+- The central runtime socket lives at `<state-root>/runtime.sock`.
 - Each SQLite connection enables WAL mode, foreign keys, and a 5-second busy timeout.
 - Startup bootstrapping also runs in-place schema migrations for supported older `state.db` versions.
 - `last-message` is read-only with respect to provider state; it reads transcript storage and writes only the requested Markdown export file, or stdout when `--out -` is used.
@@ -392,7 +425,7 @@ Purpose: open the live dashboard TUI for Claude Code panes, screen-detected Code
 
 Syntax:
 ```bash
-botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent]
+botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]
 ```
 
 Flags:
@@ -401,6 +434,7 @@ Flags:
 - `--state-dir PATH` (optional; default machine-state root)
 - `--exit-on-navigate` (optional; exit after jumping to a pane)
 - `--persistent` (optional; keep the dashboard alive in a dedicated tmux session and attach to it)
+- `--unmanaged` (optional; require an already-running runtime instead of auto-starting one)
 
 Targeting: no explicit pane target; scans all Claude Code panes, likely Codex CLI panes with visible Codex screen text, passively resolvable OpenCode panes, and Pi panes.
 
@@ -460,7 +494,7 @@ Purpose: run the live observation loop for a session.
 
 Syntax:
 ```bash
-botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH]
+botctl serve --session NAME [--pane %ID|session:window.pane] [--reconcile-ms N] [--history-lines N] [--http ADDR] [--allowed-origin URL] [--format human|jsonl] [--state-dir PATH] [--unmanaged]
 ```
 
 Flags:
@@ -472,14 +506,11 @@ Flags:
 - `--allowed-origin URL` (optional; repeat for each browser origin allowed to call the API)
 - `--format human|jsonl` (default: `human`)
 - `--state-dir PATH` (optional; default machine-state root)
+- `--unmanaged` (optional; require an already-running runtime instead of auto-starting one)
 
-Artifacts:
+Output and API:
 
-- per-event tape and session summary are persisted under `<state-root>/artifacts`:
-  - `tapes/<id>/events.jsonl` (JSON lines, one object per event)
-  - `exports/<id>/summary.json` (session summary)
-- events are still streamed to stdout with the same format behavior as before.
-- these runtime artifacts stay as regular files; they are not stored in `state.db`.
+- runtime events are streamed to stdout with the requested `--format`; `serve` no longer writes per-run tape or summary artifacts.
 - when `--http` is set, `serve` also listens for JSON requests such as:
   - `GET /instances`
   - `GET /instances/:id`
@@ -884,8 +915,8 @@ Purpose: start or stop the long-running permission loop. Canonical name: `yolo`.
 
 Syntax:
 ```bash
-botctl yolo [start] (--pane %ID|session:window.pane | --all) [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID]
-botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID]
+botctl yolo [start] (--pane %ID|session:window.pane | --all) [--follow] [--poll-ms N] [--format human|jsonl] [--live-preview] [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
+botctl yolo stop (--pane %ID|session:window.pane | --all) [--state-dir PATH] [--workspace PATH|UUID] [--unmanaged]
 ```
 
 Subcommands:
@@ -894,16 +925,19 @@ Subcommands:
 
 Start flags:
 - `--pane %ID|session:window.pane` or `--all` (exactly one required)
+- `--follow` (optional; tail matching runtime events after setting policy)
 - `--poll-ms N` (default: `1000`, must be at least `1`)
 - `--format human|jsonl` (default: `human`)
 - `--live-preview` (default: off)
 - `--state-dir PATH` (optional; overrides the default state root)
 - `--workspace PATH|UUID` (optional; filters `--all` or validates the target pane workspace)
+- `--unmanaged` (optional; require an already-running runtime instead of auto-starting one)
 
 Stop flags:
 - `--pane %ID|session:window.pane` or `--all` (exactly one required)
 - `--state-dir PATH` (optional; overrides the default state root)
 - `--workspace PATH|UUID` (optional; filters `stop --all`)
+- `--unmanaged` (optional; require an already-running runtime instead of auto-starting one)
 
 Targeting:
 - `start` can target one pane or scan all supported Claude Code and Codex panes with `--all`

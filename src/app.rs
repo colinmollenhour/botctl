@@ -1,8 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -26,8 +29,8 @@ use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
     KeepGoingArgs, LastMessageArgs, ListPanesArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs,
-    PreparePromptArgs, PromptRunArgs, RecordFixtureArgs, ReplayArgs, SendActionArgs, ServeArgs,
-    StartArgs, StatusArgs, SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
+    PreparePromptArgs, PromptRunArgs, RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs,
+    ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
@@ -40,16 +43,16 @@ use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
 };
-use crate::serve::{ServeEvent, ServePaneSnapshot, ServeRequest, run_serve_loop};
+use crate::runtime::{RuntimeClient, RuntimeServerConfig, run_runtime_server};
+use crate::serve::ServeRequest;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, capture_artifact_path, export_artifact_path,
     resolve_workspace, resolve_workspace_for_path, state_db_path,
     store_pending_prompt_for_tmux_instance, tape_artifact_path,
 };
 use crate::tmux::{StartSessionRequest, StartWindowRequest, StartedWindow, TmuxClient, TmuxPane};
-use crate::yolo::{
-    YoloRecord, disable_yolo_record, list_yolo_pane_ids, read_yolo_record, write_yolo_record,
-};
+#[cfg(test)]
+use crate::yolo::{YoloRecord, disable_yolo_record};
 
 pub(crate) const ACTION_GUARD_HISTORY_LINES: usize = 120;
 const AUTO_UNSTICK_STEP_DELAY_MS: u64 = 150;
@@ -65,6 +68,12 @@ const DASHBOARD_PERSISTENT_WINDOW: &str = "dashboard";
 const DASHBOARD_PERSISTENT_CHILD_ENV: &str = "BOTCTL_DASHBOARD_PERSISTENT_CHILD";
 const DASHBOARD_TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_DASHBOARD_TARGET_TMUX_SOCKET";
 const DEFAULT_PROMPT_SESSION: &str = "botctl";
+const RUNTIME_TARGET_TMUX_SOCKET_ENV: &str = "BOTCTL_RUNTIME_TARGET_TMUX_SOCKET";
+const RUNTIME_BACKGROUND_WINDOW: &str = "runtime";
+const RUNTIME_MANAGER_METADATA_FILE: &str = "runtime-manager.json";
+const RUNTIME_MANAGER_LEASES_DIR: &str = "runtime-leases";
+const RUNTIME_AUTOSTART_TIMEOUT_MS: u64 = 5_000;
+const RUNTIME_AUTOSTART_POLL_MS: u64 = 100;
 const KEEP_GOING_PROMPT: &str = r#"Audit the task currently in scope — only what the user explicitly asked for, not nice-to-haves or tangents you noticed.
 
 Check: every deliverable produced (not just described), every file actually written, every stated acceptance criterion met, every test/build you committed to actually run and passing, no unresolved TODOs or stubs in code you just wrote.
@@ -88,6 +97,69 @@ If any git step fails (push rejected, auth failure, merge conflict, etc.), switc
 Be honest: unsure if something works → `OKIE_DOKIE`, go verify. Don't use `ALL_DONE` just because the turn got long. Don't use `OKIE_DOKIE` to invent new work. Don't use `PANIC` to avoid effort."#;
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeManagementMode {
+    Managed,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum RuntimeLaunchMode {
+    Manual,
+    AutoManaged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeManagerMetadata {
+    mode: RuntimeLaunchMode,
+    session_name: Option<String>,
+    tmux_socket_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeBootstrapConfig {
+    reconcile_ms: u64,
+    history_lines: usize,
+}
+
+struct ManagedRuntimeGuard {
+    state_dir: PathBuf,
+    lease_path: Option<PathBuf>,
+    should_consider_stop: bool,
+}
+
+impl ManagedRuntimeGuard {
+    fn noop(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            lease_path: None,
+            should_consider_stop: false,
+        }
+    }
+}
+
+impl Drop for ManagedRuntimeGuard {
+    fn drop(&mut self) {
+        if let Some(lease_path) = self.lease_path.take() {
+            let _ = fs::remove_file(&lease_path);
+        }
+        if !self.should_consider_stop {
+            return;
+        }
+        match should_stop_auto_runtime(&self.state_dir) {
+            Ok(true) => {
+                if let Err(error) = stop_runtime_process(&self.state_dir) {
+                    eprintln!("warning: failed to stop managed runtime: {error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("warning: failed to evaluate managed runtime shutdown: {error}");
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AppError {
@@ -145,6 +217,7 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Status(args) => run_status(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Observe(args) => run_observe(args),
+        Command::Runtime(args) => run_runtime(args),
         Command::Serve(args) => run_serve(args),
         Command::Dashboard(args) => run_dashboard(args),
         Command::RecordFixture(args) => run_record_fixture(args),
@@ -180,7 +253,61 @@ fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
     if args.persistent && std::env::var_os(DASHBOARD_PERSISTENT_CHILD_ENV).is_none() {
         return run_persistent_dashboard(args);
     }
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let (_runtime_client, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: 1000,
+            history_lines: args.history_lines.max(200),
+        },
+    )?;
     dashboard::run(args)
+}
+
+fn run_runtime(args: RuntimeArgs) -> AppResult<String> {
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    if args.stop {
+        stop_runtime_process(&state_dir)?;
+        return Ok(String::from("stopped runtime"));
+    }
+    if !args.foreground {
+        let client = start_background_runtime(
+            &state_dir,
+            RuntimeBootstrapConfig {
+                reconcile_ms: args.reconcile_ms,
+                history_lines: args.history_lines,
+            },
+            RuntimeLaunchMode::Manual,
+        )?;
+        let status = client.get_status()?;
+        return Ok(format!("runtime listening on {}", status.socket_path));
+    }
+
+    let metadata = load_runtime_manager_metadata(&state_dir)?;
+    if metadata.is_none() {
+        write_runtime_manager_metadata(
+            &state_dir,
+            &RuntimeManagerMetadata {
+                mode: RuntimeLaunchMode::Manual,
+                session_name: None,
+                tmux_socket_path: managed_runtime_target_socket_path()
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            },
+        )?;
+    }
+    let result = run_runtime_server(RuntimeServerConfig {
+        state_dir: state_dir.clone(),
+        history_lines: args.history_lines,
+        reconcile_ms: args.reconcile_ms,
+    });
+    let _ = remove_runtime_manager_metadata(&state_dir);
+    result
 }
 
 fn run_persistent_dashboard(args: DashboardArgs) -> AppResult<String> {
@@ -250,6 +377,9 @@ fn persistent_dashboard_child_command_with_target_socket(
         parts.push(String::from("--state-dir"));
         parts.push(shell_escape(state_dir.to_string_lossy().as_ref()));
     }
+    if args.unmanaged {
+        parts.push(String::from("--unmanaged"));
+    }
     Ok(parts.join(" "))
 }
 
@@ -267,6 +397,282 @@ fn shell_escape(value: &str) -> String {
 fn current_tmux_socket_path() -> Option<PathBuf> {
     let tmux = std::env::var_os("TMUX")?;
     tmux_socket_path_from_value(tmux.to_string_lossy().as_ref())
+}
+
+fn managed_runtime_target_socket_path() -> Option<PathBuf> {
+    match std::env::var_os(DASHBOARD_TARGET_TMUX_SOCKET_ENV) {
+        Some(socket_path) if !socket_path.is_empty() => Some(PathBuf::from(socket_path)),
+        _ => current_tmux_socket_path(),
+    }
+}
+
+fn managed_runtime_tmux_client() -> TmuxClient {
+    match managed_runtime_target_socket_path() {
+        Some(socket_path) => TmuxClient::with_socket_path(socket_path),
+        None => TmuxClient::default(),
+    }
+}
+
+fn runtime_manager_metadata_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(RUNTIME_MANAGER_METADATA_FILE)
+}
+
+fn runtime_manager_leases_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(RUNTIME_MANAGER_LEASES_DIR)
+}
+
+fn runtime_session_name(state_dir: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    state_dir.hash(&mut hasher);
+    format!("botctl-runtime-{:x}", hasher.finish())
+}
+
+fn load_runtime_manager_metadata(state_dir: &Path) -> AppResult<Option<RuntimeManagerMetadata>> {
+    let path = runtime_manager_metadata_path(state_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)?;
+    let metadata = serde_json::from_str(&content)
+        .map_err(|error| AppError::new(format!("failed to parse {}: {error}", path.display())))?;
+    Ok(Some(metadata))
+}
+
+fn write_runtime_manager_metadata(
+    state_dir: &Path,
+    metadata: &RuntimeManagerMetadata,
+) -> AppResult<()> {
+    fs::create_dir_all(state_dir)?;
+    let content = serde_json::to_string_pretty(metadata)
+        .map_err(|error| AppError::new(format!("failed to encode runtime metadata: {error}")))?;
+    fs::write(runtime_manager_metadata_path(state_dir), content)?;
+    Ok(())
+}
+
+fn remove_runtime_manager_metadata(state_dir: &Path) -> AppResult<()> {
+    let path = runtime_manager_metadata_path(state_dir);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn create_runtime_lease(state_dir: &Path) -> AppResult<PathBuf> {
+    let lease_dir = runtime_manager_leases_dir(state_dir);
+    fs::create_dir_all(&lease_dir)?;
+    let lease_path = lease_dir.join(format!("{}-{}", process::id(), current_unix_millis()?));
+    fs::write(&lease_path, process::id().to_string())?;
+    Ok(lease_path)
+}
+
+fn live_runtime_leases(state_dir: &Path) -> AppResult<Vec<PathBuf>> {
+    let lease_dir = runtime_manager_leases_dir(state_dir);
+    if !lease_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut live = Vec::new();
+    for entry in fs::read_dir(&lease_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(content) = fs::read_to_string(&path) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        let Ok(pid) = content.trim().parse::<u32>() else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        if process_exists(pid) {
+            live.push(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(live)
+}
+
+fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn current_unix_millis() -> AppResult<u128> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::new(format!("system clock before unix epoch: {error}")))?
+        .as_millis())
+}
+
+fn background_runtime_command(
+    state_dir: &Path,
+    config: RuntimeBootstrapConfig,
+    target_socket_path: Option<&Path>,
+) -> AppResult<String> {
+    let exe = std::env::current_exe()?;
+    let mut parts = Vec::new();
+    if let Some(socket_path) = target_socket_path {
+        parts.push(format!(
+            "{}={}",
+            RUNTIME_TARGET_TMUX_SOCKET_ENV,
+            shell_escape(socket_path.to_string_lossy().as_ref())
+        ));
+    }
+    parts.push(shell_escape(exe.to_string_lossy().as_ref()));
+    parts.push(String::from("runtime"));
+    parts.push(String::from("--foreground"));
+    parts.push(String::from("--reconcile-ms"));
+    parts.push(config.reconcile_ms.to_string());
+    parts.push(String::from("--history-lines"));
+    parts.push(config.history_lines.to_string());
+    parts.push(String::from("--state-dir"));
+    parts.push(shell_escape(state_dir.to_string_lossy().as_ref()));
+    Ok(parts.join(" "))
+}
+
+fn wait_for_runtime(state_dir: &Path) -> AppResult<RuntimeClient> {
+    let client = RuntimeClient::connect(state_dir)?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(RUNTIME_AUTOSTART_TIMEOUT_MS);
+    loop {
+        match client.get_status() {
+            Ok(_) => return Ok(client),
+            Err(error) if std::time::Instant::now() < deadline => {
+                if !matches!(error.exit_code(), 1) {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(RUNTIME_AUTOSTART_POLL_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn start_background_runtime(
+    state_dir: &Path,
+    config: RuntimeBootstrapConfig,
+    mode: RuntimeLaunchMode,
+) -> AppResult<RuntimeClient> {
+    let tmux_client = managed_runtime_tmux_client();
+    let session_name = runtime_session_name(state_dir);
+    let target_socket_path = managed_runtime_target_socket_path();
+    write_runtime_manager_metadata(
+        state_dir,
+        &RuntimeManagerMetadata {
+            mode,
+            session_name: Some(session_name.clone()),
+            tmux_socket_path: target_socket_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        },
+    )?;
+
+    if tmux_client.has_session(&session_name)? {
+        if let Ok(client) = wait_for_runtime(state_dir) {
+            return Ok(client);
+        }
+        tmux_client.kill_session(&session_name)?;
+    }
+
+    let request = StartSessionRequest {
+        session_name,
+        window_name: String::from(RUNTIME_BACKGROUND_WINDOW),
+        cwd: std::env::current_dir()?,
+        command: background_runtime_command(state_dir, config, target_socket_path.as_deref())?,
+    };
+    tmux_client.start_session(&request)?;
+    wait_for_runtime(state_dir)
+}
+
+fn ensure_runtime_client(
+    state_dir: &Path,
+    management: RuntimeManagementMode,
+    config: RuntimeBootstrapConfig,
+) -> AppResult<(RuntimeClient, ManagedRuntimeGuard)> {
+    if management == RuntimeManagementMode::Unmanaged {
+        let client = RuntimeClient::connect(state_dir)?;
+        client.get_status()?;
+        return Ok((client, ManagedRuntimeGuard::noop(state_dir.to_path_buf())));
+    }
+
+    let client = RuntimeClient::connect(state_dir)?;
+    let client = match client.get_status() {
+        Ok(_) => client,
+        Err(_) => start_background_runtime(state_dir, config, RuntimeLaunchMode::AutoManaged)?,
+    };
+    let lease_path = create_runtime_lease(state_dir)?;
+    let should_consider_stop = matches!(
+        load_runtime_manager_metadata(state_dir)?.map(|metadata| metadata.mode),
+        Some(RuntimeLaunchMode::AutoManaged)
+    );
+    Ok((
+        client,
+        ManagedRuntimeGuard {
+            state_dir: state_dir.to_path_buf(),
+            lease_path: Some(lease_path),
+            should_consider_stop,
+        },
+    ))
+}
+
+fn runtime_has_active_yolo(state_dir: &Path) -> AppResult<bool> {
+    let client = RuntimeClient::connect(state_dir)?;
+    Ok(client
+        .list_panes(None, None)?
+        .into_iter()
+        .any(|snapshot| snapshot.desired_yolo_enabled))
+}
+
+fn should_stop_auto_runtime(state_dir: &Path) -> AppResult<bool> {
+    let metadata = load_runtime_manager_metadata(state_dir)?;
+    if !matches!(
+        metadata.map(|item| item.mode),
+        Some(RuntimeLaunchMode::AutoManaged)
+    ) {
+        return Ok(false);
+    }
+    if !live_runtime_leases(state_dir)?.is_empty() {
+        return Ok(false);
+    }
+    if runtime_has_active_yolo(state_dir).unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn stop_runtime_process(state_dir: &Path) -> AppResult<()> {
+    let client = RuntimeClient::connect(state_dir)?;
+    if client.stop().is_ok() {
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(RUNTIME_AUTOSTART_TIMEOUT_MS);
+        while std::time::Instant::now() < deadline {
+            if client.get_status().is_err() {
+                let _ = remove_runtime_manager_metadata(state_dir);
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(RUNTIME_AUTOSTART_POLL_MS));
+        }
+    }
+
+    if let Some(metadata) = load_runtime_manager_metadata(state_dir)? {
+        if let Some(session_name) = metadata.session_name {
+            let tmux_client = match metadata.tmux_socket_path {
+                Some(socket_path) => TmuxClient::with_socket_path(socket_path),
+                None => TmuxClient::default(),
+            };
+            if tmux_client.has_session(&session_name)? {
+                tmux_client.kill_session(&session_name)?;
+            }
+        }
+    }
+    remove_runtime_manager_metadata(state_dir)?;
+    Ok(())
 }
 
 fn tmux_socket_path_from_value(value: &str) -> Option<PathBuf> {
@@ -332,7 +738,7 @@ fn run_start(args: StartArgs) -> AppResult<String> {
         command: args.command,
     };
 
-    let client = TmuxClient::default();
+    let client = managed_runtime_tmux_client();
 
     if args.dry_run {
         Ok(client.plan_start_session(&request).render())
@@ -596,145 +1002,36 @@ struct ObserveArtifactPaths {
     export_file: PathBuf,
 }
 
-#[derive(Debug)]
-struct ServeExportSummary {
-    session_name: String,
-    target_pane: Option<String>,
-    reconcile_ms: u64,
-    history_lines: usize,
-    tape_path: PathBuf,
-    started_at: String,
-    ended_at: Option<String>,
-    stopped_reason: Option<String>,
-    total_events: usize,
-    event_counts: BTreeMap<String, usize>,
-    tracked_panes: BTreeSet<String>,
-}
-
-struct ServeArtifacts {
-    tape_writer: BufWriter<File>,
-    export_path: PathBuf,
-    summary: ServeExportSummary,
-}
-
-impl ServeExportSummary {
-    fn new(
-        session_name: &str,
-        target_pane: Option<&str>,
-        reconcile_ms: u64,
-        history_lines: usize,
-        tape_path: PathBuf,
-    ) -> Self {
-        Self {
-            session_name: session_name.to_string(),
-            target_pane: target_pane.map(ToString::to_string),
-            reconcile_ms,
-            history_lines,
-            tape_path,
-            started_at: current_babysit_timestamp(),
-            ended_at: None,
-            stopped_reason: None,
-            total_events: 0,
-            event_counts: BTreeMap::new(),
-            tracked_panes: BTreeSet::new(),
-        }
-    }
-
-    fn record_event(&mut self, event: &ServeEvent) {
-        self.total_events += 1;
-
-        match event {
-            ServeEvent::Started { tracked_panes, .. } => {
-                *self
-                    .event_counts
-                    .entry(String::from("serve-start"))
-                    .or_insert(0) += 1;
-                self.tracked_panes.extend(tracked_panes.iter().cloned());
-            }
-            ServeEvent::Snapshot(snapshot) => {
-                *self
-                    .event_counts
-                    .entry(String::from("snapshot"))
-                    .or_insert(0) += 1;
-                self.tracked_panes.insert(snapshot.pane.pane_id.clone());
-            }
-            ServeEvent::Notification(_) => {
-                *self.event_counts.entry(String::from("notify")).or_insert(0) += 1;
-            }
-            ServeEvent::PaneRemoved { pane_id } => {
-                *self
-                    .event_counts
-                    .entry(String::from("pane-removed"))
-                    .or_insert(0) += 1;
-                self.tracked_panes.remove(pane_id);
-            }
-            ServeEvent::Stopped { reason } => {
-                *self
-                    .event_counts
-                    .entry(String::from("serve-stop"))
-                    .or_insert(0) += 1;
-                self.stopped_reason = Some(reason.clone());
-            }
-        }
-    }
-
-    fn finalize(&mut self) {
-        self.ended_at = Some(current_babysit_timestamp());
-    }
-
-    fn as_json(&self) -> serde_json::Value {
-        let event_counts = self.event_counts.clone();
-        let tracked_panes = self.tracked_panes.iter().cloned().collect::<Vec<_>>();
-        serde_json::json!({
-            "command": "serve",
-            "generated_at": self.started_at,
-            "session_name": self.session_name,
-            "target_pane": self.target_pane,
-            "reconcile_ms": self.reconcile_ms,
-            "history_lines": self.history_lines,
-            "tape_path": self.tape_path.display().to_string(),
-            "started_at": self.started_at,
-            "ended_at": self.ended_at,
-            "stopped_reason": self.stopped_reason,
-            "total_events": self.total_events,
-            "event_counts": event_counts,
-            "tracked_panes": tracked_panes,
-        })
-    }
-}
-
 fn run_serve(args: ServeArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
-    let artifacts_required = args.state_dir.is_some();
+    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let (runtime, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: args.reconcile_ms,
+            history_lines: args.history_lines.max(200),
+        },
+    )?;
+
     let interrupted = Arc::new(AtomicBool::new(false));
     install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    let (state_dir, artifact_warning) = resolve_artifact_state_dir(args.state_dir.as_deref())?;
-    if let Some(warning) = artifact_warning.as_deref() {
-        eprintln!("warning: serve artifacts unavailable: {warning}");
-    }
-    let mut artifact_root = state_dir;
-    let mut artifacts: Option<ServeArtifacts> = None;
-    let artifact_session_name = args.session_name.clone();
-    let artifact_pane_id = args.pane_id.clone();
-
     let request = ServeRequest {
         session_name: args.session_name,
         target_pane: args.pane_id,
         history_lines: args.history_lines,
         reconcile_ms: args.reconcile_ms,
-        state_dir: args
-            .http_addr
-            .as_ref()
-            .map(|_| resolve_bootstrapped_state_dir(args.state_dir.as_deref()))
-            .transpose()?,
+        state_dir: Some(state_dir.clone()),
         allowed_origins: args.allowed_origins,
     };
-    let format = args.format;
-    let use_color = supports_babysit_color();
+
     let http_thread = if let Some(http_addr) = args.http_addr.clone() {
         eprintln!("http api listening on http://{http_addr}");
         Some(spawn_http_server(
-            client.clone(),
+            runtime.clone(),
             request.clone(),
             http_addr,
             Arc::clone(&interrupted),
@@ -743,92 +1040,42 @@ fn run_serve(args: ServeArgs) -> AppResult<String> {
         None
     };
 
-    let serve_result = run_serve_loop(&client, &request, Arc::clone(&interrupted), |event| {
-        let payload = render_serve_event_payload(&request, &event);
-        if artifacts.is_none() {
-            if let Some(state_dir) = artifact_root.as_deref() {
-                match open_serve_artifacts(
-                    state_dir,
-                    &artifact_session_name,
-                    artifact_pane_id.as_deref(),
-                    args.reconcile_ms,
-                    args.history_lines,
-                ) {
-                    Ok(opened_artifacts) => {
-                        artifacts = Some(opened_artifacts);
-                    }
-                    Err(error) if artifacts_required => return Err(error),
-                    Err(error) => {
-                        eprintln!("warning: serve artifacts unavailable: {error}");
-                        artifact_root = None;
-                    }
+    let mut subscription = runtime.subscribe()?;
+    while !interrupted.load(Ordering::SeqCst) {
+        if let Some(event) = subscription.recv()? {
+            if let Some(snapshot) = event.snapshot.as_ref() {
+                if snapshot.pane.session_name != request.session_name {
+                    continue;
+                }
+                if let Some(target_pane) = request.target_pane.as_deref()
+                    && snapshot.pane.pane_id != target_pane
+                {
+                    continue;
                 }
             }
-        }
-        if let Some(active_artifacts) = artifacts.as_mut() {
-            active_artifacts.summary.record_event(&event);
-            if let Err(error) = append_jsonl_event(&mut active_artifacts.tape_writer, &payload) {
-                if artifacts_required {
-                    return Err(error);
-                }
-                eprintln!("warning: serve artifacts disabled after write failure: {error}");
-                artifacts = None;
-                artifact_root = None;
-            }
-        }
-        emit_babysit_output(render_babysit_output(format.into(), payload, use_color))
-    });
-
-    if let Some(mut artifacts) = artifacts {
-        if let Err(error) = &serve_result {
-            if artifacts.summary.stopped_reason.is_none() {
-                artifacts.summary.stopped_reason = Some(error.to_string());
-            }
-        }
-        artifacts.summary.finalize();
-        if let Err(error) = write_serve_summary_export(&artifacts.export_path, &artifacts.summary) {
-            if artifacts_required && serve_result.is_ok() {
-                return Err(error);
-            }
-            eprintln!("warning: serve summary export failed: {error}");
+            let payload = serde_json::json!({
+                "kind": event.kind,
+                "pane_id": event.pane_id,
+                "workspace_id": event.workspace_id,
+                "summary": event.summary,
+                "revision": event.revision,
+                "timestamp_unix_ms": event.timestamp_unix_ms,
+            });
+            emit_babysit_output(render_babysit_output(
+                args.format.into(),
+                payload,
+                supports_babysit_color(),
+            ))?;
         }
     }
 
-    interrupted.store(true, Ordering::SeqCst);
     if let Some(http_thread) = http_thread {
         http_thread
             .join()
             .map_err(|_| AppError::new("http api thread panicked"))??;
     }
 
-    serve_result?;
-
     Ok(String::new())
-}
-
-fn open_serve_artifacts(
-    state_dir: &Path,
-    session_name: &str,
-    pane_id: Option<&str>,
-    reconcile_ms: u64,
-    history_lines: usize,
-) -> AppResult<ServeArtifacts> {
-    let artifact_id = new_artifact_id("serve", session_name, pane_id)?;
-    let tape_path = tape_artifact_path(state_dir, &artifact_id, "events.jsonl")?;
-    let export_path = export_artifact_path(state_dir, &artifact_id, "summary.json")?;
-    let tape_file = File::create(&tape_path)?;
-
-    Ok(ServeArtifacts {
-        tape_writer: BufWriter::new(tape_file),
-        export_path,
-        summary: ServeExportSummary::new(
-            session_name,
-            pane_id,
-            reconcile_ms,
-            history_lines,
-            tape_path,
-        ),
-    })
 }
 
 fn write_observe_artifacts(
@@ -918,19 +1165,6 @@ fn sanitize_artifact_token(input: &str) -> String {
     }
 }
 
-fn append_jsonl_event(writer: &mut BufWriter<File>, payload: &serde_json::Value) -> AppResult<()> {
-    writeln!(writer, "{}", payload)?;
-    writer.flush()?;
-    Ok(())
-}
-
-fn write_serve_summary_export(path: &Path, summary: &ServeExportSummary) -> AppResult<()> {
-    let content = serde_json::to_string_pretty(&summary.as_json())
-        .map_err(|error| AppError::new(format!("failed to encode serve summary JSON: {error}")))?;
-    fs::write(path, content)?;
-    Ok(())
-}
-
 fn render_observe_command_output(
     report: &str,
     artifact_paths: Option<&ObserveArtifactPaths>,
@@ -976,103 +1210,6 @@ fn render_control_log_lines(lines: &[String]) -> String {
     let mut out = lines.join("\n");
     out.push('\n');
     out
-}
-
-fn render_serve_event_payload(request: &ServeRequest, event: &ServeEvent) -> serde_json::Value {
-    match event {
-        ServeEvent::Started {
-            session_name,
-            target_pane,
-            tracked_panes,
-        } => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "serve-start",
-            "session": session_name,
-            "target_pane": target_pane,
-            "tracked_panes": tracked_panes,
-            "summary": format!("Serve mode attached to session {session_name}"),
-            "details": [
-                format!("Target: {}", target_pane.as_deref().unwrap_or("all panes")),
-                format!("Reconcile interval: {}ms", request.reconcile_ms),
-                format!("History lines: {}", request.history_lines),
-                format!(
-                    "Tracked panes: {}",
-                    if tracked_panes.is_empty() {
-                        String::from("none yet")
-                    } else {
-                        tracked_panes.join(", ")
-                    }
-                )
-            ]
-        }),
-        ServeEvent::Snapshot(snapshot) => render_serve_snapshot_event_payload(snapshot),
-        ServeEvent::Notification(message) => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "notify",
-            "summary": format!("tmux notification: {message}"),
-            "details": [format!("Session: {}", request.session_name)],
-            "body_title": "Notification",
-            "body_lines": [message]
-        }),
-        ServeEvent::PaneRemoved { pane_id } => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "pane-removed",
-            "pane_id": pane_id,
-            "summary": format!("Observed pane {pane_id} disappeared"),
-            "details": [format!("Session: {}", request.session_name)]
-        }),
-        ServeEvent::Stopped { reason } => serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "serve-stop",
-            "summary": format!("Serve mode stopped for session {}", request.session_name),
-            "details": [format!("Reason: {reason}")]
-        }),
-    }
-}
-
-fn render_serve_snapshot_event_payload(snapshot: &ServePaneSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "timestamp": current_babysit_timestamp(),
-        "kind": "snapshot",
-        "pane_id": snapshot.pane.pane_id,
-        "session": snapshot.pane.session_name,
-        "window": snapshot.pane.window_name,
-        "command": snapshot.pane.current_command,
-        "cwd": snapshot.pane.current_path,
-        "state": snapshot.classification.state.as_str(),
-        "signals": snapshot.classification.signals.clone(),
-        "changed": snapshot.changed,
-        "reason": snapshot.reason.as_str(),
-        "summary": if snapshot.changed {
-            serde_json::json!(format!(
-                "Pane {} changed to {} ({})",
-                snapshot.pane.pane_id,
-                snapshot.classification.state.as_str(),
-                snapshot.reason.as_str()
-            ))
-        } else {
-            serde_json::json!(format!(
-                "Pane {} reconciled at {} ({})",
-                snapshot.pane.pane_id,
-                snapshot.classification.state.as_str(),
-                snapshot.reason.as_str()
-            ))
-        },
-        "details": [
-            format!("Window: {}", snapshot.pane.window_name),
-            format!("Command: {}", snapshot.pane.current_command),
-            format!("Cwd: {}", snapshot.pane.current_path),
-            format!("Signals: {}", render_signals(&snapshot.classification)),
-            format!("Recap: {}", snapshot.classification.recap_excerpt.as_deref().unwrap_or("none")),
-            format!("Changed: {}", snapshot.changed),
-        ],
-        "body_title": if snapshot.live_excerpt.is_empty() { serde_json::Value::Null } else { serde_json::json!("Recent output") },
-        "body_lines": if snapshot.live_excerpt.is_empty() {
-            serde_json::json!([])
-        } else {
-            serde_json::json!(serve_body_lines(&snapshot.live_excerpt))
-        }
-    })
 }
 
 fn run_record_fixture(args: RecordFixtureArgs) -> AppResult<String> {
@@ -2419,84 +2556,105 @@ pub(crate) fn submit_prompt_for_pane(
 }
 
 fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = match args.workspace.as_deref() {
-        Some(selector) => Some(resolve_selected_workspace(&state_dir, Some(selector))?),
-        None => None,
-    };
-    let interrupted = Arc::new(AtomicBool::new(false));
-    install_babysit_sigint_handler(Arc::clone(&interrupted))?;
-    if args.all {
-        run_yolo_all(
-            &client,
-            &state_dir,
-            workspace.as_ref(),
-            args.poll_ms,
-            args.live_preview,
-            args.format,
-            interrupted,
-        )
+    let (runtime, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: args.poll_ms.max(1000),
+            history_lines: 200,
+        },
+    )?;
+    let client = managed_runtime_tmux_client();
+    let updated = if args.all {
+        runtime.set_yolo(None, args.workspace.as_deref(), true, true)?
     } else {
-        let pane_id = args.pane_id.as_deref().unwrap();
-        run_yolo_single(
-            &client,
-            &state_dir,
-            args.workspace.as_deref(),
-            pane_id,
-            args.poll_ms,
-            args.live_preview,
-            args.format,
-            interrupted,
-        )
+        let pane = client
+            .pane_by_target(args.pane_id.as_deref().unwrap())?
+            .ok_or_else(|| AppError::new("could not resolve yolo pane target"))?;
+        runtime.set_yolo(Some(&pane.pane_id), args.workspace.as_deref(), false, true)?
+    };
+    if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else if args.follow || args.live_preview {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        install_babysit_sigint_handler(Arc::clone(&interrupted))?;
+        let mut subscription = runtime.subscribe()?;
+        while !interrupted.load(Ordering::SeqCst) {
+            if let Some(event) = subscription.recv()? {
+                let matches_scope = if args.all {
+                    event
+                        .pane_id
+                        .as_ref()
+                        .map(|pane_id| updated.iter().any(|updated_id| updated_id == pane_id))
+                        .unwrap_or(false)
+                } else {
+                    event
+                        .pane_id
+                        .as_ref()
+                        .map(|pane_id| {
+                            updated
+                                .first()
+                                .map(|updated_id| updated_id == pane_id)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                };
+                if !matches_scope {
+                    continue;
+                }
+                let payload = serde_json::json!({
+                    "kind": event.kind,
+                    "pane_id": event.pane_id,
+                    "summary": event.summary,
+                    "revision": event.revision,
+                    "timestamp_unix_ms": event.timestamp_unix_ms,
+                });
+                emit_babysit_output(render_babysit_output(
+                    args.format.into(),
+                    payload,
+                    supports_babysit_color(),
+                ))?;
+            }
+        }
+        Ok(String::new())
+    } else {
+        Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
 }
 
 fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
-    let workspace = match args.workspace.as_deref() {
-        Some(selector) => Some(resolve_selected_workspace(&state_dir, Some(selector))?),
-        None => None,
-    };
-    if args.all {
-        let mut out = Vec::new();
-        for pane_id in
-            tracked_pane_ids(&state_dir, workspace.as_ref().map(|item| item.id.as_str()))?
-        {
-            let pane_label = babysit_pane_label(&state_dir, &pane_id);
-            let disabled = disable_yolo_record(&state_dir, &pane_id)?;
-            out.push(render_babysit_stop_event(
-                &pane_label,
-                &pane_id,
-                if disabled {
-                    "disabled"
-                } else {
-                    "already-disabled"
-                },
-                BabysitFormat::Human,
-                supports_babysit_color(),
-            ));
-        }
-        Ok(out.join("\n"))
+    let (runtime, _runtime_guard) = ensure_runtime_client(
+        &state_dir,
+        if args.unmanaged {
+            RuntimeManagementMode::Unmanaged
+        } else {
+            RuntimeManagementMode::Managed
+        },
+        RuntimeBootstrapConfig {
+            reconcile_ms: 1000,
+            history_lines: 200,
+        },
+    )?;
+    let updated = if args.all {
+        runtime.set_yolo(None, args.workspace.as_deref(), true, false)?
     } else {
         let raw_target = args.pane_id.as_deref().unwrap();
-        let pane_id = match TmuxClient::default().pane_by_target(raw_target)? {
+        let pane_id = match managed_runtime_tmux_client().pane_by_target(raw_target)? {
             Some(pane) => pane.pane_id,
             None => raw_target.to_string(),
         };
-        let pane_label = babysit_pane_label(&state_dir, &pane_id);
-        let disabled = disable_yolo_record(&state_dir, &pane_id)?;
-        Ok(render_babysit_stop_event(
-            &pane_label,
-            &pane_id,
-            if disabled {
-                "disabled"
-            } else {
-                "already-disabled"
-            },
-            BabysitFormat::Human,
-            supports_babysit_color(),
-        ))
+        runtime.set_yolo(Some(&pane_id), args.workspace.as_deref(), false, false)?
+    };
+    if updated.is_empty() {
+        Ok(String::from("no panes matched yolo policy update"))
+    } else {
+        Ok(format!("updated yolo policy for {} pane(s)", updated.len()))
     }
 }
 
@@ -2532,424 +2690,7 @@ pub(crate) fn resolve_workspace_for_pane(
     Ok(pane_workspace)
 }
 
-fn run_yolo_single(
-    client: &TmuxClient,
-    state_dir: &Path,
-    workspace_selector: Option<&str>,
-    pane_id: &str,
-    poll_ms: u64,
-    live_preview: bool,
-    format: BabysitFormat,
-    interrupted: Arc<AtomicBool>,
-) -> AppResult<String> {
-    let pane = resolve_pane_by_id(client, pane_id)?;
-    let workspace = resolve_workspace_for_pane(state_dir, &pane, workspace_selector)?;
-    if matches!(read_yolo_record(state_dir, &pane.pane_id)?, Some(record) if record.enabled) {
-        return Err(AppError::new(format!(
-            "yolo is already active for pane {}",
-            pane.pane_id
-        )));
-    }
-    let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-    ensure_pane_owned_by_yolo_provider(&pane, &inspected.classification)?;
-    if is_pane_command_claude(&pane) {
-        let bindings = load_automation_keybindings(None)?;
-        let _ = keys_for_action(&bindings, AutomationAction::ConfirmYes)?;
-    }
-    let record_path = write_yolo_record(state_dir, &workspace.id, &pane)?;
-    let record = read_yolo_record(state_dir, &pane.pane_id)?.ok_or_else(|| {
-        AppError::new(format!(
-            "failed to reload yolo record for pane {}",
-            pane.pane_id
-        ))
-    })?;
-    let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
-    emit_babysit_output(render_babysit_start_event(
-        &pane_label,
-        &pane.pane_id,
-        poll_ms,
-        live_preview,
-        &record,
-        &record_path,
-        format,
-        supports_babysit_color(),
-    ))?;
-    loop_yolo_pane(
-        client,
-        state_dir,
-        pane,
-        record,
-        pane_label,
-        poll_ms,
-        live_preview,
-        format,
-        interrupted,
-    )
-}
-
-fn loop_yolo_pane(
-    client: &TmuxClient,
-    state_dir: &Path,
-    pane: TmuxPane,
-    record: YoloRecord,
-    pane_label: String,
-    poll_ms: u64,
-    live_preview: bool,
-    format: BabysitFormat,
-    interrupted: Arc<AtomicBool>,
-) -> AppResult<String> {
-    let mut last_state: Option<SessionState> = None;
-    let mut poll_count: usize = 0;
-    loop {
-        if interrupted.load(Ordering::SeqCst) {
-            cleanup_babysit_record(state_dir, &pane.pane_id)?;
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "sigint",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        }
-        poll_count += 1;
-        if !yolo_record_enabled(state_dir, &pane.pane_id)? {
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "disabled",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        }
-        let Some(current) = client.pane_by_id(&pane.pane_id)? else {
-            cleanup_babysit_record(state_dir, &pane.pane_id)?;
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "missing-pane",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        };
-        if !record.matches_pane(&current) {
-            cleanup_babysit_record(state_dir, &pane.pane_id)?;
-            emit_babysit_output(render_babysit_stop_event(
-                &pane_label,
-                &pane.pane_id,
-                "identity-changed",
-                format,
-                supports_babysit_color(),
-            ))?;
-            return Ok(String::new());
-        }
-        let current_view = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-        let classification = &current_view.classification;
-        if last_state != Some(classification.state) {
-            emit_babysit_output(render_babysit_wait_event(
-                &pane_label,
-                &pane.pane_id,
-                poll_count,
-                &current_view,
-                live_preview,
-                format,
-                supports_babysit_color(),
-            ))?;
-            last_state = Some(classification.state);
-        }
-        match yolo_action_for_state(classification.state) {
-            YoloAction::ApprovePermission => {
-                if !is_yolo_safe_to_approve(&current_view) {
-                    thread::sleep(Duration::from_millis(poll_ms));
-                    continue;
-                }
-                emit_babysit_output(render_babysit_action_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &current_view,
-                    GuardedWorkflow::ApprovePermission,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                execute_classified_workflow(
-                    client,
-                    &pane.pane_id,
-                    GuardedWorkflow::ApprovePermission,
-                    classification,
-                )?;
-                thread::sleep(Duration::from_millis(poll_ms));
-                let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                emit_babysit_output(render_babysit_action_completed_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &after,
-                    GuardedWorkflow::ApprovePermission,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                last_state = Some(after.classification.state);
-            }
-            YoloAction::DismissSurvey => {
-                emit_babysit_output(render_babysit_action_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &current_view,
-                    GuardedWorkflow::DismissSurvey,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                execute_classified_workflow(
-                    client,
-                    &pane.pane_id,
-                    GuardedWorkflow::DismissSurvey,
-                    classification,
-                )?;
-                thread::sleep(Duration::from_millis(poll_ms));
-                let after = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                emit_babysit_output(render_babysit_action_completed_event(
-                    &pane_label,
-                    &pane.pane_id,
-                    poll_count,
-                    &after,
-                    GuardedWorkflow::DismissSurvey,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                last_state = Some(after.classification.state);
-            }
-            YoloAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
-        }
-    }
-}
-
-fn run_yolo_all(
-    client: &TmuxClient,
-    state_dir: &Path,
-    workspace: Option<&WorkspaceRecord>,
-    poll_ms: u64,
-    live_preview: bool,
-    format: BabysitFormat,
-    interrupted: Arc<AtomicBool>,
-) -> AppResult<String> {
-    let mut tracked: HashMap<String, TrackedYoloPane> = HashMap::new();
-    loop {
-        if interrupted.load(Ordering::SeqCst) {
-            cleanup_all_babysit_records(state_dir, tracked.keys())?;
-            return Ok(String::new());
-        }
-        for pane in discover_yolo_supported_panes(client)? {
-            let pane_workspace =
-                resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
-            if workspace.is_some_and(|workspace| workspace.id != pane_workspace.id) {
-                continue;
-            }
-            if tracked.contains_key(&pane.pane_id) {
-                continue;
-            }
-            let record_path = write_yolo_record(state_dir, &pane_workspace.id, &pane)?;
-            let record = read_yolo_record(state_dir, &pane.pane_id)?.ok_or_else(|| {
-                AppError::new(format!(
-                    "failed to reload yolo record for pane {}",
-                    pane.pane_id
-                ))
-            })?;
-            let pane_label = pane_label_from_path(&record.current_path, &pane.pane_id);
-            emit_babysit_output(render_babysit_start_event(
-                &pane_label,
-                &pane.pane_id,
-                poll_ms,
-                live_preview,
-                &record,
-                &record_path,
-                format,
-                supports_babysit_color(),
-            ))?;
-            tracked.insert(
-                pane.pane_id.clone(),
-                TrackedYoloPane {
-                    record,
-                    pane_label,
-                    last_state: None,
-                    poll_count: 0,
-                },
-            );
-        }
-        let ids = tracked.keys().cloned().collect::<Vec<_>>();
-        for pane_id in ids {
-            if interrupted.load(Ordering::SeqCst) {
-                break;
-            }
-            let Some(tracked_pane) = tracked.get_mut(&pane_id) else {
-                continue;
-            };
-            if !yolo_record_enabled(state_dir, &pane_id)? {
-                tracked.remove(&pane_id);
-                continue;
-            }
-            let Some(current) = client.pane_by_id(&pane_id)? else {
-                cleanup_babysit_record(state_dir, &pane_id)?;
-                emit_babysit_output(render_babysit_stop_event(
-                    &tracked_pane.pane_label,
-                    &pane_id,
-                    "missing-pane",
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                tracked.remove(&pane_id);
-                continue;
-            };
-            if !tracked_pane.record.matches_pane(&current) {
-                cleanup_babysit_record(state_dir, &pane_id)?;
-                emit_babysit_output(render_babysit_stop_event(
-                    &tracked_pane.pane_label,
-                    &pane_id,
-                    "identity-changed",
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                tracked.remove(&pane_id);
-                continue;
-            }
-            let current_view = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-            let classification = current_view.classification.state;
-            tracked_pane.poll_count += 1;
-            if tracked_pane.last_state != Some(classification) {
-                emit_babysit_output(render_babysit_wait_event(
-                    &tracked_pane.pane_label,
-                    &pane_id,
-                    tracked_pane.poll_count,
-                    &current_view,
-                    live_preview,
-                    format,
-                    supports_babysit_color(),
-                ))?;
-                tracked_pane.last_state = Some(classification);
-            }
-            match yolo_action_for_state(classification) {
-                YoloAction::ApprovePermission => {
-                    if !is_yolo_safe_to_approve(&current_view) {
-                        continue;
-                    }
-                    emit_babysit_output(render_babysit_action_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &current_view,
-                        GuardedWorkflow::ApprovePermission,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    execute_classified_workflow(
-                        client,
-                        &pane_id,
-                        GuardedWorkflow::ApprovePermission,
-                        &current_view.classification,
-                    )?;
-                    thread::sleep(Duration::from_millis(poll_ms));
-                    let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                    emit_babysit_output(render_babysit_action_completed_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &after,
-                        GuardedWorkflow::ApprovePermission,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    tracked_pane.last_state = Some(after.classification.state);
-                }
-                YoloAction::DismissSurvey => {
-                    emit_babysit_output(render_babysit_action_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &current_view,
-                        GuardedWorkflow::DismissSurvey,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    execute_classified_workflow(
-                        client,
-                        &pane_id,
-                        GuardedWorkflow::DismissSurvey,
-                        &current_view.classification,
-                    )?;
-                    thread::sleep(Duration::from_millis(poll_ms));
-                    let after = inspect_pane(client, &pane_id, ACTION_GUARD_HISTORY_LINES)?;
-                    emit_babysit_output(render_babysit_action_completed_event(
-                        &tracked_pane.pane_label,
-                        &pane_id,
-                        tracked_pane.poll_count,
-                        &after,
-                        GuardedWorkflow::DismissSurvey,
-                        live_preview,
-                        format,
-                        supports_babysit_color(),
-                    ))?;
-                    tracked_pane.last_state = Some(after.classification.state);
-                }
-                YoloAction::Wait => thread::sleep(Duration::from_millis(poll_ms)),
-            }
-        }
-        thread::sleep(Duration::from_millis(poll_ms));
-    }
-}
-
-fn discover_yolo_supported_panes(client: &TmuxClient) -> AppResult<Vec<TmuxPane>> {
-    let mut supported = Vec::new();
-    for pane in client.list_panes()? {
-        if is_pane_command_claude(&pane) {
-            supported.push(pane);
-            continue;
-        }
-        if !is_pane_codex_candidate(&pane) {
-            continue;
-        }
-        let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-        if is_classified_codex(&inspected.classification, &pane) {
-            supported.push(pane);
-        }
-    }
-    Ok(supported)
-}
-
-struct TrackedYoloPane {
-    record: YoloRecord,
-    pane_label: String,
-    last_state: Option<SessionState>,
-    poll_count: usize,
-}
-
-fn yolo_record_enabled(state_dir: &Path, pane_id: &str) -> AppResult<bool> {
-    Ok(matches!(read_yolo_record(state_dir, pane_id)?, Some(record) if record.enabled))
-}
-
-fn tracked_pane_ids(state_dir: &Path, workspace_id: Option<&str>) -> AppResult<Vec<String>> {
-    list_yolo_pane_ids(state_dir, workspace_id)
-}
-
-fn cleanup_all_babysit_records<'a, I: IntoIterator<Item = &'a String>>(
-    state_dir: &Path,
-    pane_ids: I,
-) -> AppResult<()> {
-    for pane_id in pane_ids {
-        cleanup_babysit_record(state_dir, pane_id)?;
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn cleanup_babysit_record(state_dir: &Path, pane_id: &str) -> AppResult<()> {
     let _ = disable_yolo_record(state_dir, pane_id)?;
     Ok(())
@@ -3015,14 +2756,6 @@ fn pane_label_from_path(current_path: &str, fallback: &str) -> String {
         .filter(|name| !name.is_empty())
         .map(|name| name.to_string())
         .unwrap_or_else(|| fallback.to_string())
-}
-
-fn babysit_pane_label(state_dir: &std::path::Path, pane_id: &str) -> String {
-    read_yolo_record(state_dir, pane_id)
-        .ok()
-        .flatten()
-        .map(|record| pane_label_from_path(&record.current_path, pane_id))
-        .unwrap_or_else(|| pane_id.to_string())
 }
 
 fn style_babysit(text: impl AsRef<str>, code: &str, use_color: bool) -> String {
@@ -3119,6 +2852,7 @@ fn render_babysit_human(event: serde_json::Value, use_color: bool) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn babysit_prompt_json(details: Option<&PermissionPromptDetails>) -> serde_json::Value {
     match details {
         Some(details) => serde_json::json!({
@@ -3132,6 +2866,7 @@ fn babysit_prompt_json(details: Option<&PermissionPromptDetails>) -> serde_json:
     }
 }
 
+#[cfg(test)]
 fn render_babysit_start_event(
     pane_label: &str,
     pane_id: &str,
@@ -3169,40 +2904,6 @@ fn render_babysit_start_event(
         }),
         use_color,
     )
-}
-
-fn render_babysit_stop_event(
-    pane_label: &str,
-    pane_id: &str,
-    reason: &str,
-    format: BabysitFormat,
-    use_color: bool,
-) -> String {
-    render_babysit_output(
-        format.into(),
-        serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": "stop",
-            "pane_label": pane_label,
-            "pane_id": pane_id,
-            "reason": reason,
-            "summary": format!("YOLO stopped for {pane_label} (id:{pane_id})"),
-            "details": [format!("Reason: {reason}")]
-        }),
-        use_color,
-    )
-}
-
-fn serve_body_lines(input: &str) -> Vec<String> {
-    input
-        .lines()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|line| line.to_string())
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -3440,6 +3141,7 @@ fn is_permission_annotation_line(line: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn render_permission_prompt_details(details: &PermissionPromptDetails) -> Vec<String> {
     let mut lines = vec![format!("Type: {}", details.prompt_type)];
     if let Some(mode) = &details.sandbox_mode {
@@ -3650,6 +3352,7 @@ fn starts_with_numbered_option_for_yolo(line: &str) -> bool {
     digits > 0 && line[digits..].starts_with('.')
 }
 
+#[cfg(test)]
 fn render_babysit_wait_event(
     pane_label: &str,
     pane_id: &str,
@@ -3693,6 +3396,7 @@ fn render_babysit_wait_event(
     )
 }
 
+#[cfg(test)]
 fn render_babysit_action_event(
     pane_label: &str,
     pane_id: &str,
@@ -3746,48 +3450,6 @@ fn render_babysit_action_event(
                 }
             ),
             "details": if format == BabysitFormat::Human { serde_json::json!(human_details) } else { json_details },
-            "body_title": body_title,
-            "body_lines": body_lines
-        }),
-        use_color,
-    )
-}
-
-fn render_babysit_action_completed_event(
-    pane_label: &str,
-    pane_id: &str,
-    poll_count: usize,
-    inspected: &InspectedPane,
-    workflow: GuardedWorkflow,
-    live_preview: bool,
-    format: BabysitFormat,
-    use_color: bool,
-) -> String {
-    let classification = &inspected.classification;
-    let _live_preview = live_preview;
-    let body_title: Option<&str> = None;
-    let body_lines: Vec<String> = Vec::new();
-    let json_details = serde_json::json!([format!("Signals: {}", render_signals(classification))]);
-    render_babysit_output(
-        format.into(),
-        serde_json::json!({
-            "timestamp": current_babysit_timestamp(),
-            "kind": format!("{}d", workflow.as_str()),
-            "pane_label": pane_label,
-            "pane_id": pane_id,
-            "poll": poll_count,
-            "state": classification.state.as_str(),
-            "signals": classification.signals.clone(),
-            "summary": format!(
-                "{} for {pane_label} (id:{pane_id}) (poll #{poll_count})",
-                match workflow {
-                    GuardedWorkflow::ApprovePermission => "Approval sent",
-                    GuardedWorkflow::DismissSurvey => "Survey dismissed",
-                    GuardedWorkflow::RejectPermission => "Rejection sent",
-                    GuardedWorkflow::SubmitPrompt => "Prompt submitted",
-                }
-            ),
-            "details": if format == BabysitFormat::Human { serde_json::json!([]) } else { json_details },
             "body_title": body_title,
             "body_lines": body_lines
         }),
@@ -3861,15 +3523,6 @@ pub(crate) struct ContinueOutcome {
     pub(crate) outcome: String,
     pub(crate) after: Classification,
     pub(crate) used_permission_approval: bool,
-}
-
-pub(crate) fn try_unstick_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<String> {
-    let classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-    let outcome = continue_from_classification(client, pane, &classification)?;
-    Ok(format!(
-        "unstick {}: {} -> {}",
-        pane.pane_id, outcome.action, outcome.outcome
-    ))
 }
 
 pub(crate) fn continue_from_classification(
@@ -4390,12 +4043,6 @@ fn is_pane_likely_codex(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("codex")
 }
 
-fn is_pane_codex_candidate(pane: &TmuxPane) -> bool {
-    pane.current_command.eq_ignore_ascii_case("codex")
-        || (pane.current_command.eq_ignore_ascii_case("node")
-            && !pane.pane_title.starts_with("OC | "))
-}
-
 fn pane_provider_label(pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
@@ -4424,7 +4071,7 @@ fn classification_provider_label(classification: &Classification, pane: &TmuxPan
     }
 }
 
-fn ensure_pane_owned_by_automatable_provider(
+pub(crate) fn ensure_pane_owned_by_automatable_provider(
     pane: &TmuxPane,
     classification: &Classification,
 ) -> AppResult<()> {
@@ -4438,7 +4085,7 @@ fn ensure_pane_owned_by_automatable_provider(
     }
 }
 
-fn ensure_pane_owned_by_yolo_provider(
+pub(crate) fn ensure_pane_owned_by_yolo_provider(
     pane: &TmuxPane,
     classification: &Classification,
 ) -> AppResult<()> {
@@ -4545,11 +4192,10 @@ mod tests {
         recovery_action_for_state, render_babysit_action_event, render_babysit_output,
         render_babysit_start_event, render_babysit_wait_event, render_guarded_workflow_output,
         render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_observe_command_output, render_screen_excerpt, render_serve_event_payload,
-        render_status_report, resolve_keep_going_prompt, resolve_prompt_run_input,
-        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
-        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
-        write_prompt_instruction_temp_file, yolo_action_for_state,
+        render_observe_command_output, render_screen_excerpt, render_status_report,
+        resolve_keep_going_prompt, resolve_prompt_run_input, run_prepare_prompt, shell_escape,
+        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
+        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -4558,7 +4204,6 @@ mod tests {
     };
     use crate::cli::{PreparePromptArgs, PromptRunArgs};
     use crate::prompt::pending_prompt_text;
-    use crate::serve::{ServeEvent, ServeRequest};
     use crate::storage::{CURRENT_SCHEMA_VERSION, resolve_workspace_for_path, state_db_path};
     use crate::tmux::TmuxPane;
     use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
@@ -4888,25 +4533,6 @@ mod tests {
         assert!(rendered.contains("control_log=/tmp/control-mode.log"));
         assert!(rendered.contains("export=/tmp/report.json"));
         assert!(!rendered.contains("unavailable="));
-    }
-
-    #[test]
-    fn serve_pane_removed_events_keep_their_own_kind() {
-        let payload = render_serve_event_payload(
-            &ServeRequest {
-                session_name: String::from("demo"),
-                target_pane: None,
-                history_lines: 120,
-                reconcile_ms: 1500,
-                state_dir: None,
-                allowed_origins: Vec::new(),
-            },
-            &ServeEvent::PaneRemoved {
-                pane_id: String::from("%7"),
-            },
-        );
-
-        assert_eq!(payload["kind"], "pane-removed");
     }
 
     #[test]
@@ -6251,6 +5877,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 state_dir: Some(PathBuf::from("/tmp/botctl state")),
                 exit_on_navigate: false,
                 persistent: true,
+                unmanaged: false,
             },
             Some(Path::new("/tmp/tmux-1000/default")),
         )
@@ -6283,6 +5910,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 state_dir: None,
                 exit_on_navigate: false,
                 persistent: true,
+                unmanaged: false,
             },
             Some(Path::new("/tmp/tmux-1000/default")),
         )
@@ -6303,6 +5931,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 state_dir: None,
                 exit_on_navigate: false,
                 persistent: true,
+                unmanaged: false,
             },
             None,
         )

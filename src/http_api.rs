@@ -10,30 +10,26 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::app::{
-    ACTION_GUARD_HISTORY_LINES, AppError, AppResult, ContinueOutcome, InspectedPane, classify_pane,
-    continue_from_classification, ensure_pane_owned_by_claude, ensure_workflow_state,
-    execute_automation_action, execute_classified_workflow, extract_permission_prompt_details,
-    inspect_pane, keys_for_action, load_automation_keybindings, render_next_safe_action,
-    render_screen_excerpt, submit_prompt_for_pane,
+    AppError, AppResult, InspectedPane, keys_for_action, load_automation_keybindings,
 };
-use crate::automation::{AutomationAction, GuardedWorkflow, inspect_keybindings};
+use crate::automation::{AutomationAction, inspect_keybindings};
 use crate::classifier::SessionState;
+use crate::runtime::{RuntimeClient, build_instance_detail_json, build_instance_summary_json};
 use crate::serve::ServeRequest;
-use crate::tmux::{TmuxClient, TmuxPane};
 
 const HTTP_POLL_MS: u64 = 200;
 
 pub fn spawn_http_server(
-    client: TmuxClient,
+    runtime: RuntimeClient,
     request: ServeRequest,
     bind_addr: String,
     interrupted: Arc<AtomicBool>,
 ) -> thread::JoinHandle<AppResult<()>> {
-    thread::spawn(move || run_http_server(client, request, &bind_addr, interrupted))
+    thread::spawn(move || run_http_server(runtime, request, &bind_addr, interrupted))
 }
 
 fn run_http_server(
-    client: TmuxClient,
+    runtime: RuntimeClient,
     request: ServeRequest,
     bind_addr: &str,
     interrupted: Arc<AtomicBool>,
@@ -52,7 +48,7 @@ fn run_http_server(
 
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(error) = handle_connection(stream, &client, &request) {
+                if let Err(error) = handle_connection(stream, &runtime, &request) {
                     eprintln!("warning: http api request failed: {error}");
                 }
             }
@@ -68,7 +64,7 @@ fn run_http_server(
 
 fn handle_connection(
     stream: TcpStream,
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
@@ -108,7 +104,7 @@ fn handle_connection(
         reader.read_exact(&mut body)?;
     }
 
-    let response = handle_request(method, target, &body, origin.as_deref(), client, request);
+    let response = handle_request(method, target, &body, origin.as_deref(), runtime, request);
     let mut stream = reader.into_inner();
     write_response(&mut stream, response)
 }
@@ -118,7 +114,7 @@ fn handle_request(
     target: &str,
     body: &[u8],
     origin: Option<&str>,
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
 ) -> HttpResponse {
     let cors_origin = match validate_origin(origin, &request.allowed_origins) {
@@ -152,7 +148,7 @@ fn handle_request(
             }),
             cors_origin,
         ),
-        ("GET", ["instances"]) => match list_instances(client, request) {
+        ("GET", ["instances"]) => match list_instances(runtime, request) {
             Ok(instances) => json_response(
                 200,
                 json!({
@@ -164,18 +160,18 @@ fn handle_request(
             ),
             Err(error) => error_response(500, error.to_string(), cors_origin),
         },
-        ("GET", ["instances", pane_id]) => match instance_detail(client, request, pane_id) {
+        ("GET", ["instances", pane_id]) => match instance_detail(runtime, request, pane_id) {
             Ok(instance) => json_response(200, json!({ "instance": instance }), cors_origin),
             Err(error) => map_app_error(error, cors_origin),
         },
         ("POST", ["instances", pane_id, "actions", action]) => {
-            match run_instance_action(client, request, pane_id, action) {
+            match run_instance_action(runtime, request, pane_id, action) {
                 Ok(result) => json_response(200, result, cors_origin),
                 Err(error) => map_app_error(error, cors_origin),
             }
         }
         ("POST", ["instances", pane_id, "interactions", option_id]) => {
-            match run_instance_interaction(client, request, pane_id, option_id) {
+            match run_instance_interaction(runtime, request, pane_id, option_id) {
                 Ok(result) => json_response(200, result, cors_origin),
                 Err(error) => map_app_error(error, cors_origin),
             }
@@ -187,7 +183,7 @@ fn handle_request(
                     return error_response(400, format!("invalid JSON body: {error}"), cors_origin);
                 }
             };
-            match run_instance_prompt(client, request, pane_id, &body) {
+            match run_instance_prompt(runtime, request, pane_id, &body) {
                 Ok(result) => json_response(200, result, cors_origin),
                 Err(error) => map_app_error(error, cors_origin),
             }
@@ -197,149 +193,71 @@ fn handle_request(
 }
 
 fn list_instances(
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
 ) -> AppResult<Vec<serde_json::Value>> {
-    list_requested_panes(client, request)?
+    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
+    runtime
+        .list_panes(Some(&request.session_name), request.target_pane.as_deref())?
         .into_iter()
-        .map(|pane| build_instance_summary(client, &pane))
+        .map(|snapshot| build_instance_summary_json(&snapshot, &bindings))
         .collect()
 }
 
 fn instance_detail(
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
     pane_id: &str,
 ) -> AppResult<serde_json::Value> {
-    let pane = resolve_api_pane(client, request, pane_id)?;
-    let inspected = inspect_pane(client, &pane.pane_id, request.history_lines)?;
-    Ok(build_instance_detail_value(&pane, &inspected)?)
-}
-
-fn build_instance_summary(client: &TmuxClient, pane: &TmuxPane) -> AppResult<serde_json::Value> {
-    let inspected = inspect_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    ensure_target_pane(request, pane_id)?;
+    let snapshot = runtime
+        .get_pane(pane_id, Some(&request.session_name))?
+        .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
     let bindings = inspect_keybindings(None).map_err(AppError::new)?;
-    Ok(json!({
-        "id": pane.pane_id,
-        "pane": pane_json(pane),
-        "owned_by_claude": pane.current_command == "claude",
-        "classification": classification_json(&inspected),
-        "screen_excerpt": render_screen_excerpt(&inspected.raw_source),
-        "next_safe_action": render_next_safe_action(&inspected.classification, pane, &bindings),
-        "interactions": interaction_summary_json(&inspected),
-    }))
-}
-
-fn build_instance_detail_value(
-    pane: &TmuxPane,
-    inspected: &InspectedPane,
-) -> AppResult<serde_json::Value> {
-    let bindings = inspect_keybindings(None).map_err(AppError::new)?;
-    let controls = available_controls_json()?;
-    Ok(json!({
-        "id": pane.pane_id,
-        "pane": pane_json(pane),
-        "owned_by_claude": pane.current_command == "claude",
-        "classification": classification_json(inspected),
-        "screen": {
-            "excerpt": render_screen_excerpt(&inspected.raw_source),
-            "focused_source": inspected.focused_source,
-        },
-        "next_safe_action": render_next_safe_action(&inspected.classification, pane, &bindings),
-        "prompt": permission_prompt_json(inspected),
-        "interactions": interaction_detail_json(inspected),
-        "controls": controls,
-    }))
+    let mut detail = build_instance_detail_json(&snapshot, &bindings)?;
+    if let Some(object) = detail.as_object_mut() {
+        object.insert(
+            String::from("interactions"),
+            interaction_detail_json(&snapshot.to_inspected_pane()),
+        );
+        object.insert(
+            String::from("controls"),
+            serde_json::json!(available_controls_json()?),
+        );
+    }
+    Ok(detail)
 }
 
 fn run_instance_action(
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
     pane_id: &str,
     action: &str,
 ) -> AppResult<serde_json::Value> {
-    let pane = resolve_api_pane(client, request, pane_id)?;
-    ensure_pane_owned_by_claude(&pane)?;
-    let classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-    let result = match action {
-        "approve-permission" => {
-            ensure_workflow_state(GuardedWorkflow::ApprovePermission, &classification)?;
-            execute_classified_workflow(
-                client,
-                &pane.pane_id,
-                GuardedWorkflow::ApprovePermission,
-                &classification,
-            )?
-        }
-        "reject-permission" => {
-            ensure_workflow_state(GuardedWorkflow::RejectPermission, &classification)?;
-            execute_classified_workflow(
-                client,
-                &pane.pane_id,
-                GuardedWorkflow::RejectPermission,
-                &classification,
-            )?
-        }
-        "dismiss-survey" => {
-            ensure_workflow_state(GuardedWorkflow::DismissSurvey, &classification)?;
-            execute_classified_workflow(
-                client,
-                &pane.pane_id,
-                GuardedWorkflow::DismissSurvey,
-                &classification,
-            )?
-        }
-        "confirm-previous" => {
-            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmPrevious)?
-        }
-        "confirm-next" => {
-            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmNext)?
-        }
-        "confirm-yes" => {
-            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmYes)?
-        }
-        "confirm-no" => {
-            execute_automation_action(client, &pane.pane_id, AutomationAction::ConfirmNo)?
-        }
-        "interrupt" => {
-            execute_automation_action(client, &pane.pane_id, AutomationAction::Interrupt)?
-        }
-        "continue-session" => {
-            let outcome = continue_from_classification(client, &pane, &classification)?;
-            return Ok(continue_outcome_json(&pane, &outcome));
-        }
-        "auto-unstick" => {
-            return run_instance_auto_unstick(client, &pane);
-        }
-        "enter" => {
-            client.send_keys(&pane.pane_id, &["Enter"])?;
-            String::from("enter")
-        }
-        _ => {
-            return Err(AppError::with_exit_code(
-                format!("unsupported action: {action}"),
-                404,
-            ));
-        }
-    };
+    ensure_target_pane(request, pane_id)?;
+    let result = runtime.run_action(pane_id, Some(&request.session_name), action)?;
 
     Ok(json!({
         "ok": true,
-        "pane_id": pane.pane_id,
-        "action": action,
-        "executed": result,
+        "pane_id": result.pane_id,
+        "action": result.action,
+        "executed": result.executed,
+        "after_state": result.after_state,
+        "detail": result.detail,
     }))
 }
 
 fn run_instance_interaction(
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
     pane_id: &str,
     option_id: &str,
 ) -> AppResult<serde_json::Value> {
-    let pane = resolve_api_pane(client, request, pane_id)?;
-    ensure_pane_owned_by_claude(&pane)?;
-    let inspected = inspect_pane(client, &pane.pane_id, request.history_lines)?;
+    ensure_target_pane(request, pane_id)?;
+    let snapshot = runtime
+        .get_pane(pane_id, Some(&request.session_name))?
+        .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
+    let inspected = snapshot.to_inspected_pane();
     let interaction = parse_interaction_surface(&inspected).ok_or_else(|| {
         AppError::with_exit_code("no interactive options are visible for this pane", 409)
     })?;
@@ -349,29 +267,23 @@ fn run_instance_interaction(
         .find(|option| option.id == option_id)
         .ok_or_else(|| AppError::with_exit_code(format!("unknown option id: {option_id}"), 404))?;
 
-    match interaction.mode {
-        InteractionMode::SurveyDigits => {
-            client.send_keys(&pane.pane_id, &[option.id.as_str()])?;
-        }
+    let result = match interaction.mode {
+        InteractionMode::SurveyDigits => runtime.run_action(
+            pane_id,
+            Some(&request.session_name),
+            &format!("send-text:{}", option.id),
+        )?,
         InteractionMode::NumberedOptions => {
-            let bindings = load_automation_keybindings(None)?;
             let current = interaction.selected_option.unwrap_or(1);
             let target = option
                 .id
                 .parse::<usize>()
                 .map_err(|_| AppError::new(format!("invalid numbered option id: {}", option.id)))?;
-            if target > current {
-                let keys = keys_for_action(&bindings, AutomationAction::ConfirmNext)?;
-                for _ in 0..(target - current) {
-                    client.send_keys(&pane.pane_id, keys)?;
-                }
-            } else if current > target {
-                let keys = keys_for_action(&bindings, AutomationAction::ConfirmPrevious)?;
-                for _ in 0..(current - target) {
-                    client.send_keys(&pane.pane_id, keys)?;
-                }
-            }
-            client.send_keys(&pane.pane_id, &["Enter"])?;
+            runtime.run_action(
+                pane_id,
+                Some(&request.session_name),
+                &format!("select-numbered-option:{current}:{target}"),
+            )?
         }
         InteractionMode::Readonly => {
             return Err(AppError::with_exit_code(
@@ -379,24 +291,26 @@ fn run_instance_interaction(
                 409,
             ));
         }
-    }
+    };
 
     Ok(json!({
         "ok": true,
-        "pane_id": pane.pane_id,
+        "pane_id": result.pane_id,
         "selected_option": interaction_option_json(option),
         "interaction_mode": interaction.mode.as_str(),
+        "executed": result.executed,
+        "after_state": result.after_state,
+        "detail": result.detail,
     }))
 }
 
 fn run_instance_prompt(
-    client: &TmuxClient,
+    runtime: &RuntimeClient,
     request: &ServeRequest,
     pane_id: &str,
     body: &serde_json::Value,
 ) -> AppResult<serde_json::Value> {
-    let pane = resolve_api_pane(client, request, pane_id)?;
-    ensure_pane_owned_by_claude(&pane)?;
+    ensure_target_pane(request, pane_id)?;
     let prompt_text = body
         .get("text")
         .and_then(serde_json::Value::as_str)
@@ -414,11 +328,9 @@ fn run_instance_prompt(
         ));
     }
 
-    let submitted = submit_prompt_for_pane(
-        client,
-        &pane,
+    let submitted = runtime.submit_prompt(
         &request.session_name,
-        request.state_dir.as_deref(),
+        pane_id,
         workspace,
         prompt_text,
         submit_delay_ms,
@@ -426,167 +338,26 @@ fn run_instance_prompt(
     Ok(json!({
         "ok": true,
         "pane_id": submitted.pane_id,
-        "workspace_id": submitted.workspace_id,
-        "state": submitted.state,
-        "state_db": submitted.state_db.display().to_string(),
-        "delay_ms": submitted.delay_ms,
+        "action": submitted.action,
+        "executed": submitted.executed,
+        "after_state": submitted.after_state,
+        "detail": submitted.detail,
     }))
 }
 
-fn run_instance_auto_unstick(client: &TmuxClient, pane: &TmuxPane) -> AppResult<serde_json::Value> {
-    let mut actions = Vec::new();
-    let mut approved_permission = false;
-    let mut current = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-
-    for _ in 0..3 {
-        if matches!(
-            current.state,
-            SessionState::ChatReady | SessionState::BusyResponding
-        ) {
-            return Ok(json!({
-                "ok": true,
-                "pane_id": pane.pane_id,
-                "final_state": current.state.as_str(),
-                "actions": actions,
-                "steps": actions.len(),
-            }));
-        }
-        if approved_permission && current.state == SessionState::PermissionDialog {
-            return Err(AppError::with_exit_code(
-                format!(
-                    "auto-unstick refuses to approve more than one permission dialog for pane {}",
-                    pane.pane_id
-                ),
-                409,
-            ));
-        }
-
-        let outcome = continue_from_classification(client, pane, &current)?;
-        if outcome.used_permission_approval {
-            approved_permission = true;
-        }
-        actions.push(outcome.action.clone());
-        current = outcome.after;
-    }
-
-    if matches!(
-        current.state,
-        SessionState::ChatReady | SessionState::BusyResponding
-    ) {
-        Ok(json!({
-            "ok": true,
-            "pane_id": pane.pane_id,
-            "final_state": current.state.as_str(),
-            "actions": actions,
-            "steps": actions.len(),
-        }))
-    } else {
-        Err(AppError::with_exit_code(
-            format!(
-                "auto-unstick stopped after {} steps with pane {} still in state {}",
-                actions.len(),
-                pane.pane_id,
-                current.state.as_str()
-            ),
-            409,
-        ))
-    }
-}
-
-fn continue_outcome_json(pane: &TmuxPane, outcome: &ContinueOutcome) -> serde_json::Value {
-    json!({
-        "ok": true,
-        "pane_id": pane.pane_id,
-        "action": outcome.action,
-        "outcome": outcome.outcome,
-        "after_state": outcome.after.state.as_str(),
-        "used_permission_approval": outcome.used_permission_approval,
-    })
-}
-
-fn resolve_api_pane(
-    client: &TmuxClient,
-    request: &ServeRequest,
-    pane_id: &str,
-) -> AppResult<TmuxPane> {
-    let pane = client
-        .pane_by_target(pane_id)?
-        .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
-    if pane.session_name != request.session_name {
+fn ensure_target_pane(request: &ServeRequest, pane_id: &str) -> AppResult<()> {
+    if request
+        .target_pane
+        .as_deref()
+        .map(|target| target != pane_id)
+        .unwrap_or(false)
+    {
         return Err(AppError::with_exit_code(
-            format!(
-                "pane {} belongs to session {} but this api serves {}",
-                pane_id, pane.session_name, request.session_name
-            ),
+            format!("pane not found: {pane_id}"),
             404,
         ));
     }
-    Ok(pane)
-}
-
-fn list_requested_panes(client: &TmuxClient, request: &ServeRequest) -> AppResult<Vec<TmuxPane>> {
-    match &request.target_pane {
-        Some(pane_id) => Ok(vec![resolve_api_pane(client, request, pane_id)?]),
-        None => client.list_panes_for_target(Some(&request.session_name)),
-    }
-}
-
-fn pane_json(pane: &TmuxPane) -> serde_json::Value {
-    json!({
-        "pane_id": pane.pane_id,
-        "pane_tty": pane.pane_tty,
-        "pane_pid": pane.pane_pid,
-        "session_id": pane.session_id,
-        "session_name": pane.session_name,
-        "window_id": pane.window_id,
-        "window_index": pane.window_index,
-        "window_name": pane.window_name,
-        "pane_index": pane.pane_index,
-        "current_command": pane.current_command,
-        "current_path": pane.current_path,
-        "pane_active": pane.pane_active,
-        "cursor_x": pane.cursor_x,
-        "cursor_y": pane.cursor_y,
-    })
-}
-
-fn classification_json(inspected: &InspectedPane) -> serde_json::Value {
-    json!({
-        "source": inspected.classification.source,
-        "state": inspected.classification.state.as_str(),
-        "has_questions": inspected.classification.has_questions,
-        "recap_present": inspected.classification.recap_present,
-        "recap_excerpt": inspected.classification.recap_excerpt,
-        "signals": inspected.classification.signals,
-    })
-}
-
-fn permission_prompt_json(inspected: &InspectedPane) -> serde_json::Value {
-    match extract_permission_prompt_details(inspected) {
-        Some(details) => json!({
-            "prompt_type": details.prompt_type,
-            "sandbox_mode": details.sandbox_mode,
-            "command": details.command,
-            "reason": details.reason,
-            "question": details.question,
-        }),
-        None => serde_json::Value::Null,
-    }
-}
-
-fn interaction_summary_json(inspected: &InspectedPane) -> serde_json::Value {
-    match parse_interaction_surface(inspected) {
-        Some(surface) => json!({
-            "mode": surface.mode.as_str(),
-            "selected_option": surface.selected_option,
-            "options": surface
-                .options
-                .iter()
-                .map(interaction_option_json)
-                .collect::<Vec<_>>(),
-        }),
-        None => serde_json::Value::Null,
-    }
+    Ok(())
 }
 
 fn interaction_detail_json(inspected: &InspectedPane) -> serde_json::Value {
