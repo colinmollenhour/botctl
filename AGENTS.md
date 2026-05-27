@@ -73,7 +73,7 @@ agy: no completed assistant message visible in pane scrollback; the extractor re
 
 Use `--history-lines` to increase the scrollback window if the response was truncated.
 
-State classification maps `? for shortcuts` to `ChatReady`, `esc to cancel` or Braille spinner glyphs to `BusyResponding`, and permission/trust overlays to `Unknown`. Cook time is derived from `BusyResponding` state using the standard derivation. YOLO, prompt submission, and keybinding automation are not supported for Antigravity in v1.
+State classification maps `? for shortcuts` to `ChatReady`, `esc to cancel` or Braille spinner glyphs to `BusyResponding`, the captured command-permission prompt to `AgyCommandPermissionPrompt`, the folder-trust prompt to `AgyFolderTrustPrompt`, and the settings-persist/allow-once overlay to `AgySettingsPersistPrompt`. Other agy permission-shaped overlays still classify as `Unknown`. Cook time is derived from `BusyResponding` state using the standard derivation. YOLO command-permission auto-approve is opt-in per pane via `yolo start --pane <agy-pane>` and sends raw `Enter` only when the cursor is on the captured default option (`> 1. Yes`) and `current_command == "agy"`. Folder-trust and settings-persist agy shapes classify but require manual review. Prompt submission and Claude-style keybinding automation are not supported for Antigravity.
 
 The dashboard glyph is `⚛` (U+269B ATOM SYMBOL, single-width). The provider label is `Antigravity` (used in both the dashboard detail view and `status`/`doctor` output). The compact pane-source marker character is `A`.
 

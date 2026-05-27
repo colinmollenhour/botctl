@@ -161,7 +161,9 @@ impl GuardedWorkflow {
             Self::ApprovePermission => {
                 matches!(
                     state,
-                    SessionState::PermissionDialog | SessionState::FolderTrustPrompt
+                    SessionState::PermissionDialog
+                        | SessionState::FolderTrustPrompt
+                        | SessionState::AgyCommandPermissionPrompt
                 )
             }
             _ => state == self.required_state(),
@@ -170,7 +172,9 @@ impl GuardedWorkflow {
 
     pub fn required_states_description(self) -> &'static str {
         match self {
-            Self::ApprovePermission => "PermissionDialog|FolderTrustPrompt",
+            Self::ApprovePermission => {
+                "PermissionDialog|FolderTrustPrompt|AgyCommandPermissionPrompt"
+            }
             _ => self.required_state().as_str(),
         }
     }
@@ -718,6 +722,55 @@ mod tests {
 
         validate_workflow_state(GuardedWorkflow::ApprovePermission, &classification)
             .expect("approve should accept folder trust prompt");
+    }
+
+    #[test]
+    fn approve_permission_accepts_agy_command_permission() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::AgyCommandPermissionPrompt,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("agy-keywords")],
+        };
+
+        validate_workflow_state(GuardedWorkflow::ApprovePermission, &classification)
+            .expect("approve should accept agy command-permission prompt");
+    }
+
+    #[test]
+    fn approve_permission_does_not_accept_agy_folder_trust() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::AgyFolderTrustPrompt,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("agy-keywords")],
+        };
+
+        let error = validate_workflow_state(GuardedWorkflow::ApprovePermission, &classification)
+            .expect_err("approve must refuse the agy folder-trust shape");
+        assert!(error.contains("AgyCommandPermissionPrompt"));
+        assert!(error.contains("AgyFolderTrustPrompt"));
+    }
+
+    #[test]
+    fn approve_permission_does_not_accept_agy_settings_persist() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::AgySettingsPersistPrompt,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from("agy-keywords")],
+        };
+
+        let error = validate_workflow_state(GuardedWorkflow::ApprovePermission, &classification)
+            .expect_err("approve must refuse the agy settings-persist shape");
+        assert!(error.contains("AgyCommandPermissionPrompt"));
+        assert!(error.contains("AgySettingsPersistPrompt"));
     }
 
     #[test]

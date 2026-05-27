@@ -1818,6 +1818,9 @@ fn detail_body_kind(pane: &PaneEntry) -> DetailBodyKind {
         | SessionState::SurveyPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
+        | SessionState::AgyCommandPermissionPrompt
+        | SessionState::AgyFolderTrustPrompt
+        | SessionState::AgySettingsPersistPrompt
         | SessionState::Unknown => DetailBodyKind::BlockingDialog,
         SessionState::ChatReady if pane.recap_present => DetailBodyKind::Recap,
         SessionState::BusyResponding | SessionState::ChatReady => DetailBodyKind::Context,
@@ -2303,16 +2306,24 @@ fn is_cooking_state(state: SessionState) -> bool {
 }
 
 fn is_waiting_state(state: SessionState) -> bool {
+    // `AgyCommandPermissionPrompt` is included because YOLO can auto-approve
+    // it (so wait-duration accounting stays meaningful). The other two agy
+    // shapes are operator-blocking — they are NOT "still working" states and
+    // intentionally remain excluded.
     matches!(
         state,
         SessionState::ChatReady
             | SessionState::PromptEditing
             | SessionState::PermissionDialog
             | SessionState::FolderTrustPrompt
+            | SessionState::AgyCommandPermissionPrompt
     )
 }
 
 fn is_attention_state(state: SessionState) -> bool {
+    // All three agy permission shapes warrant operator attention: only the
+    // command-permission shape may auto-approve, and even then the operator
+    // benefits from the dashboard cursor landing on the pane while waiting.
     matches!(
         state,
         SessionState::PermissionDialog
@@ -2323,6 +2334,9 @@ fn is_attention_state(state: SessionState) -> bool {
             | SessionState::SurveyPrompt
             | SessionState::ExternalEditorActive
             | SessionState::DiffDialog
+            | SessionState::AgyCommandPermissionPrompt
+            | SessionState::AgyFolderTrustPrompt
+            | SessionState::AgySettingsPersistPrompt
             | SessionState::Unknown
     )
 }
@@ -2366,6 +2380,10 @@ fn yolo_marker(enabled: bool) -> &'static str {
 
 #[cfg(any(test, rust_analyzer))]
 fn state_marker(state: SessionState, has_questions: bool) -> &'static str {
+    // Distinct markers for the three agy shapes so an operator scanning the
+    // dashboard can distinguish "will auto-approve" (lowercase `p`) from
+    // "requires manual review" (`f`, `s`). Lowercase `p` preserves the 1:1
+    // mapping invariant (no marker shared between two states).
     match state {
         SessionState::BusyResponding => "B",
         SessionState::PromptEditing => "E",
@@ -2378,11 +2396,19 @@ fn state_marker(state: SessionState, has_questions: bool) -> &'static str {
         SessionState::SurveyPrompt => "S",
         SessionState::ExternalEditorActive => "V",
         SessionState::DiffDialog => "D",
+        SessionState::AgyCommandPermissionPrompt => "p",
+        SessionState::AgyFolderTrustPrompt => "f",
+        SessionState::AgySettingsPersistPrompt => "s",
         SessionState::Unknown => "?",
     }
 }
 
 fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
+    // Agy emojis: command-permission shares the lock (`🔐`) with Claude
+    // PermissionDialog — the marker disambiguates. Folder-trust uses an open
+    // folder (`📂`) to distinguish from FolderTrustPrompt's closed folder
+    // (`📁`). Settings-persist uses the gear (`⚙️`) since it writes to
+    // `settings.json`.
     match state {
         SessionState::BusyResponding => "⚙️",
         SessionState::PromptEditing => "💬",
@@ -2395,6 +2421,9 @@ fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
         SessionState::SurveyPrompt => "📝",
         SessionState::ExternalEditorActive => "✏️",
         SessionState::DiffDialog => "🧾",
+        SessionState::AgyCommandPermissionPrompt => "🔐",
+        SessionState::AgyFolderTrustPrompt => "📂",
+        SessionState::AgySettingsPersistPrompt => "⚙️",
         SessionState::Unknown => "❔",
     }
 }
@@ -2914,14 +2943,15 @@ mod tests {
         dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
         detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
         footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
-        format_memory_gauge, is_codex_candidate_pane, is_codex_screen, is_cooking_state,
-        is_opencode_candidate_pane, load_saved_selection, pad_display_right, pane_list_columns,
-        pane_list_content_area, pane_source_for_non_runtime_pane_with, pane_window_prefix,
-        parse_process_stat, recap_lines, rect_contains, render_workspace_header_line,
-        repo_root_from_repo_key, save_selection, select_agent_process, select_tail_lines_for_rows,
-        should_return_navigation, split_workspace_header, state_emoji, state_marker,
-        strip_dashboard_emoji_prefixes, tmux_object_id_order, window_target, workspace_group_key,
-        workspace_group_label, yes_count_key, yolo_column_contains,
+        format_memory_gauge, is_attention_state, is_codex_candidate_pane, is_codex_screen,
+        is_cooking_state, is_opencode_candidate_pane, is_waiting_state, load_saved_selection,
+        pad_display_right, pane_list_columns, pane_list_content_area,
+        pane_source_for_non_runtime_pane_with, pane_window_prefix, parse_process_stat, recap_lines,
+        rect_contains, render_workspace_header_line, repo_root_from_repo_key, save_selection,
+        select_agent_process, select_tail_lines_for_rows, should_return_navigation,
+        split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
+        tmux_object_id_order, window_target, workspace_group_key, workspace_group_label,
+        yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::runtime::RuntimeClient;
@@ -3014,6 +3044,19 @@ mod tests {
         assert_eq!(state_emoji(SessionState::PlanApprovalPrompt, false), "❓");
         assert_eq!(state_emoji(SessionState::PromptEditing, false), "💬");
         assert_eq!(state_emoji(SessionState::ChatReady, true), "🤔");
+        // Per-shape agy emojis (folder-trust uses the open folder so it does
+        // not collide with FolderTrustPrompt; settings-persist uses the gear
+        // to communicate "writes settings.json").
+        assert_eq!(
+            state_emoji(SessionState::AgyCommandPermissionPrompt, false),
+            "🔐"
+        );
+        assert_eq!(state_emoji(SessionState::AgyFolderTrustPrompt, false), "📂");
+        assert_eq!(state_emoji(SessionState::FolderTrustPrompt, false), "📁");
+        assert_eq!(
+            state_emoji(SessionState::AgySettingsPersistPrompt, false),
+            "⚙️"
+        );
     }
 
     #[test]
@@ -3132,6 +3175,33 @@ mod tests {
         assert_eq!(state_marker(SessionState::ChatReady, true), "Q");
         assert_eq!(state_marker(SessionState::ChatReady, false), "I");
         assert_eq!(state_marker(SessionState::PermissionDialog, false), "P");
+        // Lowercase distinct markers for the three agy shapes — preserves the
+        // 1:1 invariant so an operator can map glyph → state by eye.
+        assert_eq!(
+            state_marker(SessionState::AgyCommandPermissionPrompt, false),
+            "p"
+        );
+        assert_eq!(state_marker(SessionState::AgyFolderTrustPrompt, false), "f");
+        assert_eq!(
+            state_marker(SessionState::AgySettingsPersistPrompt, false),
+            "s"
+        );
+    }
+
+    #[test]
+    fn is_attention_state_includes_all_agy_shapes() {
+        assert!(is_attention_state(SessionState::AgyCommandPermissionPrompt));
+        assert!(is_attention_state(SessionState::AgyFolderTrustPrompt));
+        assert!(is_attention_state(SessionState::AgySettingsPersistPrompt));
+    }
+
+    #[test]
+    fn is_waiting_state_only_includes_agy_command_permission() {
+        // Only the auto-approvable shape counts as "waiting" for telemetry
+        // purposes; the other two are operator-blocking.
+        assert!(is_waiting_state(SessionState::AgyCommandPermissionPrompt));
+        assert!(!is_waiting_state(SessionState::AgyFolderTrustPrompt));
+        assert!(!is_waiting_state(SessionState::AgySettingsPersistPrompt));
     }
 
     #[test]

@@ -4,7 +4,7 @@ This guide collects the shipped operator flows.
 
 For command syntax, see [command reference](./command-reference.mdx). For prompt handoff details, see [prompt handoff](./prompt-handoff.mdx).
 
-Claude Code panes support guarded automation and prompt workflows. Codex CLI panes are supported through screen-capture classification with narrow YOLO approval for command permission dialogs. OpenCode panes are supported passively in the dashboard when `botctl` can safely match the tmux pane to OpenCode's SQLite session database. Pi panes are supported passively when a `pi` tmux pane can be matched to a JSONL session under `~/.pi/agent/sessions`. Antigravity (`agy`) panes are supported passively for dashboard visibility, state classification, and pane-scrape last-message extraction when the pane command is `agy` and a secondary signal is present.
+Claude Code panes support guarded automation and prompt workflows. Codex CLI panes are supported through screen-capture classification with narrow YOLO approval for command permission dialogs. OpenCode panes are supported passively in the dashboard when `botctl` can safely match the tmux pane to OpenCode's SQLite session database. Pi panes are supported passively when a `pi` tmux pane can be matched to a JSONL session under `~/.pi/agent/sessions`. Antigravity (`agy`) panes are supported for dashboard visibility, per-shape state classification (`AgyCommandPermissionPrompt`, `AgyFolderTrustPrompt`, `AgySettingsPersistPrompt`), pane-scrape last-message extraction, and opt-in YOLO command-permission auto-approve. Opt-in is per-pane via `yolo start --pane <agy-pane>`; folder-trust and settings-persist remain manual.
 
 ## Main operator loop
 
@@ -124,6 +124,7 @@ Use the direct pane-targeted actions only when the classified state matches the 
 | --- | --- | --- |
 | `PermissionDialog` | `approve` or `reject` | `approve` uses the user's Claude confirmation binding for Claude panes; Codex YOLO sends raw `y` only for Codex command permission dialogs. |
 | `FolderTrustPrompt` | `approve` | Sends raw `Enter`, not the user's `confirm-yes` binding. |
+| `AgyCommandPermissionPrompt` | `yolo start --pane <agy-pane>` | Opt-in YOLO sends raw `Enter` only when the cursor is on the captured `> 1. Yes` default and `current_command == "agy"`. Folder-trust and settings-persist agy shapes are not auto-approved. |
 | `SurveyPrompt` | `dismiss-survey` | Sends raw `0`. |
 | `ChatReady` or `BusyResponding` after a pause | `continue-session` | Refuses unsupported states. |
 | Repeated safe blockers | `auto-unstick` | Bounded recovery loop; stops rather than guessing. |

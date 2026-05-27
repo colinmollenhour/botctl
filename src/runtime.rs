@@ -20,7 +20,7 @@ use crate::app::{
     ensure_pane_owned_by_claude, ensure_pane_owned_by_yolo_provider, ensure_workflow_state,
     execute_automation_action, execute_classified_workflow, extract_permission_prompt_details,
     inspect_pane, is_yolo_safe_to_approve, render_next_safe_action, render_screen_excerpt,
-    resolve_workspace_for_pane, submit_prompt_for_pane,
+    resolve_workspace_for_pane, submit_prompt_for_pane, yolo_action_for_state,
 };
 use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection};
 use crate::classifier::{Classification, SessionState};
@@ -452,6 +452,13 @@ struct TrackedPane {
     screen_model_seeded: bool,
     dirty: bool,
     last_stream_activity: Option<Instant>,
+    /// `Some(raw_source)` immediately after a successful YOLO approve.
+    /// `maybe_run_yolo_action` skips the next call if the current snapshot's
+    /// `raw_source` still matches this — that means the agy UI has not yet
+    /// redrawn so re-firing `Enter` would land on whatever the post-approve
+    /// frame is showing (potentially a downstream prompt). Cleared on the
+    /// first reconcile pass whose `raw_source` differs.
+    post_approve_guard_raw_source: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1327,12 +1334,21 @@ fn reconcile_all(
                         screen_model_seeded: false,
                         dirty: false,
                         last_stream_activity: None,
+                        post_approve_guard_raw_source: None,
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let tracked = entry.get_mut();
                     if tracked.snapshot.classification.state != inspected.classification.state {
                         state_changed = Some(inspected.classification.state);
+                    }
+                    // Clear the post-approve guard once the frame has changed
+                    // — the agy UI has redrawn, so it is safe to evaluate the
+                    // next prompt on its own merits.
+                    if let Some(prev_raw) = tracked.post_approve_guard_raw_source.as_deref() {
+                        if prev_raw != inspected.raw_source.as_str() {
+                            tracked.post_approve_guard_raw_source = None;
+                        }
                     }
                     tracked.pane = pane.clone();
                     tracked.workspace = workspace;
@@ -1403,6 +1419,24 @@ fn maybe_run_yolo_action(
         return Ok(());
     }
 
+    // Post-approve guard: if the previous reconcile pass already approved this
+    // exact frame (same `raw_source`), skip — the agy UI has not yet redrawn
+    // and re-firing `Enter` would land on whatever the post-approve frame is
+    // showing. The guard is cleared by `reconcile_all` once `raw_source`
+    // changes.
+    {
+        let locked = shared.lock().unwrap();
+        if let Some(tracked) = locked.panes.get(&snapshot.pane.pane_id) {
+            if tracked
+                .post_approve_guard_raw_source
+                .as_deref()
+                .is_some_and(|prev| prev == snapshot.raw_source.as_str())
+            {
+                return Ok(());
+            }
+        }
+    }
+
     let Some(record) = read_yolo_record(&config.state_dir, &snapshot.pane.pane_id)? else {
         return Ok(());
     };
@@ -1436,16 +1470,30 @@ fn maybe_run_yolo_action(
     };
 
     let inspected = snapshot.to_inspected_pane();
-    if workflow == GuardedWorkflow::ApprovePermission && !is_yolo_safe_to_approve(&inspected) {
+    if workflow == GuardedWorkflow::ApprovePermission
+        && !is_yolo_safe_to_approve(&inspected, &snapshot.pane)
+    {
         return Ok(());
     }
+
+    // Resolve the `YoloAction` once so both `action-requested` and
+    // `action-executed` payloads carry it in their summary. This lets log
+    // consumers distinguish a Claude approve from an agy command-permission
+    // approve even though both share `GuardedWorkflow::ApprovePermission`.
+    let yolo_action = yolo_action_for_state(snapshot.classification.state);
+    let action_summary = format!(
+        "yolo {} {} {}",
+        snapshot.pane.pane_id,
+        workflow.as_str(),
+        yolo_action.as_str()
+    );
 
     emit_shared_event(
         shared,
         Some(snapshot.pane.pane_id.clone()),
         Some(snapshot.workspace_id.clone()),
         "action-requested",
-        format!("yolo {} {}", snapshot.pane.pane_id, workflow.as_str()),
+        action_summary.clone(),
         Some(snapshot.clone()),
     );
     match execute_classified_workflow(
@@ -1457,16 +1505,36 @@ fn maybe_run_yolo_action(
         Ok(executed) => {
             let after = inspect_pane(client, &snapshot.pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
             let mut next_snapshot = snapshot.clone();
-            next_snapshot.classification = after.classification;
-            next_snapshot.focused_source = after.focused_source;
-            next_snapshot.raw_source = after.raw_source;
+            next_snapshot.classification = after.classification.clone();
+            next_snapshot.focused_source = after.focused_source.clone();
+            next_snapshot.raw_source = after.raw_source.clone();
             next_snapshot.last_action = Some(executed);
+            // Write the refreshed snapshot back into `shared.panes` and arm the
+            // post-approve guard with the pre-approve `raw_source`. The next
+            // reconcile pass will skip re-firing if `raw_source` is still
+            // unchanged (UI has not redrawn yet) and clear the guard once it
+            // diverges. The `ActionGuard` released on `Drop` here only covers
+            // concurrent calls within the same reconcile.
+            {
+                let mut locked = shared.lock().unwrap();
+                if let Some(tracked) = locked.panes.get_mut(&snapshot.pane.pane_id) {
+                    tracked.snapshot.classification = after.classification.clone();
+                    tracked.snapshot.focused_source = after.focused_source.clone();
+                    tracked.snapshot.raw_source = after.raw_source.clone();
+                    tracked.snapshot.last_action = next_snapshot.last_action.clone();
+                    tracked.signature = SnapshotSignature {
+                        pane: tracked.pane.clone(),
+                        classification: after.classification,
+                    };
+                    tracked.post_approve_guard_raw_source = Some(snapshot.raw_source.clone());
+                }
+            }
             emit_shared_event(
                 shared,
                 Some(snapshot.pane.pane_id.clone()),
                 Some(snapshot.workspace_id.clone()),
                 "action-executed",
-                format!("yolo {} {}", snapshot.pane.pane_id, workflow.as_str()),
+                action_summary.clone(),
                 Some(next_snapshot),
             );
         }
@@ -1488,17 +1556,26 @@ fn maybe_run_yolo_action(
 fn yolo_workflow(snapshot: &RuntimePaneSnapshot) -> Option<GuardedWorkflow> {
     match snapshot.classification.state {
         SessionState::PermissionDialog => Some(GuardedWorkflow::ApprovePermission),
+        // Agy command-permission auto-approve. Mapped to `ApprovePermission`
+        // because `raw_key_for_workflow` short-circuits this state in
+        // `execute_classified_workflow` and emits raw `Enter`, exactly
+        // mirroring the FolderTrustPrompt special case. The per-shape safety
+        // gate runs in `is_yolo_safe_to_approve` above.
+        SessionState::AgyCommandPermissionPrompt => Some(GuardedWorkflow::ApprovePermission),
         SessionState::SurveyPrompt => Some(GuardedWorkflow::DismissSurvey),
         _ => None,
     }
 }
 
 fn is_runtime_discovery_candidate(pane: &TmuxPane) -> bool {
-    pane.current_command.eq_ignore_ascii_case("claude") || is_yolo_candidate_pane(pane)
+    pane.current_command.eq_ignore_ascii_case("claude")
+        || pane.current_command.eq_ignore_ascii_case("agy")
+        || is_yolo_candidate_pane(pane)
 }
 
 fn is_yolo_candidate_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("codex")
+        || pane.current_command.eq_ignore_ascii_case("agy")
         || (pane.current_command.eq_ignore_ascii_case("node")
             && !pane.pane_title.starts_with("OC | "))
 }
@@ -1869,8 +1946,63 @@ pub fn build_instance_detail_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeEvent, RuntimeResponse, runtime_socket_path};
+    use super::{
+        RuntimeEvent, RuntimeResponse, is_runtime_discovery_candidate, is_yolo_candidate_pane,
+        runtime_socket_path,
+    };
+    use crate::tmux::TmuxPane;
     use std::path::Path;
+
+    fn sample_pane(current_command: &str) -> TmuxPane {
+        TmuxPane {
+            pane_id: String::from("%1"),
+            pane_tty: String::from("/dev/pts/1"),
+            pane_pid: Some(1234),
+            session_id: String::from("$1"),
+            session_name: String::from("demo"),
+            window_id: String::from("@2"),
+            window_index: 1,
+            window_name: String::from("demo"),
+            pane_index: 0,
+            current_command: current_command.to_string(),
+            current_path: String::from("/tmp/demo"),
+            pane_title: String::new(),
+            pane_active: true,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+        }
+    }
+
+    #[test]
+    fn is_runtime_discovery_candidate_admits_agy_pane() {
+        assert!(is_runtime_discovery_candidate(&sample_pane("agy")));
+        // Casing must not matter — `pane.current_command` may arrive
+        // capitalised on some installs.
+        assert!(is_runtime_discovery_candidate(&sample_pane("Agy")));
+    }
+
+    #[test]
+    fn is_runtime_discovery_candidate_admits_claude_and_codex_panes() {
+        assert!(is_runtime_discovery_candidate(&sample_pane("claude")));
+        assert!(is_runtime_discovery_candidate(&sample_pane("codex")));
+    }
+
+    #[test]
+    fn is_runtime_discovery_candidate_rejects_bash_pane() {
+        assert!(!is_runtime_discovery_candidate(&sample_pane("bash")));
+        assert!(!is_runtime_discovery_candidate(&sample_pane("zsh")));
+    }
+
+    #[test]
+    fn is_yolo_candidate_pane_admits_agy_pane() {
+        assert!(is_yolo_candidate_pane(&sample_pane("agy")));
+        assert!(is_yolo_candidate_pane(&sample_pane("AGY")));
+    }
+
+    #[test]
+    fn is_yolo_candidate_pane_rejects_bash_pane() {
+        assert!(!is_yolo_candidate_pane(&sample_pane("bash")));
+    }
 
     #[test]
     fn runtime_socket_path_uses_state_dir() {
