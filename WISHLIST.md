@@ -9,6 +9,31 @@
 
 ### AGY-001 Protobuf transcript reader for Antigravity conversations
 
+> **Update: encryption discovery** (inline note — deferred)
+>
+> Observed: live `~/.gemini/antigravity-cli/conversations/<uuid>.pb` files are uniformly
+> high-entropy from byte 0 with no inline ASCII. `strings <file>` returns only short noise
+> fragments — no recognizable English text, no obvious protobuf field tags. This is consistent
+> with `Encrypt(serialize(Conversation))` rather than raw protobuf.
+>
+> Implication: the wishlist's plan to "add a `.proto` definition + `prost-build`" cannot reach
+> the stated end-state without first solving the encryption layer.
+>
+> Status: **deferred**. Three follow-up paths for a future contributor:
+> 1. Confirm encryption with a fresh capture: capture a new conversation, immediately hex-dump
+>    the `.pb` and compare first 16 bytes against known protobuf varint patterns. If the first
+>    byte is `0x0a` (field 1, wire type 2 = length-delimited string) it is likely raw protobuf;
+>    a non-`0x0a` header byte is suggestive of encryption or custom framing, but is not definitive
+>    — check all known protobuf wire-type bytes (0x08, 0x0a, 0x10, 0x12, …) before concluding
+>    the file is encrypted.
+> 2. Identify a deterministic local wrap key under `~/.gemini/` — look for a `keyring`, `token`,
+>    or `credentials` file; check if the `agy` binary embeds a hard-coded salt; try to correlate
+>    the `.pb` file's first 16 bytes with a known symmetric cipher header (AES-GCM nonce, etc.).
+> 3. Pivot to relying on FD detection + pane scrape: the FD-walk identification half already
+>    works (`conversation_id_from_process_tree_fds`). The pane-scrape extractor
+>    (`extract_last_assistant_text`) is the current authoritative path and can be kept as-is
+>    until the encryption layer is solved.
+
 Replace the current pane-scrape `last-message` path for Antigravity with a direct reader for `~/.gemini/antigravity-cli/conversations/<uuid>.pb` (and `ANTIGRAVITY_STATE_DIR` overrides).
 
 Today `load_agy_last_message()` captures the pane scrollback, strips ANSI, and looks for three horizontal-rule lines to bracket the latest assistant turn. That works for live operator use but has known limitations:
