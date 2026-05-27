@@ -25,11 +25,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::AppResult;
 use crate::classifier::{Classifier, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
+use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::opencode::resolve_opencode_session_for_pane;
 use crate::pi::resolve_pi_session_for_pane;
 use crate::prompt::resolve_state_dir;
 use crate::runtime::RuntimeClient;
-use crate::storage::{WorkspaceRecord, bootstrap_state_db, sync_tmux_cook_state};
+use crate::storage::{WorkspaceRecord, bootstrap_state_db, sync_tmux_runtime_state};
 use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
 
 const FOOTER_LINE1: &[(&str, &str)] = &[
@@ -305,11 +306,26 @@ impl DashboardApp {
             });
             next_frames.insert(pane.pane_id.clone(), snapshot.raw_source.clone());
             let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
-            let cook_duration = sync_tmux_cook_state(
+            let codex_session_id = if matches!(source, PaneSource::Codex) {
+                resolve_codex_session_id_for_pane(&pane)?
+            } else {
+                None
+            };
+            let session_key = match &source {
+                PaneSource::Claude => snapshot.claude_session_id.as_deref(),
+                PaneSource::Codex => codex_session_id.as_deref(),
+                PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
+                    Some(session_id.as_str())
+                }
+            };
+            let runtime_durations = sync_tmux_runtime_state(
                 &self.state_dir,
                 &workspace.id,
                 &pane,
+                state.as_str(),
+                is_waiting_state(state),
                 is_cooking_state(state),
+                session_key,
             )?;
             let yes_count = self
                 .yes_counts
@@ -335,8 +351,8 @@ impl DashboardApp {
                 yolo_effective: snapshot.actual_yolo_enabled,
                 yolo_stop_reason: snapshot.last_stop_reason.clone(),
                 age,
-                cook_duration,
-                wait_duration: snapshot.wait_duration_ms.map(Duration::from_millis),
+                cook_duration: runtime_durations.cook_duration.unwrap_or_default(),
+                wait_duration: runtime_durations.wait_duration,
                 yes_count,
                 claude_session_id: snapshot.claude_session_id.clone(),
                 focused_source: snapshot.focused_source.clone(),
@@ -382,11 +398,26 @@ impl DashboardApp {
             });
             next_frames.insert(pane.pane_id.clone(), frame.clone());
             let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
-            let cook_duration = sync_tmux_cook_state(
+            let codex_session_id = if matches!(source, PaneSource::Codex) {
+                resolve_codex_session_id_for_pane(&pane)?
+            } else {
+                None
+            };
+            let session_key = match &source {
+                PaneSource::Claude => None,
+                PaneSource::Codex => codex_session_id.as_deref(),
+                PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
+                    Some(session_id.as_str())
+                }
+            };
+            let runtime_durations = sync_tmux_runtime_state(
                 &self.state_dir,
                 &workspace.id,
                 &pane,
+                state.as_str(),
+                is_waiting_state(state),
                 is_cooking_state(state),
+                session_key,
             )?;
 
             panes.push(PaneEntry {
@@ -404,8 +435,8 @@ impl DashboardApp {
                 yolo_effective: false,
                 yolo_stop_reason: None,
                 age,
-                cook_duration,
-                wait_duration: None,
+                cook_duration: runtime_durations.cook_duration.unwrap_or_default(),
+                wait_duration: runtime_durations.wait_duration,
                 yes_count: 0,
                 claude_session_id: None,
                 focused_source: focused_dashboard_frame(&frame),
@@ -2149,6 +2180,16 @@ fn abbreviate_home_path(path: &str) -> String {
 
 fn is_cooking_state(state: SessionState) -> bool {
     matches!(state, SessionState::BusyResponding)
+}
+
+fn is_waiting_state(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::ChatReady
+            | SessionState::PromptEditing
+            | SessionState::PermissionDialog
+            | SessionState::FolderTrustPrompt
+    )
 }
 
 fn is_attention_state(state: SessionState) -> bool {

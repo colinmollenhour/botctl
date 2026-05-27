@@ -117,6 +117,10 @@ fn load_codex_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
     })
 }
 
+pub fn resolve_codex_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<String>> {
+    Ok(resolve_codex_transcript_for_pane(pane)?.map(|(session_id, _)| session_id))
+}
+
 fn resolve_claude_transcript_for_pane(pane: &TmuxPane) -> AppResult<Option<(String, PathBuf)>> {
     let Some(projects_root) = home_dir().map(|home| home.join(CLAUDE_PROJECTS_DIR)) else {
         return Ok(None);

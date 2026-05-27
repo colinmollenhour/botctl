@@ -24,11 +24,12 @@ use crate::app::{
 };
 use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection};
 use crate::classifier::{Classification, SessionState};
+use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
 use crate::screen_model::ScreenModel;
 use crate::storage::{
     WorkspaceRecord, list_babysit_registration_pane_ids, resolve_workspace,
-    resolve_workspace_for_path, sync_tmux_claude_session_id, sync_tmux_wait_state,
+    resolve_workspace_for_path, sync_tmux_claude_session_id, sync_tmux_runtime_state,
 };
 use crate::tmux::{ControlModeReceive, TmuxClient, TmuxPane};
 use crate::yolo::{YoloRecord, disable_yolo_record, read_yolo_record, write_yolo_record};
@@ -1244,15 +1245,22 @@ fn reconcile_all(
         let workspace =
             resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
         let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
-        let wait_duration = sync_tmux_wait_state(
+        let claude_session_id =
+            sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
+        let codex_session_id = if is_yolo_candidate_pane(&pane) {
+            resolve_codex_session_id_for_pane(&pane)?
+        } else {
+            None
+        };
+        let runtime_durations = sync_tmux_runtime_state(
             &config.state_dir,
             &workspace.id,
             &pane,
             inspected.classification.state.as_str(),
             is_waiting_state(inspected.classification.state),
+            inspected.classification.state == SessionState::BusyResponding,
+            claude_session_id.as_deref().or(codex_session_id.as_deref()),
         )?;
-        let claude_session_id =
-            sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
         let desired_yolo_enabled = matches!(read_yolo_record(&config.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
 
         let live_excerpt = {
@@ -1285,7 +1293,9 @@ fn reconcile_all(
                 focused_source: inspected.focused_source.clone(),
                 raw_source: inspected.raw_source.clone(),
                 live_excerpt,
-                wait_duration_ms: wait_duration.map(|duration| duration.as_millis() as u64),
+                wait_duration_ms: runtime_durations
+                    .wait_duration
+                    .map(|duration| duration.as_millis() as u64),
                 claude_session_id,
                 workspace_id: workspace.id.clone(),
                 workspace_root: workspace.workspace_root.clone(),
@@ -1757,7 +1767,13 @@ fn notification_requires_reconcile(message: &str) -> bool {
 }
 
 fn is_waiting_state(state: SessionState) -> bool {
-    matches!(state, SessionState::BusyResponding)
+    matches!(
+        state,
+        SessionState::ChatReady
+            | SessionState::PromptEditing
+            | SessionState::PermissionDialog
+            | SessionState::FolderTrustPrompt
+    )
 }
 
 fn now_unix_ms() -> i64 {
