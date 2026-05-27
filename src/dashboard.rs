@@ -27,7 +27,7 @@ use crate::app::AppResult;
 use crate::classifier::{Classifier, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
 use crate::last_message::resolve_codex_session_id_for_pane;
-use crate::opencode::resolve_opencode_session_for_pane;
+use crate::opencode::{pane_opencode_title, resolve_opencode_session_for_pane};
 use crate::pi::resolve_pi_session_for_pane;
 use crate::prompt::resolve_state_dir;
 use crate::runtime::RuntimeClient;
@@ -192,9 +192,16 @@ struct ProcessTreeUsage {
 enum PaneSource {
     Claude,
     Codex,
-    OpenCode { session_id: String, title: String },
-    Pi { session_id: String },
-    Agy { session_id: Option<String> },
+    OpenCode {
+        session_id: Option<String>,
+        title: String,
+    },
+    Pi {
+        session_id: String,
+    },
+    Agy {
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,17 +293,14 @@ impl DashboardApp {
                 let session_id = resolve_agy_session_for_pane(&pane, &snapshot.raw_source)?
                     .and_then(|session| session.id);
                 PaneSource::Agy { session_id }
-            } else if is_codex_candidate_pane(&pane) {
-                PaneSource::Codex
+            } else if let Some(source) = opencode_source_for_pane(&pane) {
+                source
             } else if let Some(pi_session) = resolve_pi_session_for_pane(&pane)? {
                 PaneSource::Pi {
                     session_id: pi_session.id,
                 }
-            } else if let Some(opencode_session) = resolve_opencode_session_for_pane(&pane) {
-                PaneSource::OpenCode {
-                    session_id: opencode_session.id,
-                    title: opencode_session.title,
-                }
+            } else if is_codex_candidate_pane(&pane) {
+                PaneSource::Codex
             } else {
                 PaneSource::Claude
             };
@@ -327,9 +331,8 @@ impl DashboardApp {
             let session_key = match &source {
                 PaneSource::Claude => snapshot.claude_session_id.as_deref(),
                 PaneSource::Codex => codex_session_id.as_deref(),
-                PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
-                    Some(session_id.as_str())
-                }
+                PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
+                PaneSource::Pi { session_id } => Some(session_id.as_str()),
                 PaneSource::Agy { session_id } => session_id.as_deref(),
             };
             let runtime_durations = sync_tmux_runtime_state(
@@ -438,9 +441,8 @@ impl DashboardApp {
             let session_key = match &source {
                 PaneSource::Claude => None,
                 PaneSource::Codex => codex_session_id.as_deref(),
-                PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
-                    Some(session_id.as_str())
-                }
+                PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
+                PaneSource::Pi { session_id } => Some(session_id.as_str()),
                 PaneSource::Agy { session_id } => session_id.as_deref(),
             };
             let runtime_durations = sync_tmux_runtime_state(
@@ -2195,7 +2197,7 @@ fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
     match &pane.source {
         PaneSource::Claude => pane.claude_session_id.as_deref(),
         PaneSource::Codex => None,
-        PaneSource::OpenCode { session_id, .. } => Some(session_id.as_str()),
+        PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
         PaneSource::Pi { session_id } => Some(session_id.as_str()),
         PaneSource::Agy { session_id } => session_id.as_deref(),
     }
@@ -2682,6 +2684,30 @@ fn is_codex_candidate_pane(pane: &TmuxPane) -> bool {
             && !pane.pane_title.starts_with("OC | "))
 }
 
+fn is_opencode_candidate_pane(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("opencode") || pane.pane_title.starts_with("OC | ")
+}
+
+fn opencode_source_for_pane(pane: &TmuxPane) -> Option<PaneSource> {
+    if let Some(opencode_session) = resolve_opencode_session_for_pane(pane) {
+        return Some(PaneSource::OpenCode {
+            session_id: Some(opencode_session.id),
+            title: opencode_session.title,
+        });
+    }
+
+    if is_opencode_candidate_pane(pane) {
+        return Some(PaneSource::OpenCode {
+            session_id: None,
+            title: pane_opencode_title(pane)
+                .unwrap_or("unresolved")
+                .to_string(),
+        });
+    }
+
+    None
+}
+
 fn is_codex_screen(frame: &str, signals: &[String]) -> bool {
     if signals.iter().any(|signal| signal == SIGNAL_CODEX_KEYWORDS) {
         return true;
@@ -2701,10 +2727,9 @@ fn is_codex_screen(frame: &str, signals: &[String]) -> bool {
 
 fn is_dashboard_fallback_candidate(pane: &TmuxPane) -> bool {
     is_codex_candidate_pane(pane)
-        || pane.current_command.eq_ignore_ascii_case("opencode")
+        || is_opencode_candidate_pane(pane)
         || pane.current_command.eq_ignore_ascii_case("pi")
         || pane.current_command.eq_ignore_ascii_case("agy")
-        || pane.pane_title.starts_with("OC | ")
 }
 
 fn is_dashboard_visible_non_runtime_pane_with(
@@ -2721,6 +2746,7 @@ fn is_dashboard_visible_non_runtime_pane_with(
     // and no history.jsonl cwd match) would silently disappear from the
     // dashboard despite being valid agy panes.
     Ok(is_agy_pane(pane)
+        || is_opencode_candidate_pane(pane)
         || is_codex_screen(frame, signals)
         || resolve_pi_session_for_pane(pane)?.is_some()
         || resolve_opencode_session_for_pane(pane).is_some()
@@ -2742,19 +2768,16 @@ fn pane_source_for_non_runtime_pane_with(
             session_id: agy_session.and_then(|session| session.id),
         });
     }
-    if is_codex_screen(frame, signals) {
-        return Ok(PaneSource::Codex);
+    if let Some(source) = opencode_source_for_pane(pane) {
+        return Ok(source);
     }
     if let Some(pi_session) = resolve_pi_session_for_pane(pane)? {
         return Ok(PaneSource::Pi {
             session_id: pi_session.id,
         });
     }
-    if let Some(opencode_session) = resolve_opencode_session_for_pane(pane) {
-        return Ok(PaneSource::OpenCode {
-            session_id: opencode_session.id,
-            title: opencode_session.title,
-        });
+    if is_codex_screen(frame, signals) {
+        return Ok(PaneSource::Codex);
     }
     Ok(PaneSource::Codex)
 }
@@ -2809,13 +2832,13 @@ mod tests {
         detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
         footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
         format_memory_gauge, is_codex_candidate_pane, is_codex_screen, is_cooking_state,
-        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
-        pane_window_prefix, parse_process_stat, recap_lines, rect_contains,
-        render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        select_agent_process, select_tail_lines_for_rows, should_return_navigation,
-        split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
-        tmux_object_id_order, window_target, workspace_group_key, workspace_group_label,
-        yes_count_key, yolo_column_contains,
+        is_opencode_candidate_pane, load_saved_selection, pad_display_right, pane_list_columns,
+        pane_list_content_area, pane_source_for_non_runtime_pane_with, pane_window_prefix,
+        parse_process_stat, recap_lines, rect_contains, render_workspace_header_line,
+        repo_root_from_repo_key, save_selection, select_agent_process, select_tail_lines_for_rows,
+        should_return_navigation, split_workspace_header, state_emoji, state_marker,
+        strip_dashboard_emoji_prefixes, tmux_object_id_order, window_target, workspace_group_key,
+        workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::runtime::RuntimeClient;
@@ -2859,6 +2882,27 @@ mod tests {
             &[]
         ));
         assert!(!is_codex_screen("plain node output", &[]));
+    }
+
+    #[test]
+    fn dashboard_keeps_opencode_source_ahead_of_codex_screen_signals() {
+        let pane = sample_tmux_pane("opencode", "OC | Remove glob dependency from Cypress tests");
+        let source = pane_source_for_non_runtime_pane_with(
+            &pane,
+            "Plan · GPT-5.5 OpenAI",
+            &[String::from(SIGNAL_CODEX_KEYWORDS)],
+            None,
+        )
+        .expect("source should resolve");
+
+        assert!(is_opencode_candidate_pane(&pane));
+        match source {
+            PaneSource::OpenCode { session_id, title } => {
+                assert_eq!(session_id, None);
+                assert_eq!(title, "Remove glob dependency from Cypress tests");
+            }
+            _ => panic!("expected OpenCode source"),
+        }
     }
 
     #[test]
@@ -2919,7 +2963,7 @@ mod tests {
         };
         let opencode = PaneEntry {
             source: PaneSource::OpenCode {
-                session_id: String::from("ses_1"),
+                session_id: Some(String::from("ses_1")),
                 title: String::from("demo"),
             },
             ..sample_pane_entry(SessionState::ChatReady, false, false, "")

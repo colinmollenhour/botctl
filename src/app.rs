@@ -4052,9 +4052,15 @@ fn is_pane_likely_codex(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("codex")
 }
 
+fn is_pane_command_opencode(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("opencode")
+}
+
 fn pane_provider_label(pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
+    } else if is_pane_command_opencode(pane) {
+        "OpenCode"
     } else if is_pane_likely_codex(pane) {
         "Codex"
     } else if is_pane_command_agy(pane) {
@@ -4069,6 +4075,9 @@ fn is_pane_command_agy(pane: &TmuxPane) -> bool {
 }
 
 fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool {
+    if is_pane_command_opencode(pane) {
+        return false;
+    }
     is_pane_likely_codex(pane)
         || classification
             .signals
@@ -4093,6 +4102,8 @@ fn is_classified_agy(classification: &Classification, pane: &TmuxPane) -> bool {
 fn classification_provider_label(classification: &Classification, pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
+    } else if is_pane_command_opencode(pane) {
+        "OpenCode"
     } else if is_classified_codex(classification, pane) {
         "Codex"
     } else if is_classified_agy(classification, pane) {
@@ -4225,17 +4236,19 @@ mod tests {
         DASHBOARD_TARGET_TMUX_SOCKET_ENV, DashboardArgs, InspectedPane,
         KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
         ObserveArtifactPaths, RecoveryAction, YoloAction, artifact_state_dir_result,
-        cleanup_babysit_record, compose_prompt_run_content, ensure_pane_owned_by_claude,
-        ensure_state_transition, extract_keep_going_response, extract_permission_prompt_details,
-        focused_frame_source, is_prompt_completion_state, is_usable_state, is_yolo_safe_to_approve,
-        keep_going_no_yolo_blocker, parse_env_value_from_environ_bytes,
-        permission_manual_review_reason, persistent_dashboard_child_command_with_target_socket,
-        prompt_launch_command, prompt_submission_started, raw_key_for_workflow,
-        recovery_action_for_state, render_babysit_action_event, render_babysit_output,
-        render_babysit_start_event, render_babysit_wait_event, render_guarded_workflow_output,
-        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_observe_command_output, render_screen_excerpt, render_status_report,
-        resolve_keep_going_prompt, resolve_prompt_run_input, run_prepare_prompt, shell_escape,
+        classification_provider_label, cleanup_babysit_record, compose_prompt_run_content,
+        ensure_pane_owned_by_automatable_provider, ensure_pane_owned_by_claude,
+        ensure_pane_owned_by_yolo_provider, ensure_state_transition, extract_keep_going_response,
+        extract_permission_prompt_details, focused_frame_source, is_prompt_completion_state,
+        is_usable_state, is_yolo_safe_to_approve, keep_going_no_yolo_blocker, pane_provider_label,
+        parse_env_value_from_environ_bytes, permission_manual_review_reason,
+        persistent_dashboard_child_command_with_target_socket, prompt_launch_command,
+        prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
+        render_babysit_action_event, render_babysit_output, render_babysit_start_event,
+        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
+        render_list_panes, render_next_safe_action, render_observe_command_output,
+        render_screen_excerpt, render_status_report, resolve_keep_going_prompt,
+        resolve_prompt_run_input, run_prepare_prompt, shell_escape,
         strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
         tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
     };
@@ -4668,6 +4681,36 @@ mod tests {
             ),
             "safe-action: approve (y)"
         );
+    }
+
+    #[test]
+    fn opencode_panes_do_not_become_codex_from_screen_signals() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::PermissionDialog,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from(SIGNAL_CODEX_KEYWORDS)],
+        };
+        let mut pane = sample_pane("opencode");
+        pane.pane_title = String::from("OC | Remove glob dependency from Cypress tests");
+
+        assert_eq!(
+            classification_provider_label(&classification, &pane),
+            "OpenCode"
+        );
+        assert_eq!(pane_provider_label(&pane), "OpenCode");
+        assert_eq!(
+            render_next_safe_action(
+                &classification,
+                &pane,
+                &sample_bindings(KeybindingsStatus::Valid)
+            ),
+            "manual-review: pane is running opencode"
+        );
+        assert!(ensure_pane_owned_by_automatable_provider(&pane, &classification).is_err());
+        assert!(ensure_pane_owned_by_yolo_provider(&pane, &classification).is_err());
     }
 
     #[test]
