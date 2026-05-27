@@ -22,6 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::agy::{is_agy_pane, resolve_agy_session_for_pane};
 use crate::app::AppResult;
 use crate::classifier::{Classifier, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
@@ -193,6 +194,7 @@ enum PaneSource {
     Codex,
     OpenCode { session_id: String, title: String },
     Pi { session_id: String },
+    Agy { session_id: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +275,17 @@ impl DashboardApp {
             );
             let source = if is_claude_pane(&pane) {
                 PaneSource::Claude
+            } else if is_agy_pane(&pane) {
+                // Short-circuit on the process name. Even when the secondary
+                // signal hasn't fired yet (state dir missing AND frame
+                // fingerprint not yet captured) we must NOT fall through to
+                // `PaneSource::Claude`, otherwise the dashboard would offer
+                // YOLO / Claude keybindings against an agy TUI (AGENTS.md
+                // guardrail). An unresolved session id is encoded as
+                // `Agy { session_id: None }`.
+                let session_id = resolve_agy_session_for_pane(&pane, &snapshot.raw_source)?
+                    .and_then(|session| session.id);
+                PaneSource::Agy { session_id }
             } else if is_codex_candidate_pane(&pane) {
                 PaneSource::Codex
             } else if let Some(pi_session) = resolve_pi_session_for_pane(&pane)? {
@@ -317,6 +330,7 @@ impl DashboardApp {
                 PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
                     Some(session_id.as_str())
                 }
+                PaneSource::Agy { session_id } => session_id.as_deref(),
             };
             let runtime_durations = sync_tmux_runtime_state(
                 &self.state_dir,
@@ -369,7 +383,20 @@ impl DashboardApp {
                 .capture_pane(&pane.pane_id, self.history_lines)?;
             let classification =
                 Classifier.classify(&pane.pane_id, &focused_dashboard_frame(&frame));
-            if !is_dashboard_visible_non_runtime_pane(&pane, &frame, &classification.signals)? {
+            // Resolve the agy session at most once per pane per refresh and
+            // thread the result into both visibility and source construction
+            // to avoid duplicate fd-walk + history-tail parsing.
+            let agy_session = if is_agy_pane(&pane) {
+                resolve_agy_session_for_pane(&pane, &frame)?
+            } else {
+                None
+            };
+            if !is_dashboard_visible_non_runtime_pane_with(
+                &pane,
+                &frame,
+                &classification.signals,
+                agy_session.as_ref(),
+            )? {
                 continue;
             }
             seen_pane_ids.insert(pane.pane_id.clone());
@@ -379,7 +406,12 @@ impl DashboardApp {
                 self.previous_frames.get(&pane.pane_id),
                 &frame,
             );
-            let source = pane_source_for_non_runtime_pane(&pane, &frame, &classification.signals)?;
+            let source = pane_source_for_non_runtime_pane_with(
+                &pane,
+                &frame,
+                &classification.signals,
+                agy_session,
+            )?;
             let workspace = crate::storage::resolve_workspace_for_path(
                 &self.state_dir,
                 Path::new(&pane.current_path),
@@ -409,6 +441,7 @@ impl DashboardApp {
                 PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
                     Some(session_id.as_str())
                 }
+                PaneSource::Agy { session_id } => session_id.as_deref(),
             };
             let runtime_durations = sync_tmux_runtime_state(
                 &self.state_dir,
@@ -2133,6 +2166,7 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
         PaneSource::Codex => "Codex",
         PaneSource::OpenCode { .. } => "OpenCode",
         PaneSource::Pi { .. } => "Pi",
+        PaneSource::Agy { .. } => "Antigravity",
     }
 }
 
@@ -2142,6 +2176,7 @@ fn agent_emoji(pane: &PaneEntry) -> &'static str {
         PaneSource::Codex => "🞇",
         PaneSource::OpenCode { .. } => "⧈",
         PaneSource::Pi { .. } => "π",
+        PaneSource::Agy { .. } => "⚛",
     }
 }
 
@@ -2152,6 +2187,7 @@ fn agent_marker(pane: &PaneEntry) -> &'static str {
         PaneSource::Codex => "X",
         PaneSource::OpenCode { .. } => "O",
         PaneSource::Pi { .. } => "P",
+        PaneSource::Agy { .. } => "A",
     }
 }
 
@@ -2161,6 +2197,7 @@ fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
         PaneSource::Codex => None,
         PaneSource::OpenCode { session_id, .. } => Some(session_id.as_str()),
         PaneSource::Pi { session_id } => Some(session_id.as_str()),
+        PaneSource::Agy { session_id } => session_id.as_deref(),
     }
 }
 
@@ -2666,24 +2703,45 @@ fn is_dashboard_fallback_candidate(pane: &TmuxPane) -> bool {
     is_codex_candidate_pane(pane)
         || pane.current_command.eq_ignore_ascii_case("opencode")
         || pane.current_command.eq_ignore_ascii_case("pi")
+        || pane.current_command.eq_ignore_ascii_case("agy")
         || pane.pane_title.starts_with("OC | ")
 }
 
-fn is_dashboard_visible_non_runtime_pane(
+fn is_dashboard_visible_non_runtime_pane_with(
     pane: &TmuxPane,
     frame: &str,
     signals: &[String],
+    agy_session: Option<&crate::agy::AgySession>,
 ) -> AppResult<bool> {
-    Ok(is_codex_screen(frame, signals)
+    // Mirror the short-circuit in `pane_source_for_non_runtime_pane_with`:
+    // when the pane's current command is `agy` we treat it as a visible
+    // Antigravity pane even if `agy_session` is None. This keeps the new
+    // `PaneSource::Agy { session_id: None }` variant actually reachable on
+    // the non-runtime path; otherwise unresolved agy panes (no protobuf FD
+    // and no history.jsonl cwd match) would silently disappear from the
+    // dashboard despite being valid agy panes.
+    Ok(is_agy_pane(pane)
+        || is_codex_screen(frame, signals)
         || resolve_pi_session_for_pane(pane)?.is_some()
-        || resolve_opencode_session_for_pane(pane).is_some())
+        || resolve_opencode_session_for_pane(pane).is_some()
+        || agy_session.is_some())
 }
 
-fn pane_source_for_non_runtime_pane(
+fn pane_source_for_non_runtime_pane_with(
     pane: &TmuxPane,
     frame: &str,
     signals: &[String],
+    agy_session: Option<crate::agy::AgySession>,
 ) -> AppResult<PaneSource> {
+    if is_agy_pane(pane) {
+        // Short-circuit on the process name. Even if `agy_session` is None
+        // (secondary signal not yet captured), the pane must not fall through
+        // to `PaneSource::Codex` — that would let YOLO toggles target an agy
+        // pane (AGENTS.md guardrail).
+        return Ok(PaneSource::Agy {
+            session_id: agy_session.and_then(|session| session.id),
+        });
+    }
     if is_codex_screen(frame, signals) {
         return Ok(PaneSource::Codex);
     }
@@ -2872,15 +2930,71 @@ mod tests {
             },
             ..sample_pane_entry(SessionState::ChatReady, false, false, "")
         };
+        let agy = PaneEntry {
+            source: PaneSource::Agy {
+                session_id: Some(String::from("agy-uuid")),
+            },
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        };
 
         assert_eq!(agent_emoji(&claude), "❋");
         assert_eq!(agent_emoji(&opencode), "⧈");
         assert_eq!(agent_emoji(&codex), "🞇");
         assert_eq!(agent_emoji(&pi), "π");
+        assert_eq!(agent_emoji(&agy), "⚛");
         assert_eq!(agent_marker(&claude), "C");
         assert_eq!(agent_marker(&opencode), "O");
         assert_eq!(agent_marker(&codex), "X");
         assert_eq!(agent_marker(&pi), "P");
+        assert_eq!(agent_marker(&agy), "A");
+    }
+
+    #[test]
+    fn agy_glyph_is_single_width() {
+        use unicode_width::UnicodeWidthChar;
+        let glyph: char = "⚛".chars().next().unwrap();
+        assert_eq!(glyph.width(), Some(1), "agy glyph must be single-width");
+    }
+
+    #[test]
+    fn agy_pane_without_fingerprint_does_not_support_yolo() {
+        // Regression for V1: a pane whose process is `agy` must never be
+        // classified as `PaneSource::Claude` (which would enable YOLO toggles
+        // and Claude keybindings against an agy TUI). Even when the secondary
+        // signal hasn't been observed yet (frame has no Antigravity
+        // fingerprint and the state dir doesn't exist), the source must
+        // remain `PaneSource::Agy { session_id: None }`.
+        let pane = PaneEntry {
+            pane: TmuxPane {
+                current_command: String::from("agy"),
+                pane_pid: None,
+                ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
+            },
+            source: PaneSource::Agy { session_id: None },
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        };
+        assert!(
+            !pane.supports_yolo(),
+            "agy panes must never support YOLO (AGENTS.md guardrail)"
+        );
+        assert!(matches!(pane.source, PaneSource::Agy { session_id: None }));
+
+        // Also verify the non-runtime source resolver short-circuits to
+        // PaneSource::Agy even when agy_session resolution returns None
+        // (no fingerprint, no conversation resolvable).
+        let raw_pane = TmuxPane {
+            current_command: String::from("agy"),
+            pane_pid: None,
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
+        };
+        let source = super::pane_source_for_non_runtime_pane_with(
+            &raw_pane,
+            "frame with no fingerprint",
+            &[],
+            None,
+        )
+        .expect("non-runtime source should resolve without error");
+        assert!(matches!(source, PaneSource::Agy { session_id: None }));
     }
 
     #[test]

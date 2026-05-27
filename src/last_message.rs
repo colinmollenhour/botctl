@@ -4,10 +4,12 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use crate::agy;
 use crate::app::{AppError, AppResult};
 use crate::opencode;
 use crate::pi;
-use crate::tmux::TmuxPane;
+use crate::proc_fd::transcript_from_process_fds;
+use crate::tmux::{TmuxClient, TmuxPane};
 
 const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
 const CODEX_SESSIONS_DIR: &str = ".codex/sessions";
@@ -19,7 +21,13 @@ pub struct LastAgentMessage {
     pub text: String,
 }
 
-pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
+pub fn load_last_agent_message(
+    pane: &TmuxPane,
+    tmux: &TmuxClient,
+    history_lines: usize,
+) -> AppResult<LastAgentMessage> {
+    let _ = (tmux, history_lines); // ignored by non-agy branches
+
     if pane.current_command.eq_ignore_ascii_case("claude") {
         return load_claude_last_message(pane);
     }
@@ -32,6 +40,10 @@ pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
         return load_pi_last_message(pane);
     }
 
+    if pane.current_command.eq_ignore_ascii_case("agy") {
+        return load_agy_last_message(pane, tmux, history_lines);
+    }
+
     if pane.current_command.eq_ignore_ascii_case("codex")
         || (pane.current_command.eq_ignore_ascii_case("node")
             && !pane.pane_title.starts_with("OC | "))
@@ -40,7 +52,7 @@ pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
     }
 
     Err(AppError::new(format!(
-        "last-message supports Claude, Codex, OpenCode, and Pi panes; pane {} is running {}",
+        "last-message supports Claude, Codex, OpenCode, Pi, and Antigravity panes; pane {} is running {}",
         pane.pane_id, pane.current_command
     )))
 }
@@ -81,6 +93,35 @@ fn load_opencode_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
         provider: "OpenCode",
         session_id: message.session_id,
         text: message.text,
+    })
+}
+
+fn load_agy_last_message(
+    pane: &TmuxPane,
+    tmux: &TmuxClient,
+    history_lines: usize,
+) -> AppResult<LastAgentMessage> {
+    let frame = tmux.capture_pane(&pane.pane_id, history_lines)?;
+    let session = agy::resolve_agy_session_for_pane(pane, &frame)?.ok_or_else(|| {
+        AppError::new(
+            "agy: no Antigravity conversation resolvable for this pane (no open conversation file and no matching history.jsonl entry)",
+        )
+    })?;
+    let conversation_id = session.id.ok_or_else(|| {
+        AppError::new(
+            "agy: no Antigravity conversation resolvable for this pane (no open conversation file and no matching history.jsonl entry)",
+        )
+    })?;
+    let stripped = agy::strip_ansi(&frame);
+    let text = agy::extract_last_assistant_text(&stripped).ok_or_else(|| {
+        AppError::new(
+            "agy: no completed assistant message visible in pane scrollback; the extractor requires three horizontal-rule lines (one above the last assistant turn, plus the two that bracket the live input box) — use --history-lines to widen the scrollback window",
+        )
+    })?;
+    Ok(LastAgentMessage {
+        provider: "Antigravity",
+        session_id: conversation_id,
+        text,
     })
 }
 
@@ -367,33 +408,6 @@ fn codex_event_agent_message_text(value: &Value) -> Option<String> {
         .get("message")
         .and_then(Value::as_str)
         .map(str::to_string)
-}
-
-fn transcript_from_process_fds(
-    pid: u32,
-    transcript_root: &Path,
-    extension: &str,
-) -> AppResult<Option<PathBuf>> {
-    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
-    let entries = match fs::read_dir(fd_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(None),
-    };
-
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
-        };
-        if target.starts_with(transcript_root)
-            && target.extension().and_then(|value| value.to_str()) == Some(extension)
-        {
-            return Ok(Some(target));
-        }
-    }
-    Ok(None)
 }
 
 fn collect_jsonl_files(root: &Path) -> AppResult<Vec<PathBuf>> {

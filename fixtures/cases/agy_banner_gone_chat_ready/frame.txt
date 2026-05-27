@@ -1,0 +1,33 @@
+      terminal layout and the curved-monitor physical setup.
+
+  ──────
+  ### 📂 Active Mockups Directory in your Repository
+
+  Everything is fully organized inside your repository:
+
+  • Playable HTML Mockup: index.html (double-click to run locally in any browser)
+  • Flat TUI Screenshot: tui_dashboard_flat.png
+  • Environmental Render Mockup: dashboard_mockup.png
+  • Preview Documentation: README.md
+
+> /skills
+  ⎿  Exited /skills command
+
+────────────────────────────────────────────────────────────
+> Use claude opus to answer "what is the airspeed velocity of an unladen sparrow?"
+
+● Read(/home/colin/.gemini/antigravity-cli/skills/claude-cli/SKILL.md)
+● Bash(claude --model opus --print --output-format text -- "what is the airspeed velocity of an unladen sparrow?") (ctrl+o to expand)
+
+  I ran the query using the  claude  CLI with the Claude Opus model:
+
+    claude --model opus --print --output-format text -- "what is the airspeed velocity of an unladen sparrow?"
+
+  The response returned by Claude Opus was:
+
+  │ African or European?
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                Gemini 3.5 Flash (High)

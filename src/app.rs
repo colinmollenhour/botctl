@@ -848,7 +848,9 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
 fn run_last_message(args: LastMessageArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    let message = load_last_agent_message(&pane)?;
+    // `args.history_lines` defaults to 2000 for agy pane-scrape extraction;
+    // matches the dashboard polling default. Non-agy providers ignore it.
+    let message = load_last_agent_message(&pane, &client, args.history_lines)?;
     if args.out.as_deref().is_some_and(output_path_is_stdout) {
         let mut stdout = io::stdout().lock();
         stdout.write_all(message.text.as_bytes())?;
@@ -936,7 +938,7 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
             bindings.path.display(),
             bindings.status.as_str(),
             render_missing_bindings(&bindings),
-            render_doctor_recommendations(&pane, &bindings)
+            render_doctor_recommendations(&classification, &pane, &bindings)
         ))
     }
 }
@@ -1936,7 +1938,9 @@ fn run_prompt_with_resolved_input(
     pane = resolve_pane_by_id(&client, &pane.pane_id)?;
     ensure_pane_owned_by_claude(&pane)
         .map_err(|error| AppError::with_exit_code(error.to_string(), 2))?;
-    let pre_submit_message = load_last_agent_message(&pane).ok();
+    // `history_lines = 2000` matches the dashboard polling default and is only
+    // used by the agy pane-scrape branch; other providers ignore it.
+    let pre_submit_message = load_last_agent_message(&pane, &client, 2000).ok();
     submit_prompt_text_direct(
         &client,
         &pane,
@@ -1957,6 +1961,7 @@ fn run_prompt_with_resolved_input(
     )?;
     let message = wait_for_fresh_last_message(
         &pane,
+        &client,
         pre_submit_message.as_ref(),
         Duration::from_millis(args.idle_timeout_ms),
     )?;
@@ -2393,13 +2398,14 @@ fn prompt_wait_step(
 
 fn wait_for_fresh_last_message(
     pane: &TmuxPane,
+    tmux: &TmuxClient,
     prior: Option<&crate::last_message::LastAgentMessage>,
     timeout: Duration,
 ) -> AppResult<crate::last_message::LastAgentMessage> {
     let deadline = Instant::now() + timeout;
     let mut last_error = None;
     loop {
-        match load_last_agent_message(pane) {
+        match load_last_agent_message(pane, tmux, 2000) {
             Ok(message)
                 if prior
                     .map(|old| old.session_id != message.session_id || old.text != message.text)
@@ -3924,6 +3930,9 @@ pub(crate) fn render_next_safe_action(
     pane: &TmuxPane,
     bindings: &KeybindingsInspection,
 ) -> String {
+    if is_classified_agy(classification, pane) {
+        return String::from("manual-review: agy automation is not implemented");
+    }
     if is_classified_codex(classification, pane) {
         return match classification.state {
             SessionState::BusyResponding => String::from("safe-action: wait"),
@@ -4048,9 +4057,15 @@ fn pane_provider_label(pane: &TmuxPane) -> &'static str {
         "Claude"
     } else if is_pane_likely_codex(pane) {
         "Codex"
+    } else if is_pane_command_agy(pane) {
+        "Antigravity"
     } else {
         "Unknown"
     }
+}
+
+fn is_pane_command_agy(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("agy")
 }
 
 fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool {
@@ -4061,11 +4076,27 @@ fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool
             .any(|signal| signal == SIGNAL_CODEX_KEYWORDS)
 }
 
+/// True when this pane should be treated as an Antigravity (agy) pane for
+/// diagnostics and labeling. Covers both the process-name short-circuit
+/// (`current_command == "agy"`) and the signal-based classification path
+/// (the classifier set `SIGNAL_AGY_KEYWORDS` because the captured frame
+/// fingerprinted as agy). Keeping these in one predicate makes `status` and
+/// `doctor` stay internally consistent for signal-discovered panes.
+fn is_classified_agy(classification: &Classification, pane: &TmuxPane) -> bool {
+    is_pane_command_agy(pane)
+        || classification
+            .signals
+            .iter()
+            .any(|signal| signal == crate::classifier::SIGNAL_AGY_KEYWORDS)
+}
+
 fn classification_provider_label(classification: &Classification, pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
     } else if is_classified_codex(classification, pane) {
         "Codex"
+    } else if is_classified_agy(classification, pane) {
+        "Antigravity"
     } else {
         "Unknown"
     }
@@ -4079,7 +4110,7 @@ pub(crate) fn ensure_pane_owned_by_automatable_provider(
         Ok(())
     } else {
         Err(AppError::new(format!(
-            "refusing to drive pane {} because current command is {} instead of claude or codex",
+            "refusing to drive pane {} because current command is {} instead of claude or codex (agy panes are passively-discovered read-only)",
             pane.pane_id, pane.current_command
         )))
     }
@@ -4093,7 +4124,7 @@ pub(crate) fn ensure_pane_owned_by_yolo_provider(
         Ok(())
     } else {
         Err(AppError::new(format!(
-            "refusing to start yolo for pane {} because current command is {} and the screen is not classified as codex",
+            "refusing to start yolo for pane {} because current command is {} and the screen is not classified as codex (agy panes are passively-discovered read-only)",
             pane.pane_id, pane.current_command
         )))
     }
@@ -4121,17 +4152,28 @@ pub(crate) fn execute_automation_action(
     Ok(action.as_str().to_string())
 }
 
-fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspection) -> String {
+fn render_doctor_recommendations(
+    classification: &Classification,
+    pane: &TmuxPane,
+    bindings: &KeybindingsInspection,
+) -> String {
     let mut lines = Vec::new();
+    let agy = is_classified_agy(classification, pane);
 
     if !is_pane_command_claude(pane) {
-        lines.push(format!(
-            "recommendation=target pane is running {} instead of claude",
-            pane.current_command
-        ));
+        if agy {
+            lines.push(String::from(
+                "recommendation=agy panes are read-only in v1 (no YOLO, no prompt submit, no keybinding driver)",
+            ));
+        } else {
+            lines.push(format!(
+                "recommendation=target pane is running {} instead of claude",
+                pane.current_command
+            ));
+        }
     }
 
-    if bindings.status != KeybindingsStatus::Valid {
+    if !agy && bindings.status != KeybindingsStatus::Valid {
         lines.push(String::from(
             "recommendation=add the missing automation actions to your Claude keybindings; use install-bindings to merge missing botctl bindings into your existing file or bindings to inspect the recommended mapping",
         ));

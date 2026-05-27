@@ -41,6 +41,44 @@ Responsible for deciding what action is allowed in the current state. Example po
 - submit a prepared prompt
 - interrupt a long-running session
 
+## Supported Agents
+
+### Claude Code
+
+Full guarded automation path: pane launch, classification, prompt submission, YOLO permission approval, and `last-message` from `~/.claude/projects` transcripts.
+
+### Codex CLI
+
+Screen-capture classification with narrow YOLO approval for command permission dialogs. `last-message` reads `~/.codex/sessions`. No prompt submission or keybinding automation.
+
+### OpenCode
+
+Passively discovered via tmux pane title (`OC | <session title>`) and cwd match against OpenCode's SQLite database. Dashboard/status visibility and `last-message` from SQLite `message`/`part` rows. No YOLO, prompt submission, or keybinding automation.
+
+### Pi
+
+Passively discovered by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`). Dashboard/status visibility and `last-message` from JSONL session files. No YOLO, prompt submission, or keybinding automation.
+
+### Antigravity (`agy`)
+
+Passively discovered when the tmux pane command is `agy` and a secondary signal passes: the resolved state directory exists at `~/.gemini/antigravity-cli` (or `ANTIGRAVITY_STATE_DIR`) or the captured frame contains an Antigravity fingerprint (banner, footer, or spinner text).
+
+Conversation identity is resolved by walking the pane process tree for an open protobuf file descriptor first (under `<state-dir>/conversations/*.pb`), then falling back to an exact-cwd match in `~/.gemini/antigravity-cli/history.jsonl` (or `ANTIGRAVITY_HISTORY_FILE`).
+
+`last-message` on an Antigravity pane uses pane-scrape extraction. It requires three horizontal-rule lines (`─` characters, 20+ wide) to be visible in the captured scrollback: one above the last assistant turn, plus the two that bracket the live input box. The most recent complete assistant turn between the upper rule and the top of the input box is exported. If those three boundaries are not all visible, the command exits with:
+
+```text
+agy: no completed assistant message visible in pane scrollback; the extractor requires three horizontal-rule lines (one above the last assistant turn, plus the two that bracket the live input box) — use --history-lines to widen the scrollback window
+```
+
+Use `--history-lines` to increase the scrollback window if the response was truncated.
+
+State classification maps `? for shortcuts` to `ChatReady`, `esc to cancel` or Braille spinner glyphs to `BusyResponding`, and permission/trust overlays to `Unknown`. Cook time is derived from `BusyResponding` state using the standard derivation. YOLO, prompt submission, and keybinding automation are not supported for Antigravity in v1.
+
+The dashboard glyph is `⚛` (U+269B ATOM SYMBOL, single-width). The provider label is `Antigravity` (used in both the dashboard detail view and `status`/`doctor` output). The compact pane-source marker character is `A`.
+
+Output filename: `MESSAGE_<conversation-id>.md` (no provider prefix, same convention as Claude/Codex/OpenCode/Pi).
+
 ## Engineering Rules
 
 - Keep transport, observation, classification, and policy separate.

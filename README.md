@@ -1,10 +1,10 @@
 # botctl
 
-`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, and Pi sessions visible and controlled inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, Pi, and Antigravity sessions visible and controlled inside `tmux`.
 
-It can launch and safely drive Claude Code panes, classify Codex CLI panes from tmux screen captures with narrow YOLO approval for command permission dialogs, passively discover OpenCode panes, and discover Pi panes from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status.
+It can launch and safely drive Claude Code panes, classify Codex CLI panes from tmux screen captures with narrow YOLO approval for command permission dialogs, passively discover OpenCode panes, discover Pi panes from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status, and passively discover Antigravity (`agy`) panes for dashboard visibility, state classification, and pane-scrape last-message extraction.
 
-It can also dump the latest persisted assistant message from a Claude, Codex, OpenCode, or Pi pane to a Markdown file with `last-message`.
+It can also dump the latest persisted assistant message from a Claude, Codex, OpenCode, Pi, or Antigravity pane to a Markdown file with `last-message`.
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
@@ -30,14 +30,14 @@ cd botctl
 cargo install --path .
 ```
 
-See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `claude` for Claude automation, `codex` for Codex CLI visibility and permission approval, and `opencode` for OpenCode dashboard visibility).
+See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `claude` for Claude automation, `codex` for Codex CLI visibility and permission approval, `opencode` for OpenCode dashboard visibility, and `agy` for Antigravity dashboard visibility).
 
 ## Main Commands
 
 These are the commands that matter most in day-to-day use:
 
 - `runtime` to start or stop the single local coordinator that owns live observation and automation
-- `dashboard` to see Claude Code panes, runtime-discovered panes, and supported Codex/OpenCode/Pi visibility, grouped by workspace, with state, PID, CPU, memory, observed active cook time, and YOLO controls for Claude and Codex
+- `dashboard` to see Claude Code panes, runtime-discovered panes, and supported Codex/OpenCode/Pi/Antigravity visibility, grouped by workspace, with state, PID, CPU, memory, observed active cook time, and YOLO controls for Claude and Codex
 - `prompt` to run a one-shot prompt through a new interactive Claude TUI window in tmux and print only the final assistant text to stdout
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to set central YOLO policy for one pane or a scoped set of panes
@@ -52,11 +52,11 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - launch a managed Claude Code session in tmux
 - run a central local runtime over a Unix socket at `<state-dir>/runtime.sock`
 - classify Codex CLI panes from captured terminal screens and approve command permission dialogs with YOLO
-- passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database, and Pi panes by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions`
+- passively discover OpenCode panes by matching their tmux title and cwd against OpenCode's SQLite session database, Pi panes by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions`, and Antigravity panes by process-name plus state-dir detection
 - list panes and inspect tmux metadata, including each tracked pane PID
 - capture pane contents and classify the current UI state
 - run `status` and `doctor` against a live Claude Code or Codex CLI pane
-- dump the latest persisted assistant message from Claude, Codex, OpenCode, or Pi to `MESSAGE_<provider-session-id>.md` or a path passed with `--out`
+- dump the latest persisted assistant message from Claude, Codex, OpenCode, Pi, or Antigravity to `MESSAGE_<conversation-id>.md` or a path passed with `--out`
 - run `serve` as a runtime-backed foreground facade for one tmux session
 - run `dashboard` as a runtime-backed popup-sized TUI grouped by workspace with per-pane YOLO controls for Claude and Codex
 - record and replay fixture cases for classifier regression tests
@@ -81,6 +81,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - `claude` available on `PATH` for Claude Code automation
 - `codex` panes for Codex CLI screen classification and command permission approval
 - `opencode` panes with `OC | <session title>` pane titles for passive OpenCode dashboard visibility
+- `agy` available on `PATH` (optional) for Antigravity dashboard visibility; the state directory defaults to `~/.gemini/antigravity-cli` and can be overridden with `ANTIGRAVITY_STATE_DIR`; the history file can be overridden independently with `ANTIGRAVITY_HISTORY_FILE`
 
 ## Test
 
@@ -98,7 +99,7 @@ cargo test resolves_custom_binding_keys_for_actions
 
 ## Start here
 
-For a first useful run, open a tmux pane that is running Claude Code, Codex CLI, or OpenCode, then run:
+For a first useful run, open a tmux pane that is running Claude Code, Codex CLI, OpenCode, Pi, or Antigravity, then run:
 
 ```bash
 botctl runtime
@@ -136,7 +137,7 @@ Use `cargo run -- ...` instead of `botctl ...` when running from a source checko
 
 Pane-targeted commands accept either a raw tmux pane id like `%19` or an explicit tmux pane target like `0:2.3`.
 
-Open the live dashboard across Claude Code, Codex, OpenCode, and Pi panes:
+Open the live dashboard across Claude Code, Codex, OpenCode, Pi, and Antigravity panes:
 
 ```bash
 cargo run -- dashboard
@@ -256,9 +257,11 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups runtime-observed panes plus supported Codex/OpenCode/Pi visibility by workspace, shows the shared runtime state plus current pane PID, process-tree average CPU, memory, and observed active `Cook` time, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. `Cook` counts only observed busy agent work, pauses on idle and permission waits, resets when the agent session changes, and may be off by roughly one dashboard poll around state transitions. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups runtime-observed panes plus supported Codex/OpenCode/Pi/Antigravity visibility by workspace, shows the shared runtime state plus current pane PID, process-tree average CPU, memory, and observed active `Cook` time, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. `Cook` counts only observed busy agent work, pauses on idle and permission waits, resets when the agent session changes, and may be off by roughly one dashboard poll around state transitions. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
 
 The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode and Pi support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only.
+
+Antigravity panes are passively included when the tmux pane command is `agy` and the secondary signal passes (the resolved state directory exists, or the captured frame contains an Antigravity fingerprint). Conversation identity is resolved by walking the pane process tree for an open protobuf file descriptor first, and falling back to `~/.gemini/antigravity-cli/history.jsonl` for an exact-cwd workspace match. Antigravity panes show `⚛` in the dashboard, support state classification (`ChatReady`/`BusyResponding`/`Unknown`), and derive cook time from `BusyResponding` using the standard derivation. YOLO, prompt submission, and keybinding automation are not supported for Antigravity in v1.
 
 Codex CLI panes are included by capturing likely Codex terminal panes and requiring Codex screen text such as the OpenAI Codex header, Codex-specific prompt/approval language, or a `/statusline` that includes the `run-state` field. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; broader prompt submission and keybinding-based automation remain Claude-only.
 
@@ -390,4 +393,5 @@ Recap is auxiliary metadata, not a primary state. Strong anchors like `while you
 - The classifier is keyword-based and intentionally conservative.
 - `botctl` can attach to existing Claude Code panes, but the strongest and most tested automation path is still managed Claude sessions.
 - OpenCode support is passive dashboard/status visibility. Codex support includes dashboard/status visibility and YOLO approval for command permission dialogs; broader guarded keypress automation remains Claude-only.
+- Antigravity support is passive dashboard/status visibility. YOLO, prompt submission, and keybinding automation are not supported in v1.
 - `serve` is an initial foreground observer, not the full daemon/API/SSE control plane described in `PLANS-Serve-Mode.md` yet.

@@ -1,0 +1,35 @@
+
+colin in 🌐 seamus in ~/Projects/botctl on  megamind/mcp-claude +173 -3 פֿ8 ✨ 11 is 📦 v0.6.2 took 55s
+📦 ❯ agy
+
+      ▄▀▀▄        Antigravity CLI 1.0.2
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (High)
+   ▄▀▀    ▀▀▄     ~/Projects/botctl
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> please sleep for 30 minutes
+
+▸ Thought for 2s, 1.2k tokens
+  Considering Scheduling Needs
+
+● Schedule(Finished waiting 900 seconds.) (ctrl+o to expand)
+
+  I have scheduled a timer to sleep for the first 15 minutes (which is the maximum duration supported by the timer tool at one
+  time).
+
+  Once the timer expires and wakes me up, I will immediately schedule the second 15-minute segment to complete the full 30-minute
+  sleep. I am now going idle.
+
+● Schedule(Finished waiting 900 seconds.) (ctrl+o to expand)
+
+  The first 15-minute sleep phase has completed. I have scheduled the second 15-minute timer to complete your requested 30-minute
+  sleep. Going back to sleep now.
+
+  I have completed the 30-minute sleep. Please let me know how I can help you next!
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                 Gemini 3.5 Flash (High)

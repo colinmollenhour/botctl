@@ -4,13 +4,13 @@ This guide collects the shipped operator flows.
 
 For command syntax, see [command reference](./command-reference.mdx). For prompt handoff details, see [prompt handoff](./prompt-handoff.mdx).
 
-Claude Code panes support guarded automation and prompt workflows. Codex CLI panes are supported through screen-capture classification with narrow YOLO approval for command permission dialogs. OpenCode panes are supported passively in the dashboard when `botctl` can safely match the tmux pane to OpenCode's SQLite session database. Pi panes are supported passively when a `pi` tmux pane can be matched to a JSONL session under `~/.pi/agent/sessions`.
+Claude Code panes support guarded automation and prompt workflows. Codex CLI panes are supported through screen-capture classification with narrow YOLO approval for command permission dialogs. OpenCode panes are supported passively in the dashboard when `botctl` can safely match the tmux pane to OpenCode's SQLite session database. Pi panes are supported passively when a `pi` tmux pane can be matched to a JSONL session under `~/.pi/agent/sessions`. Antigravity (`agy`) panes are supported passively for dashboard visibility, state classification, and pane-scrape last-message extraction when the pane command is `agy` and a secondary signal is present.
 
 ## Main operator loop
 
 For most real use, the loop is:
 
-1. Open `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, and Pi panes.
+1. Open `dashboard` to see Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, Pi panes, and Antigravity panes.
 2. Use `yolo` on the pane or workspace you want babysat.
 3. Use `serve` when you need a live event stream or machine-readable observation.
 4. Use `last-message` when the visible pane excerpt is not enough.
@@ -114,7 +114,7 @@ Dumped last message of 951 lines out to file:
 MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
 ```
 
-Use `--out -` to stream the raw Markdown body to stdout for piping. Claude reads `~/.claude/projects`, Codex reads `~/.codex/sessions`, OpenCode reads the latest assistant text parts from its SQLite storage after resolving the pane title and cwd, and Pi reads the latest assistant text blocks from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`). The export contains assistant-visible text, not tool calls or transcript metadata.
+Use `--out -` to stream the raw Markdown body to stdout for piping. Claude reads `~/.claude/projects`, Codex reads `~/.codex/sessions`, OpenCode reads the latest assistant text parts from its SQLite storage after resolving the pane title and cwd, Pi reads the latest assistant text blocks from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`), and Antigravity uses pane-scrape extraction (requires three horizontal-rule lines to be visible in the pane scrollback: one above the last assistant turn, plus the two that bracket the live input box). The export contains assistant-visible text, not tool calls or transcript metadata.
 
 ## Blocker recovery flow
 
