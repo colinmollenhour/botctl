@@ -67,7 +67,7 @@ Conversation identity is resolved by walking the pane process tree for an open p
 
 `last-message` on an Antigravity pane uses pane-scrape extraction. It requires three horizontal-rule lines (`─` characters, 20+ wide) to be visible in the captured scrollback: one above the last assistant turn, plus the two that bracket the live input box. The most recent complete assistant turn between the upper rule and the top of the input box is exported. If those three boundaries are not all visible, the command exits with:
 
-```
+```text
 agy: no completed assistant message visible in pane scrollback; the extractor requires three horizontal-rule lines (one above the last assistant turn, plus the two that bracket the live input box) — use --history-lines to widen the scrollback window
 ```
 
@@ -75,7 +75,7 @@ Use `--history-lines` to increase the scrollback window if the response was trun
 
 State classification maps `? for shortcuts` to `ChatReady`, `esc to cancel` or Braille spinner glyphs to `BusyResponding`, and permission/trust overlays to `Unknown`. Cook time is derived from `BusyResponding` state using the standard derivation. YOLO, prompt submission, and keybinding automation are not supported for Antigravity in v1.
 
-The dashboard glyph is `⚛` (U+269B ATOM SYMBOL, single-width). The provider label is `Antigravity`. The short label in the dashboard table is `Agy`.
+The dashboard glyph is `⚛` (U+269B ATOM SYMBOL, single-width). The provider label is `Antigravity` (used in both the dashboard detail view and `status`/`doctor` output). The compact pane-source marker character is `A`.
 
 Output filename: `MESSAGE_<conversation-id>.md` (no provider prefix, same convention as Claude/Codex/OpenCode/Pi).
 

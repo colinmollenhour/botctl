@@ -3,7 +3,7 @@ colin in 🌐 seamus in ~/Projects/botctl on  megamind/mcp-claude +173 -3 פֿ8 
 📦 ❯ agy
 
       ▄▀▀▄        Antigravity CLI 1.0.2
-     ▀▀▀▀▀▀       cm525i@gmail.com (Google AI Pro)
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
     ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (High)
    ▄▀▀    ▀▀▄     ~/Projects/botctl
   ▄▀▀      ▀▀▄

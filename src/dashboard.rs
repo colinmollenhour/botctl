@@ -2166,7 +2166,7 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
         PaneSource::Codex => "Codex",
         PaneSource::OpenCode { .. } => "OpenCode",
         PaneSource::Pi { .. } => "Pi",
-        PaneSource::Agy { .. } => "Agy",
+        PaneSource::Agy { .. } => "Antigravity",
     }
 }
 
@@ -2713,7 +2713,15 @@ fn is_dashboard_visible_non_runtime_pane_with(
     signals: &[String],
     agy_session: Option<&crate::agy::AgySession>,
 ) -> AppResult<bool> {
-    Ok(is_codex_screen(frame, signals)
+    // Mirror the short-circuit in `pane_source_for_non_runtime_pane_with`:
+    // when the pane's current command is `agy` we treat it as a visible
+    // Antigravity pane even if `agy_session` is None. This keeps the new
+    // `PaneSource::Agy { session_id: None }` variant actually reachable on
+    // the non-runtime path; otherwise unresolved agy panes (no protobuf FD
+    // and no history.jsonl cwd match) would silently disappear from the
+    // dashboard despite being valid agy panes.
+    Ok(is_agy_pane(pane)
+        || is_codex_screen(frame, signals)
         || resolve_pi_session_for_pane(pane)?.is_some()
         || resolve_opencode_session_for_pane(pane).is_some()
         || agy_session.is_some())

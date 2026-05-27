@@ -99,7 +99,7 @@ cargo test resolves_custom_binding_keys_for_actions
 
 ## Start here
 
-For a first useful run, open a tmux pane that is running Claude Code, Codex CLI, OpenCode, or Antigravity, then run:
+For a first useful run, open a tmux pane that is running Claude Code, Codex CLI, OpenCode, Pi, or Antigravity, then run:
 
 ```bash
 botctl runtime

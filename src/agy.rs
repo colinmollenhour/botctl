@@ -596,6 +596,16 @@ pub(crate) fn strip_ansi(input: &str) -> Cow<'_, str> {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that mutate process-global env vars
+    /// (`ANTIGRAVITY_STATE_DIR`, `ANTIGRAVITY_HISTORY_FILE`) so they don't
+    /// race with each other or with other tests that read agy env defaults
+    /// when `cargo test` runs in parallel.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn frame_fingerprint_detects_banner_footer_spinner_artifact() {
@@ -894,6 +904,8 @@ mod tests {
 
     #[test]
     fn latest_assistant_message_returns_none_when_session_id_unresolvable() {
+        // Serialize against other tests that read/write the same env vars.
+        let _guard = env_lock().lock().expect("env lock poisoned");
         // Point env at a definitely-nonexistent state dir so:
         // - state_dir_exists() == false
         // - frame fingerprint still triggers agy_secondary_signal

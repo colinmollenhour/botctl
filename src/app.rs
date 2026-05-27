@@ -848,9 +848,9 @@ fn run_capture(args: CaptureArgs) -> AppResult<String> {
 fn run_last_message(args: LastMessageArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    // Default to 2000 history lines for agy pane-scrape extraction; matches the
-    // dashboard polling default. Non-agy providers ignore this value.
-    let message = load_last_agent_message(&pane, &client, 2000)?;
+    // `args.history_lines` defaults to 2000 for agy pane-scrape extraction;
+    // matches the dashboard polling default. Non-agy providers ignore it.
+    let message = load_last_agent_message(&pane, &client, args.history_lines)?;
     if args.out.as_deref().is_some_and(output_path_is_stdout) {
         let mut stdout = io::stdout().lock();
         stdout.write_all(message.text.as_bytes())?;
@@ -938,7 +938,7 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
             bindings.path.display(),
             bindings.status.as_str(),
             render_missing_bindings(&bindings),
-            render_doctor_recommendations(&pane, &bindings)
+            render_doctor_recommendations(&classification, &pane, &bindings)
         ))
     }
 }
@@ -3930,7 +3930,7 @@ pub(crate) fn render_next_safe_action(
     pane: &TmuxPane,
     bindings: &KeybindingsInspection,
 ) -> String {
-    if is_pane_command_agy(pane) {
+    if is_classified_agy(classification, pane) {
         return String::from("manual-review: agy automation is not implemented");
     }
     if is_classified_codex(classification, pane) {
@@ -4076,17 +4076,26 @@ fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool
             .any(|signal| signal == SIGNAL_CODEX_KEYWORDS)
 }
 
+/// True when this pane should be treated as an Antigravity (agy) pane for
+/// diagnostics and labeling. Covers both the process-name short-circuit
+/// (`current_command == "agy"`) and the signal-based classification path
+/// (the classifier set `SIGNAL_AGY_KEYWORDS` because the captured frame
+/// fingerprinted as agy). Keeping these in one predicate makes `status` and
+/// `doctor` stay internally consistent for signal-discovered panes.
+fn is_classified_agy(classification: &Classification, pane: &TmuxPane) -> bool {
+    is_pane_command_agy(pane)
+        || classification
+            .signals
+            .iter()
+            .any(|signal| signal == crate::classifier::SIGNAL_AGY_KEYWORDS)
+}
+
 fn classification_provider_label(classification: &Classification, pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
     } else if is_classified_codex(classification, pane) {
         "Codex"
-    } else if is_pane_command_agy(pane)
-        || classification
-            .signals
-            .iter()
-            .any(|signal| signal == crate::classifier::SIGNAL_AGY_KEYWORDS)
-    {
+    } else if is_classified_agy(classification, pane) {
         "Antigravity"
     } else {
         "Unknown"
@@ -4143,11 +4152,16 @@ pub(crate) fn execute_automation_action(
     Ok(action.as_str().to_string())
 }
 
-fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspection) -> String {
+fn render_doctor_recommendations(
+    classification: &Classification,
+    pane: &TmuxPane,
+    bindings: &KeybindingsInspection,
+) -> String {
     let mut lines = Vec::new();
+    let agy = is_classified_agy(classification, pane);
 
     if !is_pane_command_claude(pane) {
-        if is_pane_command_agy(pane) {
+        if agy {
             lines.push(String::from(
                 "recommendation=agy panes are read-only in v1 (no YOLO, no prompt submit, no keybinding driver)",
             ));
@@ -4159,7 +4173,7 @@ fn render_doctor_recommendations(pane: &TmuxPane, bindings: &KeybindingsInspecti
         }
     }
 
-    if !is_pane_command_agy(pane) && bindings.status != KeybindingsStatus::Valid {
+    if !agy && bindings.status != KeybindingsStatus::Valid {
         lines.push(String::from(
             "recommendation=add the missing automation actions to your Claude keybindings; use install-bindings to merge missing botctl bindings into your existing file or bindings to inspect the recommended mapping",
         ));

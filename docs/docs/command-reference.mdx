@@ -332,17 +332,18 @@ botctl capture --pane 0:2.3 --history-lines 80
 
 ### `last-message`
 
-Purpose: dump the latest persisted assistant message for one Claude Code, Codex CLI, OpenCode, Pi, or Antigravity pane as raw Markdown.
+Purpose: dump the latest assistant message for one Claude Code, Codex CLI, OpenCode, Pi, or Antigravity pane as raw Markdown. Claude/Codex/OpenCode/Pi read persisted provider transcripts; Antigravity scrapes the pane's tmux scrollback.
 
 Syntax:
 ```bash
-botctl last-message --pane %ID|session:window.pane [--out PATH]
+botctl last-message --pane %ID|session:window.pane [--out PATH] [--history-lines N]
 ```
 
 Flags:
 - `--pane %ID|session:window.pane` (required)
 - `--out PATH` (default: `MESSAGE_<provider-session-id>.md` in the current directory)
 - `--out -` (write the raw Markdown message body to stdout instead of a file)
+- `--history-lines N` (default: `2000`) widens the captured scrollback for Antigravity pane-scrape extraction. Non-agy providers ignore this value.
 
 Targeting: explicit pane only.
 

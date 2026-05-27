@@ -127,6 +127,7 @@ pub struct CaptureArgs {
 pub struct LastMessageArgs {
     pub pane_id: String,
     pub out: Option<PathBuf>,
+    pub history_lines: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -492,7 +493,7 @@ fn usage_with_color(color: bool) -> String {
     out.push('\n');
     for line in [
         "status --pane %ID|session:window.pane [--history-lines N] [--json | --plain]",
-        "last-message --pane %ID|session:window.pane [--out PATH]",
+        "last-message --pane %ID|session:window.pane [--out PATH] [--history-lines N]",
         "doctor [--session NAME] [--pane %ID|session:window.pane] [--history-lines N] [--bindings-path PATH] [--json | --plain]",
         "continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)",
         "auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]",
@@ -809,15 +810,16 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         ),
         "last-message" => (
             "last-message",
-            "Dump the latest persisted assistant message from a pane transcript.",
-            "botctl last-message --pane %ID|session:window.pane [--out PATH]",
+            "Dump the latest assistant message from a pane transcript (Claude/Codex/OpenCode/Pi) or pane scrollback (Antigravity).",
+            "botctl last-message --pane %ID|session:window.pane [--out PATH] [--history-lines N]",
             &[
                 "botctl last-message --pane %19",
                 "botctl last-message --pane 0:2.3 --out last-agent-message.md",
                 "botctl last-message --pane %19 --out -",
+                "botctl last-message --pane %19 --history-lines 5000",
             ][..],
-            &["--pane TARGET", "--out PATH", "--no-color"][..],
-            "Reads provider transcript storage for Claude, Codex, OpenCode, Pi, and pane-scrape for Antigravity. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout.",
+            &["--pane TARGET", "--out PATH", "--history-lines N", "--no-color"][..],
+            "Reads provider transcript storage for Claude, Codex, OpenCode, Pi, and pane-scrape for Antigravity. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout. --history-lines (default: 2000) widens the captured scrollback for Antigravity pane-scrape extraction; non-agy providers ignore it.",
         ),
         "status" => (
             "status",
@@ -997,7 +999,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "attach" => "botctl attach (--pane TARGET | --session NAME [--window NAME]) [--plain]",
         "list" => "botctl list [--all] [--json | --plain]",
         "capture" => "botctl capture --pane TARGET [--history-lines N]",
-        "last-message" => "botctl last-message --pane TARGET [--out PATH]",
+        "last-message" => "botctl last-message --pane TARGET [--out PATH] [--history-lines N]",
         "observe" => {
             "botctl observe --session NAME [--pane TARGET] [--events N] [--idle-timeout-ms N] [--history-lines N] [--state-dir PATH]"
         }
@@ -1043,7 +1045,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "send-action" => "Advanced plumbing: send one named automation action to a pane.",
         "dismiss-survey" => "Dismiss a survey prompt. Canonical name: dismiss-survey.",
         "last-message" => {
-            "Dump the latest persisted assistant message for a Claude, Codex, OpenCode, Pi, or Antigravity pane."
+            "Dump the latest assistant message for a Claude, Codex, OpenCode, Pi, or Antigravity pane (Antigravity messages are scraped from pane scrollback, not persisted transcripts)."
         }
         "editor-helper" => {
             "Advanced prompt plumbing: generate an editor target file for prompt handoff."
@@ -1241,6 +1243,9 @@ fn parse_capture(args: Vec<String>) -> AppResult<Command> {
 fn parse_last_message(args: Vec<String>) -> AppResult<Command> {
     let mut pane_id = None;
     let mut out = None;
+    // Default to 2000 history lines for agy pane-scrape extraction; matches
+    // the dashboard polling default. Non-agy providers ignore this value.
+    let mut history_lines = 2000usize;
 
     let mut i = 0;
     while i < args.len() {
@@ -1251,6 +1256,12 @@ fn parse_last_message(args: Vec<String>) -> AppResult<Command> {
             "--out" => {
                 out = Some(PathBuf::from(read_value(&args, &mut i, "--out")?));
             }
+            "--history-lines" => {
+                let raw = read_value(&args, &mut i, "--history-lines")?;
+                history_lines = raw.parse::<usize>().map_err(|_| {
+                    AppError::new(format!("invalid value for --history-lines: {raw}"))
+                })?;
+            }
             flag => {
                 return Err(AppError::new(format!("unknown last-message flag: {flag}")));
             }
@@ -1260,7 +1271,7 @@ fn parse_last_message(args: Vec<String>) -> AppResult<Command> {
 
     let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
 
-    Ok(Command::LastMessage(LastMessageArgs { pane_id, out }))
+    Ok(Command::LastMessage(LastMessageArgs { pane_id, out, history_lines }))
 }
 
 fn parse_status(args: Vec<String>) -> AppResult<Command> {
@@ -2698,6 +2709,7 @@ mod tests {
             Command::LastMessage(args) => {
                 assert_eq!(args.pane_id, "0:4.1");
                 assert_eq!(args.out, Some(PathBuf::from("agent.md")));
+                assert_eq!(args.history_lines, 2000);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2719,9 +2731,45 @@ mod tests {
             Command::LastMessage(args) => {
                 assert_eq!(args.pane_id, "%7");
                 assert_eq!(args.out, Some(PathBuf::from("-")));
+                assert_eq!(args.history_lines, 2000);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_last_message_history_lines_override() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("last-message"),
+            String::from("--pane"),
+            String::from("%19"),
+            String::from("--history-lines"),
+            String::from("5000"),
+        ])
+        .expect("last-message with --history-lines should parse");
+
+        match command {
+            Command::LastMessage(args) => {
+                assert_eq!(args.pane_id, "%19");
+                assert_eq!(args.history_lines, 5000);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_message_rejects_invalid_history_lines() {
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("last-message"),
+            String::from("--pane"),
+            String::from("%19"),
+            String::from("--history-lines"),
+            String::from("not-a-number"),
+        ])
+        .expect_err("last-message should reject non-numeric --history-lines");
+        assert!(error.to_string().contains("--history-lines"));
     }
 
     #[test]
