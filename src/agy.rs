@@ -105,36 +105,49 @@ pub fn latest_assistant_message_for_pane(
 }
 
 pub fn frame_has_agy_fingerprint(frame: &str) -> bool {
-    // Strong fingerprint short-circuit.
-    if frame.contains("Antigravity CLI") || frame.contains("1 artifact · /artifact to review") {
+    // Strong fingerprint short-circuit — these are unique to agy.
+    if frame.contains("Antigravity CLI")
+        || frame.contains("1 artifact · /artifact to review")
+        || frame.contains("▄▀▀▄")
+        || frame.contains("▀▄▀")
+    {
         return true;
     }
 
-    // V8: the weak `? for shortcuts` fingerprint alone is too generic
-    // (screenshots / pastes of help text would match). Require it to
-    // co-occur with another corroborating signal in the same frame.
+    // The agy bottom footer always renders one of the footer markers
+    // (`esc to cancel` or `? for shortcuts`) left-aligned, with the
+    // current Gemini model right-aligned on the same line:
+    //
+    //   esc to cancel                                          Gemini 3.5 Flash (High)
+    //   ? for shortcuts                                        Gemini 3.5 Flash (High)
+    //
+    // That combination is unique to agy — Claude/Codex/OpenCode/Pi never
+    // render `Gemini ` in their footer — and is bottom-anchored so it
+    // survives long after the banner scrolls off.
+    let mut has_agy_footer = false;
     let mut has_shortcuts_hint = false;
-    let mut has_corroborator = false;
+    let mut has_strong_corroborator = false;
     for line in frame.lines() {
         let trimmed = line.trim();
-        if trimmed == "? for shortcuts" || trimmed.starts_with("? for shortcuts") {
+
+        if (trimmed.starts_with("esc to cancel") || trimmed.starts_with("? for shortcuts"))
+            && trimmed.contains("Gemini ")
+        {
+            has_agy_footer = true;
+        }
+        if trimmed == "? for shortcuts" {
             has_shortcuts_hint = true;
         }
-        if trimmed.contains("esc to cancel") {
-            // `esc to cancel` is the canonical agy busy marker and is itself
-            // a strong-enough signal regardless of `? for shortcuts`.
-            return true;
-        }
-        if line_has_spinner_with_busy_verb(trimmed) {
-            return true;
-        }
-        if !has_corroborator
-            && (trimmed.contains("Gemini ") || trimmed.contains("▄▀▀▄") || trimmed.contains("▀▄▀"))
+        if !has_strong_corroborator
+            && (trimmed.contains("Gemini 3.")
+                || trimmed.contains("Gemini 4.")
+                || trimmed.contains("Antigravity")
+                || line_has_spinner_with_busy_verb(trimmed))
         {
-            has_corroborator = true;
+            has_strong_corroborator = true;
         }
     }
-    has_shortcuts_hint && has_corroborator
+    has_agy_footer || (has_shortcuts_hint && has_strong_corroborator)
 }
 
 pub fn classify_agy_state(frame: &str) -> Option<SessionState> {
@@ -301,6 +314,44 @@ fn read_history_tail(path: &Path) -> AppResult<Vec<String>> {
 
 fn is_agy_permission_prompt(lines: &[&str]) -> bool {
     let joined = lines.join("\n");
+
+    // Real-world agy command-permission prompt observed in the wild
+    // (captured from `tmux capture-pane -t 0:1.1 -p` during megamind testing
+    // of this branch):
+    //
+    //   Command
+    //   ─────────────────────────────────────────────────────────────────
+    //
+    //     Requesting permission for: git remote -v
+    //
+    //   Do you want to proceed?
+    //   > 1. Yes
+    //     2. Yes, and always allow in this conversation for commands that start with 'git remote'
+    //     3. Yes, and always allow for commands that start with 'git remote' (Persist to settings.json)
+    //     4. No
+    //
+    //     ↑/↓ Navigate · tab Amend · e edit command
+    //   esc to cancel                                         Gemini 3.5 Flash (High)
+    //
+    // Any of the load-bearing tokens below is sufficient to identify the
+    // prompt; we require only one because the structure is unique to agy
+    // command-permission prompts.
+    if joined.contains("Requesting permission for:") && joined.contains("Do you want to proceed?") {
+        return true;
+    }
+    if joined.contains("Do you want to proceed?")
+        && joined.contains("> 1. Yes")
+        && joined.contains("4. No")
+    {
+        return true;
+    }
+    if joined.contains("↑/↓ Navigate · tab Amend") {
+        return true;
+    }
+
+    // Future / hypothetical signals (folder-trust prompts, allow-once
+    // overlays). Kept conservative: returning `Unknown` is always safer
+    // than letting the rest of the classifier guess.
     if joined.contains("Trust this workspace?")
         || joined.contains("Trust this folder")
         || joined.contains("Allow once")
@@ -548,28 +599,41 @@ mod tests {
 
     #[test]
     fn frame_fingerprint_detects_banner_footer_spinner_artifact() {
+        // Strong fingerprints (banner / banner glyphs / artifact tray).
         assert!(frame_has_agy_fingerprint("...\nAntigravity CLI 1.0.2\n"));
         assert!(frame_has_agy_fingerprint(
             "...\n1 artifact · /artifact to review\n"
         ));
-        // V8: `? for shortcuts` alone is too generic; it must co-occur with
-        // a corroborating signal (esc to cancel, Gemini, banner glyphs).
+        assert!(frame_has_agy_fingerprint("...\n      ▄▀▀▄\n     ▀▀▀▀▀▀\n"));
+
+        // Bottom-anchored agy footer: `(esc to cancel|? for shortcuts)`
+        // co-occurring with the right-aligned Gemini model line.
         assert!(frame_has_agy_fingerprint(
             "...\n? for shortcuts                              Gemini 3.5 Flash (High)\n",
         ));
-        assert!(frame_has_agy_fingerprint("...\nesc to cancel\n"));
-        // Bare `? for shortcuts` (no corroborator) must NOT fingerprint as agy.
+        assert!(frame_has_agy_fingerprint(
+            "...\nesc to cancel                                Gemini 3.5 Flash (High)\n",
+        ));
+
+        // `? for shortcuts` co-occurring with another corroborator (banner /
+        // Antigravity / Gemini X.X) elsewhere in the frame.
+        assert!(frame_has_agy_fingerprint(
+            "Some output\nGemini 3.5 Flash\n...\n? for shortcuts\n"
+        ));
+
+        // Negative cases:
+        // - Bare `? for shortcuts` with no corroborator.
         assert!(!frame_has_agy_fingerprint("...\n? for shortcuts\n"));
-        // Various busy spinners must all register as agy fingerprints (V7).
-        assert!(frame_has_agy_fingerprint("⣾ Working..."));
-        assert!(frame_has_agy_fingerprint("⣾ Thinking..."));
-        assert!(frame_has_agy_fingerprint("⣷ Reading..."));
-        assert!(frame_has_agy_fingerprint("⠋ Searching for fish..."));
-        assert!(frame_has_agy_fingerprint("⡿ Calling tool..."));
-        assert!(frame_has_agy_fingerprint("⣽ Reasoning about it..."));
+        // - Bare `esc to cancel` (Claude's permission/busy footer also uses
+        //   it, so it cannot be the only signal).
+        assert!(!frame_has_agy_fingerprint("...\nesc to cancel\n"));
+        // - Spinner alone without footer / banner / Gemini context.
+        assert!(!frame_has_agy_fingerprint("⣾ Working..."));
+        assert!(!frame_has_agy_fingerprint("⣾ Thinking..."));
+        // - Random text.
         assert!(!frame_has_agy_fingerprint("just some random text"));
-        // Lowercase verbs after the glyph must NOT match (assistant prose can
-        // start with a spinner-shaped glyph in pasted content).
+        // - Lowercase verbs after a glyph must NOT match
+        //   (assistant prose can start with a spinner-shaped glyph).
         assert!(!frame_has_agy_fingerprint("⣾ working hard on this..."));
     }
 
@@ -637,6 +701,37 @@ mod tests {
             "[y/N]\n",
             "? for shortcuts\n",
         );
+        assert_eq!(classify_agy_state(frame), Some(SessionState::Unknown));
+    }
+
+    #[test]
+    fn classify_real_world_agy_command_permission_prompt_returns_unknown() {
+        // Verbatim shape of the command-permission prompt captured live
+        // from `tmux capture-pane -t 0:1.1 -p` during megamind testing
+        // of this branch (see fixtures/cases/agy_permission_prompt/).
+        let frame = concat!(
+            "● Bash(git remote -v) (ctrl+o to expand)\n",
+            "\n",
+            "Command\n",
+            "─────────────────────────────────────────────\n",
+            "\n",
+            "  Requesting permission for: git remote -v\n",
+            "\n",
+            "Do you want to proceed?\n",
+            "> 1. Yes\n",
+            "  2. Yes, and always allow in this conversation for commands that start with 'git remote'\n",
+            "  3. Yes, and always allow for commands that start with 'git remote' (Persist to settings.json)\n",
+            "  4. No\n",
+            "\n",
+            "  ↑/↓ Navigate · tab Amend · e edit command\n",
+            "esc to cancel                                       Gemini 3.5 Flash (High)\n",
+        );
+        // Must fingerprint as agy via the bottom-anchored footer.
+        assert!(
+            frame_has_agy_fingerprint(frame),
+            "real-world command prompt should fingerprint as agy"
+        );
+        // Must classify as `Unknown` (never auto-act on a permission UI).
         assert_eq!(classify_agy_state(frame), Some(SessionState::Unknown));
     }
 

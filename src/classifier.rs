@@ -228,7 +228,19 @@ impl Classifier {
         );
         let has_busy_status_banner = has_live_busy_status(&lines);
 
-        let mut state = if contains_any(
+        // Agy fingerprint check runs BEFORE the rest of the chain. Once a
+        // frame fingerprints as agy (Antigravity banner / box-drawing
+        // banner / `1 artifact · /artifact to review` / unique
+        // `(esc to cancel|? for shortcuts) … Gemini ` footer), the agy
+        // classifier owns the result: it has its own permission-prompt
+        // detector and its own busy/ready rules. Letting the Claude
+        // permission / busy chain run first risks misclassifying a real
+        // agy command-permission prompt as a Claude `PermissionDialog`
+        // (whose YOLO/approval paths do not apply to agy).
+        let mut state = if crate::agy::frame_has_agy_fingerprint(frame_text) {
+            signals.push(String::from(SIGNAL_AGY_KEYWORDS));
+            crate::agy::classify_agy_state(frame_text).unwrap_or(SessionState::Unknown)
+        } else if contains_any(
             &normalized,
             &[
                 "quick safety check",
@@ -358,9 +370,6 @@ impl Classifier {
                 signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
             }
             SessionState::BusyResponding
-        } else if crate::agy::frame_has_agy_fingerprint(frame_text) {
-            signals.push(String::from(SIGNAL_AGY_KEYWORDS));
-            crate::agy::classify_agy_state(frame_text).unwrap_or(SessionState::Unknown)
         } else if has_chat_input || contains_any(&normalized, &["claude"]) || has_codex_keywords {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             if has_codex_keywords {
