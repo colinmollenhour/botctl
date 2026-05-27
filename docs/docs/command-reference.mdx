@@ -108,7 +108,7 @@ Output and safety:
 
 ### `mcp`
 
-Purpose: run the small MCP-compatible JSON-RPC server for persistent Claude sessions backed by managed tmux windows.
+Purpose: run the small MCP-compatible JSON-RPC server for persistent agent sessions backed by managed tmux windows. Claude is the default provider; Codex, OpenCode, and Pi are also supported on `spawn`.
 
 Syntax:
 ```bash
@@ -116,22 +116,22 @@ botctl mcp stdio [--state-dir PATH]
 botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
 ```
 
-Tools:
+Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn`):
 
-- `botctl_spawn`
-- `botctl_prompt`
-- `botctl_wait`
-- `botctl_kill`
-- `botctl_snapshot`
-- `botctl_send_keys`
+- `spawn` (accepts optional `provider`: `claude` default, `codex`, `opencode`, `pi`)
+- `prompt`
+- `wait`
+- `kill`
+- `snapshot`
+- `send_keys`
 
 Notes:
 
 - stdio uses newline-delimited JSON-RPC on stdin/stdout.
 - HTTP v1 is deliberately minimal JSON-RPC at `POST /mcp`; it is not full MCP Streamable HTTP.
-- sessions persist after `botctl_prompt`; use `botctl_kill` for cleanup.
+- sessions persist after `prompt`; use `kill` for cleanup.
 - managed IDs resolve to exact tmux pane/window IDs before any action.
-- `botctl_send_keys` is unsafe/operator-only and does not imply progress.
+- `send_keys` is unsafe/operator-only and does not imply progress.
 
 ### `yolo`
 

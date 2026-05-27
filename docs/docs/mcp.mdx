@@ -1,6 +1,6 @@
-# MCP Claude sessions
+# MCP agent sessions
 
-`botctl mcp` exposes a small MCP-compatible JSON-RPC API for persistent Claude Code sessions backed by tmux.
+`botctl mcp` exposes a small MCP-compatible JSON-RPC API for persistent agent TUI sessions backed by tmux. Claude is the default provider; Codex, OpenCode, and Pi are also supported on `spawn`.
 
 ## Start a transport
 
@@ -13,34 +13,35 @@ The HTTP transport is intentionally minimal in v1: it accepts one JSON-RPC reque
 
 ## Tools
 
-The v1 tool names are stable and botctl-prefixed:
+Tool names are unprefixed; MCP clients typically expose them under the server name (e.g. `mcp__botctl__spawn`).
 
-- `botctl_spawn` — start a persistent Claude TUI in a managed tmux window for an existing `cwd`.
-- `botctl_prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive.
-- `botctl_wait` — wait for an existing managed session to reach a terminal outcome.
-- `botctl_kill` — kill only the verified managed tmux window; idempotent when already gone.
-- `botctl_snapshot` — capture pane text and classifier state for diagnostics.
-- `botctl_send_keys` — unsafe operator escape hatch scoped to the managed ID.
+- `spawn` — start a persistent agent TUI in a managed tmux window for an existing `cwd`. Accepts an optional `provider` (`claude` default, `codex`, `opencode`, `pi`).
+- `prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive.
+- `wait` — wait for an existing managed session to reach a terminal outcome.
+- `kill` — kill only the verified managed tmux window; idempotent when already gone.
+- `snapshot` — capture pane text and classifier state for diagnostics.
+- `send_keys` — unsafe operator escape hatch scoped to the managed ID.
 
-Sessions are addressed by generated public IDs, not tmux names. The registry stores exact tmux session/window/pane IDs under the botctl state directory and uses SQLite lock rows so concurrent prompt/wait/kill/snapshot/send operations on the same ID return `busy` instead of racing.
+Sessions are addressed by generated public IDs, not tmux names. The registry stores exact tmux session/window/pane IDs (and the chosen provider) under the botctl state directory and uses SQLite lock rows so concurrent prompt/wait/kill/snapshot/send operations on the same ID return `busy` instead of racing.
 
 ## Safety notes
 
 - `prompt` CLI behavior is unchanged: one-shot `botctl prompt` still cleans up its managed window after success.
-- MCP sessions are persistent: `botctl_prompt` does not auto-kill after a reply.
+- MCP sessions are persistent: `prompt` does not auto-kill after a reply.
 - Automation resolves the managed ID back to one exact tmux pane before acting.
 - `Unknown` and unsupported blocker states return structured outcomes instead of guessing.
 - `FolderTrustPrompt` may be advanced with raw `Enter`; ordinary permission dialogs require supported policy and otherwise block.
-- `botctl_send_keys` only reports that keys/text were sent. It does not imply Claude made progress.
+- For non-Claude providers, prompt submission pastes the text and presses `Enter`; Claude-only keybindings (`ClearInput`, `ExternalEditor`) are not consulted.
+- `send_keys` only reports that keys/text were sent. It does not imply the agent made progress.
 
 ## Smoke and torture testing
 
-Manual smoke flow with real `tmux` and `claude` prerequisites:
+Manual smoke flow with real `tmux` and the chosen agent CLI on `PATH`:
 
 1. Start `botctl mcp stdio` or `botctl mcp http --bind 127.0.0.1:8787`.
-2. Call `botctl_spawn` with a temp repo `cwd`.
-3. Call `botctl_prompt` twice for the same ID and verify the second response uses the same persistent window.
-4. Call `botctl_snapshot` and inspect the exact tmux IDs.
-5. Call `botctl_kill` and verify the managed window is gone.
+2. Call `spawn` with a temp repo `cwd` (optionally `provider`).
+3. Call `prompt` twice for the same ID and verify the second response uses the same persistent window.
+4. Call `snapshot` and inspect the exact tmux IDs.
+5. Call `kill` and verify the managed window is gone.
 
 Torture scenarios to run manually before widening client use: concurrent prompts for one ID should yield one active operation and `busy` for the rest; concurrent prompts across different IDs should progress independently; killing the tmux window externally should make prompt/wait return `dead`; killing while a wait holds the lock should return `busy`.

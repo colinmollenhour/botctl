@@ -64,7 +64,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - prepare prompts and hand them off through an external-editor workflow
 - run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files
 - run guarded higher-level actions such as prompt submission, permission approval, permission rejection, and survey dismissal
-- run MCP tools for persistent tmux-backed Claude sessions (`botctl_spawn`, `botctl_prompt`, `botctl_wait`, `botctl_kill`, `botctl_snapshot`, `botctl_send_keys`)
+- run MCP tools for persistent tmux-backed agent sessions (`spawn`, `prompt`, `wait`, `kill`, `snapshot`, `send_keys`); `spawn` accepts an optional `provider` (`claude` default, `codex`, `opencode`, `pi`)
 
 ## Docs
 

@@ -9,7 +9,7 @@ use crate::automation::{AutomationAction, load_resolved_keybindings};
 use crate::classifier::{Classification, Classifier, SessionState};
 use crate::last_message::{LastAgentMessage, load_last_agent_message};
 use crate::mcp_registry::{
-    LifecycleState, McpRegistry, McpSessionRecord, NewSessionRecord, SessionLock,
+    LifecycleState, McpRegistry, McpSessionRecord, NewSessionRecord, Provider, SessionLock,
 };
 use crate::tmux::{StartWindowRequest, TmuxClient, TmuxPane};
 
@@ -40,8 +40,10 @@ impl McpSessionService {
         let cwd = required_str(args, "cwd")?;
         let cwd = canonical_dir(cwd)?;
         let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
+        let provider = optional_provider(args)?;
         let window_name = format!(
-            "botctl-mcp-{}",
+            "botctl-mcp-{}-{}",
+            provider.as_str(),
             &self.server_id[..8.min(self.server_id.len())]
         );
         let client = TmuxClient::default();
@@ -49,10 +51,11 @@ impl McpSessionService {
             session_name: DEFAULT_SESSION_NAME.to_string(),
             window_name,
             cwd: cwd.clone(),
-            command: "claude".to_string(),
+            command: provider.command().to_string(),
         })?;
         let record = self.registry.insert_session(NewSessionRecord {
             owner_server_id: self.server_id.clone(),
+            provider,
             tmux_session_name: started.session_name,
             tmux_window_id: started.window_id,
             tmux_window_name: started.window_name,
@@ -105,7 +108,7 @@ impl McpSessionService {
         let baseline = load_last_agent_message(&pane)
             .ok()
             .or_else(|| cursor_as_message(&record));
-        self.submit_direct(&pane, prompt)?;
+        self.submit_direct(record.provider, &pane, prompt)?;
         self.registry
             .update_state(&id, LifecycleState::Running, Some("PromptEditing"))?;
         let outcome = self.wait_inner(&record, timeout_ms, false, no_yolo, Some(&lock))?;
@@ -240,7 +243,7 @@ impl McpSessionService {
         let has_text = args.get("text").is_some();
         if has_keys == has_text {
             return Err(AppError::new(
-                "invalid_params: botctl_send_keys requires exactly one of keys or text",
+                "invalid_params: send_keys requires exactly one of keys or text",
             ));
         }
         if let Some(keys) = args.get("keys") {
@@ -287,15 +290,22 @@ impl McpSessionService {
         Ok(pane)
     }
 
-    fn submit_direct(&self, pane: &TmuxPane, prompt: &str) -> AppResult<()> {
+    fn submit_direct(&self, provider: Provider, pane: &TmuxPane, prompt: &str) -> AppResult<()> {
         let client = TmuxClient::default();
-        let bindings = load_resolved_keybindings(None).map_err(AppError::new)?;
-        let submit = bindings
-            .keys_for(AutomationAction::Submit)
-            .ok_or_else(|| AppError::new("missing_keybinding: submit"))?;
         client.paste_text(&pane.pane_id, prompt)?;
         thread::sleep(Duration::from_millis(250));
-        client.send_keys(&pane.pane_id, submit)
+        match provider {
+            Provider::Claude => {
+                let bindings = load_resolved_keybindings(None).map_err(AppError::new)?;
+                let submit = bindings
+                    .keys_for(AutomationAction::Submit)
+                    .ok_or_else(|| AppError::new("missing_keybinding: submit"))?;
+                client.send_keys(&pane.pane_id, submit)
+            }
+            Provider::Codex | Provider::Opencode | Provider::Pi => {
+                client.send_keys(&pane.pane_id, &["Enter"])
+            }
+        }
     }
 
     fn wait_inner(
@@ -406,6 +416,18 @@ fn required_str<'a>(args: &'a Value, name: &str) -> AppResult<&'a str> {
         .ok_or_else(|| AppError::new(format!("invalid_params: missing or invalid {name}")))
 }
 
+fn optional_provider(args: &Value) -> AppResult<Provider> {
+    match args.get("provider") {
+        Some(Value::Null) | None => Ok(Provider::Claude),
+        Some(value) => {
+            let name = value
+                .as_str()
+                .ok_or_else(|| AppError::new("invalid_params: provider must be a string"))?;
+            Provider::parse(name)
+        }
+    }
+}
+
 fn optional_u64(args: &Value, name: &str, default: u64) -> AppResult<u64> {
     match args.get(name) {
         Some(value) => value
@@ -448,6 +470,7 @@ fn canonical_dir(path: &str) -> AppResult<PathBuf> {
 fn agent_ref(record: &McpSessionRecord) -> Value {
     json!({
         "id": record.id,
+        "provider": record.provider.as_str(),
         "state": record.lifecycle_state.as_str(),
         "cwd": record.cwd,
         "tmux": {

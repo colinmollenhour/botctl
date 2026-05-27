@@ -85,12 +85,12 @@ impl McpService {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let result = match name {
-            "botctl_spawn" => self.sessions.spawn(&args),
-            "botctl_prompt" => self.sessions.prompt(&args),
-            "botctl_wait" => self.sessions.wait(&args),
-            "botctl_kill" => self.sessions.kill(&args),
-            "botctl_snapshot" => self.sessions.snapshot(&args),
-            "botctl_send_keys" => self.sessions.send_keys(&args),
+            "spawn" => self.sessions.spawn(&args),
+            "prompt" => self.sessions.prompt(&args),
+            "wait" => self.sessions.wait(&args),
+            "kill" => self.sessions.kill(&args),
+            "snapshot" => self.sessions.snapshot(&args),
+            "send_keys" => self.sessions.send_keys(&args),
             _ => unreachable!(),
         }?;
         Ok(json!({
@@ -140,7 +140,7 @@ mod tests {
             jsonrpc: Some("2.0".into()),
             id: Some(json!(3)),
             method: "tools/call".into(),
-            params: json!({ "name": "botctl_send_keys", "arguments": {} }),
+            params: json!({ "name": "send_keys", "arguments": {} }),
         });
         let response = response.unwrap();
         assert_eq!(response["error"]["code"], -32602);

@@ -3,12 +3,12 @@ use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const TOOL_NAMES: [&str; 6] = [
-    "botctl_spawn",
-    "botctl_prompt",
-    "botctl_wait",
-    "botctl_kill",
-    "botctl_snapshot",
-    "botctl_send_keys",
+    "spawn",
+    "prompt",
+    "wait",
+    "kill",
+    "snapshot",
+    "send_keys",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,15 +60,21 @@ pub fn tools_list_result() -> Value {
 pub fn tool_catalog() -> Vec<Value> {
     vec![
         tool(
-            "botctl_spawn",
-            "Start a persistent Claude session in a managed tmux window.",
+            "spawn",
+            "Start a persistent agent TUI in a managed tmux window. Provider defaults to claude.",
             json!({
                 "type": "object", "required": ["cwd"],
-                "properties": { "cwd": {"type":"string"}, "timeout_ms": {"type":"integer", "minimum":1000}, "initial_prompt": {"type":"string"}, "policy": policy_schema() }
+                "properties": {
+                    "cwd": {"type":"string"},
+                    "provider": {"type":"string", "enum": ["claude", "codex", "opencode", "pi"]},
+                    "timeout_ms": {"type":"integer", "minimum":1000},
+                    "initial_prompt": {"type":"string"},
+                    "policy": policy_schema()
+                }
             }),
         ),
         tool(
-            "botctl_prompt",
+            "prompt",
             "Submit a prompt to a managed session and keep it alive.",
             json!({
                 "type": "object", "required": ["id", "prompt"],
@@ -76,7 +82,7 @@ pub fn tool_catalog() -> Vec<Value> {
             }),
         ),
         tool(
-            "botctl_wait",
+            "wait",
             "Wait for a managed session to reach a terminal state.",
             json!({
                 "type":"object", "required":["id"],
@@ -84,7 +90,7 @@ pub fn tool_catalog() -> Vec<Value> {
             }),
         ),
         tool(
-            "botctl_kill",
+            "kill",
             "Safely kill only the verified managed tmux window.",
             json!({
                 "type":"object", "required":["id"],
@@ -92,7 +98,7 @@ pub fn tool_catalog() -> Vec<Value> {
             }),
         ),
         tool(
-            "botctl_snapshot",
+            "snapshot",
             "Capture and classify the current managed pane.",
             json!({
                 "type":"object", "required":["id"],
@@ -100,7 +106,7 @@ pub fn tool_catalog() -> Vec<Value> {
             }),
         ),
         tool(
-            "botctl_send_keys",
+            "send_keys",
             "Unsafe operator escape hatch; no progress is implied.",
             json!({
                 "type":"object", "required":["id"],
