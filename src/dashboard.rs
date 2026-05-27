@@ -25,6 +25,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::AppResult;
 use crate::classifier::{Classifier, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::cli::DashboardArgs;
+use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::opencode::resolve_opencode_session_for_pane;
 use crate::pi::resolve_pi_session_for_pane;
 use crate::prompt::resolve_state_dir;
@@ -305,9 +306,14 @@ impl DashboardApp {
             });
             next_frames.insert(pane.pane_id.clone(), snapshot.raw_source.clone());
             let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+            let codex_session_id = if matches!(source, PaneSource::Codex) {
+                resolve_codex_session_id_for_pane(&pane)?
+            } else {
+                None
+            };
             let session_key = match &source {
                 PaneSource::Claude => snapshot.claude_session_id.as_deref(),
-                PaneSource::Codex => None,
+                PaneSource::Codex => codex_session_id.as_deref(),
                 PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
                     Some(session_id.as_str())
                 }
@@ -392,9 +398,14 @@ impl DashboardApp {
             });
             next_frames.insert(pane.pane_id.clone(), frame.clone());
             let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+            let codex_session_id = if matches!(source, PaneSource::Codex) {
+                resolve_codex_session_id_for_pane(&pane)?
+            } else {
+                None
+            };
             let session_key = match &source {
                 PaneSource::Claude => None,
-                PaneSource::Codex => None,
+                PaneSource::Codex => codex_session_id.as_deref(),
                 PaneSource::OpenCode { session_id, .. } | PaneSource::Pi { session_id } => {
                     Some(session_id.as_str())
                 }

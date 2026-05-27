@@ -24,6 +24,7 @@ use crate::app::{
 };
 use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection};
 use crate::classifier::{Classification, SessionState};
+use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
 use crate::screen_model::ScreenModel;
 use crate::storage::{
@@ -1246,6 +1247,11 @@ fn reconcile_all(
         let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
         let claude_session_id =
             sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
+        let codex_session_id = if is_yolo_candidate_pane(&pane) {
+            resolve_codex_session_id_for_pane(&pane)?
+        } else {
+            None
+        };
         let runtime_durations = sync_tmux_runtime_state(
             &config.state_dir,
             &workspace.id,
@@ -1253,7 +1259,7 @@ fn reconcile_all(
             inspected.classification.state.as_str(),
             is_waiting_state(inspected.classification.state),
             inspected.classification.state == SessionState::BusyResponding,
-            claude_session_id.as_deref(),
+            claude_session_id.as_deref().or(codex_session_id.as_deref()),
         )?;
         let desired_yolo_enabled = matches!(read_yolo_record(&config.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
 
