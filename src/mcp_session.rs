@@ -41,6 +41,10 @@ impl McpSessionService {
         let cwd = canonical_dir(cwd)?;
         let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
         let provider = optional_provider(args)?;
+        let model = optional_nonempty_str(args, "model")?;
+        let effort = optional_nonempty_str(args, "effort")?;
+        let agent = optional_nonempty_str(args, "agent")?;
+        let command = build_launch_command(provider, model.as_deref(), effort.as_deref(), agent.as_deref())?;
         let window_name = format!(
             "botctl-mcp-{}-{}",
             provider.as_str(),
@@ -51,11 +55,14 @@ impl McpSessionService {
             session_name: DEFAULT_SESSION_NAME.to_string(),
             window_name,
             cwd: cwd.clone(),
-            command: provider.command().to_string(),
+            command,
         })?;
         let record = self.registry.insert_session(NewSessionRecord {
             owner_server_id: self.server_id.clone(),
             provider,
+            model,
+            effort,
+            agent,
             tmux_session_name: started.session_name,
             tmux_window_id: started.window_id,
             tmux_window_name: started.window_name,
@@ -302,7 +309,7 @@ impl McpSessionService {
                     .ok_or_else(|| AppError::new("missing_keybinding: submit"))?;
                 client.send_keys(&pane.pane_id, submit)
             }
-            Provider::Codex | Provider::Opencode | Provider::Pi => {
+            Provider::Codex | Provider::Agy => {
                 client.send_keys(&pane.pane_id, &["Enter"])
             }
         }
@@ -428,6 +435,84 @@ fn optional_provider(args: &Value) -> AppResult<Provider> {
     }
 }
 
+fn optional_nonempty_str(args: &Value, name: &str) -> AppResult<Option<String>> {
+    match args.get(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| AppError::new(format!("invalid_params: {name} must be a string")))?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(AppError::new(format!(
+                    "invalid_params: {name} must be a non-empty string"
+                )))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+    }
+}
+
+fn build_launch_command(
+    provider: Provider,
+    model: Option<&str>,
+    effort: Option<&str>,
+    agent: Option<&str>,
+) -> AppResult<String> {
+    let mut parts = vec![provider.command().to_string()];
+    match provider {
+        Provider::Claude => {
+            if let Some(value) = model {
+                parts.push("--model".into());
+                parts.push(shell_escape_arg(value));
+            }
+            if let Some(value) = effort {
+                parts.push("--effort".into());
+                parts.push(shell_escape_arg(value));
+            }
+            if let Some(value) = agent {
+                parts.push("--agent".into());
+                parts.push(shell_escape_arg(value));
+            }
+        }
+        Provider::Codex => {
+            if let Some(value) = model {
+                parts.push("-m".into());
+                parts.push(shell_escape_arg(value));
+            }
+            if let Some(value) = effort {
+                parts.push("-c".into());
+                parts.push(shell_escape_arg(&format!("model_reasoning_effort={value}")));
+            }
+            if agent.is_some() {
+                return Err(AppError::new(
+                    "invalid_params: codex provider does not support agent",
+                ));
+            }
+        }
+        Provider::Agy => {
+            if model.is_some() || effort.is_some() || agent.is_some() {
+                return Err(AppError::new(
+                    "invalid_params: agy provider does not support model, effort, or agent",
+                ));
+            }
+        }
+    }
+    Ok(parts.join(" "))
+}
+
+fn shell_escape_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | '%' | ':'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
 fn optional_u64(args: &Value, name: &str, default: u64) -> AppResult<u64> {
     match args.get(name) {
         Some(value) => value
@@ -471,6 +556,9 @@ fn agent_ref(record: &McpSessionRecord) -> Value {
     json!({
         "id": record.id,
         "provider": record.provider.as_str(),
+        "model": record.model,
+        "effort": record.effort,
+        "agent": record.agent,
         "state": record.lifecycle_state.as_str(),
         "cwd": record.cwd,
         "tmux": {
@@ -566,5 +654,39 @@ mod tests {
     fn timeout_deadline_is_capped_safely() {
         let deadline = safe_deadline(u64::MAX);
         assert!(deadline <= Instant::now() + Duration::from_millis(MAX_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn launch_command_maps_per_provider() {
+        assert_eq!(
+            build_launch_command(Provider::Claude, Some("opus"), Some("high"), Some("reviewer"))
+                .unwrap(),
+            "claude --model opus --effort high --agent reviewer"
+        );
+        assert_eq!(
+            build_launch_command(Provider::Codex, Some("gpt-5.5"), Some("high"), None).unwrap(),
+            "codex -m gpt-5.5 -c 'model_reasoning_effort=high'"
+        );
+        assert_eq!(build_launch_command(Provider::Agy, None, None, None).unwrap(), "agy");
+    }
+
+    #[test]
+    fn launch_command_rejects_unsupported_combos() {
+        let err = build_launch_command(Provider::Codex, None, None, Some("reviewer"))
+            .expect_err("codex agent should fail");
+        assert!(err.to_string().contains("codex provider does not support agent"));
+        let err = build_launch_command(Provider::Agy, Some("any"), None, None)
+            .expect_err("agy model should fail");
+        assert!(err.to_string().contains("agy provider does not support"));
+    }
+
+    #[test]
+    fn nonempty_str_trims_and_rejects_blank() {
+        assert_eq!(
+            optional_nonempty_str(&json!({"model": "  opus  "}), "model").unwrap(),
+            Some("opus".to_string())
+        );
+        assert!(optional_nonempty_str(&json!({"model": "   "}), "model").is_err());
+        assert_eq!(optional_nonempty_str(&json!({}), "model").unwrap(), None);
     }
 }

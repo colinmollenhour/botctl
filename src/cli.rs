@@ -967,7 +967,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         ),
         "mcp" => (
             "mcp",
-            "Run the small botctl MCP JSON-RPC server for persistent agent sessions (Claude default; Codex/OpenCode/Pi also supported).",
+            "Run the small botctl MCP JSON-RPC server for persistent agent sessions (Claude default; Codex and Agy also supported).",
             "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]",
             &["botctl mcp stdio", "botctl mcp http --bind 127.0.0.1:8787"][..],
             &[
@@ -976,7 +976,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--state-dir PATH",
                 "--no-color",
             ][..],
-            "Tools use generated managed IDs and exact tmux pane IDs. spawn accepts an optional provider (claude default, codex, opencode, pi). send_keys is unsafe/operator-only and does not imply progress.",
+            "Tools use generated managed IDs and exact tmux pane IDs. spawn accepts optional provider (claude default, codex, agy), model, effort, and agent — validated per provider. send_keys is unsafe/operator-only and does not imply progress.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {

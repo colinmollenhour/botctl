@@ -108,7 +108,7 @@ Output and safety:
 
 ### `mcp`
 
-Purpose: run the small MCP-compatible JSON-RPC server for persistent agent sessions backed by managed tmux windows. Claude is the default provider; Codex, OpenCode, and Pi are also supported on `spawn`.
+Purpose: run the small MCP-compatible JSON-RPC server for persistent agent sessions backed by managed tmux windows. Claude is the default provider; Codex and Agy are also supported on `spawn`.
 
 Syntax:
 ```bash
@@ -118,7 +118,7 @@ botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
 
 Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn`):
 
-- `spawn` (accepts optional `provider`: `claude` default, `codex`, `opencode`, `pi`)
+- `spawn` (optional `provider`: `claude` default, `codex`, `agy`; optional `model`, `effort`, `agent` — validated per provider)
 - `prompt`
 - `wait`
 - `kill`

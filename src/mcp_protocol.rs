@@ -61,12 +61,15 @@ pub fn tool_catalog() -> Vec<Value> {
     vec![
         tool(
             "spawn",
-            "Start a persistent agent TUI in a managed tmux window. Provider defaults to claude.",
+            "Start a persistent agent TUI in a managed tmux window. Provider defaults to claude. model/effort/agent are validated per provider.",
             json!({
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string"},
-                    "provider": {"type":"string", "enum": ["claude", "codex", "opencode", "pi"]},
+                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"]},
+                    "model": {"type":"string", "minLength":1},
+                    "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+                    "agent": {"type":"string", "minLength":1},
                     "timeout_ms": {"type":"integer", "minimum":1000},
                     "initial_prompt": {"type":"string"},
                     "policy": policy_schema()

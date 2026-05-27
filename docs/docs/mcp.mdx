@@ -1,6 +1,6 @@
 # MCP agent sessions
 
-`botctl mcp` exposes a small MCP-compatible JSON-RPC API for persistent agent TUI sessions backed by tmux. Claude is the default provider; Codex, OpenCode, and Pi are also supported on `spawn`.
+`botctl mcp` exposes a small MCP-compatible JSON-RPC API for persistent agent TUI sessions backed by tmux. Claude is the default provider; Codex and Agy are also supported on `spawn`.
 
 ## Start a transport
 
@@ -15,7 +15,10 @@ The HTTP transport is intentionally minimal in v1: it accepts one JSON-RPC reque
 
 Tool names are unprefixed; MCP clients typically expose them under the server name (e.g. `mcp__botctl__spawn`).
 
-- `spawn` — start a persistent agent TUI in a managed tmux window for an existing `cwd`. Accepts an optional `provider` (`claude` default, `codex`, `opencode`, `pi`).
+- `spawn` — start a persistent agent TUI in a managed tmux window for an existing `cwd`. Accepts optional `provider` (`claude` default, `codex`, `agy`), `model`, `effort` (`low`/`medium`/`high`/`xhigh`/`max`), and `agent`. Per-provider support:
+  - Claude: `model` → `--model`, `effort` → `--effort`, `agent` → `--agent`.
+  - Codex: `model` → `-m`, `effort` → `-c model_reasoning_effort=<v>`. `agent` is rejected.
+  - Agy: all three are rejected (no matching CLI flags).
 - `prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive.
 - `wait` — wait for an existing managed session to reach a terminal outcome.
 - `kill` — kill only the verified managed tmux window; idempotent when already gone.
@@ -32,6 +35,7 @@ Sessions are addressed by generated public IDs, not tmux names. The registry sto
 - `Unknown` and unsupported blocker states return structured outcomes instead of guessing.
 - `FolderTrustPrompt` may be advanced with raw `Enter`; ordinary permission dialogs require supported policy and otherwise block.
 - For non-Claude providers, prompt submission pastes the text and presses `Enter`; Claude-only keybindings (`ClearInput`, `ExternalEditor`) are not consulted.
+- For Agy, fresh-message extraction is not yet supported, so `prompt` responses return `fresh_message: false` with a `stale_transcript` warning; use `snapshot` to inspect the pane.
 - `send_keys` only reports that keys/text were sent. It does not imply the agent made progress.
 
 ## Smoke and torture testing

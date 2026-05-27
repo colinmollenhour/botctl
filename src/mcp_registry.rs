@@ -27,8 +27,7 @@ pub enum LifecycleState {
 pub enum Provider {
     Claude,
     Codex,
-    Opencode,
-    Pi,
+    Agy,
 }
 
 impl Provider {
@@ -36,8 +35,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Opencode => "opencode",
-            Self::Pi => "pi",
+            Self::Agy => "agy",
         }
     }
 
@@ -45,8 +43,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Opencode => "opencode",
-            Self::Pi => "pi",
+            Self::Agy => "agy",
         }
     }
 
@@ -54,8 +51,7 @@ impl Provider {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            "opencode" => Ok(Self::Opencode),
-            "pi" => Ok(Self::Pi),
+            "agy" => Ok(Self::Agy),
             other => Err(AppError::new(format!(
                 "invalid_params: unknown provider {other}"
             ))),
@@ -101,6 +97,9 @@ pub struct McpSessionRecord {
     pub id: String,
     pub owner_server_id: String,
     pub provider: Provider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub agent: Option<String>,
     pub tmux_session_name: String,
     pub tmux_window_id: String,
     pub tmux_window_name: String,
@@ -121,6 +120,9 @@ pub struct McpSessionRecord {
 pub struct NewSessionRecord {
     pub owner_server_id: String,
     pub provider: Provider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub agent: Option<String>,
     pub tmux_session_name: String,
     pub tmux_window_id: String,
     pub tmux_window_name: String,
@@ -183,6 +185,9 @@ impl McpRegistry {
                 id TEXT PRIMARY KEY,
                 owner_server_id TEXT NOT NULL,
                 provider TEXT NOT NULL DEFAULT 'claude',
+                model TEXT,
+                effort TEXT,
+                agent TEXT,
                 tmux_session_name TEXT NOT NULL,
                 tmux_window_id TEXT NOT NULL,
                 tmux_window_name TEXT NOT NULL,
@@ -206,14 +211,18 @@ impl McpRegistry {
                 expires_at_ms INTEGER NOT NULL
             );",
         )?;
-        // Idempotent migration for DBs created before the provider column existed.
-        match conn.execute(
+        for stmt in [
             "ALTER TABLE mcp_sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'",
-            [],
-        ) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {}
-            Err(error) => return Err(error.into()),
+            "ALTER TABLE mcp_sessions ADD COLUMN model TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN effort TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN agent TEXT",
+        ] {
+            match conn.execute(stmt, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                    if msg.contains("duplicate column") => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }
@@ -227,6 +236,9 @@ impl McpRegistry {
                 id,
                 owner_server_id: new.owner_server_id.clone(),
                 provider: new.provider,
+                model: new.model.clone(),
+                effort: new.effort.clone(),
+                agent: new.agent.clone(),
                 tmux_session_name: new.tmux_session_name.clone(),
                 tmux_window_id: new.tmux_window_id.clone(),
                 tmux_window_name: new.tmux_window_name.clone(),
@@ -252,16 +264,16 @@ impl McpRegistry {
 
     fn insert_record(&self, r: &McpSessionRecord) -> AppResult<()> {
         self.conn()?.execute(
-            "INSERT INTO mcp_sessions (id, owner_server_id, provider, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![r.id, r.owner_server_id, r.provider.as_str(), r.tmux_session_name, r.tmux_window_id, r.tmux_window_name, r.tmux_pane_id, r.cwd, r.lifecycle_state.as_str(), r.created_at_ms, r.updated_at_ms],
+            "INSERT INTO mcp_sessions (id, owner_server_id, provider, model, effort, agent, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![r.id, r.owner_server_id, r.provider.as_str(), r.model, r.effort, r.agent, r.tmux_session_name, r.tmux_window_id, r.tmux_window_name, r.tmux_pane_id, r.cwd, r.lifecycle_state.as_str(), r.created_at_ms, r.updated_at_ms],
         )?;
         Ok(())
     }
 
     pub fn get(&self, id: &str) -> AppResult<Option<McpSessionRecord>> {
         self.conn()?.query_row(
-            "SELECT id, owner_server_id, provider, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, last_state, last_message_id, last_message_text, last_message_seen_at_ms, created_at_ms, updated_at_ms, dead_at_ms, killed_at_ms FROM mcp_sessions WHERE id=?1",
+            "SELECT id, owner_server_id, provider, model, effort, agent, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, last_state, last_message_id, last_message_text, last_message_seen_at_ms, created_at_ms, updated_at_ms, dead_at_ms, killed_at_ms FROM mcp_sessions WHERE id=?1",
             params![id],
             row_to_record,
         ).optional().map_err(AppError::from)
@@ -350,28 +362,31 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpSessionRecord> 
     let provider = Provider::from_db(&provider_str).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
     })?;
-    let state: String = row.get(8)?;
+    let state: String = row.get(11)?;
     let lifecycle_state = LifecycleState::from_str(&state).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
     })?;
     Ok(McpSessionRecord {
         id: row.get(0)?,
         owner_server_id: row.get(1)?,
         provider,
-        tmux_session_name: row.get(3)?,
-        tmux_window_id: row.get(4)?,
-        tmux_window_name: row.get(5)?,
-        tmux_pane_id: row.get(6)?,
-        cwd: row.get(7)?,
+        model: row.get(3)?,
+        effort: row.get(4)?,
+        agent: row.get(5)?,
+        tmux_session_name: row.get(6)?,
+        tmux_window_id: row.get(7)?,
+        tmux_window_name: row.get(8)?,
+        tmux_pane_id: row.get(9)?,
+        cwd: row.get(10)?,
         lifecycle_state,
-        last_state: row.get(9)?,
-        last_message_id: row.get(10)?,
-        last_message_text: row.get(11)?,
-        last_message_seen_at_ms: row.get(12)?,
-        created_at_ms: row.get(13)?,
-        updated_at_ms: row.get(14)?,
-        dead_at_ms: row.get(15)?,
-        killed_at_ms: row.get(16)?,
+        last_state: row.get(12)?,
+        last_message_id: row.get(13)?,
+        last_message_text: row.get(14)?,
+        last_message_seen_at_ms: row.get(15)?,
+        created_at_ms: row.get(16)?,
+        updated_at_ms: row.get(17)?,
+        dead_at_ms: row.get(18)?,
+        killed_at_ms: row.get(19)?,
     })
 }
 
@@ -436,6 +451,9 @@ mod tests {
         NewSessionRecord {
             owner_server_id: "server-a".into(),
             provider: Provider::Claude,
+            model: None,
+            effort: None,
+            agent: None,
             tmux_session_name: "botctl".into(),
             tmux_window_id: window.into(),
             tmux_window_name: "mcp".into(),
