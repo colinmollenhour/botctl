@@ -29,7 +29,11 @@ impl McpService {
     pub fn handle(&self, request: JsonRpcRequest) -> Option<Value> {
         let id = request.id.clone();
         if id.is_none() {
-            if request.method != "notifications/initialized" {
+            // Per JSON-RPC, notifications have no id and receive no response.
+            // Only dispatch methods that are defined as notifications; ignore any
+            // request method (e.g. tools/call) arriving without an id so that
+            // side-effecting calls cannot be smuggled through the notification path.
+            if request.method.starts_with("notifications/") {
                 let _ = self.handle_result(&request);
             }
             return None;
@@ -158,6 +162,28 @@ mod tests {
             id: None,
             method: "notifications/initialized".into(),
             params: json!({}),
+        });
+        assert!(response.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tools_call_without_id_is_not_dispatched() {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-service-notify-call-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = McpService::new(Some(&root)).unwrap();
+        // A tools/call sent without an id is not a defined notification.
+        // The server must drop it rather than running the underlying tool,
+        // since notifications never return errors and would otherwise allow
+        // side-effecting calls (spawn, kill, send_keys) to be smuggled in.
+        let response = service.handle(JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: None,
+            method: "tools/call".into(),
+            params: json!({ "name": "send_keys", "arguments": { "id": "missing" } }),
         });
         assert!(response.is_none());
         let _ = std::fs::remove_dir_all(&root);

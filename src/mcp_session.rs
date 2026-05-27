@@ -40,6 +40,10 @@ impl McpSessionService {
         let cwd = required_str(args, "cwd")?;
         let cwd = canonical_dir(cwd)?;
         let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
+        let no_yolo = args
+            .pointer("/policy/no_yolo")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let provider = optional_provider(args)?;
         let model = optional_nonempty_str(args, "model")?;
         let effort = optional_nonempty_str(args, "effort")?;
@@ -70,11 +74,12 @@ impl McpSessionService {
             cwd: cwd.display().to_string(),
         })?;
 
-        let outcome = self.wait_inner(&record, timeout_ms, false, false, None)?;
-        if outcome["outcome"] == "ready" {
-            self.registry
-                .update_state(&record.id, LifecycleState::Ready, Some("ChatReady"))?;
-        }
+        let outcome = self.wait_inner(&record, timeout_ms, false, no_yolo, None, None)?;
+        self.registry.update_state(
+            &record.id,
+            lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
+            outcome["classified_state"].as_str(),
+        )?;
         let record = self.registry.get(&record.id)?.unwrap_or(record);
         let mut result = json!({ "agent": agent_ref(&record), "outcome": outcome });
         if let Some(initial_prompt) = args.get("initial_prompt").and_then(Value::as_str) {
@@ -101,7 +106,7 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let ready = self.wait_inner(&record, timeout_ms, false, no_yolo, Some(&lock))?;
+        let ready = self.wait_inner(&record, timeout_ms, false, no_yolo, None, Some(&lock))?;
         if ready["outcome"] != "ready" {
             self.registry.update_state(
                 &id,
@@ -118,27 +123,23 @@ impl McpSessionService {
         self.submit_direct(record.provider, &pane, prompt)?;
         self.registry
             .update_state(&id, LifecycleState::Running, Some("PromptEditing"))?;
-        let outcome = self.wait_inner(&record, timeout_ms, false, no_yolo, Some(&lock))?;
+        let outcome = self.wait_inner(
+            &record,
+            timeout_ms,
+            true,
+            no_yolo,
+            baseline.clone(),
+            Some(&lock),
+        )?;
         let mut outcome = outcome;
         let outcome_kind = outcome["outcome"].as_str().unwrap_or("unknown");
         if outcome_kind == "ready" || outcome_kind == "needs_user_input" {
-            match self
-                .verify_pane(&record)
-                .and_then(|pane| fresh_message(&pane, baseline.as_ref()))
-            {
-                Ok(message) => {
-                    self.registry
-                        .update_cursor(&id, Some(&message.session_id), &message.text)?;
-                    outcome["message"] =
-                        json!({ "role":"assistant", "text": message.text, "fresh": true });
-                    outcome["fresh_message"] = json!(true);
-                }
-                Err(_) => {
-                    outcome["message"] = Value::Null;
-                    outcome["fresh_message"] = json!(false);
-                    outcome["warnings"] = json!(["stale_transcript"]);
-                }
-            }
+            outcome["fresh_message"] = json!(
+                outcome
+                    .get("message")
+                    .map(|v| v.is_object())
+                    .unwrap_or(false)
+            );
         }
         let state = lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown"));
         self.registry
@@ -158,7 +159,7 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let outcome = self.wait_inner(&record, timeout_ms, require_fresh, false, Some(&lock))?;
+        let outcome = self.wait_inner(&record, timeout_ms, require_fresh, true, None, Some(&lock))?;
         self.registry.update_state(
             &id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
@@ -321,16 +322,18 @@ impl McpSessionService {
         timeout_ms: u64,
         require_fresh: bool,
         no_yolo: bool,
+        baseline_override: Option<LastAgentMessage>,
         lock: Option<&SessionLock>,
     ) -> AppResult<Value> {
         let client = TmuxClient::default();
         let deadline = safe_deadline(timeout_ms);
         let mut last_lock_refresh = Instant::now();
         let baseline = if require_fresh {
-            cursor_as_message(record)
+            baseline_override.or_else(|| cursor_as_message(record))
         } else {
             None
         };
+        let mut stale_transcript_seen = false;
         loop {
             if let Some(lock) = lock
                 && last_lock_refresh.elapsed() >= Duration::from_millis(LOCK_REFRESH_INTERVAL_MS)
@@ -350,25 +353,65 @@ impl McpSessionService {
             let classification = Classifier.classify(&pane.pane_id, &frame);
             match classification.state {
                 SessionState::ChatReady => {
-                    let mut out = outcome("ready", Some(&classification), Some(&frame), None);
-                    if require_fresh && let Ok(message) = fresh_message(&pane, baseline.as_ref()) {
-                        self.registry.update_cursor(
-                            &record.id,
-                            Some(&message.session_id),
-                            &message.text,
-                        )?;
-                        out["message"] =
-                            json!({ "role":"assistant", "text": message.text, "fresh": true });
+                    if require_fresh {
+                        match fresh_message(&pane, baseline.as_ref()) {
+                            Ok(message) => {
+                                self.registry.update_cursor(
+                                    &record.id,
+                                    Some(&message.session_id),
+                                    &message.text,
+                                )?;
+                                let mut out =
+                                    outcome("ready", Some(&classification), Some(&frame), None);
+                                out["message"] = json!({
+                                    "role": "assistant",
+                                    "text": message.text,
+                                    "fresh": true,
+                                });
+                                return Ok(out);
+                            }
+                            Err(_) => {
+                                stale_transcript_seen = true;
+                            }
+                        }
+                    } else {
+                        return Ok(outcome("ready", Some(&classification), Some(&frame), None));
                     }
-                    return Ok(out);
                 }
                 SessionState::UserQuestionPrompt => {
-                    return Ok(outcome(
-                        "needs_user_input",
-                        Some(&classification),
-                        Some(&frame),
-                        None,
-                    ));
+                    if require_fresh {
+                        match fresh_message(&pane, baseline.as_ref()) {
+                            Ok(message) => {
+                                self.registry.update_cursor(
+                                    &record.id,
+                                    Some(&message.session_id),
+                                    &message.text,
+                                )?;
+                                let mut out = outcome(
+                                    "needs_user_input",
+                                    Some(&classification),
+                                    Some(&frame),
+                                    None,
+                                );
+                                out["message"] = json!({
+                                    "role": "assistant",
+                                    "text": message.text,
+                                    "fresh": true,
+                                });
+                                return Ok(out);
+                            }
+                            Err(_) => {
+                                stale_transcript_seen = true;
+                            }
+                        }
+                    } else {
+                        return Ok(outcome(
+                            "needs_user_input",
+                            Some(&classification),
+                            Some(&frame),
+                            None,
+                        ));
+                    }
                 }
                 SessionState::BusyResponding
                 | SessionState::PromptEditing
@@ -398,11 +441,16 @@ impl McpSessionService {
                 }
             }
             if Instant::now() >= deadline {
+                let reason = if stale_transcript_seen {
+                    "stale_transcript"
+                } else {
+                    "timeout"
+                };
                 return Ok(outcome(
                     "timeout",
                     Some(&classification),
                     Some(&frame),
-                    Some("timeout"),
+                    Some(reason),
                 ));
             }
             thread::sleep(Duration::from_millis(DEFAULT_POLL_MS));
@@ -601,7 +649,8 @@ fn outcome_for_state(state: SessionState) -> &'static str {
 
 fn lifecycle_from_outcome(outcome: &str) -> LifecycleState {
     match outcome {
-        "ready" | "needs_user_input" | "timeout" => LifecycleState::Ready,
+        "ready" | "needs_user_input" => LifecycleState::Ready,
+        "timeout" => LifecycleState::Running,
         "blocked" | "unknown" => LifecycleState::Blocked,
         "dead" => LifecycleState::Dead,
         _ => LifecycleState::Ready,
@@ -648,6 +697,14 @@ mod tests {
         assert_eq!(lifecycle_from_outcome("dead"), LifecycleState::Dead);
         assert_eq!(lifecycle_from_outcome("blocked"), LifecycleState::Blocked);
         assert_eq!(lifecycle_from_outcome("ready"), LifecycleState::Ready);
+        assert_eq!(
+            lifecycle_from_outcome("needs_user_input"),
+            LifecycleState::Ready
+        );
+        // Submitted turns that time out may still be running; preserve that
+        // signal rather than flipping the persisted state to ready.
+        assert_eq!(lifecycle_from_outcome("timeout"), LifecycleState::Running);
+        assert_eq!(lifecycle_from_outcome("unknown"), LifecycleState::Blocked);
     }
 
     #[test]
