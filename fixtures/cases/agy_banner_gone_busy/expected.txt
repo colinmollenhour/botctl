@@ -1,0 +1,3 @@
+state=BusyResponding
+recap_present=false
+agy_model=Gemini 3.5 Flash (High)

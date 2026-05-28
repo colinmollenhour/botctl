@@ -12,10 +12,36 @@ pub enum SessionState {
     SurveyPrompt,
     ExternalEditorActive,
     DiffDialog,
+    AgyCommandPermissionPrompt,
+    AgyFolderTrustPrompt,
+    AgySettingsPersistPrompt,
     Unknown,
 }
 
 impl SessionState {
+    /// Defensive enumeration of every variant for tests that need to walk the
+    /// enum (e.g. `session_state_str_roundtrip_covers_all_variants`). Keeping
+    /// this constant alongside the variant declaration ensures the test can't
+    /// silently drift when a new variant is added without updating both
+    /// `as_str` and `from_str`.
+    #[cfg(any(test, rust_analyzer))]
+    pub const ALL_VARIANTS: &'static [Self] = &[
+        Self::ChatReady,
+        Self::PromptEditing,
+        Self::UserQuestionPrompt,
+        Self::BusyResponding,
+        Self::PermissionDialog,
+        Self::PlanApprovalPrompt,
+        Self::FolderTrustPrompt,
+        Self::SurveyPrompt,
+        Self::ExternalEditorActive,
+        Self::DiffDialog,
+        Self::AgyCommandPermissionPrompt,
+        Self::AgyFolderTrustPrompt,
+        Self::AgySettingsPersistPrompt,
+        Self::Unknown,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ChatReady => "ChatReady",
@@ -28,6 +54,9 @@ impl SessionState {
             Self::SurveyPrompt => "SurveyPrompt",
             Self::ExternalEditorActive => "ExternalEditorActive",
             Self::DiffDialog => "DiffDialog",
+            Self::AgyCommandPermissionPrompt => "AgyCommandPermissionPrompt",
+            Self::AgyFolderTrustPrompt => "AgyFolderTrustPrompt",
+            Self::AgySettingsPersistPrompt => "AgySettingsPersistPrompt",
             Self::Unknown => "Unknown",
         }
     }
@@ -44,6 +73,9 @@ impl SessionState {
             "SurveyPrompt" => Some(Self::SurveyPrompt),
             "ExternalEditorActive" => Some(Self::ExternalEditorActive),
             "DiffDialog" => Some(Self::DiffDialog),
+            "AgyCommandPermissionPrompt" => Some(Self::AgyCommandPermissionPrompt),
+            "AgyFolderTrustPrompt" => Some(Self::AgyFolderTrustPrompt),
+            "AgySettingsPersistPrompt" => Some(Self::AgySettingsPersistPrompt),
             "Unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -61,6 +93,7 @@ pub const SIGNAL_DIFF_KEYWORDS: &str = "diff-keywords";
 pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
 pub const SIGNAL_CHAT_QUESTIONS: &str = "chat-questions";
 pub const SIGNAL_CODEX_KEYWORDS: &str = "codex-keywords";
+pub const SIGNAL_AGY_KEYWORDS: &str = "agy-keywords";
 pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
 pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
 
@@ -227,7 +260,19 @@ impl Classifier {
         );
         let has_busy_status_banner = has_live_busy_status(&lines);
 
-        let mut state = if contains_any(
+        // Agy fingerprint check runs BEFORE the rest of the chain. Once a
+        // frame fingerprints as agy (Antigravity banner / box-drawing
+        // banner / `1 artifact · /artifact to review` / unique
+        // `(esc to cancel|? for shortcuts) … Gemini ` footer), the agy
+        // classifier owns the result: it has its own permission-prompt
+        // detector and its own busy/ready rules. Letting the Claude
+        // permission / busy chain run first risks misclassifying a real
+        // agy command-permission prompt as a Claude `PermissionDialog`
+        // (whose YOLO/approval paths do not apply to agy).
+        let mut state = if crate::agy::frame_has_agy_fingerprint(frame_text) {
+            signals.push(String::from(SIGNAL_AGY_KEYWORDS));
+            crate::agy::classify_agy_state(frame_text).unwrap_or(SessionState::Unknown)
+        } else if contains_any(
             &normalized,
             &[
                 "quick safety check",
@@ -371,11 +416,16 @@ impl Classifier {
             SessionState::Unknown
         };
 
-        let has_questions = matches!(
-            state,
-            SessionState::ChatReady | SessionState::UserQuestionPrompt
-        ) && (chat_ready_has_questions(frame_text)
-            || recap_has_user_question(&recap));
+        // Agy pane-scrape doesn't currently support reliable question detection;
+        // the operator-question path is Claude/Codex specific (it keys on chat
+        // input markers and recap excerpts that agy does not produce).
+        let is_agy_state = signals.iter().any(|s| s == SIGNAL_AGY_KEYWORDS);
+        let has_questions = !is_agy_state
+            && matches!(
+                state,
+                SessionState::ChatReady | SessionState::UserQuestionPrompt
+            )
+            && (chat_ready_has_questions(frame_text) || recap_has_user_question(&recap));
         if has_questions {
             signals.push(String::from(SIGNAL_CHAT_QUESTIONS));
             if state == SessionState::ChatReady {
@@ -1378,6 +1428,21 @@ mod tests {
         SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
         SIGNAL_SURVEY_KEYWORDS, SessionState,
     };
+
+    #[test]
+    fn session_state_str_roundtrip_covers_all_variants() {
+        // Bijection guard: any new SessionState variant must be added to BOTH
+        // `as_str` and `from_str`, and to the ALL_VARIANTS table. If a future
+        // change forgets one of the three, this test fails.
+        for variant in SessionState::ALL_VARIANTS {
+            let rendered = variant.as_str();
+            assert_eq!(
+                SessionState::from_str(rendered),
+                Some(*variant),
+                "round-trip failed for {rendered}",
+            );
+        }
+    }
 
     #[test]
     fn classifies_permission_dialog() {

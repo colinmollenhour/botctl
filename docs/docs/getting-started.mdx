@@ -1,8 +1,8 @@
 # Getting started
 
-`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, and Pi sessions visible and controlled inside `tmux`.
+`botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, Pi, and Antigravity sessions visible and controlled inside `tmux`.
 
-Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively from their SQLite database. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status.
+Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively from their SQLite database. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status. Antigravity (`agy`) panes are discovered passively for dashboard visibility, state classification, and pane-scrape last-message extraction.
 
 For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
@@ -11,7 +11,7 @@ For end-to-end operator flows, see [workflows](./workflows.mdx). For command det
 Most users only need a few commands:
 
 - `runtime` for the single local coordinator that owns live observation and automation
-- `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode/Pi visibility
+- `dashboard` for a live control surface across Claude Code panes plus screen-detected Codex CLI and passive OpenCode/Pi/Antigravity visibility
 - `prompt` for one-shot Claude prompts that still run through an inspectable tmux TUI
 - `yolo` for centralized babysitting policy and recovery
 - `serve` for a runtime-backed observation stream and HTTP facade
@@ -28,6 +28,7 @@ If you just want to get value quickly, install it, open `dashboard`, then try `y
 - `claude` on `PATH` for Claude Code automation
 - `codex` panes for Codex CLI screen classification and command permission approval
 - `opencode` panes with `OC | <session title>` pane titles for passive OpenCode dashboard visibility
+- `agy` on `PATH` (optional) for Antigravity dashboard visibility; the state directory defaults to `~/.gemini/antigravity-cli` and can be overridden with `ANTIGRAVITY_STATE_DIR`
 - `botctl` installed
 
 ## Install
@@ -51,7 +52,7 @@ botctl dashboard
 
 ## First useful run
 
-1. Open at least one Claude Code, Codex CLI, or OpenCode pane inside `tmux`.
+1. Open at least one Claude Code, Codex CLI, OpenCode, Pi, or Antigravity pane inside `tmux`.
 
 2. Open the dashboard:
 
@@ -191,6 +192,8 @@ OpenCode panes can appear in the same dashboard without terminal capture or keyp
 
 Codex CLI panes can also appear in the same dashboard. They are included only after `botctl` captures a likely Codex pane and sees Codex screen text such as the OpenAI Codex header, Codex approval prompt language, or a `/statusline` with `run-state`. With that statusline enabled, `Ready` maps to `ChatReady`, while `Working` and `Thinking` map to `BusyResponding`. Codex panes are navigable and classified from their screen, and Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`. Broader recovery actions remain Claude-only.
 
+Antigravity (`agy`) panes appear in the same dashboard when the pane command is `agy` and the secondary signal passes. The dashboard shows the `⚛` glyph, the current classified state (`ChatReady`/`BusyResponding`/`AgyCommandPermissionPrompt`/`AgyFolderTrustPrompt`/`AgySettingsPersistPrompt`/`Unknown`), and cook time derived from `BusyResponding`. Antigravity panes are navigable; YOLO command-permission auto-approve is opt-in per pane with `botctl yolo start --pane <agy-pane>` and fires only on the captured `> 1. Yes` default. Folder-trust and settings-persist prompts are detected separately but require manual review. Direct `approve`/`reject`/`auto-unstick` actions are not enabled for Antigravity panes.
+
 ## Dump the latest assistant message
 
 Use `last-message` when you need the full latest assistant text as Markdown instead of a bounded screen capture or dashboard excerpt:
@@ -208,7 +211,7 @@ Dumped last message of 951 lines out to file:
 MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
 ```
 
-Use `--out -` to stream the raw Markdown body to stdout instead of writing a file. The command supports Claude, Codex, OpenCode, and Pi transcript storage. Claude is resolved from `~/.claude/projects`, Codex from `~/.codex/sessions`, OpenCode from its SQLite `message`/`part` rows after the same pane title plus cwd resolution used by the dashboard, and Pi from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`). It writes assistant-visible text only; tool calls and provider metadata are not included.
+Use `--out -` to stream the raw Markdown body to stdout instead of writing a file. The command supports Claude, Codex, OpenCode, Pi, and Antigravity transcript sources. Claude is resolved from `~/.claude/projects`, Codex from `~/.codex/sessions`, OpenCode from its SQLite `message`/`part` rows after the same pane title plus cwd resolution used by the dashboard, Pi from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`), and Antigravity from pane-scrape extraction (requires three horizontal-rule lines to be visible in the pane scrollback: one above the last assistant turn, plus the two that bracket the live input box). It writes assistant-visible text only; tool calls and provider metadata are not included.
 
 If you use tmux, this is the recommended way to launch the dashboard as a popup and keep it alive:
 
@@ -279,6 +282,7 @@ botctl serve --session demo --format jsonl
 - Folder trust approval is special and uses raw `Enter`.
 - Codex YOLO is limited to command permission dialogs.
 - OpenCode support is passive dashboard and status visibility.
+- Antigravity support is dashboard/status visibility plus opt-in YOLO command-permission auto-approve. Folder-trust, settings-persist, direct `approve`/`reject`, and `auto-unstick` remain manual.
 
 For blocker recovery, prompt handoff, and recovery examples, see [workflows](./workflows.mdx) and [prompt handoff](./prompt-handoff.mdx).
 

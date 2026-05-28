@@ -1,3 +1,23 @@
+//! YOLO record storage and lookup helpers.
+//!
+//! ## Per-provider opt-in semantics
+//!
+//! The opt-in signal for *every* provider (Claude, Codex, agy) is the
+//! presence of an enabled [`YoloRecord`] row keyed by pane id. There is no
+//! per-provider scope column — `botctl yolo start --pane <pane>` writes the
+//! row, the runtime YOLO loop reads it, and on each tick the loop consults
+//! the per-shape [`crate::classifier::SessionState`] to decide whether
+//! the current frame is one it knows how to approve.
+//!
+//! For **agy** panes specifically: the row admits the pane to the YOLO loop,
+//! but the runtime still requires
+//! `SessionState::AgyCommandPermissionPrompt` AND
+//! [`crate::agy::is_agy_pane`] AND the captured-default cursor guard
+//! ([`crate::agy::agy_command_permission_default_option_is_yes`]) before
+//! `Enter` is sent. Folder-trust and settings-persist agy shapes classify
+//! into their own states and the loop returns `Wait` for them — they remain
+//! manual review in v1.
+
 use std::path::{Path, PathBuf};
 
 use crate::app::AppResult;

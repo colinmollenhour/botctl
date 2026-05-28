@@ -14,6 +14,8 @@
 - `src/fixtures.rs` — fixture recording, loading, and replay support
 - `src/prompt.rs` — prompt staging and external-editor handoff helpers
 - `src/yolo.rs` — state persistence for the `yolo` permission loop
+- `src/agy.rs` — Antigravity (`agy`) pane discovery, state classification, conversation id resolution, and pane-scrape last-message extraction
+- `src/proc_fd.rs` — shared `/proc/<pid>/fd` walking helpers used by `agy`, Pi, and last-message resolution
 - `src/app.rs` — command execution, status/doctor output, and top-level workflow orchestration
 - `src/cli.rs` — argument parsing and command definitions
 - `src/main.rs` — process entry point and error printing
@@ -68,7 +70,7 @@ Current states:
 Automation should only run after:
 
 1. the target is resolved to an explicit pane id
-2. the pane is confirmed to be Claude-owned for guarded automation, classified as Codex for command permission approval, or passively resolved as OpenCode for dashboard visibility
+2. the pane is confirmed to be Claude-owned for guarded automation, classified as Codex for command permission approval, or passively resolved as OpenCode, Pi, or Antigravity for dashboard visibility
 3. the current classified state permits the workflow
 
 This is why raw `send-keys` success is never enough.

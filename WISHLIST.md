@@ -1,6 +1,108 @@
 # botctl Wishlist
 
-## Checklist
+## Agy Follow-up Checklist (deferred from ultra-review, non-blocking)
+
+- [ ] [AGY-001](#wl-001-protobuf-transcript-reader-for-antigravity-conversations) Protobuf transcript reader for `~/.gemini/antigravity-cli/conversations/<uuid>.pb`.
+- [ ] [AGY-002](#wl-002-dashboard-model-line-rendering-for-antigravity-panes) Dashboard model-line rendering for Antigravity panes (Gemini 3.5 Flash etc.) in the detail panel.
+- [ ] [AGY-003](#wl-003-proc_fdchild_pids-perf-per-refresh-pidchildren-map) `proc_fd::child_pids` perf — per-refresh pid→children map instead of full `/proc` scan per pid.
+- [ ] [AGY-004](#wl-004-yolo-automation-for-agy-permissiontrust-prompts) YOLO automation for agy permission / trust prompts once their UI is observed in the wild.
+
+### AGY-001 Protobuf transcript reader for Antigravity conversations
+
+> **Update: encryption discovery** (inline note — deferred)
+>
+> Observed: live `~/.gemini/antigravity-cli/conversations/<uuid>.pb` files are uniformly
+> high-entropy from byte 0 with no inline ASCII. `strings <file>` returns only short noise
+> fragments — no recognizable English text, no obvious protobuf field tags. This is consistent
+> with `Encrypt(serialize(Conversation))` rather than raw protobuf.
+>
+> Implication: the wishlist's plan to "add a `.proto` definition + `prost-build`" cannot reach
+> the stated end-state without first solving the encryption layer.
+>
+> Status: **deferred**. Three follow-up paths for a future contributor:
+> 1. Confirm encryption with a fresh capture: capture a new conversation, immediately hex-dump
+>    the `.pb` and compare first 16 bytes against known protobuf varint patterns. If the first
+>    byte is `0x0a` (field 1, wire type 2 = length-delimited string) it is likely raw protobuf;
+>    a non-`0x0a` header byte is suggestive of encryption or custom framing, but is not definitive
+>    — check all known protobuf wire-type bytes (0x08, 0x0a, 0x10, 0x12, …) before concluding
+>    the file is encrypted.
+> 2. Identify a deterministic local wrap key under `~/.gemini/` — look for a `keyring`, `token`,
+>    or `credentials` file; check if the `agy` binary embeds a hard-coded salt; try to correlate
+>    the `.pb` file's first 16 bytes with a known symmetric cipher header (AES-GCM nonce, etc.).
+> 3. Pivot to relying on FD detection + pane scrape: the FD-walk identification half already
+>    works (`conversation_id_from_process_tree_fds`). The pane-scrape extractor
+>    (`extract_last_assistant_text`) is the current authoritative path and can be kept as-is
+>    until the encryption layer is solved.
+
+Replace the current pane-scrape `last-message` path for Antigravity with a direct reader for `~/.gemini/antigravity-cli/conversations/<uuid>.pb` (and `ANTIGRAVITY_STATE_DIR` overrides).
+
+Today `load_agy_last_message()` captures the pane scrollback, strips ANSI, and looks for three horizontal-rule lines to bracket the latest assistant turn. That works for live operator use but has known limitations:
+
+- Bounded by `--history-lines` — very long messages or scrolled-back panes can miss content.
+- Sensitive to whitespace, wrapping, tool-call header glyphs (`●`, `▸`, `⎿`), and `Thought for …` subtitles. Each new agy UI revision risks silently changing the extracted text.
+- No structured metadata (timestamps, tool calls, reasoning blocks) — only assistant-visible text survives.
+- Can never recover a message that has fully scrolled off the pane.
+
+The persisted protobuf transcript is authoritative and avoids all of those. Work to do:
+
+- Add a `.proto` definition (or `prost-build` integration) matching the on-disk schema for Antigravity conversation files. Confirm by inspecting a real `<uuid>.pb` file the schema versioning story (single message stream vs. event-sourced log).
+- Resolve the right `.pb` for a pane: prefer an open file descriptor under `<state-dir>/conversations/*.pb` via `proc_fd::transcript_from_process_fds` (same pattern Claude/Codex use), with the existing `history.jsonl` cwd match as fallback for picking the conversation id.
+- Implement `latest_assistant_message_from_pb(path) -> AppResult<Option<String>>` that walks the message stream, picks the last `role == assistant` message with non-empty visible text, and strips tool calls / reasoning the same way Claude/Codex readers do.
+- Keep the pane-scrape extractor as a fallback for the case where the protobuf is missing, unreadable, or schema-mismatched, behind a clear log line. Decide if `--history-lines` becomes a fallback-only flag or stays user-visible.
+- Tests: a checked-in synthetic `.pb` fixture plus a real-capture redacted fixture, exercising message ordering, tool-call filtering, and the fallback-on-corrupt-file path.
+
+Risks: schema instability between Antigravity releases (need a version pin or feature detection), and protobuf schema licensing if upstream considers it private.
+
+### AGY-002 Dashboard model-line rendering for Antigravity panes
+
+Surface the current Antigravity model (e.g. `Gemini 3.5 Flash (High)`) in the dashboard detail panel, the same way Claude shows its current Claude model and Codex shows the `/statusline` model.
+
+Source: the bottom-anchored agy footer line that the classifier already parses for fingerprinting. The string after the trailing whitespace on `esc to cancel ... Gemini …` / `? for shortcuts ... Gemini …` is the model label. Parsing it during classification is essentially free — we already split that line in `frame_has_agy_fingerprint` and `classify_agy_state`.
+
+Work to do:
+
+- Add an `agy_model: Option<String>` field to whatever struct currently carries per-pane diagnostics on the dashboard side (likely the per-pane row alongside `cook_ms`, `state`, etc.). Wire it from the classifier or from a separate `extract_agy_model_label(frame)` helper.
+- Render it in the dashboard detail panel beneath `Provider: Antigravity`, e.g. `Model: Gemini 3.5 Flash (High)`. Hide the line when `None`.
+- Optional: thread the same label into `status --json` so external tooling can read it.
+- Be conservative: redact / truncate anything longer than ~64 chars and reject any line containing control characters. The agy footer is bottom-anchored, so guard against a misaligned capture that grabs the wrong line.
+- Fixture coverage: extend the existing `agy_chat_ready` / `agy_busy_responding` / `agy_permission_prompt` fixtures with expected-model assertions if they don't already cover the parse.
+
+Caveats: model identity drifts (Gemini 3.5 Flash today, something else tomorrow). The renderer should treat the string as opaque — no version comparison, no special handling.
+
+### AGY-003 `proc_fd::child_pids` perf — per-refresh pid→children map
+
+The agy session resolver walks the pane process tree by calling `proc_fd::child_pids(pid)` for each pid, which currently does a full `/proc/*/stat` scan for every call. On hosts with many processes (large dev boxes, CI runners, long-lived shells with many descendants), each pane refresh ends up re-reading `/proc` `N × depth` times.
+
+Replace the per-call scan with a single pass per dashboard refresh:
+
+- Add a `ProcessTreeSnapshot` (or similar) built once per refresh by walking `/proc` once and producing two maps:
+  - `pid → ppid` (or simply `ppid → Vec<pid>` — the children map directly)
+  - optionally `pid → comm` so callers that want command-name filtering can avoid re-reading `stat`
+- Expose `snapshot.children_of(pid) -> &[Pid]` and `snapshot.descendants_of(pid) -> impl Iterator<Item = Pid>` (BFS over the children map). Both must be O(1) lookup + O(out_degree) iteration, not O(/proc).
+- Thread the snapshot through the dashboard's per-refresh code path: `resolve_agy_session_for_pane`, the AGY protobuf FD walk in AGY-001, the Pi session resolver, and Codex FD lookup. Each should take `Option<&ProcessTreeSnapshot>` and fall back to the existing per-call scan if `None` (e.g. one-shot `status` / `doctor` invocations).
+- Benchmark before/after on a host with ≥1000 processes. Document the speedup in a comment.
+- Tests: a synthetic in-memory snapshot used by `proc_fd` unit tests to assert `descendants_of` ordering and cycle safety (defensive — `/proc` should not produce cycles, but a malformed snapshot must not loop forever).
+
+Risk: snapshot staleness within a single refresh is acceptable (PIDs born or dying mid-refresh just won't be seen until the next refresh). Don't try to cache across refreshes — `/proc` is cheap enough once per refresh.
+
+### AGY-004 YOLO automation for agy permission / trust prompts
+
+Antigravity (`agy`) is read-only in v1. Once the permission / trust UI shapes are observed enough in the wild to characterize and lock down, add narrow YOLO support analogous to what Codex has today (`y` for `Yes, proceed` on command permission dialogs only).
+
+Prerequisites before turning this on:
+
+- Multiple verbatim captures of each prompt shape (command permission, folder trust, "always allow in this conversation", any future allow-once overlay). Each captured as a fixture with an expected classifier state.
+- A separate `SessionState` variant or a more specific signal so the policy layer can distinguish a command-permission prompt from a folder-trust prompt from a settings-persist prompt. Today they all classify as `Unknown` (intentionally — see the existing `is_agy_permission_prompt` detector and the AGY classifier branch in `classifier.rs`).
+- Decide the keystroke contract for each prompt. The current agy command-permission prompt uses an arrow-key + Enter selector — not a single `y`. The automation layer needs a "submit numbered option N" primitive, not just `y`/`n`.
+- A YOLO scope policy: should agy YOLO be off by default and require explicit opt-in per pane / per workspace / globally, mirroring Codex? Most likely yes.
+- `ensure_pane_owned_by_yolo_provider` and `ensure_pane_owned_by_automatable_provider` in `src/app.rs` must be updated; today they explicitly exclude agy with the message `agy panes are passively-discovered read-only`.
+- `render_doctor_recommendations` should switch from "read-only in v1" to a per-prompt next-action when agy YOLO is enabled.
+
+Risks: agy's UI is still young and changing. False positives on permission detection that auto-approve a destructive command would be very bad. The safe default is to keep this disabled until the classifier has a high-confidence per-shape detector and we have at least two release versions of agy where the prompt shape hasn't moved.
+
+---
+
+## Existing Checklist
 
 1. [x] P0-1 Attach to existing Claude tmux targets.
 2. [x] P0-2 Add `continue-session` and `auto-unstick` commands.

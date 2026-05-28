@@ -4,10 +4,12 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use crate::agy;
 use crate::app::{AppError, AppResult};
 use crate::opencode;
 use crate::pi;
-use crate::tmux::TmuxPane;
+use crate::proc_fd::transcript_from_process_fds;
+use crate::tmux::{TmuxClient, TmuxPane};
 
 const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
 const CODEX_SESSIONS_DIR: &str = ".codex/sessions";
@@ -19,7 +21,13 @@ pub struct LastAgentMessage {
     pub text: String,
 }
 
-pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
+pub fn load_last_agent_message(
+    pane: &TmuxPane,
+    tmux: &TmuxClient,
+    history_lines: usize,
+) -> AppResult<LastAgentMessage> {
+    let _ = (tmux, history_lines); // ignored by non-agy branches
+
     if pane.current_command.eq_ignore_ascii_case("claude") {
         return load_claude_last_message(pane);
     }
@@ -32,6 +40,10 @@ pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
         return load_pi_last_message(pane);
     }
 
+    if pane.current_command.eq_ignore_ascii_case("agy") {
+        return load_agy_last_message(pane, tmux, history_lines);
+    }
+
     if pane.current_command.eq_ignore_ascii_case("codex")
         || (pane.current_command.eq_ignore_ascii_case("node")
             && !pane.pane_title.starts_with("OC | "))
@@ -40,7 +52,7 @@ pub fn load_last_agent_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
     }
 
     Err(AppError::new(format!(
-        "last-message supports Claude, Codex, OpenCode, and Pi panes; pane {} is running {}",
+        "last-message supports Claude, Codex, OpenCode, Pi, and Antigravity panes; pane {} is running {}",
         pane.pane_id, pane.current_command
     )))
 }
@@ -84,10 +96,65 @@ fn load_opencode_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
     })
 }
 
+/// Build the error returned by [`load_agy_last_message`] when an agy pane is
+/// confirmed but no `.pb` conversation file could be resolved. Extracted as a
+/// shared helper so tests can assert against the production wording without
+/// needing a real `TmuxClient` to drive `load_agy_last_message` end-to-end.
+fn agy_no_conversation_error(pane_pid: Option<u32>) -> AppError {
+    let state_dir = agy::default_state_dir();
+    if let Some(pid) = pane_pid {
+        AppError::new(format!(
+            "agy: pane process {pid} has no open conversation file under \
+             {state_dir}/conversations/; either the agy session has no active \
+             conversation yet, ANTIGRAVITY_STATE_DIR is misconfigured, or \
+             /proc/{pid}/fd is unreadable for this user.",
+            state_dir = state_dir.display(),
+        ))
+    } else {
+        // Reached only inside the `session.id.ok_or_else` closure, so the agy
+        // session is already confirmed. The conversation_id lookup just
+        // couldn't run without a pane_pid for the FD walk.
+        AppError::new(
+            "agy: pane confirmed as Antigravity but pane_pid is unavailable, so the open conversation file could not be verified; this usually means tmux did not report a pane process id",
+        )
+    }
+}
+
+fn load_agy_last_message(
+    pane: &TmuxPane,
+    tmux: &TmuxClient,
+    history_lines: usize,
+) -> AppResult<LastAgentMessage> {
+    use crate::proc_fd::LiveProc;
+    let frame = tmux.capture_pane(&pane.pane_id, history_lines)?;
+    let session = agy::resolve_agy_session_for_pane(pane, &frame, &LiveProc)?.ok_or_else(|| {
+        // The secondary signal (state dir or frame fingerprint) was absent —
+        // we cannot even confirm this is an agy pane.
+        AppError::new(
+            "agy: no Antigravity conversation resolvable for this pane (state directory or process info unavailable; history.jsonl had no matching entry)",
+        )
+    })?;
+    let conversation_id = session
+        .id
+        .ok_or_else(|| agy_no_conversation_error(pane.pane_pid))?;
+    let stripped = agy::strip_ansi(&frame);
+    let text = agy::extract_last_assistant_text(&stripped).ok_or_else(|| {
+        AppError::new(
+            "agy: no completed assistant message visible in pane scrollback; the extractor requires three horizontal-rule lines (one above the last assistant turn, plus the two that bracket the live input box) — use --history-lines to widen the scrollback window",
+        )
+    })?;
+    Ok(LastAgentMessage {
+        provider: "Antigravity",
+        session_id: conversation_id,
+        text,
+    })
+}
+
 fn load_pi_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
-    let session = pi::resolve_pi_session_for_pane(pane)?
+    use crate::proc_fd::LiveProc;
+    let session = pi::resolve_pi_session_for_pane(pane, &LiveProc)?
         .ok_or_else(|| AppError::new("no Pi session resolved for pane"))?;
-    let message = pi::latest_assistant_message_for_pane(pane)?.ok_or_else(|| {
+    let message = pi::latest_assistant_message_for_pane(pane, &LiveProc)?.ok_or_else(|| {
         AppError::new(format!(
             "no assistant text message found in Pi transcript {}",
             session.path.display()
@@ -369,33 +436,6 @@ fn codex_event_agent_message_text(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn transcript_from_process_fds(
-    pid: u32,
-    transcript_root: &Path,
-    extension: &str,
-) -> AppResult<Option<PathBuf>> {
-    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
-    let entries = match fs::read_dir(fd_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(None),
-    };
-
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
-        };
-        if target.starts_with(transcript_root)
-            && target.extension().and_then(|value| value.to_str()) == Some(extension)
-        {
-            return Ok(Some(target));
-        }
-    }
-    Ok(None)
-}
-
 fn collect_jsonl_files(root: &Path) -> AppResult<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_jsonl_files_into(root, &mut files)?;
@@ -459,6 +499,7 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -466,6 +507,19 @@ mod tests {
         latest_codex_assistant_text, line_count, resolve_claude_transcript_in_projects_root,
     };
     use crate::tmux::TmuxPane;
+
+    /// A pid guaranteed not to exist on any current Linux system. `/proc/4294967295/fd`
+    /// will never be present; using `u32::MAX` is more portable than reading
+    /// `/proc/sys/kernel/pid_max`.
+    const NEVER_PID: u32 = u32::MAX;
+
+    /// Serialize tests that mutate process-global env vars
+    /// (`ANTIGRAVITY_STATE_DIR`, `ANTIGRAVITY_HISTORY_FILE`) so they don't race
+    /// with parallel tests in the same binary.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn claude_reader_returns_latest_text_assistant_message() {
@@ -590,5 +644,152 @@ mod tests {
             cursor_x: None,
             cursor_y: None,
         }
+    }
+
+    /// V-18: Verify the WL-001 error message split by exercising the real
+    /// production path `resolve_agy_session_for_pane` with a synthetic pane
+    /// (NEVER_PID, real temp state dir) and asserting the resulting error
+    /// mentions the pid and "no open conversation file".
+    /// RAII guard that captures the prior values of the agy env vars and
+    /// restores them on drop, so a panicking test does not leak global state
+    /// into sibling tests run in parallel.
+    struct AgyEnvGuard {
+        prior_state_dir: Option<std::ffi::OsString>,
+        prior_history_file: Option<std::ffi::OsString>,
+    }
+
+    impl AgyEnvGuard {
+        fn install(state_dir: &str, history_file: &str) -> Self {
+            let prior_state_dir = std::env::var_os("ANTIGRAVITY_STATE_DIR");
+            let prior_history_file = std::env::var_os("ANTIGRAVITY_HISTORY_FILE");
+            // SAFETY: callers hold the module-level env_lock for the lifetime
+            // of this guard.
+            unsafe {
+                std::env::set_var("ANTIGRAVITY_STATE_DIR", state_dir);
+                std::env::set_var("ANTIGRAVITY_HISTORY_FILE", history_file);
+            }
+            Self {
+                prior_state_dir,
+                prior_history_file,
+            }
+        }
+    }
+
+    impl Drop for AgyEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold the module-level env_lock for the lifetime
+            // of this guard; restoring is exactly the inverse of `install`.
+            unsafe {
+                match self.prior_state_dir.take() {
+                    Some(value) => std::env::set_var("ANTIGRAVITY_STATE_DIR", value),
+                    None => std::env::remove_var("ANTIGRAVITY_STATE_DIR"),
+                }
+                match self.prior_history_file.take() {
+                    Some(value) => std::env::set_var("ANTIGRAVITY_HISTORY_FILE", value),
+                    None => std::env::remove_var("ANTIGRAVITY_HISTORY_FILE"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agy_no_open_conversation_file_error_mentions_pid() {
+        // Serialize env-var mutations with the module-local lock.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+
+        let unique = format!(
+            "{}/agy-test-lm-{}-{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::create_dir_all(&unique).expect("temp dir should create");
+        let _env_guard = AgyEnvGuard::install(&unique, &format!("{unique}/history.jsonl"));
+
+        // NEVER_PID (u32::MAX) is guaranteed not to have a /proc entry on any
+        // current Linux system, so the FD walk returns None while pane_pid is Some.
+        let pane = TmuxPane {
+            pane_id: String::from("%99"),
+            pane_tty: String::from("/dev/pts/9"),
+            pane_pid: Some(NEVER_PID),
+            session_id: String::from("$9"),
+            session_name: String::from("demo"),
+            window_id: String::from("@9"),
+            window_index: 0,
+            window_name: String::from("agy"),
+            pane_index: 0,
+            current_command: String::from("agy"),
+            current_path: String::from("/tmp/agy-no-conv-test"),
+            pane_title: String::new(),
+            pane_active: true,
+            cursor_x: None,
+            cursor_y: None,
+        };
+
+        // Exercise the real production path up to the point where the
+        // conversation id resolution fails. We cannot drive
+        // `load_agy_last_message` end-to-end here because it needs a real
+        // `TmuxClient`; instead we exercise `resolve_agy_session_for_pane`
+        // (the production input to the error path) and then assert the
+        // exact error that `load_agy_last_message` would construct via the
+        // shared `agy_no_conversation_error` helper.
+        let session = crate::agy::resolve_agy_session_for_pane(
+            &pane,
+            "Antigravity CLI 1.0.2\n? for shortcuts\n",
+            &crate::proc_fd::LiveProc,
+        )
+        .expect("resolution should not error")
+        .expect("agy pane with fingerprint and real state dir should yield a session");
+
+        assert!(
+            session.id.is_none(),
+            "no conversation id expected: NEVER_PID has no /proc entry"
+        );
+
+        // Use the SAME helper the production code uses to build the error,
+        // so any drift in the wording is caught here without re-stating the
+        // message inline.
+        let err = super::agy_no_conversation_error(pane.pane_pid);
+        let err_msg = format!("{err}");
+
+        let pid_str = NEVER_PID.to_string();
+        assert!(
+            err_msg.contains(&pid_str),
+            "error message should mention the pid ({pid_str}): {err_msg}"
+        );
+        assert!(
+            err_msg.contains("no open conversation file"),
+            "error should say 'no open conversation file': {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("no matching history.jsonl entry"),
+            "pid-present branch should not emit the generic fallback text: {err_msg}"
+        );
+
+        fs::remove_dir_all(&unique).ok();
+    }
+
+    #[test]
+    fn agy_no_conversation_error_no_pid_mentions_session_resolved() {
+        // The `pane.pane_pid == None` branch is only reached inside the
+        // `session.id.ok_or_else` closure, so the agy pane is already
+        // confirmed. The error wording must reflect that.
+        let err = super::agy_no_conversation_error(None);
+        let err_msg = format!("{err}");
+        assert!(
+            err_msg.contains("pane confirmed as Antigravity"),
+            "no-pid branch should state the pane is confirmed agy: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("pane_pid is unavailable"),
+            "no-pid branch should name the missing pane_pid: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("no matching history.jsonl entry"),
+            "no-pid branch must not reuse the generic fallback wording: {err_msg}"
+        );
     }
 }

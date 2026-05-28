@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::app::AppResult;
 use crate::classifier::SessionState;
+use crate::proc_fd::{ChildResolver, transcript_from_process_tree_fds_with_resolver_ext};
 use crate::tmux::TmuxPane;
 
 const PI_AGENT_DIR: &str = ".pi/agent";
@@ -39,11 +40,14 @@ pub fn is_pi_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("pi")
 }
 
-pub fn resolve_pi_session_for_pane(pane: &TmuxPane) -> AppResult<Option<PiSession>> {
+pub fn resolve_pi_session_for_pane(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<PiSession>> {
     if !is_pi_pane(pane) {
         return Ok(None);
     }
-    let Some((session_id, path, cwd)) = resolve_pi_transcript_for_pane(pane)? else {
+    let Some((session_id, path, cwd)) = resolve_pi_transcript_for_pane(pane, resolver)? else {
         return Ok(None);
     };
     let state = pi_session_state(&path)?.unwrap_or(SessionState::ChatReady);
@@ -65,11 +69,14 @@ pub fn resolve_pi_session_for_pane(pane: &TmuxPane) -> AppResult<Option<PiSessio
     }))
 }
 
-pub fn latest_assistant_message_for_pane(pane: &TmuxPane) -> AppResult<Option<PiLastMessage>> {
+pub fn latest_assistant_message_for_pane(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<PiLastMessage>> {
     if !is_pi_pane(pane) {
         return Ok(None);
     }
-    let Some((session_id, path, _)) = resolve_pi_transcript_for_pane(pane)? else {
+    let Some((session_id, path, _)) = resolve_pi_transcript_for_pane(pane, resolver)? else {
         return Ok(None);
     };
     let Some(text) = latest_pi_assistant_text(&path)?.filter(|text| !text.trim().is_empty()) else {
@@ -78,11 +85,19 @@ pub fn latest_assistant_message_for_pane(pane: &TmuxPane) -> AppResult<Option<Pi
     Ok(Some(PiLastMessage { session_id, text }))
 }
 
-fn resolve_pi_transcript_for_pane(pane: &TmuxPane) -> AppResult<Option<(String, PathBuf, String)>> {
+fn resolve_pi_transcript_for_pane(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<(String, PathBuf, String)>> {
     let sessions_root = default_pi_sessions_root();
 
-    if let Some(pid) = pane.pane_pid
-        && let Some(transcript) = transcript_from_process_tree_fds(pid, &sessions_root, "jsonl")?
+    if let Some(pid) = pane.pane_pid.filter(|&p| p != 0)
+        && let Some(transcript) = transcript_from_process_tree_fds_with_resolver_ext(
+            pid,
+            resolver,
+            &sessions_root,
+            "jsonl",
+        )?
         && let Some(meta) = pi_session_meta(&transcript)?
     {
         return Ok(Some((meta.id, transcript, meta.cwd)));
@@ -333,87 +348,6 @@ fn compact_context(text: &str) -> String {
     truncated
 }
 
-fn transcript_from_process_tree_fds(
-    pid: u32,
-    transcript_root: &Path,
-    extension: &str,
-) -> AppResult<Option<PathBuf>> {
-    let mut stack = vec![pid];
-    let mut seen = Vec::<u32>::new();
-    while let Some(current) = stack.pop() {
-        if seen.contains(&current) {
-            continue;
-        }
-        seen.push(current);
-        if let Some(path) = transcript_from_process_fds(current, transcript_root, extension)? {
-            return Ok(Some(path));
-        }
-        stack.extend(child_pids(current)?);
-    }
-    Ok(None)
-}
-
-fn transcript_from_process_fds(
-    pid: u32,
-    transcript_root: &Path,
-    extension: &str,
-) -> AppResult<Option<PathBuf>> {
-    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
-    let entries = match fs::read_dir(fd_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(None),
-    };
-
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
-        };
-        if target.starts_with(transcript_root)
-            && target.extension().and_then(|value| value.to_str()) == Some(extension)
-        {
-            return Ok(Some(target));
-        }
-    }
-    Ok(None)
-}
-
-fn child_pids(pid: u32) -> AppResult<Vec<u32>> {
-    let mut children = Vec::new();
-    let proc_dir = match fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(_) => return Ok(children),
-    };
-    for entry in proc_dir {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Some(child_pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(_) => continue,
-        };
-        if process_parent_pid(&stat) == Some(pid) {
-            children.push(child_pid);
-        }
-    }
-    Ok(children)
-}
-
-fn process_parent_pid(stat: &str) -> Option<u32> {
-    let close = stat.rfind(") ")?;
-    let rest = stat.get(close + 2..)?;
-    rest.split_whitespace().nth(1)?.parse().ok()
-}
-
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
@@ -421,7 +355,7 @@ mod tests {
 
     use super::{
         encode_pi_session_path, latest_pi_assistant_text, latest_pi_transcript_for_cwd,
-        pi_session_state, process_parent_pid,
+        pi_session_state,
     };
 
     #[test]
@@ -507,14 +441,6 @@ mod tests {
         assert_eq!(
             pi_session_state(&path).expect("state should read"),
             Some(crate::classifier::SessionState::ChatReady)
-        );
-    }
-
-    #[test]
-    fn parses_proc_stat_parent_pid() {
-        assert_eq!(
-            process_parent_pid("123 (agent worker) S 7 1 1 0 -1 4194560"),
-            Some(7)
         );
     }
 

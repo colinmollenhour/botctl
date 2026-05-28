@@ -1,0 +1,23 @@
+
+colin in 🌐 seamus in ~/Projects/botctl on  megamind/mcp-claude +173 -3 פֿ8 ✨ 11 is 📦 v0.6.2 took 55s
+📦 ❯ agy
+
+      ▄▀▀▄        Antigravity CLI 1.0.2
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (High)
+   ▄▀▀    ▀▀▄     ~/Projects/botctl
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> please draft an example response
+
+▸ Thought for 1s, 320 tokens
+  Drafting an example response
+
+● Read(/home/colin/.gemini/antigravity-cli/skills/example/SKILL.md)
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+⣾ Working...
+esc to cancel                                                                                                           Gemini 3.5 Flash (High)
