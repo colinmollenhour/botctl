@@ -1,0 +1,21 @@
+
+      ▄▀▀▄        Antigravity CLI 1.0.2
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (High)
+   ▄▀▀    ▀▀▄     ~/Projects/example
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+
+Allow Antigravity to access your shell history file (~/.bash_history)?
+
+  Allow once
+> Allow for session
+  Persist allow to settings.json
+  Deny
+
+  ↑/↓ Navigate · enter Confirm
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                 Gemini 3.5 Flash (High)

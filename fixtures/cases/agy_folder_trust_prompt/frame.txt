@@ -1,0 +1,20 @@
+
+      ▄▀▀▄        Antigravity CLI 1.0.2
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (High)
+   ▄▀▀    ▀▀▄     ~/Projects/example
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+
+Trust this workspace?
+
+This workspace has not been opened in Antigravity before. Trusting it allows
+the assistant to read project files and run commands from this directory.
+
+[y/N]
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                 Gemini 3.5 Flash (High)

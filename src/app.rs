@@ -1457,7 +1457,7 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
 
             match yolo_action_for_state(classification.state) {
                 YoloAction::ApprovePermission => {
-                    if is_yolo_safe_to_approve(&inspected) {
+                    if is_yolo_safe_to_approve(&inspected, &current_pane) {
                         emit_babysit_output(format!(
                             "keep-going pane={} action=approve",
                             pane.pane_id
@@ -1486,7 +1486,12 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                     thread::sleep(Duration::from_millis(args.poll_ms));
                     continue;
                 }
-                YoloAction::Wait => {}
+                // Defensive: keep-going gates on `ensure_pane_owned_by_claude`
+                // above, so an agy command-permission state is unreachable here.
+                // Treat it as Wait so the match stays exhaustive without
+                // accidentally driving agy panes through the Claude keystroke
+                // path.
+                YoloAction::ApproveAgyCommandPermission | YoloAction::Wait => {}
             }
         } else if let Some(error) = keep_going_no_yolo_blocker(classification, &pane.pane_id) {
             return Err(error);
@@ -1637,6 +1642,13 @@ fn prompt_submission_started(
         SessionState::PromptEditing
         | SessionState::ExternalEditorActive
         | SessionState::Unknown => return false,
+        // Agy panes do not use the prompt-submission path (no Claude-style
+        // keybinding contract), so a frame that landed in any agy state can
+        // never represent "submission started". Treat as not-started so the
+        // caller does not advance to the wait-for-response phase.
+        SessionState::AgyCommandPermissionPrompt
+        | SessionState::AgyFolderTrustPrompt
+        | SessionState::AgySettingsPersistPrompt => return false,
         SessionState::ChatReady => {}
     }
 
@@ -2375,7 +2387,7 @@ fn prompt_wait_step(
             )?;
             Ok(())
         }
-        SessionState::PermissionDialog if !no_yolo && is_yolo_safe_to_approve(inspected) => {
+        SessionState::PermissionDialog if !no_yolo && is_yolo_safe_to_approve(inspected, pane) => {
             execute_keep_going_yolo_action(
                 client,
                 &pane.pane_id,
@@ -2710,13 +2722,39 @@ fn install_babysit_sigint_handler(flag: Arc<AtomicBool>) -> AppResult<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum YoloAction {
+pub(crate) enum YoloAction {
     Wait,
     ApprovePermission,
+    /// Agy command-permission auto-approve (raw `Enter` to confirm the
+    /// captured default option `> 1. Yes`). Kept separate from
+    /// `ApprovePermission` for telemetry/readability — both paths converge
+    /// inside `execute_classified_workflow` via `raw_key_for_workflow`. The
+    /// interactive `keep-going` loop continues to reject agy panes at the
+    /// pane-ownership gate, so this variant is observed in practice only by
+    /// the runtime YOLO loop (`maybe_run_yolo_action`).
+    ApproveAgyCommandPermission,
     DismissSurvey,
 }
 
-fn yolo_action_for_state(state: SessionState) -> YoloAction {
+impl YoloAction {
+    /// Stable string rendering for telemetry/event payloads. Kept in sync
+    /// with the runtime event consumers (babysit log, `runtime` event
+    /// stream): existing strings (`wait`, `approve-permission`,
+    /// `dismiss-survey`) preserved verbatim so historical log parsers do
+    /// not break. The agy variant gets its own distinct string so an
+    /// operator scanning events can tell agy approves apart from Claude
+    /// approves.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            YoloAction::Wait => "wait",
+            YoloAction::ApprovePermission => "approve-permission",
+            YoloAction::ApproveAgyCommandPermission => "approve-agy-command-permission",
+            YoloAction::DismissSurvey => "dismiss-survey",
+        }
+    }
+}
+
+pub(crate) fn yolo_action_for_state(state: SessionState) -> YoloAction {
     match state {
         SessionState::ChatReady
         | SessionState::PromptEditing
@@ -2726,8 +2764,11 @@ fn yolo_action_for_state(state: SessionState) -> YoloAction {
         | SessionState::FolderTrustPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
+        | SessionState::AgyFolderTrustPrompt
+        | SessionState::AgySettingsPersistPrompt
         | SessionState::Unknown => YoloAction::Wait,
         SessionState::PermissionDialog => YoloAction::ApprovePermission,
+        SessionState::AgyCommandPermissionPrompt => YoloAction::ApproveAgyCommandPermission,
         SessionState::SurveyPrompt => YoloAction::DismissSurvey,
     }
 }
@@ -3165,7 +3206,26 @@ fn render_permission_prompt_details(details: &PermissionPromptDetails) -> Vec<St
     lines
 }
 
-pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
+pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane, pane: &TmuxPane) -> bool {
+    // Agy panes have their own per-shape safety contract: classify as the
+    // command-permission variant, pane process must be `agy`, and the cursor
+    // must still be on the captured default `> 1. Yes`. Folder-trust and
+    // settings-persist agy shapes refuse here (returning false → YOLO loop
+    // waits for manual review). Keep this branch first so a frame that
+    // accidentally contains Claude-style permission strings on an agy pane
+    // is not routed through the Claude/Codex dispatch.
+    //
+    // Gate the branch on the pane process (`current_command == "agy"`) rather
+    // than on the classification signal: a Claude pane whose scrollback
+    // contains "Antigravity"/"Gemini" can carry `SIGNAL_AGY_KEYWORDS` without
+    // actually being an agy pane, and we must NOT refuse to approve a genuine
+    // Claude PermissionDialog in that case. The downstream
+    // `is_agy_command_permission_safe_to_approve` re-checks `is_agy_pane`
+    // for defense-in-depth.
+    if is_pane_command_agy(pane) {
+        return is_agy_command_permission_safe_to_approve(inspected, pane);
+    }
+
     if inspected.classification.state != SessionState::PermissionDialog {
         return false;
     }
@@ -3196,6 +3256,27 @@ pub(crate) fn is_yolo_safe_to_approve(inspected: &InspectedPane) -> bool {
     details.question.is_some()
         && details.command.is_some()
         && !permission_prompt_has_active_chat_input(inspected)
+}
+
+/// Per-shape YOLO safety gate for agy panes. Approve is allowed iff all three
+/// preconditions hold:
+///
+/// 1. The frame classified as `AgyCommandPermissionPrompt` (so neither
+///    folder-trust nor settings-persist shapes reach this code path).
+/// 2. The pane process is actually `agy` — the frame fingerprint alone is
+///    insufficient because a Claude/Codex pane could contain the literal
+///    string "Antigravity" in its scrollback (see consolidated critique #5).
+/// 3. The cursor is still on the captured default option (`> 1. Yes`). If
+///    the user arrowed the selector to option 3 (the global-settings persist
+///    option), `Enter` would mutate settings.json. This guard refuses to
+///    fire in that case; the YOLO loop will wait for the next tick.
+pub(crate) fn is_agy_command_permission_safe_to_approve(
+    inspected: &InspectedPane,
+    pane: &TmuxPane,
+) -> bool {
+    inspected.classification.state == SessionState::AgyCommandPermissionPrompt
+        && crate::agy::is_agy_pane(pane)
+        && crate::agy::agy_command_permission_default_option_is_yes(&inspected.raw_source)
 }
 
 fn is_codex_permission_prompt_safe_to_approve(inspected: &InspectedPane) -> bool {
@@ -3629,6 +3710,15 @@ fn recovery_action_for_state(state: SessionState) -> AppResult<Option<RecoveryAc
         SessionState::Unknown => Err(AppError::new(
             "no safe automatic recovery is defined for Unknown state; refusing to guess",
         )),
+        SessionState::AgyCommandPermissionPrompt => Err(AppError::new(
+            "auto-unstick is not supported for agy command-permission prompts; opt in to YOLO with `botctl yolo start --pane <agy-pane>` instead",
+        )),
+        SessionState::AgyFolderTrustPrompt => Err(AppError::new(
+            "auto-unstick is not supported for agy folder-trust prompts; confirm the workspace manually",
+        )),
+        SessionState::AgySettingsPersistPrompt => Err(AppError::new(
+            "auto-unstick is not supported for agy settings-persist prompts; review and confirm manually",
+        )),
     }
 }
 
@@ -3714,6 +3804,17 @@ fn raw_key_for_workflow(
             Some(("y", "y"))
         }
         (GuardedWorkflow::ApprovePermission, SessionState::FolderTrustPrompt) => {
+            Some(("Enter", "enter"))
+        }
+        // Agy command-permission prompt: the captured shape pre-positions the
+        // cursor on `> 1. Yes`, so approve is literally raw `Enter`. Routing
+        // through `~/.claude/keybindings.json` would be wrong (the binding
+        // exists in the user's Claude keymap, not in agy's), so we mirror the
+        // FolderTrustPrompt special case. The safety predicate
+        // `is_agy_command_permission_safe_to_approve` (in this module) is
+        // responsible for ensuring the cursor is actually still on option 1
+        // before this arm is reached.
+        (GuardedWorkflow::ApprovePermission, SessionState::AgyCommandPermissionPrompt) => {
             Some(("Enter", "enter"))
         }
         (GuardedWorkflow::DismissSurvey, SessionState::SurveyPrompt) => Some(("0", "0")),
@@ -3942,7 +4043,21 @@ pub(crate) fn render_next_safe_action(
     bindings: &KeybindingsInspection,
 ) -> String {
     if is_classified_agy(classification, pane) {
-        return String::from("manual-review: agy automation is not implemented");
+        // Per-shape dispatch: only the command-permission shape is
+        // auto-approvable; the other two require manual review. The default
+        // arm covers any future agy state that has not been wired up yet.
+        return match classification.state {
+            SessionState::AgyCommandPermissionPrompt => {
+                String::from("safe-action: approve (Enter)")
+            }
+            SessionState::AgyFolderTrustPrompt => {
+                String::from("manual-review: agy folder-trust prompt")
+            }
+            SessionState::AgySettingsPersistPrompt => {
+                String::from("manual-review: agy settings-persist prompt")
+            }
+            _ => String::from("manual-review: agy automation is not implemented"),
+        };
     }
     if is_classified_codex(classification, pane) {
         return match classification.state {
@@ -3983,6 +4098,15 @@ pub(crate) fn render_next_safe_action(
             String::from("manual-review: external editor is active")
         }
         SessionState::Unknown => String::from("manual-review: classify the pane before acting"),
+        // Defensive: agy panes short-circuit at the top of this function via
+        // `is_classified_agy`, so these arms are dead-code. Spell them out
+        // explicitly so a future change that drops the agy short-circuit
+        // cannot silently route agy frames through the Claude action map.
+        SessionState::AgyCommandPermissionPrompt
+        | SessionState::AgyFolderTrustPrompt
+        | SessionState::AgySettingsPersistPrompt => {
+            String::from("manual-review: agy panes use the per-shape doctor recommendation")
+        }
     }
 }
 
@@ -4132,7 +4256,7 @@ pub(crate) fn ensure_pane_owned_by_automatable_provider(
         Ok(())
     } else {
         Err(AppError::new(format!(
-            "refusing to drive pane {} because current command is {} instead of claude or codex (agy panes are passively-discovered read-only)",
+            "refusing to drive pane {} because current command is {} instead of claude or codex; agy panes only support opt-in YOLO command-permission auto-approve, not direct keybinding automation",
             pane.pane_id, pane.current_command
         )))
     }
@@ -4142,11 +4266,14 @@ pub(crate) fn ensure_pane_owned_by_yolo_provider(
     pane: &TmuxPane,
     classification: &Classification,
 ) -> AppResult<()> {
-    if is_pane_command_claude(pane) || is_classified_codex(classification, pane) {
+    if is_pane_command_claude(pane)
+        || is_classified_codex(classification, pane)
+        || is_classified_agy(classification, pane)
+    {
         Ok(())
     } else {
         Err(AppError::new(format!(
-            "refusing to start yolo for pane {} because current command is {} and the screen is not classified as codex (agy panes are passively-discovered read-only)",
+            "refusing to start yolo for pane {} because current command is {} and the screen is not classified as claude, codex, or agy",
             pane.pane_id, pane.current_command
         )))
     }
@@ -4174,6 +4301,27 @@ pub(crate) fn execute_automation_action(
     Ok(action.as_str().to_string())
 }
 
+/// Per-shape operator-facing recommendation copy emitted by `doctor` for
+/// agy panes. Mirrors (but does not enforce) the runtime YOLO policy:
+/// only the command-permission shape is auto-approvable; the other two
+/// require manual review.
+fn agy_doctor_recommendation_line(state: SessionState) -> &'static str {
+    match state {
+        SessionState::AgyCommandPermissionPrompt => {
+            "recommendation=agy command-permission prompt; opt in with `botctl yolo start --pane <agy-pane>` to auto-approve the default `1. Yes` option"
+        }
+        SessionState::AgyFolderTrustPrompt => {
+            "recommendation=agy folder-trust prompt; confirm the workspace manually (folder-trust auto-approve is not enabled in v1)"
+        }
+        SessionState::AgySettingsPersistPrompt => {
+            "recommendation=agy settings-persist prompt; review and confirm manually (settings-persist auto-approve is not enabled in v1)"
+        }
+        _ => {
+            "recommendation=agy pane detected; dashboard and last-message extraction are supported; opt in to YOLO command-permission auto-approve with `botctl yolo start --pane <agy-pane>`"
+        }
+    }
+}
+
 fn render_doctor_recommendations(
     classification: &Classification,
     pane: &TmuxPane,
@@ -4184,9 +4332,9 @@ fn render_doctor_recommendations(
 
     if !is_pane_command_claude(pane) {
         if agy {
-            lines.push(String::from(
-                "recommendation=agy panes are read-only in v1 (no YOLO, no prompt submit, no keybinding driver)",
-            ));
+            lines.push(String::from(agy_doctor_recommendation_line(
+                classification.state,
+            )));
         } else {
             lines.push(format!(
                 "recommendation=target pane is running {} instead of claude",
@@ -4246,22 +4394,24 @@ mod tests {
         AppError, BabysitFormat, BabysitOutputFormat, DASHBOARD_PERSISTENT_CHILD_ENV,
         DASHBOARD_TARGET_TMUX_SOCKET_ENV, DashboardArgs, InspectedPane,
         KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
-        ObserveArtifactPaths, RecoveryAction, YoloAction, artifact_state_dir_result,
-        classification_provider_label, cleanup_babysit_record, compose_prompt_run_content,
-        ensure_pane_owned_by_automatable_provider, ensure_pane_owned_by_claude,
-        ensure_pane_owned_by_yolo_provider, ensure_state_transition, extract_keep_going_response,
-        extract_permission_prompt_details, focused_frame_source, is_prompt_completion_state,
-        is_usable_state, is_yolo_safe_to_approve, keep_going_no_yolo_blocker, pane_provider_label,
+        ObserveArtifactPaths, RecoveryAction, YoloAction, agy_doctor_recommendation_line,
+        artifact_state_dir_result, classification_provider_label, cleanup_babysit_record,
+        compose_prompt_run_content, ensure_pane_owned_by_automatable_provider,
+        ensure_pane_owned_by_claude, ensure_pane_owned_by_yolo_provider, ensure_state_transition,
+        extract_keep_going_response, extract_permission_prompt_details, focused_frame_source,
+        is_agy_command_permission_safe_to_approve, is_prompt_completion_state, is_usable_state,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, pane_provider_label,
         parse_env_value_from_environ_bytes, permission_manual_review_reason,
         persistent_dashboard_child_command_with_target_socket, prompt_launch_command,
         prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
         render_babysit_action_event, render_babysit_output, render_babysit_start_event,
-        render_babysit_wait_event, render_guarded_workflow_output, render_keep_going_wait_message,
-        render_list_panes, render_next_safe_action, render_observe_command_output,
-        render_screen_excerpt, render_status_json, render_status_report, resolve_keep_going_prompt,
-        resolve_prompt_run_input, run_prepare_prompt, shell_escape,
-        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
-        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
+        render_babysit_wait_event, render_doctor_recommendations, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_observe_command_output, render_screen_excerpt, render_status_json,
+        render_status_report, resolve_keep_going_prompt, resolve_prompt_run_input,
+        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
+        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
+        write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -4695,6 +4845,42 @@ mod tests {
     }
 
     #[test]
+    fn render_next_safe_action_branches_per_agy_shape() {
+        let bindings = sample_bindings(KeybindingsStatus::Valid);
+        let pane = sample_pane("agy");
+
+        // Command-permission: the only auto-approvable agy shape.
+        let mut classification =
+            sample_agy_classification(SessionState::AgyCommandPermissionPrompt);
+        assert_eq!(
+            render_next_safe_action(&classification, &pane, &bindings),
+            "safe-action: approve (Enter)"
+        );
+
+        // Folder-trust: manual review.
+        classification.state = SessionState::AgyFolderTrustPrompt;
+        assert_eq!(
+            render_next_safe_action(&classification, &pane, &bindings),
+            "manual-review: agy folder-trust prompt"
+        );
+
+        // Settings-persist: manual review.
+        classification.state = SessionState::AgySettingsPersistPrompt;
+        assert_eq!(
+            render_next_safe_action(&classification, &pane, &bindings),
+            "manual-review: agy settings-persist prompt"
+        );
+
+        // Generic agy state (ChatReady/BusyResponding/Unknown) falls through
+        // to the generic copy.
+        classification.state = SessionState::ChatReady;
+        assert_eq!(
+            render_next_safe_action(&classification, &pane, &bindings),
+            "manual-review: agy automation is not implemented"
+        );
+    }
+
+    #[test]
     fn opencode_panes_do_not_become_codex_from_screen_signals() {
         let classification = Classification {
             source: String::from("pane"),
@@ -4968,10 +5154,20 @@ mod tests {
             SessionState::FolderTrustPrompt,
             SessionState::ExternalEditorActive,
             SessionState::DiffDialog,
+            SessionState::AgyFolderTrustPrompt,
+            SessionState::AgySettingsPersistPrompt,
             SessionState::Unknown,
         ] {
             assert_eq!(yolo_action_for_state(state), YoloAction::Wait);
         }
+    }
+
+    #[test]
+    fn yolo_action_for_state_maps_agy_command_permission_to_approve() {
+        assert_eq!(
+            yolo_action_for_state(SessionState::AgyCommandPermissionPrompt),
+            YoloAction::ApproveAgyCommandPermission
+        );
     }
 
     #[test]
@@ -5469,7 +5665,7 @@ mod tests {
         );
         assert_eq!(details.reason.as_deref(), Some("FG ready state"));
         assert_eq!(details.question.as_deref(), Some("Do you want to proceed?"));
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5506,7 +5702,7 @@ mod tests {
             details.question.as_deref(),
             Some("Do you want to allow Claude to fetch this content?")
         );
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5634,7 +5830,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             )
         );
         assert_eq!(details.reason.as_deref(), Some("Run golangci-lint"));
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5678,7 +5874,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(!is_yolo_safe_to_approve(&inspected));
+        assert!(!is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5723,7 +5919,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 .as_deref()
                 .is_some_and(|command| command.starts_with("OPENCODE_SERVER_HOST=seamus"))
         );
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5745,7 +5941,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(!is_yolo_safe_to_approve(&inspected));
+        assert!(!is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5770,7 +5966,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5795,7 +5991,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5820,7 +6016,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5845,7 +6041,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(!is_yolo_safe_to_approve(&inspected));
+        assert!(!is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5870,7 +6066,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(!is_yolo_safe_to_approve(&inspected));
+        assert!(!is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5895,7 +6091,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(!is_yolo_safe_to_approve(&inspected));
+        assert!(!is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5917,7 +6113,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5939,7 +6135,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             raw_source: String::from(source),
         };
 
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -5961,7 +6157,7 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             ),
         };
 
-        assert!(is_yolo_safe_to_approve(&inspected));
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
     }
 
     #[test]
@@ -6361,5 +6557,248 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             parsed.get("agy_model").is_some(),
             "agy_model key must be present for signal-fingerprinted agy pane, got: {parsed}"
         );
+    }
+
+    // ── AGY-004: per-shape YOLO safety + ownership + raw-key + doctor ──────
+
+    /// Captured agy command-permission frame with cursor on default `> 1. Yes`.
+    /// Includes the bottom-anchored agy footer so the classifier short-circuits
+    /// into `agy::classify_agy_state` rather than the Claude permission chain.
+    const AGY_COMMAND_PERMISSION_FRAME_DEFAULT_CURSOR: &str = concat!(
+        "● Bash(git remote -v) (ctrl+o to expand)\n",
+        "\n",
+        "Command\n",
+        "─────────────────────────────────────────────\n",
+        "\n",
+        "  Requesting permission for: git remote -v\n",
+        "\n",
+        "Do you want to proceed?\n",
+        "> 1. Yes\n",
+        "  2. Yes, and always allow in this conversation for commands that start with 'git remote'\n",
+        "  3. Yes, and always allow for commands that start with 'git remote' (Persist to settings.json)\n",
+        "  4. No\n",
+        "\n",
+        "  ↑/↓ Navigate · tab Amend · e edit command\n",
+        "esc to cancel                                       Gemini 3.5 Flash (High)\n",
+    );
+
+    /// Same shape but the operator has arrow-keyed onto option 3 (the persist
+    /// option). The safety predicate must refuse.
+    const AGY_COMMAND_PERMISSION_FRAME_CURSOR_MOVED: &str = concat!(
+        "Command\n",
+        "─────────────────────────────────────────────\n",
+        "\n",
+        "  Requesting permission for: git remote -v\n",
+        "\n",
+        "Do you want to proceed?\n",
+        "  1. Yes\n",
+        "  2. Yes, and always allow in this conversation for commands that start with 'git remote'\n",
+        "> 3. Yes, and always allow for commands that start with 'git remote' (Persist to settings.json)\n",
+        "  4. No\n",
+        "\n",
+        "esc to cancel                                       Gemini 3.5 Flash (High)\n",
+    );
+
+    fn sample_agy_inspected(raw_source: &str) -> InspectedPane {
+        InspectedPane {
+            classification: sample_agy_classification(SessionState::AgyCommandPermissionPrompt),
+            focused_source: raw_source.to_string(),
+            raw_source: raw_source.to_string(),
+        }
+    }
+
+    /// Shared test fixture: a `Classification` carrying `SIGNAL_AGY_KEYWORDS`
+    /// at the given state, with the recap/questions/source fields set to the
+    /// canonical agy-classifier defaults. Extracted from five repeated inline
+    /// literals across the tests below.
+    fn sample_agy_classification(state: SessionState) -> Classification {
+        Classification {
+            source: String::from("pane"),
+            state,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![String::from(crate::classifier::SIGNAL_AGY_KEYWORDS)],
+        }
+    }
+
+    #[test]
+    fn is_agy_command_permission_safe_to_approve_accepts_default_cursor() {
+        let inspected = sample_agy_inspected(AGY_COMMAND_PERMISSION_FRAME_DEFAULT_CURSOR);
+        let pane = sample_pane("agy");
+        assert!(is_agy_command_permission_safe_to_approve(&inspected, &pane));
+    }
+
+    #[test]
+    fn is_agy_command_permission_safe_to_approve_rejects_moved_cursor() {
+        // Cursor on `> 3. ...` — must refuse so the YOLO loop does not
+        // confirm the global-settings persist option.
+        let inspected = sample_agy_inspected(AGY_COMMAND_PERMISSION_FRAME_CURSOR_MOVED);
+        let pane = sample_pane("agy");
+        assert!(!is_agy_command_permission_safe_to_approve(
+            &inspected, &pane
+        ));
+    }
+
+    #[test]
+    fn is_agy_command_permission_safe_to_approve_rejects_non_agy_pane() {
+        // Frame fingerprints as agy and is classified as the agy
+        // command-permission shape — but the pane process is `claude`. The
+        // pane process gate (`is_agy_pane`) must reject this so a stray
+        // scrollback that contains the literal "Antigravity" string cannot
+        // drive a Claude pane through the agy approve path.
+        let inspected = sample_agy_inspected(AGY_COMMAND_PERMISSION_FRAME_DEFAULT_CURSOR);
+        let pane = sample_pane("claude");
+        assert!(!is_agy_command_permission_safe_to_approve(
+            &inspected, &pane
+        ));
+    }
+
+    #[test]
+    fn is_agy_command_permission_safe_to_approve_rejects_wrong_state() {
+        let mut inspected = sample_agy_inspected(AGY_COMMAND_PERMISSION_FRAME_DEFAULT_CURSOR);
+        // Folder-trust agy shape: classifier-only, no auto-approve.
+        inspected.classification.state = SessionState::AgyFolderTrustPrompt;
+        let pane = sample_pane("agy");
+        assert!(!is_agy_command_permission_safe_to_approve(
+            &inspected, &pane
+        ));
+    }
+
+    #[test]
+    fn is_yolo_safe_to_approve_routes_agy_through_per_shape_branch() {
+        // Top-level safety predicate must dispatch into the agy branch when
+        // the pane process is `agy`. The branch is now gated on
+        // `is_pane_command_agy` (not on the signal), so it fires only for a
+        // real agy pane and the downstream `is_agy_pane` check is
+        // defense-in-depth.
+        let inspected = sample_agy_inspected(AGY_COMMAND_PERMISSION_FRAME_DEFAULT_CURSOR);
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("agy")));
+        // Same classification, wrong pane process — falls through to the
+        // Claude/Codex dispatch. The agy state is not a `PermissionDialog`,
+        // so the Claude branch refuses (no auto-approve).
+        assert!(!is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
+    }
+
+    #[test]
+    fn is_yolo_safe_to_approve_claude_pane_with_agy_signal_does_not_short_circuit() {
+        // Regression for the over-broad early branch: a Claude pane whose
+        // scrollback contains "Antigravity"/"Gemini" can carry
+        // `SIGNAL_AGY_KEYWORDS` on its classification without actually being
+        // an agy pane. The top-level safety predicate must NOT route through
+        // the agy refusal in that case — it must fall through to the
+        // Claude/Codex dispatch and approve a genuine PermissionDialog.
+        let raw = "Bash command (unsandboxed)\n  echo hi\n  Run a harmless echo\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+        let inspected = InspectedPane {
+            classification: Classification {
+                source: String::from("pane"),
+                state: SessionState::PermissionDialog,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                // Stale agy signal from scrollback — the pane process is the
+                // source of truth.
+                signals: vec![String::from(crate::classifier::SIGNAL_AGY_KEYWORDS)],
+            },
+            focused_source: raw.to_string(),
+            raw_source: raw.to_string(),
+        };
+        // Claude pane → must approve a genuine PermissionDialog despite the
+        // stray agy signal.
+        assert!(is_yolo_safe_to_approve(&inspected, &sample_pane("claude")));
+    }
+
+    #[test]
+    fn ensure_pane_owned_by_yolo_provider_accepts_agy_pane() {
+        let classification = sample_agy_classification(SessionState::AgyCommandPermissionPrompt);
+        let pane = sample_pane("agy");
+        ensure_pane_owned_by_yolo_provider(&pane, &classification)
+            .expect("yolo start must admit agy panes");
+    }
+
+    #[test]
+    fn ensure_pane_owned_by_yolo_provider_rejects_unknown_provider() {
+        let classification = Classification {
+            source: String::from("pane"),
+            state: SessionState::Unknown,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: vec![],
+        };
+        let pane = sample_pane("bash");
+        assert!(ensure_pane_owned_by_yolo_provider(&pane, &classification).is_err());
+    }
+
+    #[test]
+    fn ensure_pane_owned_by_automatable_provider_still_rejects_agy_pane() {
+        // `automatable_provider` gates approve/reject/submit/auto-unstick;
+        // agy has no Claude-style keybinding contract so it must keep
+        // returning Err here even though the YOLO guard now admits it.
+        let classification = sample_agy_classification(SessionState::AgyCommandPermissionPrompt);
+        let pane = sample_pane("agy");
+        let error = ensure_pane_owned_by_automatable_provider(&pane, &classification)
+            .expect_err("automatable guard must still reject agy");
+        assert!(error.to_string().contains("agy"));
+    }
+
+    #[test]
+    fn raw_key_for_workflow_returns_enter_for_agy_command_permission() {
+        let classification = sample_agy_classification(SessionState::AgyCommandPermissionPrompt);
+        assert_eq!(
+            raw_key_for_workflow(GuardedWorkflow::ApprovePermission, &classification),
+            Some(("Enter", "enter"))
+        );
+    }
+
+    #[test]
+    fn render_doctor_recommendations_per_agy_shape() {
+        let pane = sample_pane("agy");
+        let bindings = sample_bindings(KeybindingsStatus::Valid);
+
+        // Each of the three agy shapes must round-trip *exactly* to its
+        // per-shape recommendation line. Substring matching is too weak — a
+        // regression that truncated the helper to just "recommendation=agy"
+        // would silently pass. Assert byte-for-byte equality (post-trim).
+        for state in [
+            SessionState::AgyCommandPermissionPrompt,
+            SessionState::AgyFolderTrustPrompt,
+            SessionState::AgySettingsPersistPrompt,
+        ] {
+            let classification = sample_agy_classification(state);
+            let report = render_doctor_recommendations(&classification, &pane, &bindings);
+            assert_eq!(
+                report.trim(),
+                agy_doctor_recommendation_line(state).trim(),
+                "doctor report for {} must equal the per-shape helper line verbatim",
+                state.as_str(),
+            );
+            assert!(
+                !report.contains("install-bindings"),
+                "agy doctor output must not suggest install-bindings; got {report}",
+            );
+        }
+
+        // Fallback arm: any non-agy-prompt state on an agy pane funnels into
+        // the generic copy. Exercise multiple states so a regression that
+        // collapses one fallback case is caught.
+        for state in [
+            SessionState::ChatReady,
+            SessionState::BusyResponding,
+            SessionState::Unknown,
+        ] {
+            let classification = sample_agy_classification(state);
+            let report = render_doctor_recommendations(&classification, &pane, &bindings);
+            assert_eq!(
+                report.trim(),
+                agy_doctor_recommendation_line(state).trim(),
+                "doctor report for {} must equal the fallback helper line verbatim",
+                state.as_str(),
+            );
+            assert!(
+                !report.contains("install-bindings"),
+                "agy doctor output must not suggest install-bindings; got {report}",
+            );
+        }
     }
 }
