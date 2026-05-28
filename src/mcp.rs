@@ -5,7 +5,8 @@ use uuid::{ContextV7, Timestamp, Uuid};
 
 use crate::app::{AppError, AppResult};
 use crate::mcp_protocol::{
-    JsonRpcRequest, TOOL_NAMES, error, initialize_result, success, tools_list_result,
+    JsonRpcRequest, PROTOCOL_VERSION, TOOL_NAMES, error, initialize_result, success,
+    tools_list_result,
 };
 use crate::mcp_registry::McpRegistry;
 use crate::mcp_session::McpSessionService;
@@ -14,15 +15,24 @@ use crate::prompt::resolve_state_dir;
 #[derive(Debug, Clone)]
 pub struct McpService {
     sessions: McpSessionService,
+    protocol_version: &'static str,
 }
 
 impl McpService {
     pub fn new(state_dir: Option<&Path>) -> AppResult<Self> {
+        Self::new_with_protocol(state_dir, PROTOCOL_VERSION)
+    }
+
+    pub fn new_with_protocol(
+        state_dir: Option<&Path>,
+        protocol_version: &'static str,
+    ) -> AppResult<Self> {
         let state_dir = resolve_state_dir(state_dir)?;
         let registry = McpRegistry::open(&state_dir)?;
         let server_id = Uuid::new_v7(Timestamp::now(ContextV7::new())).to_string();
         Ok(Self {
             sessions: McpSessionService::new(registry, server_id),
+            protocol_version,
         })
     }
 
@@ -63,7 +73,7 @@ impl McpService {
 
     fn handle_result(&self, request: &JsonRpcRequest) -> AppResult<Value> {
         match request.method.as_str() {
-            "initialize" => Ok(initialize_result()),
+            "initialize" => Ok(initialize_result(self.protocol_version)),
             "tools/list" => Ok(tools_list_result()),
             "tools/call" => self.call_tool(&request.params),
             "notifications/initialized" => Ok(json!({})),
@@ -95,6 +105,7 @@ impl McpService {
             "kill" => self.sessions.kill(&args),
             "snapshot" => self.sessions.snapshot(&args),
             "send_keys" => self.sessions.send_keys(&args),
+            "one_shot" => self.sessions.one_shot(&args),
             _ => unreachable!(),
         }?;
         Ok(json!({
@@ -130,7 +141,27 @@ mod tests {
             params: json!({}),
         });
         let tools = tools.unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn http_service_advertises_2025_version() {
+        let root =
+            std::env::temp_dir().join(format!("botctl-mcp-service-http-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let service =
+            McpService::new_with_protocol(Some(&root), crate::mcp_protocol::HTTP_PROTOCOL_VERSION)
+                .unwrap();
+        let init = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: "initialize".into(),
+                params: json!({}),
+            })
+            .unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         let _ = std::fs::remove_dir_all(&root);
     }
 

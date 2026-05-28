@@ -42,7 +42,7 @@ These are the commands that matter most in day-to-day use:
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to set central YOLO policy for one pane or a scoped set of panes
 - `serve` to expose HTTP and event output as a facade over runtime state
-- `mcp` to expose persistent Claude Code sessions as a small MCP JSON-RPC tool API over stdio or minimal `POST /mcp` HTTP
+- `mcp` to expose persistent Claude Code sessions as an MCP JSON-RPC tool API over stdio or a stateless Streamable-HTTP-compatible `POST /mcp` HTTP server
 
 For recovery actions, use the canonical names `approve`, `reject`, and `dismiss-survey`. The long names `approve-permission` and `reject-permission` remain compatibility aliases.
 

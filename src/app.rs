@@ -254,9 +254,10 @@ pub fn run(command: Command) -> AppResult<String> {
 fn run_mcp(args: McpArgs) -> AppResult<String> {
     match args.transport {
         McpTransportArgs::Stdio => crate::mcp_stdio::run_stdio(args.state_dir.as_deref())?,
-        McpTransportArgs::Http { bind } => {
-            crate::mcp_http::run_http(&bind, args.state_dir.as_deref())?
-        }
+        McpTransportArgs::Http {
+            bind,
+            allow_non_loopback,
+        } => crate::mcp_http::run_http(&bind, args.state_dir.as_deref(), allow_non_loopback)?,
     }
     Ok(String::new())
 }

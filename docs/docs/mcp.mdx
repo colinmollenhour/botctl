@@ -7,9 +7,21 @@
 ```bash
 botctl mcp stdio
 botctl mcp http --bind 127.0.0.1:8787
+botctl mcp http --bind 0.0.0.0:8787 --allow-non-loopback
 ```
 
-The HTTP transport is intentionally minimal in v1: it accepts one JSON-RPC request object per `POST /mcp` and returns one JSON-RPC response body. It is **not** full MCP Streamable HTTP: no SSE, resumable streams, or MCP HTTP session lifecycle are implemented.
+The HTTP transport is a **stateless, Streamable-HTTP-compatible** JSON request/response server (single endpoint `POST /mcp`):
+
+- **`POST /mcp`** returns `application/json` (one JSON-RPC response per request — no SSE). A request body containing only notifications/responses returns `202 Accepted` with an empty body.
+- **`GET /mcp`** returns `405 Method Not Allowed` with `Allow: POST, DELETE, OPTIONS`: there is no server-initiated SSE stream (botctl emits no server notifications).
+- **`DELETE /mcp`** returns `204 No Content` — a no-op, because the server is stateless (no `Mcp-Session-Id`; agent state lives in SQLite keyed by tool args).
+- **`OPTIONS /mcp`** returns `204` with `Allow: POST, GET, DELETE, OPTIONS` (no CORS/`Access-Control-*` headers — this is not a browser API).
+- Protocol version: HTTP advertises `2025-03-26`. The `MCP-Protocol-Version` header is optional, but if present on a post-initialize request it must equal `2025-03-26` or the request is rejected with `400`. (The stdio transport still advertises `2024-11-05`.)
+- **Security:** A missing `Origin` is allowed (native MCP clients omit it); if present, `Origin` must be loopback — a literal `Origin: null` (sandboxed/opaque browser context) is rejected with `403`. The host check parses the authority strictly (only a loopback IP or exactly `localhost`), so loopback-prefixed names like `127.0.0.1.evil.com` and userinfo smuggling like `http://127.0.0.1@evil.com` are rejected. When bound to loopback, the `Host` header must also be loopback (DNS-rebinding protection). `Content-Type`/`Accept` handling is lenient.
+- **Non-loopback bind:** binding a non-loopback address (e.g. `0.0.0.0`) is **hard-rejected** unless you pass `--allow-non-loopback`, because the MCP control plane has no authentication and can spawn/kill agents. With the flag, a prominent warning is printed at startup.
+- A top-level JSON-RPC batch (array) is rejected with a JSON-RPC `invalid_request` error.
+
+**Explicitly out of scope:** SSE response bodies, GET SSE streams, SSE resumability / `Last-Event-ID`, `Mcp-Session-Id` / stateful sessions, authentication/OAuth, and browser CORS.
 
 ## Tools
 
@@ -24,6 +36,12 @@ Tool names are unprefixed; MCP clients typically expose them under the server na
 - `kill` — kill only the verified managed tmux window; idempotent when already gone.
 - `snapshot` — capture pane text and classifier state for diagnostics.
 - `send_keys` — unsafe operator escape hatch scoped to the managed ID.
+- `one_shot` — create a temporary managed session, run **exactly one** prompt to a terminal outcome, then **always attempt to kill** the window (best-effort cleanup). Required args: `cwd`, `prompt` (non-empty). Optional: `provider`/`model`/`effort`/`agent`/`timeout_ms`/`policy` (same validation as `spawn`). It is implemented by composing `spawn` (with `initial_prompt`) + `kill`, so the prompt is submitted exactly once.
+  - **Timeout (per-phase):** `timeout_ms` applies independently to the spawn-ready wait and the prompt turn; `kill` uses its own default. Worst case ≈ `2×timeout_ms` + kill.
+  - **Auto-approval policy:** uses managed auto-approval (`no_yolo=false`) — only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block. A caller MAY set `policy.no_yolo:true` to be more conservative; it can never broaden beyond the existing gate.
+  - **Error vs result:** argument-validation failures (missing/blank `prompt`, bad `cwd`, invalid optional args) surface as JSON-RPC errors. Spawn, turn, and kill failures are NOT errors — they are encoded in the result fields below and the call returns a normal result (`isError:false`). A failure after the window is created still always attempts the best-effort kill (no leaked tmux window).
+  - **Connection slot (operator note):** `one_shot` holds its HTTP connection slot for the full duration of the call (spawn-ready wait + prompt turn + kill, worst case ≈ `2×timeout_ms` + kill), unlike the split `spawn`/`prompt`/`wait` flow. Effective `one_shot` concurrency is therefore bounded by `MAX_ACTIVE_CONNECTIONS` (64) — long-running one-shots can saturate the slot pool, so size `timeout_ms` and client concurrency accordingly.
+  - **Result shape:** the call returns a normal result whose fields encode the outcome. Fields: `agent` (or `null` on spawn failure), `spawn_outcome`, `outcome` (`ready`/`needs_user_input`/`blocked`/`timeout`/`dead`/`busy`/`unknown`/`spawn_failed`), `message` (set on `ready`/`needs_user_input`), `fresh_message`, `killed`, `kill` (`{status: ok|error|busy|skipped, …}`), and `error` (present on spawn failure, a post-creation failure, or kill-error detail).
 
 Sessions are addressed by generated public IDs, not tmux names. The registry stores exact tmux session/window/pane IDs (and the chosen provider) under the botctl state directory and uses SQLite lock rows so concurrent prompt/wait/kill/snapshot/send operations on the same ID return `busy` instead of racing.
 

@@ -121,7 +121,10 @@ pub struct PromptRunArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTransportArgs {
     Stdio,
-    Http { bind: String },
+    Http {
+        bind: String,
+        allow_non_loopback: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,7 +555,7 @@ fn usage_with_color(color: bool) -> String {
     out.push('\n');
     for line in [
         "mcp stdio [--state-dir PATH]",
-        "mcp http --bind 127.0.0.1:8787 [--state-dir PATH]",
+        "mcp http --bind 127.0.0.1:8787 [--allow-non-loopback] [--state-dir PATH]",
     ] {
         out.push_str(&command(line));
         out.push('\n');
@@ -974,16 +977,16 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         ),
         "mcp" => (
             "mcp",
-            "Run the small botctl MCP JSON-RPC server for persistent agent sessions (Claude default; Codex and Agy also supported).",
-            "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]",
+            "Run the botctl MCP JSON-RPC server for persistent agent sessions (stdio, or stateless Streamable-HTTP-compatible POST /mcp). Claude default; Codex and Agy also supported.",
+            "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind 127.0.0.1:8787 [--allow-non-loopback] [--state-dir PATH]",
             &["botctl mcp stdio", "botctl mcp http --bind 127.0.0.1:8787"][..],
             &[
                 "stdio (newline-delimited JSON-RPC on stdin/stdout)",
-                "http --bind ADDR (minimal JSON-RPC POST /mcp; not full MCP Streamable HTTP)",
+                "http --bind ADDR [--allow-non-loopback] (stateless Streamable-HTTP-compatible JSON-RPC POST /mcp; GET->405, DELETE->204, Origin/Host checks, no SSE)",
                 "--state-dir PATH",
                 "--no-color",
             ][..],
-            "Tools use generated managed IDs and exact tmux pane IDs. spawn accepts optional provider (claude default, codex, agy), model, effort, and agent — validated per provider. send_keys is unsafe/operator-only and does not imply progress.",
+            "Tools use generated managed IDs and exact tmux pane IDs. spawn accepts optional provider (claude default, codex, agy), model, effort, and agent — validated per provider. one_shot spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort). send_keys is unsafe/operator-only and does not imply progress.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {
@@ -1072,7 +1075,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
             "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]"
         }
         "mcp" => {
-            "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind ADDR [--state-dir PATH]"
+            "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind ADDR [--allow-non-loopback] [--state-dir PATH]"
         }
         "prepare-prompt" => {
             "botctl prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]"
@@ -2080,6 +2083,7 @@ fn parse_mcp(args: Vec<String>) -> AppResult<Command> {
     let rest = iter.collect::<Vec<_>>();
     let mut state_dir = None;
     let mut bind = None;
+    let mut allow_non_loopback = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -2088,6 +2092,9 @@ fn parse_mcp(args: Vec<String>) -> AppResult<Command> {
             }
             "--bind" if transport_name == "http" => {
                 bind = Some(read_value(&rest, &mut i, "--bind")?);
+            }
+            "--allow-non-loopback" if transport_name == "http" => {
+                allow_non_loopback = true;
             }
             flag => return Err(AppError::new(format!("unknown mcp flag: {flag}"))),
         }
@@ -2098,6 +2105,7 @@ fn parse_mcp(args: Vec<String>) -> AppResult<Command> {
         "stdio" => McpTransportArgs::Stdio,
         "http" => McpTransportArgs::Http {
             bind: bind.ok_or_else(|| AppError::new("mcp http requires --bind ADDR"))?,
+            allow_non_loopback,
         },
         other => return Err(AppError::new(format!("unknown mcp transport: {other}"))),
     };
@@ -3500,11 +3508,47 @@ mod tests {
             Command::Mcp(args) => assert_eq!(
                 args.transport,
                 super::McpTransportArgs::Http {
-                    bind: String::from("127.0.0.1:8787")
+                    bind: String::from("127.0.0.1:8787"),
+                    allow_non_loopback: false,
                 }
             ),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_mcp_http_with_allow_non_loopback() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("mcp"),
+            String::from("http"),
+            String::from("--bind"),
+            String::from("0.0.0.0:8787"),
+            String::from("--allow-non-loopback"),
+        ])
+        .expect("mcp http command with allow-non-loopback should parse");
+
+        match command {
+            Command::Mcp(args) => assert_eq!(
+                args.transport,
+                super::McpTransportArgs::Http {
+                    bind: String::from("0.0.0.0:8787"),
+                    allow_non_loopback: true,
+                }
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_allow_non_loopback_for_stdio() {
+        let result = parse_args(vec![
+            String::from("botctl"),
+            String::from("mcp"),
+            String::from("stdio"),
+            String::from("--allow-non-loopback"),
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

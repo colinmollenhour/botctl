@@ -38,23 +38,38 @@ impl McpSessionService {
     }
 
     pub fn spawn(&self, args: &Value) -> AppResult<Value> {
-        let cwd = required_str(args, "cwd")?;
-        let cwd = canonical_dir(cwd)?;
-        let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
-        let no_yolo = args
-            .pointer("/policy/no_yolo")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let provider = optional_provider(args)?;
-        let model = optional_nonempty_str(args, "model")?;
-        let effort = optional_nonempty_str(args, "effort")?;
-        let agent = optional_nonempty_str(args, "agent")?;
-        let command = build_launch_command(
+        // R1: validate ALL args (incl. timeout_ms range + policy.no_yolo) up
+        // front so an invalid arg returns Err with ZERO side effects (no tmux
+        // window). The validated values are threaded forward — no re-validation.
+        let validated = validate_spawn_args(args)?;
+        let record = self.spawn_window(&validated)?;
+        // After this point a tmux window + registry record exist. Any error from
+        // the ready-wait / prompt phase must NOT leak the window: a direct `spawn`
+        // caller cannot recover the id, so kill it best-effort before propagating.
+        match self.spawn_after_window(&record, &validated) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let _ = self.kill(&json!({ "id": record.id }));
+                Err(error)
+            }
+        }
+    }
+
+    /// Create the tmux window and insert the registry record from already
+    /// validated args (validation happened in `validate_spawn_args`, so no
+    /// window can be created on an invalid arg). If the registry insert fails
+    /// right after the window is created, the raw tmux window is killed
+    /// best-effort so it does not leak. Returns the inserted record on success.
+    fn spawn_window(&self, validated: &ValidatedSpawnArgs) -> AppResult<McpSessionRecord> {
+        let ValidatedSpawnArgs {
+            cwd,
             provider,
-            model.as_deref(),
-            effort.as_deref(),
-            agent.as_deref(),
-        )?;
+            model,
+            effort,
+            agent,
+            command,
+            ..
+        } = validated;
         let window_name = format!(
             "botctl-mcp-{}-{}",
             provider.as_str(),
@@ -65,35 +80,58 @@ impl McpSessionService {
             session_name: DEFAULT_SESSION_NAME.to_string(),
             window_name,
             cwd: cwd.clone(),
-            command,
+            command: command.clone(),
         })?;
-        let record = self.registry.insert_session(NewSessionRecord {
+        let window_id = started.window_id.clone();
+        match self.registry.insert_session(NewSessionRecord {
             owner_server_id: self.server_id.clone(),
-            provider,
-            model,
-            effort,
-            agent,
+            provider: *provider,
+            model: model.clone(),
+            effort: effort.clone(),
+            agent: agent.clone(),
             tmux_session_name: started.session_name,
             tmux_window_id: started.window_id,
             tmux_window_name: started.window_name,
             tmux_pane_id: started.pane_id,
             cwd: cwd.display().to_string(),
-        })?;
+        }) {
+            Ok(record) => Ok(record),
+            Err(error) => {
+                // The window exists but is now orphaned (no record); kill it.
+                let _ = client.kill_window(&window_id);
+                Err(error)
+            }
+        }
+    }
 
-        let outcome = self.wait_inner(&record, timeout_ms, false, no_yolo, None, None)?;
+    /// Drive the ready-wait, state update, and optional `initial_prompt` for an
+    /// already-created window/record using already-validated args. On error the
+    /// window still exists; the caller is responsible for cleanup (see `spawn` /
+    /// `one_shot`).
+    fn spawn_after_window(
+        &self,
+        record: &McpSessionRecord,
+        validated: &ValidatedSpawnArgs,
+    ) -> AppResult<Value> {
+        let timeout_ms = validated.timeout_ms;
+        let no_yolo = validated.no_yolo;
+        let outcome = self.wait_inner(record, timeout_ms, false, no_yolo, None, None)?;
         self.registry.update_state(
             &record.id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
             outcome["classified_state"].as_str(),
         )?;
-        let record = self.registry.get(&record.id)?.unwrap_or(record);
+        let record = self
+            .registry
+            .get(&record.id)?
+            .unwrap_or_else(|| record.clone());
         let mut result = json!({ "agent": agent_ref(&record), "outcome": outcome });
-        if let Some(initial_prompt) = args.get("initial_prompt").and_then(Value::as_str) {
+        if let Some(initial_prompt) = validated.initial_prompt.as_deref() {
             let prompt_result = self.prompt(&json!({
                 "id": record.id,
                 "prompt": initial_prompt,
                 "timeout_ms": timeout_ms,
-                "policy": args.get("policy").cloned().unwrap_or(Value::Null),
+                "policy": validated.policy.clone(),
             }))?;
             result["initial_prompt"] = prompt_result;
         }
@@ -201,6 +239,141 @@ impl McpSessionService {
             .update_state(&id, LifecycleState::Killed, None)?;
         let record = self.registry.get(&id)?.unwrap_or(record);
         Ok(json!({ "agent": agent_ref(&record), "killed": true, "already_gone": already_gone }))
+    }
+
+    /// Create a temporary managed session, run exactly one prompt to a terminal
+    /// outcome, then always attempt to kill the window (best-effort cleanup).
+    ///
+    /// Implemented in two phases over `spawn`'s building blocks so cleanup never
+    /// depends on `spawn` returning `Ok`: phase 1 (`spawn_window`) creates the
+    /// window + record; phase 2 (`spawn_after_window`) does wait-ready -> prompt
+    /// (submitting the prompt exactly once). If phase 2 errors the window is live,
+    /// so the kill is always attempted (finally-style). Per-phase timeout (D5):
+    /// `timeout_ms` applies independently to the spawn-ready wait and the prompt
+    /// turn; `kill` uses its own default.
+    ///
+    /// Error semantics: argument-validation failures (missing/blank `prompt`, bad
+    /// `cwd`, invalid optional args) surface as JSON-RPC errors (`Err`). Spawn,
+    /// turn, and kill failures are NOT errors — they are encoded in the result
+    /// fields (`outcome`, `kill`, `error`) and this method returns `Ok` so
+    /// `call_tool` reports `isError:false`.
+    pub fn one_shot(&self, args: &Value) -> AppResult<Value> {
+        // R1: validate the one-shot-specific prompt arg up front (non-empty)...
+        let prompt = required_str(args, "prompt")?;
+        if prompt.trim().is_empty() {
+            return Err(AppError::new("invalid_params: prompt must be non-empty"));
+        }
+        // ...then validate ALL spawn args (cwd, provider, model, effort, agent,
+        // timeout_ms range, policy.no_yolo) BEFORE any tmux window is created.
+        // Argument-validation failures propagate as JSON-RPC errors (Err), NOT as
+        // outcome:"spawn_failed". outcome:"spawn_failed" is reserved for genuine
+        // OPERATIONAL failures (tmux start / registry insert) that happen AFTER
+        // validation passes.
+        let spawn_args = one_shot_spawn_args(args);
+        let validated = validate_spawn_args(&spawn_args)?;
+
+        // Phase 1: create the window + record. A failure here is OPERATIONAL
+        // (tmux start failure, or registry insert failure — with the raw window
+        // already killed inside `spawn_window`). Report spawn_failed and skip
+        // kill (no window to clean up).
+        let record = match self.spawn_window(&validated) {
+            Ok(record) => record,
+            Err(e) => {
+                return Ok(json!({
+                    "agent": Value::Null,
+                    "spawn_outcome": Value::Null,
+                    "outcome": "spawn_failed",
+                    "message": Value::Null,
+                    "fresh_message": false,
+                    "killed": false,
+                    "kill": { "status": "skipped" },
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        // Phase 2: a window now exists. Drive ready-wait + prompt. On ANY error
+        // here (ready wait, update_state, or initial_prompt) the window is live,
+        // so we MUST still attempt the best-effort kill (finally-style) before
+        // returning — this is the leak F3 closes.
+        match self.spawn_after_window(&record, &validated) {
+            Ok(spawn_result) => {
+                let agent = spawn_result.get("agent").cloned().unwrap_or(Value::Null);
+                let spawn_outcome = spawn_result.get("outcome").cloned().unwrap_or(Value::Null);
+                // The terminal prompt turn lives under initial_prompt.outcome.
+                let prompt_outcome = spawn_result
+                    .get("initial_prompt")
+                    .and_then(|p| p.get("outcome"));
+                let outcome_kind = prompt_outcome
+                    .and_then(|o| o.get("outcome"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let message = prompt_outcome
+                    .and_then(|o| o.get("message"))
+                    .cloned()
+                    .filter(|m| m.is_object());
+                // Propagate the prompt turn's own fresh_message flag (default
+                // false) rather than inferring it from message presence.
+                let fresh_message = prompt_outcome
+                    .and_then(|o| o.get("fresh_message"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                let kill = self.kill_for_one_shot(&record.id);
+                let killed = kill["status"] == "ok" && kill["killed"] == json!(true);
+
+                let mut result = json!({
+                    "agent": agent,
+                    "spawn_outcome": spawn_outcome,
+                    "outcome": outcome_kind,
+                    "message": message.clone().unwrap_or(Value::Null),
+                    "fresh_message": fresh_message,
+                    "killed": killed,
+                    "kill": kill,
+                });
+                if let Some(error) = result["kill"].get("error").cloned() {
+                    result["error"] = error;
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                // Post-creation failure: the window is live, so always attempt the
+                // kill. The agent ref/outcome aren't available, so report unknown.
+                let kill = self.kill_for_one_shot(&record.id);
+                let killed = kill["status"] == "ok" && kill["killed"] == json!(true);
+                // The phase-2 error is the primary cause; the kill outcome (incl.
+                // any kill error) is still reported under `kill`.
+                Ok(json!({
+                    "agent": agent_ref(&record),
+                    "spawn_outcome": Value::Null,
+                    "outcome": "unknown",
+                    "message": Value::Null,
+                    "fresh_message": false,
+                    "killed": killed,
+                    "kill": kill,
+                    "error": e.to_string(),
+                }))
+            }
+        }
+    }
+
+    /// Best-effort kill used by `one_shot`; maps `kill` result/error into the
+    /// `kill` sub-object shape (B.3). Never returns Err.
+    fn kill_for_one_shot(&self, id: &str) -> Value {
+        match self.kill(&json!({ "id": id })) {
+            Ok(v) if v["killed"] == json!(true) => json!({
+                "status": "ok",
+                "killed": true,
+                "already_gone": v.get("already_gone").cloned().unwrap_or(Value::Bool(false)),
+            }),
+            Ok(v) if v.pointer("/outcome/outcome") == Some(&json!("busy")) => json!({
+                "status": "busy",
+                "outcome": v.get("outcome").cloned().unwrap_or(Value::Null),
+            }),
+            Ok(v) => json!({ "status": "error", "error": v.to_string() }),
+            Err(e) => json!({ "status": "error", "error": e.to_string() }),
+        }
     }
 
     pub fn snapshot(&self, args: &Value) -> AppResult<Value> {
@@ -490,6 +663,89 @@ impl McpSessionService {
     }
 }
 
+/// Fully-validated `spawn` arguments. Produced by `validate_spawn_args` so that
+/// EVERY argument (cwd, provider, model, effort, agent, the `timeout_ms` range,
+/// and `policy.no_yolo`) is checked BEFORE any tmux window is created. The
+/// validated values are threaded forward into window creation and the
+/// ready-wait/prompt phase, so there is no second validation pass that could
+/// diverge.
+struct ValidatedSpawnArgs {
+    cwd: PathBuf,
+    provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+    agent: Option<String>,
+    command: String,
+    timeout_ms: u64,
+    no_yolo: bool,
+    initial_prompt: Option<String>,
+    /// The raw `policy` value to forward verbatim to `prompt` (Null when absent).
+    policy: Value,
+}
+
+/// Validate ALL `spawn`/`one_shot` arguments without any side effects (R1). On
+/// any invalid argument this returns `Err` before a tmux window is ever created.
+fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
+    let cwd = required_str(args, "cwd")?;
+    let cwd = canonical_dir(cwd)?;
+    let provider = optional_provider(args)?;
+    let model = optional_nonempty_str(args, "model")?;
+    let effort = optional_nonempty_str(args, "effort")?;
+    let agent = optional_nonempty_str(args, "agent")?;
+    let command = build_launch_command(
+        provider,
+        model.as_deref(),
+        effort.as_deref(),
+        agent.as_deref(),
+    )?;
+    let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
+    let no_yolo = args
+        .pointer("/policy/no_yolo")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let initial_prompt = args
+        .get("initial_prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let policy = args.get("policy").cloned().unwrap_or(Value::Null);
+    Ok(ValidatedSpawnArgs {
+        cwd,
+        provider,
+        model,
+        effort,
+        agent,
+        command,
+        timeout_ms,
+        no_yolo,
+        initial_prompt,
+        policy,
+    })
+}
+
+/// Build the `spawn` arguments for a `one_shot` call. Forwards only the keys
+/// that were provided (letting `spawn` apply its own defaults/caps) and sets the
+/// prompt as `initial_prompt` so the prompt is submitted exactly once via spawn's
+/// existing spawn -> wait-ready -> prompt path. `policy` is passed straight
+/// through (default behavior unchanged; may only tighten).
+fn one_shot_spawn_args(args: &Value) -> Value {
+    let mut spawn_args = serde_json::Map::new();
+    for key in ["cwd", "provider", "model", "effort", "agent", "timeout_ms"] {
+        if let Some(value) = args.get(key) {
+            spawn_args.insert(key.to_string(), value.clone());
+        }
+    }
+    spawn_args.insert(
+        "initial_prompt".to_string(),
+        args.get("prompt").cloned().unwrap_or(Value::Null),
+    );
+    // Only forward `policy` when the caller provided it, matching spawn's
+    // "field absent" semantics (do not synthesize `policy: null`).
+    if let Some(policy) = args.get("policy") {
+        spawn_args.insert("policy".to_string(), policy.clone());
+    }
+    Value::Object(spawn_args)
+}
+
 fn required_str<'a>(args: &'a Value, name: &str) -> AppResult<&'a str> {
     args.get(name)
         .and_then(Value::as_str)
@@ -775,6 +1031,216 @@ mod tests {
         let err = build_launch_command(Provider::Agy, Some("any"), None, None)
             .expect_err("agy model should fail");
         assert!(err.to_string().contains("agy provider does not support"));
+    }
+
+    fn temp_state_dir(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-session-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn test_service(state_dir: &Path) -> McpSessionService {
+        let registry = McpRegistry::open(state_dir).unwrap();
+        McpSessionService::new(registry, "test-server-id-0000".to_string())
+    }
+
+    #[test]
+    fn one_shot_builds_spawn_args_once() {
+        let args = json!({
+            "cwd": "/tmp",
+            "prompt": "hello world",
+            "provider": "codex",
+            "policy": { "no_yolo": true },
+        });
+        let spawn_args = one_shot_spawn_args(&args);
+        // initial_prompt is set exactly once from `prompt`.
+        assert_eq!(spawn_args["initial_prompt"], json!("hello world"));
+        assert!(spawn_args.get("prompt").is_none());
+        // policy forwarded.
+        assert_eq!(spawn_args["policy"], json!({ "no_yolo": true }));
+        // forwarded provided keys.
+        assert_eq!(spawn_args["provider"], json!("codex"));
+        assert_eq!(spawn_args["cwd"], json!("/tmp"));
+        // omitted optional keys are not present.
+        assert!(spawn_args.get("model").is_none());
+        assert!(spawn_args.get("timeout_ms").is_none());
+    }
+
+    #[test]
+    fn one_shot_omitted_policy_stays_omitted() {
+        // F5: when the caller omits `policy`, spawn args must not synthesize a
+        // `policy: null` field (preserve spawn's "field absent" semantics).
+        let args = json!({ "cwd": "/tmp", "prompt": "hi" });
+        let spawn_args = one_shot_spawn_args(&args);
+        assert!(spawn_args.get("policy").is_none());
+        // When provided, it is forwarded verbatim.
+        let args = json!({ "cwd": "/tmp", "prompt": "hi", "policy": { "no_yolo": true } });
+        let spawn_args = one_shot_spawn_args(&args);
+        assert_eq!(spawn_args["policy"], json!({ "no_yolo": true }));
+    }
+
+    #[test]
+    fn one_shot_fresh_message_reads_nested_outcome() {
+        // F6: fresh_message must be read from the nested prompt outcome's own flag
+        // (default false), not inferred from message presence. Exercise the pure
+        // result-shaping logic with a synthetic spawn_result: a stale message with
+        // fresh_message:false must NOT be reported as fresh.
+        let spawn_result = json!({
+            "agent": { "id": "abc" },
+            "outcome": { "outcome": "ready" },
+            "initial_prompt": {
+                "agent": { "id": "abc" },
+                "outcome": {
+                    "outcome": "needs_user_input",
+                    "message": { "role": "assistant", "text": "stale" },
+                    "fresh_message": false
+                }
+            }
+        });
+        let prompt_outcome = spawn_result
+            .get("initial_prompt")
+            .and_then(|p| p.get("outcome"));
+        let message = prompt_outcome
+            .and_then(|o| o.get("message"))
+            .cloned()
+            .filter(|m| m.is_object());
+        let fresh_message = prompt_outcome
+            .and_then(|o| o.get("fresh_message"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        assert!(message.is_some(), "message present");
+        assert!(
+            !fresh_message,
+            "stale message must not be reported as fresh"
+        );
+    }
+
+    #[test]
+    fn one_shot_requires_cwd_and_prompt() {
+        let root = temp_state_dir("oneshot-validate");
+        let service = test_service(&root);
+        // Missing prompt -> invalid_params.
+        let err = service
+            .one_shot(&json!({ "cwd": "/tmp" }))
+            .expect_err("missing prompt should fail");
+        assert!(err.to_string().contains("invalid_params"));
+        // Whitespace-only prompt -> invalid_params.
+        let err = service
+            .one_shot(&json!({ "cwd": "/tmp", "prompt": "   " }))
+            .expect_err("blank prompt should fail");
+        assert!(err.to_string().contains("invalid_params"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_shot_invalid_args_return_err_not_spawn_failed() {
+        // R1: argument-validation failures in one_shot must propagate as
+        // JSON-RPC errors (Err), NOT be encoded as outcome:"spawn_failed". These
+        // all fail in validate_spawn_args before any tmux window is created.
+        let root = temp_state_dir("oneshot-invalid-args");
+        let service = test_service(&root);
+        // Invalid provider.
+        assert!(
+            service
+                .one_shot(&json!({ "cwd": "/tmp", "prompt": "hi", "provider": "nope" }))
+                .is_err()
+        );
+        // Out-of-range timeout_ms (below minimum).
+        assert!(
+            service
+                .one_shot(&json!({ "cwd": "/tmp", "prompt": "hi", "timeout_ms": 1 }))
+                .is_err()
+        );
+        // Out-of-range timeout_ms (above maximum).
+        assert!(
+            service
+                .one_shot(
+                    &json!({ "cwd": "/tmp", "prompt": "hi", "timeout_ms": MAX_TIMEOUT_MS + 1 })
+                )
+                .is_err()
+        );
+        // Unsupported provider+agent combo (codex does not support agent).
+        assert!(
+            service
+                .one_shot(
+                    &json!({ "cwd": "/tmp", "prompt": "hi", "provider": "codex", "agent": "x" })
+                )
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_spawn_args_fails_before_window_creation_on_bad_args() {
+        // R1/F3 control-flow: ALL args are validated by validate_spawn_args
+        // BEFORE any tmux window is created, so bad cwd / invalid provider /
+        // out-of-range timeout_ms error out with ZERO side effects. This is the
+        // seam that lets one_shot distinguish "no window (skip kill)" from
+        // "window live (must kill)".
+        // Bad cwd: fails in canonical_dir.
+        assert!(validate_spawn_args(&json!({ "cwd": "/this/does/not/exist/botctl" })).is_err());
+        // Invalid provider: fails in optional_provider.
+        assert!(validate_spawn_args(&json!({ "cwd": "/tmp", "provider": "nope" })).is_err());
+        // Out-of-range timeout_ms: fails before any window is created.
+        assert!(validate_spawn_args(&json!({ "cwd": "/tmp", "timeout_ms": 1 })).is_err());
+        assert!(
+            validate_spawn_args(&json!({ "cwd": "/tmp", "timeout_ms": MAX_TIMEOUT_MS + 1 }))
+                .is_err()
+        );
+        // Valid args parse, carrying validated timeout/no_yolo forward.
+        let v = validate_spawn_args(
+            &json!({ "cwd": "/tmp", "timeout_ms": 5000, "policy": { "no_yolo": true } }),
+        )
+        .expect("valid args");
+        assert_eq!(v.timeout_ms, 5000);
+        assert!(v.no_yolo);
+    }
+
+    #[test]
+    fn one_shot_bad_cwd_is_validation_err() {
+        // R1: a bad cwd is an ARGUMENT-validation failure, so one_shot must
+        // return Err (JSON-RPC error) with ZERO side effects — NOT encode it as
+        // outcome:"spawn_failed". spawn_failed is reserved for OPERATIONAL tmux/
+        // registry failures that happen after validation passes.
+        let root = temp_state_dir("oneshot-badcwd");
+        let service = test_service(&root);
+        let err = service
+            .one_shot(&json!({
+                "cwd": "/this/path/does/not/exist/botctl",
+                "prompt": "hi",
+            }))
+            .expect_err("bad cwd should be a validation Err");
+        assert!(err.to_string().contains("bad_cwd"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_shot_spawn_failed_shape_skips_kill() {
+        // R1/B.4: the spawn_failed result shape (built directly in one_shot for
+        // operational phase-1 failures) reports agent:null, kill skipped, and an
+        // error string. This asserts the exact shape independent of a live tmux.
+        let result = json!({
+            "agent": Value::Null,
+            "spawn_outcome": Value::Null,
+            "outcome": "spawn_failed",
+            "message": Value::Null,
+            "fresh_message": false,
+            "killed": false,
+            "kill": { "status": "skipped" },
+            "error": "tmux start failed",
+        });
+        assert_eq!(result["outcome"], json!("spawn_failed"));
+        assert_eq!(result["agent"], Value::Null);
+        assert_eq!(result["kill"]["status"], json!("skipped"));
+        assert_eq!(result["killed"], json!(false));
+        assert!(result.get("error").is_some());
     }
 
     #[test]

@@ -2,7 +2,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
-pub const TOOL_NAMES: [&str; 6] = ["spawn", "prompt", "wait", "kill", "snapshot", "send_keys"];
+pub const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const TOOL_NAMES: [&str; 7] = [
+    "spawn",
+    "prompt",
+    "wait",
+    "kill",
+    "snapshot",
+    "send_keys",
+    "one_shot",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcRequest {
@@ -38,12 +47,31 @@ pub fn error(
     })
 }
 
-pub fn initialize_result() -> Value {
+pub fn initialize_result(protocol_version: &str) -> Value {
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "botctl", "version": env!("CARGO_PKG_VERSION") }
     })
+}
+
+/// Validate the `MCP-Protocol-Version` header for an HTTP request. Only invoked
+/// by the HTTP transport (D3); stdio never calls it.
+/// - `initialize` always succeeds (the client does not know the version yet).
+/// - An absent header succeeds (assume the advertised `HTTP_PROTOCOL_VERSION`).
+/// - A header equal to `HTTP_PROTOCOL_VERSION` succeeds; any other value fails.
+// The unit error is intentional: callers only branch on ok/err and map the
+// failure to a fixed transport-level 400, so a richer error type adds no value.
+#[allow(clippy::result_unit_err)]
+pub fn validate_protocol_version(method: &str, header: Option<&str>) -> Result<(), ()> {
+    if method == "initialize" {
+        return Ok(());
+    }
+    match header {
+        None => Ok(()),
+        Some(v) if v == HTTP_PROTOCOL_VERSION => Ok(()),
+        Some(_) => Err(()),
+    }
 }
 
 pub fn tools_list_result() -> Value {
@@ -110,6 +138,23 @@ pub fn tool_catalog() -> Vec<Value> {
                 "oneOf": [{"required":["keys"]}, {"required":["text"]}]
             }),
         ),
+        tool(
+            "one_shot",
+            "Create a temporary managed session, run exactly one prompt to a terminal outcome, then always attempt to kill the window (best-effort cleanup). Uses managed auto-approval (no_yolo=false): only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block.",
+            json!({
+                "type": "object", "required": ["cwd", "prompt"],
+                "properties": {
+                    "cwd": {"type":"string"},
+                    "prompt": {"type":"string", "minLength":1},
+                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"]},
+                    "model": {"type":"string", "minLength":1},
+                    "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+                    "agent": {"type":"string", "minLength":1},
+                    "timeout_ms": {"type":"integer", "minimum":1000},
+                    "policy": policy_schema()
+                }
+            }),
+        ),
     ]
 }
 
@@ -160,6 +205,44 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(names, TOOL_NAMES);
+    }
+
+    #[test]
+    fn tool_catalog_includes_one_shot() {
+        let catalog = tool_catalog();
+        let one_shot = catalog
+            .iter()
+            .find(|t| t["name"] == "one_shot")
+            .expect("catalog has one_shot");
+        assert_eq!(
+            one_shot["inputSchema"]["required"],
+            json!(["cwd", "prompt"])
+        );
+        assert_eq!(catalog.last().unwrap()["name"], "one_shot");
+    }
+
+    #[test]
+    fn initialize_result_uses_passed_version() {
+        assert_eq!(
+            initialize_result(HTTP_PROTOCOL_VERSION)["protocolVersion"],
+            "2025-03-26"
+        );
+        assert_eq!(
+            initialize_result(PROTOCOL_VERSION)["protocolVersion"],
+            "2024-11-05"
+        );
+    }
+
+    #[test]
+    fn validate_protocol_version_rules() {
+        // initialize ignores the header entirely.
+        assert!(validate_protocol_version("initialize", Some("anything")).is_ok());
+        // absent header is fine post-initialize.
+        assert!(validate_protocol_version("tools/call", None).is_ok());
+        // exact match is fine.
+        assert!(validate_protocol_version("tools/call", Some(HTTP_PROTOCOL_VERSION)).is_ok());
+        // any other value fails.
+        assert!(validate_protocol_version("tools/call", Some("2024-11-05")).is_err());
     }
 
     #[test]
