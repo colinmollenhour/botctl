@@ -89,12 +89,22 @@ fn handle_connection(stream: TcpStream, service: &McpService) -> AppResult<()> {
             ),
         )
     } else {
-        let body = String::from_utf8_lossy(&request.body);
-        let value = match parse_request(&body) {
-            Ok(request) => service.handle(request),
-            Err(response) => Some(response),
-        };
-        (200, value)
+        match std::str::from_utf8(&request.body) {
+            Ok(body) => {
+                let value = match parse_request(body) {
+                    Ok(request) => service.handle(request),
+                    Err(response) => Some(response),
+                };
+                (200, value)
+            }
+            // Decode strictly: from_utf8_lossy would substitute U+FFFD for
+            // malformed bytes and could hand parse_request a different, valid
+            // JSON document than the client actually sent.
+            Err(_) => (
+                400,
+                Some(json!({ "error": "request body is not valid UTF-8" })),
+            ),
+        }
     };
     let stream = &mut reader.into_inner();
     match response.1 {
@@ -113,8 +123,12 @@ struct HttpRequest {
 }
 
 fn read_http_request<R: BufRead>(reader: &mut R) -> AppResult<Option<HttpRequest>> {
-    let Some(request_line) = read_limited_line(reader)? else {
-        return Ok(None);
+    let request_line = match read_limited_line(reader)? {
+        LineOutcome::Eof => return Ok(None),
+        LineOutcome::TooLarge => {
+            return Ok(Some(headers_too_large(String::new(), String::new())));
+        }
+        LineOutcome::Line(line) => line,
     };
     let request_line = request_line.trim_end_matches(['\r', '\n']);
     let mut parts = request_line.split_whitespace();
@@ -122,8 +136,10 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> AppResult<Option<HttpRequest
     let target = parts.next().unwrap_or("").to_string();
     let mut content_length = 0usize;
     for _ in 0..MAX_HEADER_LINES {
-        let Some(line) = read_limited_line(reader)? else {
-            break;
+        let line = match read_limited_line(reader)? {
+            LineOutcome::Eof => break,
+            LineOutcome::TooLarge => return Ok(Some(headers_too_large(method, target))),
+            LineOutcome::Line(line) => line,
         };
         if line == "\r\n" || line == "\n" {
             if content_length > MAX_BODY_BYTES {
@@ -153,26 +169,34 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> AppResult<Option<HttpRequest
             content_length = value.trim().parse().unwrap_or(MAX_BODY_BYTES + 1);
         }
     }
-    Ok(Some(HttpRequest {
+    Ok(Some(headers_too_large(method, target)))
+}
+
+fn headers_too_large(method: String, target: String) -> HttpRequest {
+    HttpRequest {
         status: 431,
         error: Some("request headers too large"),
         method,
         target,
         body: Vec::new(),
-    }))
+    }
 }
 
-fn read_limited_line<R: BufRead>(reader: &mut R) -> AppResult<Option<String>> {
+enum LineOutcome {
+    Eof,
+    TooLarge,
+    Line(String),
+}
+
+fn read_limited_line<R: BufRead>(reader: &mut R) -> AppResult<LineOutcome> {
     let mut bytes = Vec::with_capacity(128);
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
             return if bytes.is_empty() {
-                Ok(None)
+                Ok(LineOutcome::Eof)
             } else {
-                String::from_utf8(bytes).map(Some).map_err(|error| {
-                    AppError::new(format!("invalid HTTP header encoding: {error}"))
-                })
+                decode_line(bytes)
             };
         }
 
@@ -182,7 +206,9 @@ fn read_limited_line<R: BufRead>(reader: &mut R) -> AppResult<Option<String>> {
             .map(|index| index + 1)
             .unwrap_or(available.len());
         if bytes.len().saturating_add(take) > MAX_HEADER_LINE_BYTES {
-            return Err(AppError::new("request header line too large"));
+            // Surface as a structured 431 rather than an Err that would only be
+            // logged and would drop the socket without an HTTP response.
+            return Ok(LineOutcome::TooLarge);
         }
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
@@ -190,8 +216,12 @@ fn read_limited_line<R: BufRead>(reader: &mut R) -> AppResult<Option<String>> {
             break;
         }
     }
+    decode_line(bytes)
+}
+
+fn decode_line(bytes: Vec<u8>) -> AppResult<LineOutcome> {
     String::from_utf8(bytes)
-        .map(Some)
+        .map(LineOutcome::Line)
         .map_err(|error| AppError::new(format!("invalid HTTP header encoding: {error}")))
 }
 
@@ -203,6 +233,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &serde_json::Value)
     });
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
@@ -263,13 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_header_line_without_allocating_more() {
+    fn oversized_header_line_yields_structured_431() {
         let request = format!(
             "GET /{} HTTP/1.1\r\n\r\n",
             "x".repeat(MAX_HEADER_LINE_BYTES)
         );
         let mut cursor = Cursor::new(request.into_bytes());
-        let error = read_http_request(&mut cursor).expect_err("large header line should fail");
-        assert!(error.to_string().contains("header line too large"));
+        let parsed = read_http_request(&mut cursor)
+            .expect("oversized header line should not error")
+            .expect("oversized header line should still produce a response");
+        assert_eq!(parsed.status, 431);
+    }
+
+    #[test]
+    fn oversized_trailing_header_line_yields_431_with_method() {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nX-Big: {}\r\n\r\n",
+            "x".repeat(MAX_HEADER_LINE_BYTES)
+        );
+        let mut cursor = Cursor::new(request.into_bytes());
+        let parsed = read_http_request(&mut cursor).unwrap().unwrap();
+        assert_eq!(parsed.status, 431);
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.target, "/mcp");
     }
 }

@@ -138,13 +138,17 @@ pub struct SessionLock {
     registry: McpRegistry,
     session_id: String,
     owner_server_id: String,
+    // Discriminates this acquisition from a later one of the same
+    // (session_id, owner_server_id): if this lock expires and the same server
+    // reacquires it, the stale handle must not refresh or drop the newer row.
+    acquired_at_ms: i64,
 }
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        if let Err(error) = self
-            .registry
-            .release_lock(&self.session_id, &self.owner_server_id)
+        if let Err(error) =
+            self.registry
+                .release_lock(&self.session_id, &self.owner_server_id, self.acquired_at_ms)
         {
             eprintln!(
                 "warning: failed to release MCP session lock for {}: {error}",
@@ -157,7 +161,7 @@ impl Drop for SessionLock {
 impl SessionLock {
     pub fn refresh(&self) -> AppResult<()> {
         self.registry
-            .refresh_lock(&self.session_id, &self.owner_server_id)
+            .refresh_lock(&self.session_id, &self.owner_server_id, self.acquired_at_ms)
     }
 }
 
@@ -330,24 +334,35 @@ impl McpRegistry {
                 registry: self.clone(),
                 session_id: session_id.to_string(),
                 owner_server_id: owner_server_id.to_string(),
+                acquired_at_ms: now,
             }))
         }
     }
 
-    fn release_lock(&self, session_id: &str, owner_server_id: &str) -> AppResult<()> {
+    fn release_lock(
+        &self,
+        session_id: &str,
+        owner_server_id: &str,
+        acquired_at_ms: i64,
+    ) -> AppResult<()> {
         self.conn()?.execute(
-            "DELETE FROM mcp_session_locks WHERE session_id=?1 AND owner_server_id=?2",
-            params![session_id, owner_server_id],
+            "DELETE FROM mcp_session_locks WHERE session_id=?1 AND owner_server_id=?2 AND acquired_at_ms=?3",
+            params![session_id, owner_server_id, acquired_at_ms],
         )?;
         Ok(())
     }
 
-    fn refresh_lock(&self, session_id: &str, owner_server_id: &str) -> AppResult<()> {
+    fn refresh_lock(
+        &self,
+        session_id: &str,
+        owner_server_id: &str,
+        acquired_at_ms: i64,
+    ) -> AppResult<()> {
         let now = now_ms()?;
         let expires = now + LOCK_TTL_MS;
         let updated = self.conn()?.execute(
-            "UPDATE mcp_session_locks SET expires_at_ms=?3 WHERE session_id=?1 AND owner_server_id=?2",
-            params![session_id, owner_server_id, expires],
+            "UPDATE mcp_session_locks SET expires_at_ms=?4 WHERE session_id=?1 AND owner_server_id=?2 AND acquired_at_ms=?3",
+            params![session_id, owner_server_id, acquired_at_ms, expires],
         )?;
         if updated == 0 {
             return Err(AppError::new("mcp session lock is no longer held"));
@@ -423,6 +438,47 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_lock_handle_cannot_refresh_or_release_reacquired_row() {
+        let root =
+            std::env::temp_dir().join(format!("botctl-mcp-reg-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let registry = McpRegistry::open(&root).unwrap();
+        let record = registry.insert_session(fake_new("%1", "@1")).unwrap();
+
+        let stale = registry
+            .acquire_lock(&record.id, "server-a", "prompt")
+            .unwrap()
+            .expect("first acquisition should succeed");
+
+        // Simulate the same server reacquiring after expiry: the live row now
+        // carries a newer acquisition token than the stale handle holds.
+        let newer_token = stale.acquired_at_ms + 5_000;
+        registry
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE mcp_session_locks SET acquired_at_ms=?2 WHERE session_id=?1",
+                params![record.id, newer_token],
+            )
+            .unwrap();
+
+        // The stale handle must not refresh the newer acquisition...
+        assert!(stale.refresh().is_err());
+
+        // ...nor delete its row on Drop.
+        drop(stale);
+        let busy = registry
+            .acquire_lock(&record.id, "server-b", "prompt")
+            .unwrap();
+        assert!(
+            busy.is_none(),
+            "newer lock row must survive stale handle drop"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
