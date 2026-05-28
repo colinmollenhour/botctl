@@ -19,6 +19,7 @@ const DEFAULT_SPAWN_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TURN_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_KILL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CAPTURE_LINES: usize = 200;
+const LAST_MESSAGE_HISTORY_LINES: usize = 2000;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const LOCK_REFRESH_INTERVAL_MS: u64 = 30_000;
 
@@ -48,7 +49,12 @@ impl McpSessionService {
         let model = optional_nonempty_str(args, "model")?;
         let effort = optional_nonempty_str(args, "effort")?;
         let agent = optional_nonempty_str(args, "agent")?;
-        let command = build_launch_command(provider, model.as_deref(), effort.as_deref(), agent.as_deref())?;
+        let command = build_launch_command(
+            provider,
+            model.as_deref(),
+            effort.as_deref(),
+            agent.as_deref(),
+        )?;
         let window_name = format!(
             "botctl-mcp-{}-{}",
             provider.as_str(),
@@ -117,9 +123,10 @@ impl McpSessionService {
             return Ok(json!({ "agent": agent_ref(&record), "outcome": ready }));
         }
         let pane = self.verify_pane(&record)?;
-        let baseline = load_last_agent_message(&pane)
-            .ok()
-            .or_else(|| cursor_as_message(&record));
+        let baseline =
+            load_last_agent_message(&pane, &TmuxClient::default(), LAST_MESSAGE_HISTORY_LINES)
+                .ok()
+                .or_else(|| cursor_as_message(&record));
         self.submit_direct(record.provider, &pane, prompt)?;
         self.registry
             .update_state(&id, LifecycleState::Running, Some("PromptEditing"))?;
@@ -159,7 +166,8 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let outcome = self.wait_inner(&record, timeout_ms, require_fresh, true, None, Some(&lock))?;
+        let outcome =
+            self.wait_inner(&record, timeout_ms, require_fresh, true, None, Some(&lock))?;
         self.registry.update_state(
             &id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
@@ -310,9 +318,7 @@ impl McpSessionService {
                     .ok_or_else(|| AppError::new("missing_keybinding: submit"))?;
                 client.send_keys(&pane.pane_id, submit)
             }
-            Provider::Codex | Provider::Agy => {
-                client.send_keys(&pane.pane_id, &["Enter"])
-            }
+            Provider::Codex | Provider::Agy => client.send_keys(&pane.pane_id, &["Enter"]),
         }
     }
 
@@ -354,7 +360,7 @@ impl McpSessionService {
             match classification.state {
                 SessionState::ChatReady => {
                     if require_fresh {
-                        match fresh_message(&pane, baseline.as_ref()) {
+                        match fresh_message(&pane, &client, baseline.as_ref()) {
                             Ok(message) => {
                                 self.registry.update_cursor(
                                     &record.id,
@@ -380,7 +386,7 @@ impl McpSessionService {
                 }
                 SessionState::UserQuestionPrompt => {
                     if require_fresh {
-                        match fresh_message(&pane, baseline.as_ref()) {
+                        match fresh_message(&pane, &client, baseline.as_ref()) {
                             Ok(message) => {
                                 self.registry.update_cursor(
                                     &record.id,
@@ -419,11 +425,30 @@ impl McpSessionService {
                 SessionState::FolderTrustPrompt if !no_yolo => {
                     client.send_keys(&pane.pane_id, &["Enter"])?
                 }
+                // Agy command-permission is the only agy prompt shape that is
+                // safe to auto-approve, mirroring the runtime YOLO loop: require
+                // the pane to actually be agy and the default cursor to still sit
+                // on `> 1. Yes` so a moved cursor or scrollback bleed can never
+                // land Enter on a settings-persist option.
+                SessionState::AgyCommandPermissionPrompt
+                    if !no_yolo
+                        && crate::agy::is_agy_pane(&pane)
+                        && crate::agy::agy_command_permission_default_option_is_yes(&frame) =>
+                {
+                    client.send_keys(&pane.pane_id, &["Enter"])?
+                }
                 SessionState::PermissionDialog
                 | SessionState::FolderTrustPrompt
                 | SessionState::SurveyPrompt
                 | SessionState::PlanApprovalPrompt
-                | SessionState::DiffDialog => {
+                | SessionState::DiffDialog
+                // Agy folder-trust and settings-persist never auto-approve (the
+                // latter would mutate settings.json); surface them as blocked so
+                // the caller decides via send_keys. Command-permission also lands
+                // here when no_yolo is set or the safety gate above declined.
+                | SessionState::AgyCommandPermissionPrompt
+                | SessionState::AgyFolderTrustPrompt
+                | SessionState::AgySettingsPersistPrompt => {
                     return Ok(outcome(
                         "blocked",
                         Some(&classification),
@@ -665,8 +690,12 @@ fn cursor_as_message(record: &McpSessionRecord) -> Option<LastAgentMessage> {
     })
 }
 
-fn fresh_message(pane: &TmuxPane, prior: Option<&LastAgentMessage>) -> AppResult<LastAgentMessage> {
-    let message = load_last_agent_message(pane)?;
+fn fresh_message(
+    pane: &TmuxPane,
+    tmux: &TmuxClient,
+    prior: Option<&LastAgentMessage>,
+) -> AppResult<LastAgentMessage> {
+    let message = load_last_agent_message(pane, tmux, LAST_MESSAGE_HISTORY_LINES)?;
     if prior
         .map(|old| old.session_id != message.session_id || old.text != message.text)
         .unwrap_or(true)
@@ -716,22 +745,33 @@ mod tests {
     #[test]
     fn launch_command_maps_per_provider() {
         assert_eq!(
-            build_launch_command(Provider::Claude, Some("opus"), Some("high"), Some("reviewer"))
-                .unwrap(),
+            build_launch_command(
+                Provider::Claude,
+                Some("opus"),
+                Some("high"),
+                Some("reviewer")
+            )
+            .unwrap(),
             "claude --model opus --effort high --agent reviewer"
         );
         assert_eq!(
             build_launch_command(Provider::Codex, Some("gpt-5.5"), Some("high"), None).unwrap(),
             "codex -m gpt-5.5 -c 'model_reasoning_effort=high'"
         );
-        assert_eq!(build_launch_command(Provider::Agy, None, None, None).unwrap(), "agy");
+        assert_eq!(
+            build_launch_command(Provider::Agy, None, None, None).unwrap(),
+            "agy"
+        );
     }
 
     #[test]
     fn launch_command_rejects_unsupported_combos() {
         let err = build_launch_command(Provider::Codex, None, None, Some("reviewer"))
             .expect_err("codex agent should fail");
-        assert!(err.to_string().contains("codex provider does not support agent"));
+        assert!(
+            err.to_string()
+                .contains("codex provider does not support agent")
+        );
         let err = build_launch_command(Provider::Agy, Some("any"), None, None)
             .expect_err("agy model should fail");
         assert!(err.to_string().contains("agy provider does not support"));

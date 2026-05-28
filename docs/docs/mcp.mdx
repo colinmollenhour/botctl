@@ -34,8 +34,9 @@ Sessions are addressed by generated public IDs, not tmux names. The registry sto
 - Automation resolves the managed ID back to one exact tmux pane before acting.
 - `Unknown` and unsupported blocker states return structured outcomes instead of guessing.
 - `FolderTrustPrompt` may be advanced with raw `Enter`; ordinary permission dialogs require supported policy and otherwise block.
+- Agy command-permission prompts are auto-approved with raw `Enter` only when the pane process is `agy` and the default cursor is still on `1. Yes` (skipped when `policy.no_yolo` is set); Agy folder-trust and settings-persist prompts always block for manual review because the latter can mutate `settings.json`.
 - For non-Claude providers, prompt submission pastes the text and presses `Enter`; Claude-only keybindings (`ClearInput`, `ExternalEditor`) are not consulted.
-- For Agy, fresh-message extraction is not yet supported, so `prompt` responses return `fresh_message: false` with a `stale_transcript` warning; use `snapshot` to inspect the pane.
+- For Agy, fresh-message extraction is pane-scrape based: `prompt` returns the latest assistant text as `fresh_message: true` when a new message is detected, otherwise it keeps polling until the timeout and reports `stale_transcript`. Use `snapshot` to inspect the pane directly.
 - `send_keys` only reports that keys/text were sent. It does not imply the agent made progress.
 
 ## Smoke and torture testing

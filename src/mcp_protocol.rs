@@ -2,14 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
-pub const TOOL_NAMES: [&str; 6] = [
-    "spawn",
-    "prompt",
-    "wait",
-    "kill",
-    "snapshot",
-    "send_keys",
-];
+pub const TOOL_NAMES: [&str; 6] = ["spawn", "prompt", "wait", "kill", "snapshot", "send_keys"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcRequest {

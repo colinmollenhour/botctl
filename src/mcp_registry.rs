@@ -59,9 +59,8 @@ impl Provider {
     }
 
     fn from_db(value: &str) -> AppResult<Self> {
-        Self::parse(value).map_err(|_| {
-            AppError::new(format!("invalid mcp provider in database: {value}"))
-        })
+        Self::parse(value)
+            .map_err(|_| AppError::new(format!("invalid mcp provider in database: {value}")))
     }
 }
 
