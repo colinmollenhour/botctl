@@ -986,7 +986,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--state-dir PATH",
                 "--no-color",
             ][..],
-            "Tools use generated managed IDs and exact tmux pane IDs. spawn accepts optional provider (claude default, codex, agy), model, effort, and agent — validated per provider. one_shot spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort). send_keys is unsafe/operator-only and does not imply progress.",
+            "Tools use generated managed IDs and exact tmux pane IDs. Provider-specific spawn tools are advertised only when their binaries are on PATH and validate provider-specific options. one_shot spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort). send_keys is unsafe/operator-only and does not imply progress.",
         ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {

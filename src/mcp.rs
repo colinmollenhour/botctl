@@ -5,10 +5,10 @@ use uuid::{ContextV7, Timestamp, Uuid};
 
 use crate::app::{AppError, AppResult};
 use crate::mcp_protocol::{
-    JsonRpcRequest, PROTOCOL_VERSION, TOOL_NAMES, error, initialize_result, success,
-    tools_list_result,
+    JsonRpcRequest, PROTOCOL_VERSION, TOOL_NAMES, ToolAvailability, error, initialize_result,
+    success, tools_list_result_for,
 };
-use crate::mcp_registry::McpRegistry;
+use crate::mcp_registry::{McpRegistry, Provider};
 use crate::mcp_session::McpSessionService;
 use crate::prompt::resolve_state_dir;
 
@@ -16,6 +16,7 @@ use crate::prompt::resolve_state_dir;
 pub struct McpService {
     sessions: McpSessionService,
     protocol_version: &'static str,
+    tool_availability: ToolAvailability,
 }
 
 impl McpService {
@@ -30,9 +31,27 @@ impl McpService {
         let state_dir = resolve_state_dir(state_dir)?;
         let registry = McpRegistry::open(&state_dir)?;
         let server_id = Uuid::new_v7(Timestamp::now(ContextV7::new())).to_string();
+        let tool_availability = detect_tool_availability();
         Ok(Self {
             sessions: McpSessionService::new(registry, server_id),
             protocol_version,
+            tool_availability,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_availability(
+        state_dir: Option<&Path>,
+        protocol_version: &'static str,
+        tool_availability: ToolAvailability,
+    ) -> AppResult<Self> {
+        let state_dir = resolve_state_dir(state_dir)?;
+        let registry = McpRegistry::open(&state_dir)?;
+        let server_id = Uuid::new_v7(Timestamp::now(ContextV7::new())).to_string();
+        Ok(Self {
+            sessions: McpSessionService::new(registry, server_id),
+            protocol_version,
+            tool_availability,
         })
     }
 
@@ -74,7 +93,7 @@ impl McpService {
     fn handle_result(&self, request: &JsonRpcRequest) -> AppResult<Value> {
         match request.method.as_str() {
             "initialize" => Ok(initialize_result(self.protocol_version)),
-            "tools/list" => Ok(tools_list_result()),
+            "tools/list" => Ok(tools_list_result_for(self.tool_availability)),
             "tools/call" => self.call_tool(&request.params),
             "notifications/initialized" => Ok(json!({})),
             other => Err(AppError::with_exit_code(
@@ -94,12 +113,23 @@ impl McpService {
                 "invalid_params: unknown tool {name}"
             )));
         }
+        if !self.tool_availability.tool_names().contains(&name) {
+            return Err(AppError::new(format!(
+                "invalid_params: unavailable tool {name}"
+            )));
+        }
         let args = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
         let result = match name {
-            "spawn" => self.sessions.spawn(&args),
+            "spawn_claude" => self
+                .sessions
+                .spawn(&spawn_args_for_provider(&args, "claude")),
+            "spawn_codex" => self
+                .sessions
+                .spawn(&spawn_args_for_provider(&args, "codex")),
+            "spawn_agy" => self.sessions.spawn(&spawn_args_for_provider(&args, "agy")),
             "prompt" => self.sessions.prompt(&args),
             "wait" => self.sessions.wait(&args),
             "kill" => self.sessions.kill(&args),
@@ -115,6 +145,26 @@ impl McpService {
             "isError": false,
         }))
     }
+}
+
+fn detect_tool_availability() -> ToolAvailability {
+    ToolAvailability {
+        claude: command_available(Provider::Claude.command()),
+        codex: command_available(Provider::Codex.command()),
+        agy: command_available(Provider::Agy.command()),
+    }
+}
+
+fn command_available(command: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file()))
+        .unwrap_or(false)
+}
+
+fn spawn_args_for_provider(args: &Value, provider: &str) -> Value {
+    let mut args = args.as_object().cloned().unwrap_or_default();
+    args.insert("provider".into(), json!(provider));
+    Value::Object(args)
 }
 
 fn tool_content_text(name: &str, result: &Value) -> String {
@@ -146,7 +196,12 @@ mod tests {
     fn handles_initialize_and_tools_list() {
         let root = std::env::temp_dir().join(format!("botctl-mcp-service-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let service = McpService::new(Some(&root)).unwrap();
+        let service = McpService::new_with_availability(
+            Some(&root),
+            PROTOCOL_VERSION,
+            ToolAvailability::all(),
+        )
+        .unwrap();
         let init = service.handle(JsonRpcRequest {
             jsonrpc: Some("2.0".into()),
             id: Some(json!(1)),
@@ -162,7 +217,81 @@ mod tests {
             params: json!({}),
         });
         let tools = tools.unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tools_list_hides_unavailable_provider_spawns() {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-service-availability-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = McpService::new_with_availability(
+            Some(&root),
+            PROTOCOL_VERSION,
+            ToolAvailability {
+                claude: true,
+                codex: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+
+        let tools = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(2)),
+                method: "tools/list".into(),
+                params: json!({}),
+            })
+            .unwrap();
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"spawn_claude"));
+        assert!(!names.contains(&"spawn_codex"));
+        assert!(!names.contains(&"spawn_agy"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unavailable_provider_spawns_are_not_callable() {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-service-unavailable-call-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = McpService::new_with_availability(
+            Some(&root),
+            PROTOCOL_VERSION,
+            ToolAvailability {
+                claude: true,
+                codex: false,
+                agy: true,
+            },
+        )
+        .unwrap();
+
+        let response = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(3)),
+                method: "tools/call".into(),
+                params: json!({ "name": "spawn_codex", "arguments": { "cwd": "/tmp" } }),
+            })
+            .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["data"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable tool spawn_codex")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -239,6 +368,18 @@ mod tests {
         });
         assert!(response.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provider_spawn_tools_force_provider() {
+        let args = spawn_args_for_provider(
+            &json!({ "cwd": "/tmp", "provider": "codex", "model": "sonnet" }),
+            "claude",
+        );
+
+        assert_eq!(args["provider"], "claude");
+        assert_eq!(args["cwd"], "/tmp");
+        assert_eq!(args["model"], "sonnet");
     }
 
     #[test]

@@ -115,7 +115,7 @@ impl McpSessionService {
     ) -> AppResult<Value> {
         let timeout_ms = validated.timeout_ms;
         let no_yolo = validated.no_yolo;
-        let outcome = self.wait_inner(record, timeout_ms, false, no_yolo, None, None)?;
+        let outcome = self.wait_inner(record, timeout_ms, false, no_yolo, None, true, None)?;
         self.registry.update_state(
             &record.id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
@@ -126,7 +126,9 @@ impl McpSessionService {
             .get(&record.id)?
             .unwrap_or_else(|| record.clone());
         let mut result = json!({ "agent": agent_ref(&record), "outcome": outcome });
-        if let Some(initial_prompt) = validated.initial_prompt.as_deref() {
+        if result["outcome"]["outcome"] == "ready"
+            && let Some(initial_prompt) = validated.initial_prompt.as_deref()
+        {
             let prompt_result = self.prompt(&json!({
                 "id": record.id,
                 "prompt": initial_prompt,
@@ -150,7 +152,15 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let ready = self.wait_inner(&record, timeout_ms, false, no_yolo, None, Some(&lock))?;
+        let ready = self.wait_inner(
+            &record,
+            timeout_ms,
+            false,
+            no_yolo,
+            None,
+            false,
+            Some(&lock),
+        )?;
         if ready["outcome"] != "ready" {
             self.registry.update_state(
                 &id,
@@ -174,6 +184,7 @@ impl McpSessionService {
             true,
             no_yolo,
             baseline.clone(),
+            false,
             Some(&lock),
         )?;
         let mut outcome = outcome;
@@ -205,8 +216,15 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let outcome =
-            self.wait_inner(&record, timeout_ms, require_fresh, true, None, Some(&lock))?;
+        let outcome = self.wait_inner(
+            &record,
+            timeout_ms,
+            require_fresh,
+            true,
+            None,
+            false,
+            Some(&lock),
+        )?;
         self.registry.update_state(
             &id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
@@ -429,32 +447,22 @@ impl McpSessionService {
         let record = self.get_record(&id)?;
         let pane = self.verify_pane(&record)?;
         let client = TmuxClient::default();
-        let has_keys = args.get("keys").is_some();
-        let has_text = args.get("text").is_some();
-        if has_keys == has_text {
+        let keys = optional_keys(args)?;
+        let text = optional_nonblank_str(args, "text")?;
+        if keys.is_empty() && text.is_none() {
             return Err(AppError::new(
-                "invalid_params: send_keys requires exactly one of keys or text",
+                "invalid_params: send_keys requires non-empty keys or text",
             ));
         }
-        if let Some(keys) = args.get("keys") {
-            let keys = keys
-                .as_array()
-                .ok_or_else(|| AppError::new("invalid_params: keys must be an array"))?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| AppError::new("invalid_params: key must be a string"))
-                })
-                .collect::<AppResult<Vec<_>>>()?;
-            client.send_keys(&pane.pane_id, &keys)?;
-        } else {
-            let text = required_str(args, "text")?;
+        if let Some(text) = text {
             if args.get("paste").and_then(Value::as_bool).unwrap_or(true) {
-                client.paste_text(&pane.pane_id, text)?;
+                client.paste_text(&pane.pane_id, &text)?;
             } else {
                 client.send_keys(&pane.pane_id, &[text])?;
             }
+        }
+        if !keys.is_empty() {
+            client.send_keys(&pane.pane_id, &keys)?;
         }
         Ok(
             json!({ "agent": agent_ref(&record), "sent": true, "warning": "unsafe_operator_escape_hatch_no_progress_implied" }),
@@ -503,6 +511,7 @@ impl McpSessionService {
         require_fresh: bool,
         no_yolo: bool,
         baseline_override: Option<LastAgentMessage>,
+        wait_unknown_until_deadline: bool,
         lock: Option<&SessionLock>,
     ) -> AppResult<Value> {
         let client = TmuxClient::default();
@@ -514,6 +523,7 @@ impl McpSessionService {
             None
         };
         let mut stale_transcript_seen = false;
+        let mut last_unknown_frame: Option<(Classification, String)> = None;
         loop {
             if let Some(lock) = lock
                 && last_lock_refresh.elapsed() >= Duration::from_millis(LOCK_REFRESH_INTERVAL_MS)
@@ -631,6 +641,20 @@ impl McpSessionService {
                     ));
                 }
                 SessionState::Unknown => {
+                    if frame_is_blank(&frame) || wait_unknown_until_deadline {
+                        last_unknown_frame = Some((classification.clone(), frame.clone()));
+                    } else {
+                        return Ok(outcome(
+                            "unknown",
+                            Some(&classification),
+                            Some(&frame),
+                            Some("unknown_state"),
+                        ));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                if let Some((classification, frame)) = last_unknown_frame {
                     return Ok(outcome(
                         "unknown",
                         Some(&classification),
@@ -638,8 +662,6 @@ impl McpSessionService {
                         Some("unknown_state"),
                     ));
                 }
-            }
-            if Instant::now() >= deadline {
                 let reason = if stale_transcript_seen {
                     "stale_transcript"
                 } else {
@@ -711,6 +733,8 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
     let initial_prompt = args
         .get("initial_prompt")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
     let policy = args.get("policy").cloned().unwrap_or(Value::Null);
     Ok(ValidatedSpawnArgs {
@@ -793,6 +817,41 @@ fn optional_nonempty_str(args: &Value, name: &str) -> AppResult<Option<String>> 
             } else {
                 Ok(Some(trimmed.to_string()))
             }
+        }
+    }
+}
+
+fn optional_nonblank_str(args: &Value, name: &str) -> AppResult<Option<String>> {
+    match args.get(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| AppError::new(format!("invalid_params: {name} must be a string")))?;
+            if raw.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(raw.to_string()))
+            }
+        }
+    }
+}
+
+fn optional_keys(args: &Value) -> AppResult<Vec<String>> {
+    match args.get("keys") {
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(value) => {
+            let keys = value
+                .as_array()
+                .ok_or_else(|| AppError::new("invalid_params: keys must be an array"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| AppError::new("invalid_params: key must be a string"))
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            Ok(keys.into_iter().filter(|key| !key.is_empty()).collect())
         }
     }
 }
@@ -988,6 +1047,10 @@ fn remove_snapshot_for_transcript_outcome(outcome: &mut Value) {
     }
 }
 
+fn frame_is_blank(frame: &str) -> bool {
+    frame.trim().is_empty()
+}
+
 fn outcome_for_state(state: SessionState) -> &'static str {
     match state {
         SessionState::ChatReady => "ready",
@@ -1039,8 +1102,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_keys_requires_exactly_one_payload() {
+    fn parses_send_keys_payloads_leniently() {
         assert!(required_str(&json!({}), "id").is_err());
+        assert_eq!(
+            optional_keys(&json!({"keys":["Enter", ""]})).unwrap(),
+            vec!["Enter"]
+        );
+        assert_eq!(
+            optional_keys(&json!({"keys":[]})).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            optional_nonblank_str(&json!({"text":""}), "text").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_nonblank_str(&json!({"text":"hello"}), "text").unwrap(),
+            Some("hello".to_string())
+        );
         assert_eq!(
             optional_u64(&json!({"timeout_ms":1000}), "timeout_ms", 5).unwrap(),
             1000
@@ -1170,6 +1249,7 @@ mod tests {
             "cwd": "/tmp",
             "permission_mode": "acceptEdits",
             "settings": "/home/colin/Seamus/gitlab-settings.json",
+            "initial_prompt": "",
         }))
         .expect("valid permission_mode/settings");
         assert!(v.command.contains("--permission-mode acceptEdits"));
@@ -1177,6 +1257,7 @@ mod tests {
             v.command
                 .contains("--settings /home/colin/Seamus/gitlab-settings.json")
         );
+        assert_eq!(v.initial_prompt, None);
     }
 
     fn temp_state_dir(tag: &str) -> PathBuf {
@@ -1281,6 +1362,12 @@ mod tests {
 
         assert_eq!(outcome["message"]["text"], "reply");
         assert!(outcome.get("snapshot").is_none());
+    }
+
+    #[test]
+    fn blank_frames_are_detected_for_startup_grace() {
+        assert!(frame_is_blank("\n\n   \n"));
+        assert!(!frame_is_blank("Claude Code"));
     }
 
     #[test]
