@@ -82,7 +82,7 @@ pub fn tool_catalog() -> Vec<Value> {
     vec![
         tool(
             "spawn",
-            "Start a persistent agent TUI in a managed tmux window. Provider defaults to claude. model/effort/agent are validated per provider.",
+            "Start a persistent agent TUI in a managed tmux window. Provider defaults to claude. model/effort/agent/permission_mode/settings are validated per provider (permission_mode and settings are claude-only).",
             json!({
                 "type": "object", "required": ["cwd"],
                 "properties": {
@@ -91,6 +91,8 @@ pub fn tool_catalog() -> Vec<Value> {
                     "model": {"type":"string", "minLength":1},
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "agent": {"type":"string", "minLength":1},
+                    "permission_mode": permission_mode_schema(),
+                    "settings": {"type":"string", "minLength":1},
                     "timeout_ms": {"type":"integer", "minimum":1000},
                     "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
@@ -150,6 +152,8 @@ pub fn tool_catalog() -> Vec<Value> {
                     "model": {"type":"string", "minLength":1},
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "agent": {"type":"string", "minLength":1},
+                    "permission_mode": permission_mode_schema(),
+                    "settings": {"type":"string", "minLength":1},
                     "timeout_ms": {"type":"integer", "minimum":1000},
                     "policy": policy_schema()
                 }
@@ -160,6 +164,15 @@ pub fn tool_catalog() -> Vec<Value> {
 
 fn policy_schema() -> Value {
     json!({ "type":"object", "properties": { "no_yolo": { "type":"boolean" } } })
+}
+
+/// Schema for the claude-only `--permission-mode` flag. Kept in sync with
+/// `CLAUDE_PERMISSION_MODES` in `mcp_session.rs`.
+fn permission_mode_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]
+    })
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

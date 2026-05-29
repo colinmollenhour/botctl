@@ -118,13 +118,13 @@ botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
 
 Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn`):
 
-- `spawn` (optional `provider`: `claude` default, `codex`, `agy`; optional `model`, `effort`, `agent` — validated per provider)
+- `spawn` (optional `provider`: `claude` default, `codex`, `agy`; optional `model`, `effort`, `agent`, and claude-only `permission_mode` + `settings` — validated per provider)
 - `prompt`
 - `wait`
 - `kill`
 - `snapshot`
 - `send_keys`
-- `one_shot` (required `cwd`, `prompt`; optional `provider`/`model`/`effort`/`agent`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
+- `one_shot` (required `cwd`, `prompt`; optional `provider`/`model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
 
 Notes:
 

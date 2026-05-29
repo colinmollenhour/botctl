@@ -692,11 +692,15 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
     let model = optional_nonempty_str(args, "model")?;
     let effort = optional_nonempty_str(args, "effort")?;
     let agent = optional_nonempty_str(args, "agent")?;
+    let permission_mode = optional_enum_str(args, "permission_mode", &CLAUDE_PERMISSION_MODES)?;
+    let settings = optional_nonempty_str(args, "settings")?;
     let command = build_launch_command(
         provider,
         model.as_deref(),
         effort.as_deref(),
         agent.as_deref(),
+        permission_mode.as_deref(),
+        settings.as_deref(),
     )?;
     let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
     let no_yolo = args
@@ -729,7 +733,16 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
 /// through (default behavior unchanged; may only tighten).
 fn one_shot_spawn_args(args: &Value) -> Value {
     let mut spawn_args = serde_json::Map::new();
-    for key in ["cwd", "provider", "model", "effort", "agent", "timeout_ms"] {
+    for key in [
+        "cwd",
+        "provider",
+        "model",
+        "effort",
+        "agent",
+        "timeout_ms",
+        "permission_mode",
+        "settings",
+    ] {
         if let Some(value) = args.get(key) {
             spawn_args.insert(key.to_string(), value.clone());
         }
@@ -783,11 +796,43 @@ fn optional_nonempty_str(args: &Value, name: &str) -> AppResult<Option<String>> 
     }
 }
 
+/// Valid `--permission-mode` values accepted by the Claude CLI. Kept in sync
+/// with the `permission_mode` enum in the tool schema (`mcp_protocol.rs`).
+const CLAUDE_PERMISSION_MODES: [&str; 6] = [
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "default",
+    "dontAsk",
+    "plan",
+];
+
+/// Parse an optional string argument and validate it against a fixed set of
+/// allowed values. Returns `Ok(None)` when absent/null, `Err(invalid_params)`
+/// when present but not one of `allowed`.
+fn optional_enum_str(args: &Value, name: &str, allowed: &[&str]) -> AppResult<Option<String>> {
+    match optional_nonempty_str(args, name)? {
+        None => Ok(None),
+        Some(value) => {
+            if allowed.contains(&value.as_str()) {
+                Ok(Some(value))
+            } else {
+                Err(AppError::new(format!(
+                    "invalid_params: {name} must be one of {}",
+                    allowed.join(", ")
+                )))
+            }
+        }
+    }
+}
+
 fn build_launch_command(
     provider: Provider,
     model: Option<&str>,
     effort: Option<&str>,
     agent: Option<&str>,
+    permission_mode: Option<&str>,
+    settings: Option<&str>,
 ) -> AppResult<String> {
     let mut parts = vec![provider.command().to_string()];
     match provider {
@@ -802,6 +847,14 @@ fn build_launch_command(
             }
             if let Some(value) = agent {
                 parts.push("--agent".into());
+                parts.push(shell_escape_arg(value));
+            }
+            if let Some(value) = permission_mode {
+                parts.push("--permission-mode".into());
+                parts.push(shell_escape_arg(value));
+            }
+            if let Some(value) = settings {
+                parts.push("--settings".into());
                 parts.push(shell_escape_arg(value));
             }
         }
@@ -819,11 +872,21 @@ fn build_launch_command(
                     "invalid_params: codex provider does not support agent",
                 ));
             }
+            if permission_mode.is_some() || settings.is_some() {
+                return Err(AppError::new(
+                    "invalid_params: codex provider does not support permission_mode or settings",
+                ));
+            }
         }
         Provider::Agy => {
             if model.is_some() || effort.is_some() || agent.is_some() {
                 return Err(AppError::new(
                     "invalid_params: agy provider does not support model, effort, or agent",
+                ));
+            }
+            if permission_mode.is_some() || settings.is_some() {
+                return Err(AppError::new(
+                    "invalid_params: agy provider does not support permission_mode or settings",
                 ));
             }
         }
@@ -1005,32 +1068,106 @@ mod tests {
                 Provider::Claude,
                 Some("opus"),
                 Some("high"),
-                Some("reviewer")
+                Some("reviewer"),
+                None,
+                None,
             )
             .unwrap(),
             "claude --model opus --effort high --agent reviewer"
         );
         assert_eq!(
-            build_launch_command(Provider::Codex, Some("gpt-5.5"), Some("high"), None).unwrap(),
+            build_launch_command(
+                Provider::Codex,
+                Some("gpt-5.5"),
+                Some("high"),
+                None,
+                None,
+                None
+            )
+            .unwrap(),
             "codex -m gpt-5.5 -c 'model_reasoning_effort=high'"
         );
         assert_eq!(
-            build_launch_command(Provider::Agy, None, None, None).unwrap(),
+            build_launch_command(Provider::Agy, None, None, None, None, None).unwrap(),
             "agy"
         );
     }
 
     #[test]
+    fn launch_command_claude_permission_mode_and_settings() {
+        // permission_mode + settings map to the claude CLI flags and the
+        // settings path is shell-escaped (the path contains no special chars
+        // here, so it stays bare).
+        assert_eq!(
+            build_launch_command(
+                Provider::Claude,
+                None,
+                None,
+                None,
+                Some("acceptEdits"),
+                Some("/home/colin/Seamus/gitlab-settings.json"),
+            )
+            .unwrap(),
+            "claude --permission-mode acceptEdits --settings /home/colin/Seamus/gitlab-settings.json"
+        );
+        // A settings JSON string with spaces/quotes is shell-escaped.
+        assert_eq!(
+            build_launch_command(
+                Provider::Claude,
+                None,
+                None,
+                None,
+                None,
+                Some(r#"{"key": "v"}"#),
+            )
+            .unwrap(),
+            r#"claude --settings '{"key": "v"}'"#
+        );
+    }
+
+    #[test]
     fn launch_command_rejects_unsupported_combos() {
-        let err = build_launch_command(Provider::Codex, None, None, Some("reviewer"))
+        let err = build_launch_command(Provider::Codex, None, None, Some("reviewer"), None, None)
             .expect_err("codex agent should fail");
         assert!(
             err.to_string()
                 .contains("codex provider does not support agent")
         );
-        let err = build_launch_command(Provider::Agy, Some("any"), None, None)
+        let err = build_launch_command(Provider::Agy, Some("any"), None, None, None, None)
             .expect_err("agy model should fail");
         assert!(err.to_string().contains("agy provider does not support"));
+        // permission_mode / settings are claude-only.
+        let err =
+            build_launch_command(Provider::Codex, None, None, None, Some("acceptEdits"), None)
+                .expect_err("codex permission_mode should fail");
+        assert!(
+            err.to_string()
+                .contains("codex provider does not support permission_mode or settings")
+        );
+        let err = build_launch_command(Provider::Agy, None, None, None, None, Some("/x.json"))
+            .expect_err("agy settings should fail");
+        assert!(
+            err.to_string()
+                .contains("agy provider does not support permission_mode or settings")
+        );
+    }
+
+    #[test]
+    fn validate_spawn_args_rejects_bad_permission_mode() {
+        // Invalid permission_mode is an argument-validation error (before any
+        // window is created); a valid one is accepted and baked into the command.
+        assert!(validate_spawn_args(&json!({ "cwd": "/tmp", "permission_mode": "yolo" })).is_err());
+        let v = validate_spawn_args(&json!({
+            "cwd": "/tmp",
+            "permission_mode": "acceptEdits",
+            "settings": "/home/colin/Seamus/gitlab-settings.json",
+        }))
+        .expect("valid permission_mode/settings");
+        assert!(v.command.contains("--permission-mode acceptEdits"));
+        assert!(
+            v.command
+                .contains("--settings /home/colin/Seamus/gitlab-settings.json")
+        );
     }
 
     fn temp_state_dir(tag: &str) -> PathBuf {

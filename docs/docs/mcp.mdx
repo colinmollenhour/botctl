@@ -27,16 +27,16 @@ The HTTP transport is a **stateless, Streamable-HTTP-compatible** JSON request/r
 
 Tool names are unprefixed; MCP clients typically expose them under the server name (e.g. `mcp__botctl__spawn`).
 
-- `spawn` — start a persistent agent TUI in a managed tmux window for an existing `cwd`. Accepts optional `provider` (`claude` default, `codex`, `agy`), `model`, `effort` (`low`/`medium`/`high`/`xhigh`/`max`), and `agent`. Per-provider support:
-  - Claude: `model` → `--model`, `effort` → `--effort`, `agent` → `--agent`.
-  - Codex: `model` → `-m`, `effort` → `-c model_reasoning_effort=<v>`. `agent` is rejected.
-  - Agy: all three are rejected (no matching CLI flags).
+- `spawn` — start a persistent agent TUI in a managed tmux window for an existing `cwd`. Accepts optional `provider` (`claude` default, `codex`, `agy`), `model`, `effort` (`low`/`medium`/`high`/`xhigh`/`max`), `agent`, and the **claude-only** `permission_mode` (`acceptEdits`/`auto`/`bypassPermissions`/`default`/`dontAsk`/`plan`) and `settings` (a settings JSON file path or a JSON string). Per-provider support:
+  - Claude: `model` → `--model`, `effort` → `--effort`, `agent` → `--agent`, `permission_mode` → `--permission-mode`, `settings` → `--settings`.
+  - Codex: `model` → `-m`, `effort` → `-c model_reasoning_effort=<v>`. `agent`, `permission_mode`, and `settings` are rejected.
+  - Agy: `model`/`effort`/`agent`/`permission_mode`/`settings` are all rejected (no matching CLI flags).
 - `prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive.
 - `wait` — wait for an existing managed session to reach a terminal outcome.
 - `kill` — kill only the verified managed tmux window; idempotent when already gone.
 - `snapshot` — capture pane text and classifier state for diagnostics.
 - `send_keys` — unsafe operator escape hatch scoped to the managed ID.
-- `one_shot` — create a temporary managed session, run **exactly one** prompt to a terminal outcome, then **always attempt to kill** the window (best-effort cleanup). Required args: `cwd`, `prompt` (non-empty). Optional: `provider`/`model`/`effort`/`agent`/`timeout_ms`/`policy` (same validation as `spawn`). It is implemented by composing `spawn` (with `initial_prompt`) + `kill`, so the prompt is submitted exactly once.
+- `one_shot` — create a temporary managed session, run **exactly one** prompt to a terminal outcome, then **always attempt to kill** the window (best-effort cleanup). Required args: `cwd`, `prompt` (non-empty). Optional: `provider`/`model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy` (same validation as `spawn`; `permission_mode`/`settings` are claude-only). It is implemented by composing `spawn` (with `initial_prompt`) + `kill`, so the prompt is submitted exactly once.
   - **Timeout (per-phase):** `timeout_ms` applies independently to the spawn-ready wait and the prompt turn; `kill` uses its own default. Worst case ≈ `2×timeout_ms` + kill.
   - **Auto-approval policy:** uses managed auto-approval (`no_yolo=false`) — only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block. A caller MAY set `policy.no_yolo:true` to be more conservative; it can never broaden beyond the existing gate.
   - **Error vs result:** argument-validation failures (missing/blank `prompt`, bad `cwd`, invalid optional args) surface as JSON-RPC errors. Spawn, turn, and kill failures are NOT errors — they are encoded in the result fields below and the call returns a normal result (`isError:false`). A failure after the window is created still always attempts the best-effort kill (no leaked tmux window).
