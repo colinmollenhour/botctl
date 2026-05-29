@@ -163,6 +163,7 @@ fn command_available(command: &str) -> bool {
 
 fn spawn_args_for_provider(args: &Value, provider: &str) -> Value {
     let mut args = args.as_object().cloned().unwrap_or_default();
+    args.remove("initial_prompt");
     args.insert("provider".into(), json!(provider));
     Value::Object(args)
 }
@@ -373,13 +374,14 @@ mod tests {
     #[test]
     fn provider_spawn_tools_force_provider() {
         let args = spawn_args_for_provider(
-            &json!({ "cwd": "/tmp", "provider": "codex", "model": "sonnet" }),
+            &json!({ "cwd": "/tmp", "provider": "codex", "model": "sonnet", "initial_prompt": "ignored" }),
             "claude",
         );
 
         assert_eq!(args["provider"], "claude");
         assert_eq!(args["cwd"], "/tmp");
         assert_eq!(args["model"], "sonnet");
+        assert!(args.get("initial_prompt").is_none());
     }
 
     #[test]

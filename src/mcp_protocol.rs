@@ -143,7 +143,6 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                     "permission_mode": permission_mode_schema(),
                     "settings": {"type":"string", "minLength":1, "description":"Settings JSON file path or JSON string passed to Claude --settings."},
                     "timeout_ms": {"type":"integer", "minimum":1000},
-                    "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
                 }
             }),
@@ -160,7 +159,6 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                     "model": {"type":"string", "minLength":1},
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "timeout_ms": {"type":"integer", "minimum":1000},
-                    "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
                 }
             }),
@@ -175,7 +173,6 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
                     "timeout_ms": {"type":"integer", "minimum":1000},
-                    "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
                 }
             }),
@@ -373,6 +370,21 @@ mod tests {
         assert!(
             spawn_agy["inputSchema"]["properties"]
                 .get("provider")
+                .is_none()
+        );
+        assert!(
+            spawn_claude["inputSchema"]["properties"]
+                .get("initial_prompt")
+                .is_none()
+        );
+        assert!(
+            spawn_codex["inputSchema"]["properties"]
+                .get("initial_prompt")
+                .is_none()
+        );
+        assert!(
+            spawn_agy["inputSchema"]["properties"]
+                .get("initial_prompt")
                 .is_none()
         );
         assert!(
