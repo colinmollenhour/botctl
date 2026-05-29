@@ -185,6 +185,7 @@ impl McpSessionService {
                     .map(|v| v.is_object())
                     .unwrap_or(false)
             );
+            remove_snapshot_for_transcript_outcome(&mut outcome);
         }
         let state = lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown"));
         self.registry
@@ -979,6 +980,14 @@ fn outcome(
     })
 }
 
+fn remove_snapshot_for_transcript_outcome(outcome: &mut Value) {
+    if outcome.get("message").is_some_and(Value::is_object)
+        && let Some(object) = outcome.as_object_mut()
+    {
+        object.remove("snapshot");
+    }
+}
+
 fn outcome_for_state(state: SessionState) -> &'static str {
     match state {
         SessionState::ChatReady => "ready",
@@ -1257,6 +1266,21 @@ mod tests {
             !fresh_message,
             "stale message must not be reported as fresh"
         );
+    }
+
+    #[test]
+    fn transcript_outcome_omits_pane_snapshot() {
+        let mut outcome = json!({
+            "outcome": "ready",
+            "classified_state": "ChatReady",
+            "message": { "role": "assistant", "text": "reply", "fresh": true },
+            "snapshot": "pane text"
+        });
+
+        remove_snapshot_for_transcript_outcome(&mut outcome);
+
+        assert_eq!(outcome["message"]["text"], "reply");
+        assert!(outcome.get("snapshot").is_none());
     }
 
     #[test]

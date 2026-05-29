@@ -108,12 +108,33 @@ impl McpService {
             "one_shot" => self.sessions.one_shot(&args),
             _ => unreachable!(),
         }?;
+        let content_text = tool_content_text(name, &result);
         Ok(json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()) }],
+            "content": [{ "type": "text", "text": content_text }],
             "structuredContent": result,
             "isError": false,
         }))
     }
+}
+
+fn tool_content_text(name: &str, result: &Value) -> String {
+    match name {
+        "prompt" => result
+            .pointer("/outcome/message/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| pretty_json(result)),
+        "one_shot" => result
+            .pointer("/message/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| pretty_json(result)),
+        _ => pretty_json(result),
+    }
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 #[cfg(test)]
@@ -218,5 +239,29 @@ mod tests {
         });
         assert!(response.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_tool_content_is_assistant_text() {
+        let result = json!({
+            "agent": { "id": "agent-1" },
+            "outcome": {
+                "outcome": "ready",
+                "message": { "role": "assistant", "text": "reply only", "fresh": true },
+                "snapshot": "pane text should not be surfaced as tool content"
+            }
+        });
+
+        assert_eq!(tool_content_text("prompt", &result), "reply only");
+    }
+
+    #[test]
+    fn one_shot_tool_content_is_assistant_text() {
+        let result = json!({
+            "outcome": "ready",
+            "message": { "role": "assistant", "text": "one shot reply", "fresh": true }
+        });
+
+        assert_eq!(tool_content_text("one_shot", &result), "one shot reply");
     }
 }
