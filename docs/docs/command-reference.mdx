@@ -106,6 +106,34 @@ Output and safety:
 - submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 
+### `mcp`
+
+Purpose: run the small MCP-compatible JSON-RPC server for persistent agent sessions backed by managed tmux windows. Claude is the default provider; Codex and Agy are also supported on `spawn`.
+
+Syntax:
+```bash
+botctl mcp stdio [--state-dir PATH]
+botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
+```
+
+Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn`):
+
+- `spawn` (optional `provider`: `claude` default, `codex`, `agy`; optional `model`, `effort`, `agent`, and claude-only `permission_mode` + `settings` — validated per provider)
+- `prompt`
+- `wait`
+- `kill`
+- `snapshot`
+- `send_keys`
+- `one_shot` (required `cwd`, `prompt`; optional `provider`/`model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
+
+Notes:
+
+- stdio uses newline-delimited JSON-RPC on stdin/stdout.
+- HTTP is a stateless, Streamable-HTTP-compatible JSON request/response server at `POST /mcp` (GET→405, DELETE→204, OPTIONS→204, Origin/Host loopback checks, `MCP-Protocol-Version 2025-03-26`); no SSE, no sessions, no auth. Binding a non-loopback address requires `--allow-non-loopback`.
+- sessions persist after `prompt`; use `kill` for cleanup.
+- managed IDs resolve to exact tmux pane/window IDs before any action.
+- `send_keys` is unsafe/operator-only and does not imply progress.
+
 ### `yolo`
 
 Purpose: set centralized yolo policy for one pane, all panes, or a workspace-scoped subset.

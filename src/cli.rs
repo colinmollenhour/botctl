@@ -29,6 +29,7 @@ pub enum Command {
     AutoUnstick(AutoUnstickArgs),
     KeepGoing(KeepGoingArgs),
     Prompt(PromptRunArgs),
+    Mcp(McpArgs),
     PreparePrompt(PreparePromptArgs),
     EditorHelper(EditorHelperArgs),
     SubmitPrompt(SubmitPromptArgs),
@@ -115,6 +116,21 @@ pub struct PromptRunArgs {
     pub no_yolo: bool,
     pub verbose: bool,
     pub claude_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTransportArgs {
+    Stdio,
+    Http {
+        bind: String,
+        allow_non_loopback: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpArgs {
+    pub transport: McpTransportArgs,
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +389,7 @@ where
         "auto-unstick" => with_command_context(parse_auto_unstick(rest), "auto-unstick"),
         "keep-going" => with_command_context(parse_keep_going(rest), "keep-going"),
         "prompt" => with_command_context(parse_prompt_run(rest), "prompt"),
+        "mcp" => with_command_context(parse_mcp(rest), "mcp"),
         "prepare-prompt" => with_command_context(parse_prepare_prompt(rest), "prepare-prompt"),
         "editor-helper" => with_command_context(parse_editor_helper(rest), "editor-helper"),
         "submit-prompt" => with_command_context(parse_submit_prompt(rest), "submit-prompt"),
@@ -534,6 +551,17 @@ fn usage_with_color(color: bool) -> String {
     }
     out.push('\n');
 
+    out.push_str(&section("MCP:"));
+    out.push('\n');
+    for line in [
+        "mcp stdio [--state-dir PATH]",
+        "mcp http --bind 127.0.0.1:8787 [--allow-non-loopback] [--state-dir PATH]",
+    ] {
+        out.push_str(&command(line));
+        out.push('\n');
+    }
+    out.push('\n');
+
     out.push_str(&section("Advanced Diagnostics And Plumbing:"));
     out.push('\n');
     for line in [
@@ -615,6 +643,7 @@ fn closest_command(command: &str) -> Option<&'static str> {
         "prepare-prompt",
         "editor-helper",
         "submit-prompt",
+        "mcp",
         "yolo",
         "help",
     ];
@@ -946,6 +975,19 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             "Launches Claude in a new detached tmux window in the owning session, creating that session first when needed, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. The default owning session is botctl; --session overrides it. On success, botctl loads a fresh assistant message before killing only the captured prompt window. Failed prompt windows are left alive for inspection. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
         ),
+        "mcp" => (
+            "mcp",
+            "Run the botctl MCP JSON-RPC server for persistent agent sessions (stdio, or stateless Streamable-HTTP-compatible POST /mcp). Claude default; Codex and Agy also supported.",
+            "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind 127.0.0.1:8787 [--allow-non-loopback] [--state-dir PATH]",
+            &["botctl mcp stdio", "botctl mcp http --bind 127.0.0.1:8787"][..],
+            &[
+                "stdio (newline-delimited JSON-RPC on stdin/stdout)",
+                "http --bind ADDR [--allow-non-loopback] (stateless Streamable-HTTP-compatible JSON-RPC POST /mcp; GET->405, DELETE->204, Origin/Host checks, no SSE)",
+                "--state-dir PATH",
+                "--no-color",
+            ][..],
+            "Tools use generated managed IDs and exact tmux pane IDs. spawn accepts optional provider (claude default, codex, agy), model, effort, and agent — validated per provider. one_shot spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort). send_keys is unsafe/operator-only and does not imply progress.",
+        ),
         "targeting" => return Some(topic_page("targeting", TARGET_HELP)),
         "safety" => {
             return Some(topic_page(
@@ -1031,6 +1073,9 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         }
         "prompt" => {
             "botctl prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]"
+        }
+        "mcp" => {
+            "botctl mcp stdio [--state-dir PATH] | botctl mcp http --bind ADDR [--allow-non-loopback] [--state-dir PATH]"
         }
         "prepare-prompt" => {
             "botctl prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]"
@@ -2028,6 +2073,46 @@ fn reject_zero_prompt_flag(value: u64, flag: &str) -> AppResult<()> {
     } else {
         Ok(())
     }
+}
+
+fn parse_mcp(args: Vec<String>) -> AppResult<Command> {
+    let mut iter = args.into_iter();
+    let transport_name = iter
+        .next()
+        .ok_or_else(|| AppError::new("mcp requires transport: stdio or http"))?;
+    let rest = iter.collect::<Vec<_>>();
+    let mut state_dir = None;
+    let mut bind = None;
+    let mut allow_non_loopback = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(read_value(&rest, &mut i, "--state-dir")?));
+            }
+            "--bind" if transport_name == "http" => {
+                bind = Some(read_value(&rest, &mut i, "--bind")?);
+            }
+            "--allow-non-loopback" if transport_name == "http" => {
+                allow_non_loopback = true;
+            }
+            flag => return Err(AppError::new(format!("unknown mcp flag: {flag}"))),
+        }
+        i += 1;
+    }
+
+    let transport = match transport_name.as_str() {
+        "stdio" => McpTransportArgs::Stdio,
+        "http" => McpTransportArgs::Http {
+            bind: bind.ok_or_else(|| AppError::new("mcp http requires --bind ADDR"))?,
+            allow_non_loopback,
+        },
+        other => return Err(AppError::new(format!("unknown mcp transport: {other}"))),
+    };
+    Ok(Command::Mcp(McpArgs {
+        transport,
+        state_dir,
+    }))
 }
 
 fn parse_pane_target_args(args: Vec<String>, command_name: &str) -> AppResult<PaneTargetArgs> {
@@ -3386,6 +3471,84 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_mcp_stdio_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("mcp"),
+            String::from("stdio"),
+            String::from("--state-dir"),
+            String::from("/tmp/botctl-mcp"),
+        ])
+        .expect("mcp stdio command should parse");
+
+        match command {
+            Command::Mcp(args) => {
+                assert_eq!(args.transport, super::McpTransportArgs::Stdio);
+                assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/botctl-mcp")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_http_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("mcp"),
+            String::from("http"),
+            String::from("--bind"),
+            String::from("127.0.0.1:8787"),
+        ])
+        .expect("mcp http command should parse");
+
+        match command {
+            Command::Mcp(args) => assert_eq!(
+                args.transport,
+                super::McpTransportArgs::Http {
+                    bind: String::from("127.0.0.1:8787"),
+                    allow_non_loopback: false,
+                }
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_http_with_allow_non_loopback() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("mcp"),
+            String::from("http"),
+            String::from("--bind"),
+            String::from("0.0.0.0:8787"),
+            String::from("--allow-non-loopback"),
+        ])
+        .expect("mcp http command with allow-non-loopback should parse");
+
+        match command {
+            Command::Mcp(args) => assert_eq!(
+                args.transport,
+                super::McpTransportArgs::Http {
+                    bind: String::from("0.0.0.0:8787"),
+                    allow_non_loopback: true,
+                }
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_allow_non_loopback_for_stdio() {
+        let result = parse_args(vec![
+            String::from("botctl"),
+            String::from("mcp"),
+            String::from("stdio"),
+            String::from("--allow-non-loopback"),
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]
