@@ -223,11 +223,14 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
             "one_shot",
             "Create a temporary managed session, run exactly one prompt to a terminal outcome, then always attempt to kill the window (best-effort cleanup). Uses managed auto-approval (no_yolo=false): only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block.",
             json!({
-                "type": "object", "required": ["cwd", "prompt"],
+                "type": "object",
                 "properties": {
-                    "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "prompt": {"type":"string", "minLength":1},
-                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Use claude by default. If agy, omit model/effort/agent/permission_mode/settings."},
+                    "cwd": {"type":"string", "description":"Existing working directory for the managed agent. Defaults to the MCP server current directory when omitted or blank."},
+                    "prompt": {"type":"string", "minLength":1, "description":"Preferred prompt text field. The aliases text, message, input, and initial_prompt are also accepted at runtime."},
+                    "text": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                    "message": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                    "input": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Defaults to the first available provider binary in claude, codex, agy order. If agy, omit model/effort/agent/permission_mode/settings."},
                     "model": {"type":"string", "minLength":1, "description":"Claude and Codex only. Do not pass when provider is agy."},
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"], "description":"Claude and Codex only. Do not pass when provider is agy."},
                     "agent": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
@@ -334,10 +337,7 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "one_shot")
             .expect("catalog has one_shot");
-        assert_eq!(
-            one_shot["inputSchema"]["required"],
-            json!(["cwd", "prompt"])
-        );
+        assert!(one_shot["inputSchema"].get("required").is_none());
         assert_eq!(catalog.last().unwrap()["name"], "one_shot");
     }
 

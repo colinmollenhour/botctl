@@ -126,7 +126,7 @@ Tools (clients typically expose them under the server name, e.g. `mcp__botctl__s
 - `kill`
 - `snapshot`
 - `send_keys`
-- `one_shot` (required `cwd`, `prompt`; optional `provider`/`model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
+- `one_shot` (preferred `prompt`, aliases `text`/`message`/`input`; optional `cwd` defaults to the MCP server current directory; optional `provider` defaults to the first available provider binary; optional `model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
 
 Notes:
 

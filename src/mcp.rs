@@ -135,7 +135,9 @@ impl McpService {
             "kill" => self.sessions.kill(&args),
             "snapshot" => self.sessions.snapshot(&args),
             "send_keys" => self.sessions.send_keys(&args),
-            "one_shot" => self.sessions.one_shot(&args),
+            "one_shot" => self
+                .sessions
+                .one_shot(&one_shot_args_with_defaults(&args, self.tool_availability)),
             _ => unreachable!(),
         }?;
         let content_text = tool_content_text(name, &result);
@@ -165,6 +167,24 @@ fn spawn_args_for_provider(args: &Value, provider: &str) -> Value {
     let mut args = args.as_object().cloned().unwrap_or_default();
     args.remove("initial_prompt");
     args.insert("provider".into(), json!(provider));
+    Value::Object(args)
+}
+
+fn one_shot_args_with_defaults(args: &Value, availability: ToolAvailability) -> Value {
+    let mut args = args.as_object().cloned().unwrap_or_default();
+    if !args
+        .get("provider")
+        .and_then(Value::as_str)
+        .is_some_and(|provider| !provider.trim().is_empty())
+    {
+        if availability.claude {
+            args.insert("provider".into(), json!("claude"));
+        } else if availability.codex {
+            args.insert("provider".into(), json!("codex"));
+        } else if availability.agy {
+            args.insert("provider".into(), json!("agy"));
+        }
+    }
     Value::Object(args)
 }
 
@@ -382,6 +402,29 @@ mod tests {
         assert_eq!(args["cwd"], "/tmp");
         assert_eq!(args["model"], "sonnet");
         assert!(args.get("initial_prompt").is_none());
+    }
+
+    #[test]
+    fn one_shot_defaults_provider_to_available_binary() {
+        let args = one_shot_args_with_defaults(
+            &json!({ "prompt": "hi" }),
+            ToolAvailability {
+                claude: false,
+                codex: true,
+                agy: true,
+            },
+        );
+        assert_eq!(args["provider"], "codex");
+
+        let args = one_shot_args_with_defaults(
+            &json!({ "prompt": "hi", "provider": "agy" }),
+            ToolAvailability {
+                claude: true,
+                codex: true,
+                agy: false,
+            },
+        );
+        assert_eq!(args["provider"], "agy");
     }
 
     #[test]

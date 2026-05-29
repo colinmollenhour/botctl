@@ -271,17 +271,14 @@ impl McpSessionService {
     /// `timeout_ms` applies independently to the spawn-ready wait and the prompt
     /// turn; `kill` uses its own default.
     ///
-    /// Error semantics: argument-validation failures (missing/blank `prompt`, bad
-    /// `cwd`, invalid optional args) surface as JSON-RPC errors (`Err`). Spawn,
-    /// turn, and kill failures are NOT errors — they are encoded in the result
-    /// fields (`outcome`, `kill`, `error`) and this method returns `Ok` so
-    /// `call_tool` reports `isError:false`.
+    /// Error semantics: argument-validation failures (missing/blank prompt text,
+    /// bad explicit `cwd`, invalid optional args) surface as JSON-RPC errors
+    /// (`Err`). Spawn, turn, and kill failures are NOT errors — they are encoded
+    /// in the result fields (`outcome`, `kill`, `error`) and this method returns
+    /// `Ok` so `call_tool` reports `isError:false`.
     pub fn one_shot(&self, args: &Value) -> AppResult<Value> {
-        // R1: validate the one-shot-specific prompt arg up front (non-empty)...
-        let prompt = required_str(args, "prompt")?;
-        if prompt.trim().is_empty() {
-            return Err(AppError::new("invalid_params: prompt must be non-empty"));
-        }
+        // R1: validate the one-shot-specific prompt text up front (non-empty)...
+        let _ = one_shot_prompt(args)?;
         // ...then validate ALL spawn args (cwd, provider, model, effort, agent,
         // timeout_ms range, policy.no_yolo) BEFORE any tmux window is created.
         // Argument-validation failures propagate as JSON-RPC errors (Err), NOT as
@@ -758,8 +755,16 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
 /// through (default behavior unchanged; may only tighten).
 fn one_shot_spawn_args(args: &Value) -> Value {
     let mut spawn_args = serde_json::Map::new();
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(default_one_shot_cwd);
+    spawn_args.insert("cwd".to_string(), json!(cwd));
+
     for key in [
-        "cwd",
         "provider",
         "model",
         "effort",
@@ -768,13 +773,13 @@ fn one_shot_spawn_args(args: &Value) -> Value {
         "permission_mode",
         "settings",
     ] {
-        if let Some(value) = args.get(key) {
+        if let Some(value) = args.get(key).filter(|value| !value.is_null()) {
             spawn_args.insert(key.to_string(), value.clone());
         }
     }
     spawn_args.insert(
         "initial_prompt".to_string(),
-        args.get("prompt").cloned().unwrap_or(Value::Null),
+        json!(one_shot_prompt(args).unwrap_or_default()),
     );
     // Only forward `policy` when the caller provided it, matching spawn's
     // "field absent" semantics (do not synthesize `policy: null`).
@@ -782,6 +787,29 @@ fn one_shot_spawn_args(args: &Value) -> Value {
         spawn_args.insert("policy".to_string(), policy.clone());
     }
     Value::Object(spawn_args)
+}
+
+fn one_shot_prompt(args: &Value) -> AppResult<String> {
+    for key in ["prompt", "text", "message", "input", "initial_prompt"] {
+        if let Some(prompt) = args
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        {
+            return Ok(prompt.to_string());
+        }
+    }
+    Err(AppError::new(
+        "invalid_params: prompt must be non-empty (accepted fields: prompt, text, message, input)",
+    ))
+}
+
+fn default_one_shot_cwd() -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string()
 }
 
 fn required_str<'a>(args: &'a Value, name: &str) -> AppResult<&'a str> {
@@ -1301,6 +1329,20 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_defaults_cwd_and_accepts_prompt_aliases() {
+        let spawn_args = one_shot_spawn_args(&json!({ "text": "hello from alias" }));
+
+        assert_eq!(spawn_args["cwd"], json!(default_one_shot_cwd()));
+        assert_eq!(spawn_args["initial_prompt"], json!("hello from alias"));
+        assert_eq!(one_shot_prompt(&json!({ "message": "hi" })).unwrap(), "hi");
+        assert_eq!(one_shot_prompt(&json!({ "input": "hi" })).unwrap(), "hi");
+        assert_eq!(
+            one_shot_prompt(&json!({ "initial_prompt": "hi" })).unwrap(),
+            "hi"
+        );
+    }
+
+    #[test]
     fn one_shot_omitted_policy_stays_omitted() {
         // F5: when the caller omits `policy`, spawn args must not synthesize a
         // `policy: null` field (preserve spawn's "field absent" semantics).
@@ -1371,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_requires_cwd_and_prompt() {
+    fn one_shot_requires_prompt_text() {
         let root = temp_state_dir("oneshot-validate");
         let service = test_service(&root);
         // Missing prompt -> invalid_params.
