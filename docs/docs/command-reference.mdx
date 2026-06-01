@@ -118,15 +118,15 @@ botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
 
 Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn_claude`; provider-specific spawn tools are listed only when their provider binary is available on `PATH`):
 
-- `spawn_claude` (Claude spawn: required `cwd`; optional `model`, `effort`, `agent`, `permission_mode`, `settings`, `timeout_ms`, `policy`)
-- `spawn_codex` (Codex spawn: required `cwd`; optional `model`, `effort`, `timeout_ms`, `policy`)
+- `spawn_claude` (Claude spawn: required `cwd`; optional `model_preset`, advanced raw `model`, `effort`, `agent`, `permission_mode`, `settings`, `timeout_ms`, `policy`)
+- `spawn_codex` (Codex spawn: required `cwd`; optional `model_preset`, advanced raw `model`, `effort`, `timeout_ms`, `policy`)
 - `spawn_agy` (Agy spawn: required `cwd`; optional `timeout_ms`, `policy`)
 - `prompt`
 - `wait`
 - `kill`
 - `snapshot`
 - `send_keys`
-- `one_shot` (preferred `prompt`, aliases `text`/`message`/`input`; optional `cwd` defaults to the MCP server current directory; optional `provider` defaults to the first available provider binary; optional `model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
+- `one_shot` (preferred `prompt`, aliases `text`/`message`/`input`; optional `cwd` defaults to the MCP server current directory; optional `provider` defaults to the first available provider binary; optional `model_preset`, advanced raw `model`, `effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
 
 Notes:
 

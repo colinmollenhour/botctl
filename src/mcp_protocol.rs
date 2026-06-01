@@ -137,7 +137,8 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "model": {"type":"string", "minLength":1},
+                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Claude model override. Prefer model_preset unless you need an exact provider model."},
+                    "model_preset": model_preset_schema("Claude"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "agent": {"type":"string", "minLength":1},
                     "permission_mode": permission_mode_schema(),
@@ -156,7 +157,8 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "model": {"type":"string", "minLength":1},
+                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Codex model override. Prefer model_preset unless you need an exact provider model."},
+                    "model_preset": model_preset_schema("Codex"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "timeout_ms": {"type":"integer", "minimum":1000},
                     "policy": policy_schema()
@@ -231,7 +233,8 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                     "message": {"type":"string", "minLength":1, "description":"Alias for prompt."},
                     "input": {"type":"string", "minLength":1, "description":"Alias for prompt."},
                     "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Defaults to the first available provider binary in claude, codex, agy order. If agy, omit model/effort/agent/permission_mode/settings."},
-                    "model": {"type":"string", "minLength":1, "description":"Claude and Codex only. Do not pass when provider is agy."},
+                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Claude/Codex model override. Prefer model_preset unless you need an exact provider model. Do not pass when provider is agy."},
+                    "model_preset": model_preset_schema("Claude/Codex"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"], "description":"Claude and Codex only. Do not pass when provider is agy."},
                     "agent": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
                     "permission_mode": permission_mode_schema(),
@@ -247,6 +250,14 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
 
 fn policy_schema() -> Value {
     json!({ "type":"object", "properties": { "no_yolo": { "type":"boolean" } } })
+}
+
+fn model_preset_schema(provider: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["best", "balanced", "fast", "cheap"],
+        "description": format!("Preferred model selector for {provider}. Defaults to best when both model and model_preset are omitted; raw model overrides this.")
+    })
 }
 
 /// Schema for the claude-only `--permission-mode` flag. Kept in sync with
@@ -405,6 +416,21 @@ mod tests {
         assert!(
             spawn_agy["inputSchema"]["properties"]
                 .get("model")
+                .is_none()
+        );
+        assert!(
+            spawn_claude["inputSchema"]["properties"]
+                .get("model_preset")
+                .is_some()
+        );
+        assert!(
+            spawn_codex["inputSchema"]["properties"]
+                .get("model_preset")
+                .is_some()
+        );
+        assert!(
+            spawn_agy["inputSchema"]["properties"]
+                .get("model_preset")
                 .is_none()
         );
         assert!(

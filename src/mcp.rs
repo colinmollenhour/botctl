@@ -167,11 +167,18 @@ fn spawn_args_for_provider(args: &Value, provider: &str) -> Value {
     let mut args = args.as_object().cloned().unwrap_or_default();
     args.remove("initial_prompt");
     args.insert("provider".into(), json!(provider));
+    apply_model_defaults(&mut args, provider);
     Value::Object(args)
 }
 
 fn one_shot_args_with_defaults(args: &Value, availability: ToolAvailability) -> Value {
     let mut args = args.as_object().cloned().unwrap_or_default();
+    let mut selected_provider = args
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_string);
     if !args
         .get("provider")
         .and_then(Value::as_str)
@@ -179,13 +186,67 @@ fn one_shot_args_with_defaults(args: &Value, availability: ToolAvailability) -> 
     {
         if availability.claude {
             args.insert("provider".into(), json!("claude"));
+            selected_provider = Some("claude".to_string());
         } else if availability.codex {
             args.insert("provider".into(), json!("codex"));
+            selected_provider = Some("codex".to_string());
         } else if availability.agy {
             args.insert("provider".into(), json!("agy"));
+            selected_provider = Some("agy".to_string());
         }
     }
+    if let Some(provider) = selected_provider.as_deref() {
+        apply_model_defaults(&mut args, provider);
+    }
     Value::Object(args)
+}
+
+fn apply_model_defaults(args: &mut serde_json::Map<String, Value>, provider: &str) {
+    let Some(model) = resolve_model(args, provider) else {
+        args.remove("model_preset");
+        return;
+    };
+    args.insert("model".into(), json!(model));
+    args.remove("model_preset");
+}
+
+fn resolve_model(args: &serde_json::Map<String, Value>, provider: &str) -> Option<&'static str> {
+    if args
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| !model.trim().is_empty())
+    {
+        return None;
+    }
+    match provider {
+        "claude" => Some(claude_model_for_preset(model_preset(args))),
+        "codex" => Some(codex_model_for_preset(model_preset(args))),
+        _ => None,
+    }
+}
+
+fn model_preset(args: &serde_json::Map<String, Value>) -> &str {
+    args.get("model_preset")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|preset| !preset.is_empty())
+        .unwrap_or("best")
+}
+
+fn claude_model_for_preset(preset: &str) -> &'static str {
+    match preset {
+        "best" => "opus",
+        "balanced" => "sonnet",
+        "fast" | "cheap" => "haiku",
+        _ => "opus",
+    }
+}
+
+fn codex_model_for_preset(preset: &str) -> &'static str {
+    match preset {
+        "best" | "balanced" | "fast" | "cheap" => "gpt-5.5",
+        _ => "gpt-5.5",
+    }
 }
 
 fn tool_content_text(name: &str, result: &Value) -> String {
@@ -405,6 +466,23 @@ mod tests {
     }
 
     #[test]
+    fn provider_spawns_apply_model_presets_and_defaults() {
+        let args = spawn_args_for_provider(&json!({ "cwd": "/tmp" }), "codex");
+        assert_eq!(args["model"], "gpt-5.5");
+
+        let args = spawn_args_for_provider(
+            &json!({ "cwd": "/tmp", "model_preset": "balanced" }),
+            "claude",
+        );
+        assert_eq!(args["model"], "sonnet");
+        assert!(args.get("model_preset").is_none());
+
+        let args = spawn_args_for_provider(&json!({ "cwd": "/tmp" }), "agy");
+        assert!(args.get("model").is_none());
+        assert!(args.get("model_preset").is_none());
+    }
+
+    #[test]
     fn one_shot_defaults_provider_to_available_binary() {
         let args = one_shot_args_with_defaults(
             &json!({ "prompt": "hi" }),
@@ -425,6 +503,26 @@ mod tests {
             },
         );
         assert_eq!(args["provider"], "agy");
+    }
+
+    #[test]
+    fn one_shot_defaults_model_after_provider_selection() {
+        let args = one_shot_args_with_defaults(
+            &json!({ "prompt": "hi" }),
+            ToolAvailability {
+                claude: false,
+                codex: true,
+                agy: true,
+            },
+        );
+        assert_eq!(args["provider"], "codex");
+        assert_eq!(args["model"], "gpt-5.5");
+
+        let args = one_shot_args_with_defaults(
+            &json!({ "prompt": "hi", "provider": "codex", "model": "custom" }),
+            ToolAvailability::all(),
+        );
+        assert_eq!(args["model"], "custom");
     }
 
     #[test]
