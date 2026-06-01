@@ -1,6 +1,6 @@
 # MCP agent sessions
 
-`botctl mcp` exposes a small MCP-compatible JSON-RPC API for persistent agent TUI sessions backed by tmux. Claude is the default provider; Codex and Agy are also supported on `spawn`.
+`botctl mcp` exposes a small MCP-compatible JSON-RPC API for persistent agent TUI sessions backed by tmux. Claude, Codex, and Agy are supported through provider-specific spawn tools.
 
 ## Start a transport
 
@@ -25,23 +25,26 @@ The HTTP transport is a **stateless, Streamable-HTTP-compatible** JSON request/r
 
 ## Tools
 
-Tool names are unprefixed; MCP clients typically expose them under the server name (e.g. `mcp__botctl__spawn`).
+Tool names are unprefixed; MCP clients typically expose them under the server name (e.g. `mcp__botctl__spawn_claude`). Provider-specific spawn tools are advertised only when their provider binary is available on `PATH`.
 
-- `spawn` — start a persistent agent TUI in a managed tmux window for an existing `cwd`. Accepts optional `provider` (`claude` default, `codex`, `agy`), `model`, `effort` (`low`/`medium`/`high`/`xhigh`/`max`), `agent`, and the **claude-only** `permission_mode` (`acceptEdits`/`auto`/`bypassPermissions`/`default`/`dontAsk`/`plan`) and `settings` (a settings JSON file path or a JSON string). Per-provider support:
+- `spawn_claude` — Claude spawn tool. Required: `cwd`. Optional: `model_preset` (`best`/`balanced`/`fast`/`cheap`, defaults to `best`), advanced raw `model`, `effort` (`low`/`medium`/`high`/`xhigh`/`max`), `agent`, `permission_mode` (`acceptEdits`/`auto`/`bypassPermissions`/`default`/`dontAsk`/`plan`), `settings`, `timeout_ms`, `policy`.
+- `spawn_codex` — Codex spawn tool. Required: `cwd`. Optional: `model_preset` (`best`/`balanced`/`fast`/`cheap`, defaults to `best`), advanced raw `model`, `effort`, `timeout_ms`, `policy`.
+- `spawn_agy` — Agy/Antigravity spawn tool. Required: `cwd`. Optional: `timeout_ms`, `policy`.
+- Per-provider argument support:
   - Claude: `model` → `--model`, `effort` → `--effort`, `agent` → `--agent`, `permission_mode` → `--permission-mode`, `settings` → `--settings`.
   - Codex: `model` → `-m`, `effort` → `-c model_reasoning_effort=<v>`. `agent`, `permission_mode`, and `settings` are rejected.
   - Agy: `model`/`effort`/`agent`/`permission_mode`/`settings` are all rejected (no matching CLI flags).
 - `prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive.
 - `wait` — wait for an existing managed session to reach a terminal outcome.
 - `kill` — kill only the verified managed tmux window; idempotent when already gone.
-- `snapshot` — capture pane text and classifier state for diagnostics.
+- `snapshot` — capture raw pane text and classifier state for diagnostics. `pane_text` is the raw tmux capture, while `recent_lines` and structured `outcome.snapshot` drop only trailing blank terminal padding and then return the last useful lines from that same capture. Calling `snapshot` also refreshes the persisted `agent.state` from the live classified state.
 - `send_keys` — unsafe operator escape hatch scoped to the managed ID.
-- `one_shot` — create a temporary managed session, run **exactly one** prompt to a terminal outcome, then **always attempt to kill** the window (best-effort cleanup). Required args: `cwd`, `prompt` (non-empty). Optional: `provider`/`model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy` (same validation as `spawn`; `permission_mode`/`settings` are claude-only). It is implemented by composing `spawn` (with `initial_prompt`) + `kill`, so the prompt is submitted exactly once.
+- `one_shot` — create a temporary managed session, run **exactly one** prompt to a terminal outcome, then **always attempt to kill** the window (best-effort cleanup). Preferred arg: `prompt` (non-empty); aliases `text`, `message`, `input`, and `initial_prompt` are accepted. Optional: `cwd` (defaults to the MCP server current directory), `provider` (defaults to the first available provider binary in `claude`, `codex`, `agy` order), `model_preset` (`best` by default for Claude/Codex), advanced raw `model`, `effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy` (same provider validation as persistent spawns; `permission_mode`/`settings` are claude-only). It is implemented by composing session creation + prompt + `kill`, so the prompt is submitted exactly once.
   - **Timeout (per-phase):** `timeout_ms` applies independently to the spawn-ready wait and the prompt turn; `kill` uses its own default. Worst case ≈ `2×timeout_ms` + kill.
   - **Auto-approval policy:** uses managed auto-approval (`no_yolo=false`) — only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block. A caller MAY set `policy.no_yolo:true` to be more conservative; it can never broaden beyond the existing gate.
   - **Error vs result:** argument-validation failures (missing/blank `prompt`, bad `cwd`, invalid optional args) surface as JSON-RPC errors. Spawn, turn, and kill failures are NOT errors — they are encoded in the result fields below and the call returns a normal result (`isError:false`). A failure after the window is created still always attempts the best-effort kill (no leaked tmux window).
   - **Connection slot (operator note):** `one_shot` holds its HTTP connection slot for the full duration of the call (spawn-ready wait + prompt turn + kill, worst case ≈ `2×timeout_ms` + kill), unlike the split `spawn`/`prompt`/`wait` flow. Effective `one_shot` concurrency is therefore bounded by `MAX_ACTIVE_CONNECTIONS` (64) — long-running one-shots can saturate the slot pool, so size `timeout_ms` and client concurrency accordingly.
-  - **Result shape:** the call returns a normal result whose fields encode the outcome. Fields: `agent` (or `null` on spawn failure), `spawn_outcome`, `outcome` (`ready`/`needs_user_input`/`blocked`/`timeout`/`dead`/`busy`/`unknown`/`spawn_failed`), `message` (set on `ready`/`needs_user_input`), `fresh_message`, `killed`, `kill` (`{status: ok|error|busy|skipped, …}`), and `error` (present on spawn failure, a post-creation failure, or kill-error detail).
+  - **Result shape:** the call returns a normal result whose fields encode the outcome. Fields: `agent` (or `null` on spawn failure), `spawn_outcome`, `outcome` (`ready`/`needs_user_input`/`provider_error`/`blocked`/`timeout`/`dead`/`busy`/`unknown`/`spawn_failed`), `message` (set on `ready`/`needs_user_input`), `fresh_message`, `killed`, `kill` (`{status: ok|error|busy|skipped, …}`), and `error` (present on spawn failure, a post-creation failure, or kill-error detail). `provider_error` includes `error_excerpt` when a visible Codex provider/API error is detected in the pane.
 
 Sessions are addressed by generated public IDs, not tmux names. The registry stores exact tmux session/window/pane IDs (and the chosen provider) under the botctl state directory and uses SQLite lock rows so concurrent prompt/wait/kill/snapshot/send operations on the same ID return `busy` instead of racing.
 
@@ -51,6 +54,7 @@ Sessions are addressed by generated public IDs, not tmux names. The registry sto
 - MCP sessions are persistent: `prompt` does not auto-kill after a reply.
 - Automation resolves the managed ID back to one exact tmux pane before acting.
 - `Unknown` and unsupported blocker states return structured outcomes instead of guessing.
+- Visible Codex provider/API errors return structured `provider_error` outcomes with `error_excerpt`; this is a tool result, not a JSON-RPC transport error.
 - `FolderTrustPrompt` may be advanced with raw `Enter`; ordinary permission dialogs require supported policy and otherwise block.
 - Agy command-permission prompts are auto-approved with raw `Enter` only when the pane process is `agy` and the default cursor is still on `1. Yes` (skipped when `policy.no_yolo` is set); Agy folder-trust and settings-persist prompts always block for manual review because the latter can mutate `settings.json`.
 - For non-Claude providers, prompt submission pastes the text and presses `Enter`; Claude-only keybindings (`ClearInput`, `ExternalEditor`) are not consulted.
@@ -62,7 +66,7 @@ Sessions are addressed by generated public IDs, not tmux names. The registry sto
 Manual smoke flow with real `tmux` and the chosen agent CLI on `PATH`:
 
 1. Start `botctl mcp stdio` or `botctl mcp http --bind 127.0.0.1:8787`.
-2. Call `spawn` with a temp repo `cwd` (optionally `provider`).
+2. Call the provider-specific spawn tool, such as `spawn_claude`, with a temp repo `cwd`.
 3. Call `prompt` twice for the same ID and verify the second response uses the same persistent window.
 4. Call `snapshot` and inspect the exact tmux IDs.
 5. Call `kill` and verify the managed window is gone.

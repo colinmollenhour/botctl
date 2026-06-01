@@ -108,7 +108,7 @@ Output and safety:
 
 ### `mcp`
 
-Purpose: run the small MCP-compatible JSON-RPC server for persistent agent sessions backed by managed tmux windows. Claude is the default provider; Codex and Agy are also supported on `spawn`.
+Purpose: run the small MCP-compatible JSON-RPC server for persistent agent sessions backed by managed tmux windows. Claude, Codex, and Agy are supported through provider-specific spawn tools.
 
 Syntax:
 ```bash
@@ -116,15 +116,17 @@ botctl mcp stdio [--state-dir PATH]
 botctl mcp http --bind 127.0.0.1:8787 [--state-dir PATH]
 ```
 
-Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn`):
+Tools (clients typically expose them under the server name, e.g. `mcp__botctl__spawn_claude`; provider-specific spawn tools are listed only when their provider binary is available on `PATH`):
 
-- `spawn` (optional `provider`: `claude` default, `codex`, `agy`; optional `model`, `effort`, `agent`, and claude-only `permission_mode` + `settings` — validated per provider)
+- `spawn_claude` (Claude spawn: required `cwd`; optional `model_preset`, advanced raw `model`, `effort`, `agent`, `permission_mode`, `settings`, `timeout_ms`, `policy`)
+- `spawn_codex` (Codex spawn: required `cwd`; optional `model_preset`, advanced raw `model`, `effort`, `timeout_ms`, `policy`)
+- `spawn_agy` (Agy spawn: required `cwd`; optional `timeout_ms`, `policy`)
 - `prompt`
 - `wait`
 - `kill`
-- `snapshot`
+- `snapshot` (returns raw `pane_text`; `recent_lines` and structured `outcome.snapshot` omit trailing blank terminal padding and `agent.state` is refreshed from the live classification)
 - `send_keys`
-- `one_shot` (required `cwd`, `prompt`; optional `provider`/`model`/`effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
+- `one_shot` (preferred `prompt`, aliases `text`/`message`/`input`; optional `cwd` defaults to the MCP server current directory; optional `provider` defaults to the first available provider binary; optional `model_preset`, advanced raw `model`, `effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort). `prompt`/`wait`/`one_shot` can return `provider_error` with `error_excerpt` when a visible Codex provider/API error appears in the pane.
 
 Notes:
 

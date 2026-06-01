@@ -115,7 +115,7 @@ impl McpSessionService {
     ) -> AppResult<Value> {
         let timeout_ms = validated.timeout_ms;
         let no_yolo = validated.no_yolo;
-        let outcome = self.wait_inner(record, timeout_ms, false, no_yolo, None, None)?;
+        let outcome = self.wait_inner(record, timeout_ms, false, no_yolo, None, true, None)?;
         self.registry.update_state(
             &record.id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
@@ -126,7 +126,9 @@ impl McpSessionService {
             .get(&record.id)?
             .unwrap_or_else(|| record.clone());
         let mut result = json!({ "agent": agent_ref(&record), "outcome": outcome });
-        if let Some(initial_prompt) = validated.initial_prompt.as_deref() {
+        if result["outcome"]["outcome"] == "ready"
+            && let Some(initial_prompt) = validated.initial_prompt.as_deref()
+        {
             let prompt_result = self.prompt(&json!({
                 "id": record.id,
                 "prompt": initial_prompt,
@@ -150,7 +152,15 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let ready = self.wait_inner(&record, timeout_ms, false, no_yolo, None, Some(&lock))?;
+        let ready = self.wait_inner(
+            &record,
+            timeout_ms,
+            false,
+            no_yolo,
+            None,
+            false,
+            Some(&lock),
+        )?;
         if ready["outcome"] != "ready" {
             self.registry.update_state(
                 &id,
@@ -174,6 +184,7 @@ impl McpSessionService {
             true,
             no_yolo,
             baseline.clone(),
+            false,
             Some(&lock),
         )?;
         let mut outcome = outcome;
@@ -185,6 +196,7 @@ impl McpSessionService {
                     .map(|v| v.is_object())
                     .unwrap_or(false)
             );
+            remove_snapshot_for_transcript_outcome(&mut outcome);
         }
         let state = lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown"));
         self.registry
@@ -204,8 +216,15 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let record = self.get_record(&id)?;
-        let outcome =
-            self.wait_inner(&record, timeout_ms, require_fresh, true, None, Some(&lock))?;
+        let outcome = self.wait_inner(
+            &record,
+            timeout_ms,
+            require_fresh,
+            true,
+            None,
+            false,
+            Some(&lock),
+        )?;
         self.registry.update_state(
             &id,
             lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
@@ -252,17 +271,14 @@ impl McpSessionService {
     /// `timeout_ms` applies independently to the spawn-ready wait and the prompt
     /// turn; `kill` uses its own default.
     ///
-    /// Error semantics: argument-validation failures (missing/blank `prompt`, bad
-    /// `cwd`, invalid optional args) surface as JSON-RPC errors (`Err`). Spawn,
-    /// turn, and kill failures are NOT errors — they are encoded in the result
-    /// fields (`outcome`, `kill`, `error`) and this method returns `Ok` so
-    /// `call_tool` reports `isError:false`.
+    /// Error semantics: argument-validation failures (missing/blank prompt text,
+    /// bad explicit `cwd`, invalid optional args) surface as JSON-RPC errors
+    /// (`Err`). Spawn, turn, and kill failures are NOT errors — they are encoded
+    /// in the result fields (`outcome`, `kill`, `error`) and this method returns
+    /// `Ok` so `call_tool` reports `isError:false`.
     pub fn one_shot(&self, args: &Value) -> AppResult<Value> {
-        // R1: validate the one-shot-specific prompt arg up front (non-empty)...
-        let prompt = required_str(args, "prompt")?;
-        if prompt.trim().is_empty() {
-            return Err(AppError::new("invalid_params: prompt must be non-empty"));
-        }
+        // R1: validate the one-shot-specific prompt text up front (non-empty)...
+        let _ = one_shot_prompt(args)?;
         // ...then validate ALL spawn args (cwd, provider, model, effort, agent,
         // timeout_ms range, policy.no_yolo) BEFORE any tmux window is created.
         // Argument-validation failures propagate as JSON-RPC errors (Err), NOT as
@@ -401,17 +417,17 @@ impl McpSessionService {
         }
         let pane_text = client.capture_pane(&pane.pane_id, capture_lines)?;
         let classification = Classifier.classify(&pane.pane_id, &pane_text);
-        let recent_lines = pane_text
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>();
+        let outcome_kind = outcome_for_state(classification.state);
+        self.registry.update_state(
+            &id,
+            lifecycle_from_outcome(outcome_kind),
+            Some(classification.state.as_str()),
+        )?;
+        let record = self.registry.get(&id)?.unwrap_or(record);
+        let recent_lines = useful_recent_lines(&pane_text, 20);
         Ok(json!({
             "agent": agent_ref(&record),
-            "outcome": outcome(outcome_for_state(classification.state), Some(&classification), Some(&pane_text), None),
+            "outcome": outcome(outcome_kind, Some(&classification), Some(&pane_text), None),
             "pane_text": pane_text,
             "recent_lines": recent_lines,
         }))
@@ -428,32 +444,22 @@ impl McpSessionService {
         let record = self.get_record(&id)?;
         let pane = self.verify_pane(&record)?;
         let client = TmuxClient::default();
-        let has_keys = args.get("keys").is_some();
-        let has_text = args.get("text").is_some();
-        if has_keys == has_text {
+        let keys = optional_keys(args)?;
+        let text = optional_nonblank_str(args, "text")?;
+        if keys.is_empty() && text.is_none() {
             return Err(AppError::new(
-                "invalid_params: send_keys requires exactly one of keys or text",
+                "invalid_params: send_keys requires non-empty keys or text",
             ));
         }
-        if let Some(keys) = args.get("keys") {
-            let keys = keys
-                .as_array()
-                .ok_or_else(|| AppError::new("invalid_params: keys must be an array"))?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| AppError::new("invalid_params: key must be a string"))
-                })
-                .collect::<AppResult<Vec<_>>>()?;
-            client.send_keys(&pane.pane_id, &keys)?;
-        } else {
-            let text = required_str(args, "text")?;
+        if let Some(text) = text {
             if args.get("paste").and_then(Value::as_bool).unwrap_or(true) {
-                client.paste_text(&pane.pane_id, text)?;
+                client.paste_text(&pane.pane_id, &text)?;
             } else {
                 client.send_keys(&pane.pane_id, &[text])?;
             }
+        }
+        if !keys.is_empty() {
+            client.send_keys(&pane.pane_id, &keys)?;
         }
         Ok(
             json!({ "agent": agent_ref(&record), "sent": true, "warning": "unsafe_operator_escape_hatch_no_progress_implied" }),
@@ -502,6 +508,7 @@ impl McpSessionService {
         require_fresh: bool,
         no_yolo: bool,
         baseline_override: Option<LastAgentMessage>,
+        wait_unknown_until_deadline: bool,
         lock: Option<&SessionLock>,
     ) -> AppResult<Value> {
         let client = TmuxClient::default();
@@ -513,6 +520,7 @@ impl McpSessionService {
             None
         };
         let mut stale_transcript_seen = false;
+        let mut last_unknown_frame: Option<(Classification, String)> = None;
         loop {
             if let Some(lock) = lock
                 && last_lock_refresh.elapsed() >= Duration::from_millis(LOCK_REFRESH_INTERVAL_MS)
@@ -530,6 +538,21 @@ impl McpSessionService {
             }
             let frame = client.capture_pane(&pane.pane_id, 2000)?;
             let classification = Classifier.classify(&pane.pane_id, &frame);
+            if record.provider == Provider::Codex
+                && let Some(error_excerpt) = provider_error_excerpt(&frame)
+            {
+                let mut out = outcome(
+                    "provider_error",
+                    Some(&classification),
+                    Some(&frame),
+                    Some("provider_error"),
+                );
+                out["error_excerpt"] = json!(error_excerpt);
+                return Ok(out);
+            }
+            if !matches!(classification.state, SessionState::Unknown) {
+                last_unknown_frame = None;
+            }
             match classification.state {
                 SessionState::ChatReady => {
                     if require_fresh {
@@ -630,6 +653,20 @@ impl McpSessionService {
                     ));
                 }
                 SessionState::Unknown => {
+                    if frame_is_blank(&frame) || wait_unknown_until_deadline {
+                        last_unknown_frame = Some((classification.clone(), frame.clone()));
+                    } else {
+                        return Ok(outcome(
+                            "unknown",
+                            Some(&classification),
+                            Some(&frame),
+                            Some("unknown_state"),
+                        ));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                if let Some((classification, frame)) = last_unknown_frame {
                     return Ok(outcome(
                         "unknown",
                         Some(&classification),
@@ -637,8 +674,6 @@ impl McpSessionService {
                         Some("unknown_state"),
                     ));
                 }
-            }
-            if Instant::now() >= deadline {
                 let reason = if stale_transcript_seen {
                     "stale_transcript"
                 } else {
@@ -710,6 +745,8 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
     let initial_prompt = args
         .get("initial_prompt")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
     let policy = args.get("policy").cloned().unwrap_or(Value::Null);
     Ok(ValidatedSpawnArgs {
@@ -733,8 +770,16 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
 /// through (default behavior unchanged; may only tighten).
 fn one_shot_spawn_args(args: &Value) -> Value {
     let mut spawn_args = serde_json::Map::new();
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(default_one_shot_cwd);
+    spawn_args.insert("cwd".to_string(), json!(cwd));
+
     for key in [
-        "cwd",
         "provider",
         "model",
         "effort",
@@ -743,13 +788,13 @@ fn one_shot_spawn_args(args: &Value) -> Value {
         "permission_mode",
         "settings",
     ] {
-        if let Some(value) = args.get(key) {
+        if let Some(value) = args.get(key).filter(|value| !value.is_null()) {
             spawn_args.insert(key.to_string(), value.clone());
         }
     }
     spawn_args.insert(
         "initial_prompt".to_string(),
-        args.get("prompt").cloned().unwrap_or(Value::Null),
+        json!(one_shot_prompt(args).unwrap_or_default()),
     );
     // Only forward `policy` when the caller provided it, matching spawn's
     // "field absent" semantics (do not synthesize `policy: null`).
@@ -757,6 +802,29 @@ fn one_shot_spawn_args(args: &Value) -> Value {
         spawn_args.insert("policy".to_string(), policy.clone());
     }
     Value::Object(spawn_args)
+}
+
+fn one_shot_prompt(args: &Value) -> AppResult<String> {
+    for key in ["prompt", "text", "message", "input", "initial_prompt"] {
+        if let Some(prompt) = args
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        {
+            return Ok(prompt.to_string());
+        }
+    }
+    Err(AppError::new(
+        "invalid_params: prompt must be non-empty (accepted fields: prompt, text, message, input, initial_prompt)",
+    ))
+}
+
+fn default_one_shot_cwd() -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string()
 }
 
 fn required_str<'a>(args: &'a Value, name: &str) -> AppResult<&'a str> {
@@ -792,6 +860,41 @@ fn optional_nonempty_str(args: &Value, name: &str) -> AppResult<Option<String>> 
             } else {
                 Ok(Some(trimmed.to_string()))
             }
+        }
+    }
+}
+
+fn optional_nonblank_str(args: &Value, name: &str) -> AppResult<Option<String>> {
+    match args.get(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| AppError::new(format!("invalid_params: {name} must be a string")))?;
+            if raw.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(raw.to_string()))
+            }
+        }
+    }
+}
+
+fn optional_keys(args: &Value) -> AppResult<Vec<String>> {
+    match args.get("keys") {
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(value) => {
+            let keys = value
+                .as_array()
+                .ok_or_else(|| AppError::new("invalid_params: keys must be an array"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| AppError::new("invalid_params: key must be a string"))
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            Ok(keys.into_iter().filter(|key| !key.is_empty()).collect())
         }
     }
 }
@@ -975,8 +1078,106 @@ fn outcome(
         "classified_state": classification.map(|c| c.state.as_str()),
         "message": Value::Null,
         "warnings": reason.map(|r| vec![r]).unwrap_or_default(),
-        "snapshot": snapshot.map(|s| s.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")),
+        "snapshot": snapshot.map(|s| useful_recent_lines(s, 20).join("\n")),
     })
+}
+
+fn useful_recent_lines(frame: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let lines = frame.lines().collect::<Vec<_>>();
+    let useful_end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    if useful_end == 0 {
+        return Vec::new();
+    }
+
+    let start = useful_end.saturating_sub(limit);
+    lines[start..useful_end]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect()
+}
+
+fn provider_error_excerpt(frame: &str) -> Option<String> {
+    let recent = useful_recent_lines(frame, 80);
+    let lines = recent
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    let anchor_idx = lines
+        .iter()
+        .rposition(|line| is_fatal_codex_provider_error_anchor(line))?;
+    if lines
+        .iter()
+        .skip(anchor_idx + 1)
+        .any(|line| codex_ready_marker_after_provider_error(line))
+    {
+        return None;
+    }
+    let previous_prompt_idx = lines[..anchor_idx]
+        .iter()
+        .rposition(|line| codex_ready_marker_after_provider_error(line));
+    let start = anchor_idx
+        .saturating_sub(2)
+        .max(previous_prompt_idx.map(|idx| idx + 1).unwrap_or(0));
+    let end = (anchor_idx + 3).min(lines.len());
+    let excerpt = lines[start..end]
+        .iter()
+        .copied()
+        .filter(|line| is_codex_provider_error_context(line))
+        .collect::<Vec<_>>();
+
+    if excerpt.is_empty() {
+        Some(lines[anchor_idx].chars().take(500).collect())
+    } else {
+        Some(excerpt.join("\n").chars().take(1000).collect())
+    }
+}
+
+fn is_fatal_codex_provider_error_anchor(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let compact = lower.replace(' ', "");
+    lower.contains("invalid_request_error")
+        || compact.contains("\"status\":400") && lower.contains("error")
+        || compact.contains("\"type\":\"error\"") && lower.contains("openai")
+        || (lower.contains("provider error") || lower.contains("api error"))
+            && (lower.contains("codex") || lower.contains("openai") || lower.contains("model"))
+}
+
+fn is_codex_provider_error_context(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let compact = lower.replace(' ', "");
+    lower.contains("invalid_request_error")
+        || compact.contains("\"status\":400") && lower.contains("error")
+        || compact.contains("\"type\":\"error\"")
+        || lower.contains("model metadata for")
+        || lower.contains("not found")
+        || lower.contains("provider error")
+        || lower.contains("api error")
+}
+
+fn codex_ready_marker_after_provider_error(line: &str) -> bool {
+    line.trim_start().starts_with('›')
+}
+
+fn remove_snapshot_for_transcript_outcome(outcome: &mut Value) {
+    if outcome.get("message").is_some_and(Value::is_object)
+        && let Some(object) = outcome.as_object_mut()
+    {
+        object.remove("snapshot");
+    }
+}
+
+fn frame_is_blank(frame: &str) -> bool {
+    frame.trim().is_empty()
 }
 
 fn outcome_for_state(state: SessionState) -> &'static str {
@@ -995,7 +1196,7 @@ fn lifecycle_from_outcome(outcome: &str) -> LifecycleState {
     match outcome {
         "ready" | "needs_user_input" => LifecycleState::Ready,
         "timeout" => LifecycleState::Running,
-        "blocked" | "unknown" => LifecycleState::Blocked,
+        "blocked" | "unknown" | "provider_error" => LifecycleState::Blocked,
         "dead" => LifecycleState::Dead,
         _ => LifecycleState::Ready,
     }
@@ -1030,8 +1231,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_keys_requires_exactly_one_payload() {
+    fn parses_send_keys_payloads_leniently() {
         assert!(required_str(&json!({}), "id").is_err());
+        assert_eq!(
+            optional_keys(&json!({"keys":["Enter", ""]})).unwrap(),
+            vec!["Enter"]
+        );
+        assert_eq!(
+            optional_keys(&json!({"keys":[]})).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            optional_nonblank_str(&json!({"text":""}), "text").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_nonblank_str(&json!({"text":"hello"}), "text").unwrap(),
+            Some("hello".to_string())
+        );
         assert_eq!(
             optional_u64(&json!({"timeout_ms":1000}), "timeout_ms", 5).unwrap(),
             1000
@@ -1053,6 +1270,70 @@ mod tests {
         // signal rather than flipping the persisted state to ready.
         assert_eq!(lifecycle_from_outcome("timeout"), LifecycleState::Running);
         assert_eq!(lifecycle_from_outcome("unknown"), LifecycleState::Blocked);
+        assert_eq!(
+            lifecycle_from_outcome("provider_error"),
+            LifecycleState::Blocked
+        );
+    }
+
+    #[test]
+    fn useful_recent_lines_drops_trailing_blank_padding() {
+        let frame = "old\nvisible 1\nvisible 2\n   \n\n";
+
+        assert_eq!(
+            useful_recent_lines(frame, 2),
+            vec!["visible 1".to_string(), "visible 2".to_string()]
+        );
+        assert_eq!(useful_recent_lines("\n  \n", 20), Vec::<String>::new());
+    }
+
+    #[test]
+    fn outcome_snapshot_uses_useful_recent_lines() {
+        let out = outcome("timeout", None, Some("answer text\n\n\n"), Some("timeout"));
+
+        assert_eq!(out["snapshot"], json!("answer text"));
+    }
+
+    #[test]
+    fn codex_provider_error_excerpt_is_narrow_and_useful() {
+        let frame = r#"› hello
+{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Model metadata for gpt-nope not found"}}
+Model metadata for gpt-nope not found
+gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used"#;
+        let excerpt = provider_error_excerpt(frame).expect("provider error excerpt");
+
+        assert!(excerpt.contains("invalid_request_error"));
+        assert!(excerpt.contains("Model metadata for gpt-nope not found"));
+        assert!(provider_error_excerpt("{\"type\":\"note\",\"status\":200}").is_none());
+        assert!(provider_error_excerpt("{\"status\":400,\"kind\":\"fixture\"}").is_none());
+        assert!(provider_error_excerpt("Model metadata for gpt-nope not found").is_none());
+        assert!(provider_error_excerpt("regular stderr: command failed").is_none());
+    }
+
+    #[test]
+    fn codex_provider_error_excerpt_ignores_stale_scrollback() {
+        let old_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"old unsupported model"}}"#;
+        let mut frame = format!("{old_error}\n");
+        for idx in 0..10 {
+            frame.push_str(&format!("ordinary later line {idx}\n"));
+        }
+        frame.push_str("› later prompt after recovery\n");
+        frame.push_str("gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used\n");
+
+        assert!(provider_error_excerpt(&frame).is_none());
+    }
+
+    #[test]
+    fn codex_provider_error_excerpt_prefers_latest_fatal_anchor() {
+        let old_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"old unsupported model"}}"#;
+        let new_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"new unsupported model"}}"#;
+        let frame = format!(
+            "{old_error}\n› recovered prompt\n{new_error}\nModel metadata for new unsupported model not found\n"
+        );
+        let excerpt = provider_error_excerpt(&frame).expect("latest provider error excerpt");
+
+        assert!(excerpt.contains("new unsupported model"));
+        assert!(!excerpt.contains("old unsupported model"));
     }
 
     #[test]
@@ -1161,6 +1442,7 @@ mod tests {
             "cwd": "/tmp",
             "permission_mode": "acceptEdits",
             "settings": "/home/colin/Seamus/gitlab-settings.json",
+            "initial_prompt": "",
         }))
         .expect("valid permission_mode/settings");
         assert!(v.command.contains("--permission-mode acceptEdits"));
@@ -1168,6 +1450,7 @@ mod tests {
             v.command
                 .contains("--settings /home/colin/Seamus/gitlab-settings.json")
         );
+        assert_eq!(v.initial_prompt, None);
     }
 
     fn temp_state_dir(tag: &str) -> PathBuf {
@@ -1208,6 +1491,20 @@ mod tests {
         // omitted optional keys are not present.
         assert!(spawn_args.get("model").is_none());
         assert!(spawn_args.get("timeout_ms").is_none());
+    }
+
+    #[test]
+    fn one_shot_defaults_cwd_and_accepts_prompt_aliases() {
+        let spawn_args = one_shot_spawn_args(&json!({ "text": "hello from alias" }));
+
+        assert_eq!(spawn_args["cwd"], json!(default_one_shot_cwd()));
+        assert_eq!(spawn_args["initial_prompt"], json!("hello from alias"));
+        assert_eq!(one_shot_prompt(&json!({ "message": "hi" })).unwrap(), "hi");
+        assert_eq!(one_shot_prompt(&json!({ "input": "hi" })).unwrap(), "hi");
+        assert_eq!(
+            one_shot_prompt(&json!({ "initial_prompt": "hi" })).unwrap(),
+            "hi"
+        );
     }
 
     #[test]
@@ -1260,7 +1557,28 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_requires_cwd_and_prompt() {
+    fn transcript_outcome_omits_pane_snapshot() {
+        let mut outcome = json!({
+            "outcome": "ready",
+            "classified_state": "ChatReady",
+            "message": { "role": "assistant", "text": "reply", "fresh": true },
+            "snapshot": "pane text"
+        });
+
+        remove_snapshot_for_transcript_outcome(&mut outcome);
+
+        assert_eq!(outcome["message"]["text"], "reply");
+        assert!(outcome.get("snapshot").is_none());
+    }
+
+    #[test]
+    fn blank_frames_are_detected_for_startup_grace() {
+        assert!(frame_is_blank("\n\n   \n"));
+        assert!(!frame_is_blank("Claude Code"));
+    }
+
+    #[test]
+    fn one_shot_requires_prompt_text() {
         let root = temp_state_dir("oneshot-validate");
         let service = test_service(&root);
         // Missing prompt -> invalid_params.
