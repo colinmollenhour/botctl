@@ -417,17 +417,17 @@ impl McpSessionService {
         }
         let pane_text = client.capture_pane(&pane.pane_id, capture_lines)?;
         let classification = Classifier.classify(&pane.pane_id, &pane_text);
-        let recent_lines = pane_text
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>();
+        let outcome_kind = outcome_for_state(classification.state);
+        self.registry.update_state(
+            &id,
+            lifecycle_from_outcome(outcome_kind),
+            Some(classification.state.as_str()),
+        )?;
+        let record = self.registry.get(&id)?.unwrap_or(record);
+        let recent_lines = useful_recent_lines(&pane_text, 20);
         Ok(json!({
             "agent": agent_ref(&record),
-            "outcome": outcome(outcome_for_state(classification.state), Some(&classification), Some(&pane_text), None),
+            "outcome": outcome(outcome_kind, Some(&classification), Some(&pane_text), None),
             "pane_text": pane_text,
             "recent_lines": recent_lines,
         }))
@@ -538,6 +538,18 @@ impl McpSessionService {
             }
             let frame = client.capture_pane(&pane.pane_id, 2000)?;
             let classification = Classifier.classify(&pane.pane_id, &frame);
+            if record.provider == Provider::Codex
+                && let Some(error_excerpt) = provider_error_excerpt(&frame)
+            {
+                let mut out = outcome(
+                    "provider_error",
+                    Some(&classification),
+                    Some(&frame),
+                    Some("provider_error"),
+                );
+                out["error_excerpt"] = json!(error_excerpt);
+                return Ok(out);
+            }
             if !matches!(classification.state, SessionState::Unknown) {
                 last_unknown_frame = None;
             }
@@ -1066,8 +1078,94 @@ fn outcome(
         "classified_state": classification.map(|c| c.state.as_str()),
         "message": Value::Null,
         "warnings": reason.map(|r| vec![r]).unwrap_or_default(),
-        "snapshot": snapshot.map(|s| s.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")),
+        "snapshot": snapshot.map(|s| useful_recent_lines(s, 20).join("\n")),
     })
+}
+
+fn useful_recent_lines(frame: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let lines = frame.lines().collect::<Vec<_>>();
+    let useful_end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    if useful_end == 0 {
+        return Vec::new();
+    }
+
+    let start = useful_end.saturating_sub(limit);
+    lines[start..useful_end]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect()
+}
+
+fn provider_error_excerpt(frame: &str) -> Option<String> {
+    let recent = useful_recent_lines(frame, 80);
+    let lines = recent
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    let anchor_idx = lines
+        .iter()
+        .rposition(|line| is_fatal_codex_provider_error_anchor(line))?;
+    if lines
+        .iter()
+        .skip(anchor_idx + 1)
+        .any(|line| codex_ready_marker_after_provider_error(line))
+    {
+        return None;
+    }
+    let previous_prompt_idx = lines[..anchor_idx]
+        .iter()
+        .rposition(|line| codex_ready_marker_after_provider_error(line));
+    let start = anchor_idx
+        .saturating_sub(2)
+        .max(previous_prompt_idx.map(|idx| idx + 1).unwrap_or(0));
+    let end = (anchor_idx + 3).min(lines.len());
+    let excerpt = lines[start..end]
+        .iter()
+        .copied()
+        .filter(|line| is_codex_provider_error_context(line))
+        .collect::<Vec<_>>();
+
+    if excerpt.is_empty() {
+        Some(lines[anchor_idx].chars().take(500).collect())
+    } else {
+        Some(excerpt.join("\n").chars().take(1000).collect())
+    }
+}
+
+fn is_fatal_codex_provider_error_anchor(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let compact = lower.replace(' ', "");
+    lower.contains("invalid_request_error")
+        || compact.contains("\"status\":400") && lower.contains("error")
+        || compact.contains("\"type\":\"error\"") && lower.contains("openai")
+        || (lower.contains("provider error") || lower.contains("api error"))
+            && (lower.contains("codex") || lower.contains("openai") || lower.contains("model"))
+}
+
+fn is_codex_provider_error_context(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let compact = lower.replace(' ', "");
+    lower.contains("invalid_request_error")
+        || compact.contains("\"status\":400") && lower.contains("error")
+        || compact.contains("\"type\":\"error\"")
+        || lower.contains("model metadata for")
+        || lower.contains("not found")
+        || lower.contains("provider error")
+        || lower.contains("api error")
+}
+
+fn codex_ready_marker_after_provider_error(line: &str) -> bool {
+    line.trim_start().starts_with('›')
 }
 
 fn remove_snapshot_for_transcript_outcome(outcome: &mut Value) {
@@ -1098,7 +1196,7 @@ fn lifecycle_from_outcome(outcome: &str) -> LifecycleState {
     match outcome {
         "ready" | "needs_user_input" => LifecycleState::Ready,
         "timeout" => LifecycleState::Running,
-        "blocked" | "unknown" => LifecycleState::Blocked,
+        "blocked" | "unknown" | "provider_error" => LifecycleState::Blocked,
         "dead" => LifecycleState::Dead,
         _ => LifecycleState::Ready,
     }
@@ -1172,6 +1270,70 @@ mod tests {
         // signal rather than flipping the persisted state to ready.
         assert_eq!(lifecycle_from_outcome("timeout"), LifecycleState::Running);
         assert_eq!(lifecycle_from_outcome("unknown"), LifecycleState::Blocked);
+        assert_eq!(
+            lifecycle_from_outcome("provider_error"),
+            LifecycleState::Blocked
+        );
+    }
+
+    #[test]
+    fn useful_recent_lines_drops_trailing_blank_padding() {
+        let frame = "old\nvisible 1\nvisible 2\n   \n\n";
+
+        assert_eq!(
+            useful_recent_lines(frame, 2),
+            vec!["visible 1".to_string(), "visible 2".to_string()]
+        );
+        assert_eq!(useful_recent_lines("\n  \n", 20), Vec::<String>::new());
+    }
+
+    #[test]
+    fn outcome_snapshot_uses_useful_recent_lines() {
+        let out = outcome("timeout", None, Some("answer text\n\n\n"), Some("timeout"));
+
+        assert_eq!(out["snapshot"], json!("answer text"));
+    }
+
+    #[test]
+    fn codex_provider_error_excerpt_is_narrow_and_useful() {
+        let frame = r#"› hello
+{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Model metadata for gpt-nope not found"}}
+Model metadata for gpt-nope not found
+gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used"#;
+        let excerpt = provider_error_excerpt(frame).expect("provider error excerpt");
+
+        assert!(excerpt.contains("invalid_request_error"));
+        assert!(excerpt.contains("Model metadata for gpt-nope not found"));
+        assert!(provider_error_excerpt("{\"type\":\"note\",\"status\":200}").is_none());
+        assert!(provider_error_excerpt("{\"status\":400,\"kind\":\"fixture\"}").is_none());
+        assert!(provider_error_excerpt("Model metadata for gpt-nope not found").is_none());
+        assert!(provider_error_excerpt("regular stderr: command failed").is_none());
+    }
+
+    #[test]
+    fn codex_provider_error_excerpt_ignores_stale_scrollback() {
+        let old_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"old unsupported model"}}"#;
+        let mut frame = format!("{old_error}\n");
+        for idx in 0..10 {
+            frame.push_str(&format!("ordinary later line {idx}\n"));
+        }
+        frame.push_str("› later prompt after recovery\n");
+        frame.push_str("gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used\n");
+
+        assert!(provider_error_excerpt(&frame).is_none());
+    }
+
+    #[test]
+    fn codex_provider_error_excerpt_prefers_latest_fatal_anchor() {
+        let old_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"old unsupported model"}}"#;
+        let new_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"new unsupported model"}}"#;
+        let frame = format!(
+            "{old_error}\n› recovered prompt\n{new_error}\nModel metadata for new unsupported model not found\n"
+        );
+        let excerpt = provider_error_excerpt(&frame).expect("latest provider error excerpt");
+
+        assert!(excerpt.contains("new unsupported model"));
+        assert!(!excerpt.contains("old unsupported model"));
     }
 
     #[test]

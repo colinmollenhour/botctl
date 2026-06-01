@@ -124,9 +124,9 @@ Tools (clients typically expose them under the server name, e.g. `mcp__botctl__s
 - `prompt`
 - `wait`
 - `kill`
-- `snapshot`
+- `snapshot` (returns raw `pane_text`; `recent_lines` and structured `outcome.snapshot` omit trailing blank terminal padding and `agent.state` is refreshed from the live classification)
 - `send_keys`
-- `one_shot` (preferred `prompt`, aliases `text`/`message`/`input`; optional `cwd` defaults to the MCP server current directory; optional `provider` defaults to the first available provider binary; optional `model_preset`, advanced raw `model`, `effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort)
+- `one_shot` (preferred `prompt`, aliases `text`/`message`/`input`; optional `cwd` defaults to the MCP server current directory; optional `provider` defaults to the first available provider binary; optional `model_preset`, advanced raw `model`, `effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy`): spawns a temporary session, runs one prompt to a terminal outcome, then always attempts to kill the window (best-effort). `prompt`/`wait`/`one_shot` can return `provider_error` with `error_excerpt` when a visible Codex provider/API error appears in the pane.
 
 Notes:
 
