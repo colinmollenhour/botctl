@@ -538,6 +538,9 @@ impl McpSessionService {
             }
             let frame = client.capture_pane(&pane.pane_id, 2000)?;
             let classification = Classifier.classify(&pane.pane_id, &frame);
+            if !matches!(classification.state, SessionState::Unknown) {
+                last_unknown_frame = None;
+            }
             match classification.state {
                 SessionState::ChatReady => {
                     if require_fresh {
@@ -801,7 +804,7 @@ fn one_shot_prompt(args: &Value) -> AppResult<String> {
         }
     }
     Err(AppError::new(
-        "invalid_params: prompt must be non-empty (accepted fields: prompt, text, message, input)",
+        "invalid_params: prompt must be non-empty (accepted fields: prompt, text, message, input, initial_prompt)",
     ))
 }
 

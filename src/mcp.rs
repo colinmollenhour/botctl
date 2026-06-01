@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{Value, json};
 use uuid::{ContextV7, Timestamp, Uuid};
@@ -125,11 +128,11 @@ impl McpService {
         let result = match name {
             "spawn_claude" => self
                 .sessions
-                .spawn(&spawn_args_for_provider(&args, "claude")),
+                .spawn(&spawn_args_for_provider(&args, "claude")?),
             "spawn_codex" => self
                 .sessions
-                .spawn(&spawn_args_for_provider(&args, "codex")),
-            "spawn_agy" => self.sessions.spawn(&spawn_args_for_provider(&args, "agy")),
+                .spawn(&spawn_args_for_provider(&args, "codex")?),
+            "spawn_agy" => self.sessions.spawn(&spawn_args_for_provider(&args, "agy")?),
             "prompt" => self.sessions.prompt(&args),
             "wait" => self.sessions.wait(&args),
             "kill" => self.sessions.kill(&args),
@@ -137,7 +140,7 @@ impl McpService {
             "send_keys" => self.sessions.send_keys(&args),
             "one_shot" => self
                 .sessions
-                .one_shot(&one_shot_args_with_defaults(&args, self.tool_availability)),
+                .one_shot(&one_shot_args_with_defaults(&args, self.tool_availability)?),
             _ => unreachable!(),
         }?;
         let content_text = tool_content_text(name, &result);
@@ -159,31 +162,69 @@ fn detect_tool_availability() -> ToolAvailability {
 
 fn command_available(command: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file()))
+        .map(|path| {
+            std::env::split_paths(&path).any(|dir| {
+                command_candidates(&dir, command)
+                    .into_iter()
+                    .any(is_executable_file)
+            })
+        })
         .unwrap_or(false)
 }
 
-fn spawn_args_for_provider(args: &Value, provider: &str) -> Value {
+#[cfg(unix)]
+fn command_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    vec![dir.join(command)]
+}
+
+#[cfg(windows)]
+fn command_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![dir.join(command)];
+    if Path::new(command).extension().is_some() {
+        return candidates;
+    }
+    if let Some(pathext) = std::env::var_os("PATHEXT") {
+        candidates.extend(
+            pathext
+                .to_string_lossy()
+                .split(';')
+                .map(str::trim)
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| dir.join(format!("{command}{ext}"))),
+        );
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: PathBuf) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: PathBuf) -> bool {
+    path.is_file()
+}
+
+fn spawn_args_for_provider(args: &Value, provider: &str) -> AppResult<Value> {
     let mut args = args.as_object().cloned().unwrap_or_default();
     args.remove("initial_prompt");
     args.insert("provider".into(), json!(provider));
-    apply_model_defaults(&mut args, provider);
-    Value::Object(args)
+    apply_model_defaults(&mut args, provider)?;
+    Ok(Value::Object(args))
 }
 
-fn one_shot_args_with_defaults(args: &Value, availability: ToolAvailability) -> Value {
+fn one_shot_args_with_defaults(args: &Value, availability: ToolAvailability) -> AppResult<Value> {
     let mut args = args.as_object().cloned().unwrap_or_default();
-    let mut selected_provider = args
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .map(str::to_string);
-    if !args
-        .get("provider")
-        .and_then(Value::as_str)
-        .is_some_and(|provider| !provider.trim().is_empty())
-    {
+    let mut selected_provider = match args.get("provider") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(provider)) if provider.trim().is_empty() => None,
+        Some(Value::String(provider)) => Some(provider.trim().to_string()),
+        Some(_) => return Ok(Value::Object(args)),
+    };
+    if selected_provider.is_none() {
         if availability.claude {
             args.insert("provider".into(), json!("claude"));
             selected_provider = Some("claude".to_string());
@@ -193,24 +234,49 @@ fn one_shot_args_with_defaults(args: &Value, availability: ToolAvailability) -> 
         } else if availability.agy {
             args.insert("provider".into(), json!("agy"));
             selected_provider = Some("agy".to_string());
+        } else {
+            return Err(AppError::new(
+                "invalid_params: no available provider binaries found",
+            ));
         }
     }
     if let Some(provider) = selected_provider.as_deref() {
-        apply_model_defaults(&mut args, provider);
+        if !provider_available(availability, provider) {
+            return Err(AppError::new(format!(
+                "invalid_params: unavailable provider {provider}"
+            )));
+        }
+        apply_model_defaults(&mut args, provider)?;
     }
-    Value::Object(args)
+    Ok(Value::Object(args))
 }
 
-fn apply_model_defaults(args: &mut serde_json::Map<String, Value>, provider: &str) {
+fn provider_available(availability: ToolAvailability, provider: &str) -> bool {
+    match provider {
+        "claude" => availability.claude,
+        "codex" => availability.codex,
+        "agy" => availability.agy,
+        _ => true,
+    }
+}
+
+fn apply_model_defaults(
+    args: &mut serde_json::Map<String, Value>,
+    provider: &str,
+) -> AppResult<()> {
     let Some(model) = resolve_model(args, provider) else {
         args.remove("model_preset");
-        return;
+        return Ok(());
     };
-    args.insert("model".into(), json!(model));
+    args.insert("model".into(), json!(model?));
     args.remove("model_preset");
+    Ok(())
 }
 
-fn resolve_model(args: &serde_json::Map<String, Value>, provider: &str) -> Option<&'static str> {
+fn resolve_model(
+    args: &serde_json::Map<String, Value>,
+    provider: &str,
+) -> Option<AppResult<&'static str>> {
     if args
         .get("model")
         .and_then(Value::as_str)
@@ -219,18 +285,32 @@ fn resolve_model(args: &serde_json::Map<String, Value>, provider: &str) -> Optio
         return None;
     }
     match provider {
-        "claude" => Some(claude_model_for_preset(model_preset(args))),
-        "codex" => Some(codex_model_for_preset(model_preset(args))),
+        "claude" => Some(model_preset(args).map(claude_model_for_preset)),
+        "codex" => Some(model_preset(args).map(codex_model_for_preset)),
         _ => None,
     }
 }
 
-fn model_preset(args: &serde_json::Map<String, Value>) -> &str {
-    args.get("model_preset")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|preset| !preset.is_empty())
-        .unwrap_or("best")
+fn model_preset(args: &serde_json::Map<String, Value>) -> AppResult<&str> {
+    match args.get("model_preset") {
+        Some(Value::Null) | None => Ok("best"),
+        Some(value) => {
+            let preset = value
+                .as_str()
+                .ok_or_else(|| AppError::new("invalid_params: model_preset must be a string"))?
+                .trim();
+            if preset.is_empty() {
+                return Ok("best");
+            }
+            if matches!(preset, "best" | "balanced" | "fast" | "cheap") {
+                Ok(preset)
+            } else {
+                Err(AppError::new(
+                    "invalid_params: model_preset must be one of best, balanced, fast, cheap",
+                ))
+            }
+        }
+    }
 }
 
 fn claude_model_for_preset(preset: &str) -> &'static str {
@@ -457,7 +537,8 @@ mod tests {
         let args = spawn_args_for_provider(
             &json!({ "cwd": "/tmp", "provider": "codex", "model": "sonnet", "initial_prompt": "ignored" }),
             "claude",
-        );
+        )
+        .unwrap();
 
         assert_eq!(args["provider"], "claude");
         assert_eq!(args["cwd"], "/tmp");
@@ -467,17 +548,18 @@ mod tests {
 
     #[test]
     fn provider_spawns_apply_model_presets_and_defaults() {
-        let args = spawn_args_for_provider(&json!({ "cwd": "/tmp" }), "codex");
+        let args = spawn_args_for_provider(&json!({ "cwd": "/tmp" }), "codex").unwrap();
         assert_eq!(args["model"], "gpt-5.5");
 
         let args = spawn_args_for_provider(
             &json!({ "cwd": "/tmp", "model_preset": "balanced" }),
             "claude",
-        );
+        )
+        .unwrap();
         assert_eq!(args["model"], "sonnet");
         assert!(args.get("model_preset").is_none());
 
-        let args = spawn_args_for_provider(&json!({ "cwd": "/tmp" }), "agy");
+        let args = spawn_args_for_provider(&json!({ "cwd": "/tmp" }), "agy").unwrap();
         assert!(args.get("model").is_none());
         assert!(args.get("model_preset").is_none());
     }
@@ -491,18 +573,20 @@ mod tests {
                 codex: true,
                 agy: true,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(args["provider"], "codex");
 
-        let args = one_shot_args_with_defaults(
+        let err = one_shot_args_with_defaults(
             &json!({ "prompt": "hi", "provider": "agy" }),
             ToolAvailability {
                 claude: true,
                 codex: true,
                 agy: false,
             },
-        );
-        assert_eq!(args["provider"], "agy");
+        )
+        .expect_err("explicit unavailable provider should fail");
+        assert!(err.to_string().contains("unavailable provider agy"));
     }
 
     #[test]
@@ -514,15 +598,46 @@ mod tests {
                 codex: true,
                 agy: true,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(args["provider"], "codex");
         assert_eq!(args["model"], "gpt-5.5");
 
         let args = one_shot_args_with_defaults(
             &json!({ "prompt": "hi", "provider": "codex", "model": "custom" }),
             ToolAvailability::all(),
-        );
+        )
+        .unwrap();
         assert_eq!(args["model"], "custom");
+    }
+
+    #[test]
+    fn one_shot_rejects_when_no_provider_is_available() {
+        let err = one_shot_args_with_defaults(
+            &json!({ "prompt": "hi" }),
+            ToolAvailability {
+                claude: false,
+                codex: false,
+                agy: false,
+            },
+        )
+        .expect_err("missing provider with no available binary should fail");
+
+        assert!(err.to_string().contains("no available provider binaries"));
+    }
+
+    #[test]
+    fn model_preset_rejects_invalid_values() {
+        let err = spawn_args_for_provider(
+            &json!({ "cwd": "/tmp", "model_preset": "surprise" }),
+            "claude",
+        )
+        .expect_err("unknown model preset should fail");
+        assert!(err.to_string().contains("model_preset must be one of"));
+
+        let err = spawn_args_for_provider(&json!({ "cwd": "/tmp", "model_preset": 3 }), "codex")
+            .expect_err("non-string model preset should fail");
+        assert!(err.to_string().contains("model_preset must be a string"));
     }
 
     #[test]
