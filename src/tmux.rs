@@ -421,6 +421,19 @@ impl TmuxClient {
         ])
     }
 
+    pub fn capture_pane_ansi(&self, pane_id: &str, history_lines: usize) -> AppResult<String> {
+        self.run_output(vec![
+            String::from("capture-pane"),
+            String::from("-p"),
+            String::from("-e"),
+            String::from("-J"),
+            String::from("-S"),
+            format!("-{history_lines}"),
+            String::from("-t"),
+            pane_id.to_string(),
+        ])
+    }
+
     pub fn send_keys<S: AsRef<str>>(&self, pane_id: &str, keys: &[S]) -> AppResult<()> {
         let mut args = vec![
             String::from("send-keys"),

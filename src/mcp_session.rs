@@ -4,9 +4,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::app::{AppError, AppResult};
+use crate::app::{AppError, AppResult, is_startup_enter_prompt};
 use crate::automation::{AutomationAction, load_resolved_keybindings};
-use crate::classifier::{Classification, Classifier, SessionState};
+use crate::classifier::{
+    Classification, Classifier, SessionState, prepare_frame_for_classification,
+};
 use crate::last_message::{LastAgentMessage, load_last_agent_message};
 use crate::mcp_registry::{
     LifecycleState, McpRegistry, McpSessionRecord, NewSessionRecord, Provider, SessionLock,
@@ -418,7 +420,8 @@ impl McpSessionService {
                 "ambiguous_target: managed pane no longer belongs to recorded window",
             ));
         }
-        let pane_text = client.capture_pane(&pane.pane_id, capture_lines)?;
+        let pane_text = client.capture_pane_ansi(&pane.pane_id, capture_lines)?;
+        let pane_text = prepare_frame_for_classification(&pane_text);
         let classification = Classifier.classify(&pane.pane_id, &pane_text);
         let recent_lines = pane_text
             .lines()
@@ -539,8 +542,14 @@ impl McpSessionService {
             if pane.window_id != record.tmux_window_id {
                 return Ok(outcome("blocked", None, None, Some("ambiguous_target")));
             }
-            let frame = client.capture_pane(&pane.pane_id, 2000)?;
+            let frame = client.capture_pane_ansi(&pane.pane_id, 2000)?;
+            let frame = prepare_frame_for_classification(&frame);
             let classification = Classifier.classify(&pane.pane_id, &frame);
+            if !no_yolo && is_startup_enter_prompt(&frame) {
+                client.send_keys(&pane.pane_id, &["Enter"])?;
+                thread::sleep(Duration::from_millis(DEFAULT_POLL_MS));
+                continue;
+            }
             match classification.state {
                 SessionState::ChatReady => {
                     if require_fresh {

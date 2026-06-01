@@ -7,7 +7,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::app::{AppError, AppResult, focused_frame_source};
-use crate::classifier::{Classification, Classifier, SessionState};
+use crate::classifier::{
+    Classification, Classifier, SessionState, prepare_frame_for_classification,
+};
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
 use crate::screen_model::ScreenModel;
 use crate::tmux::{ControlModeReceive, TmuxClient, TmuxPane};
@@ -442,7 +444,8 @@ where
             continue;
         }
 
-        let frame = client.capture_pane(&pane_id, request.history_lines)?;
+        let frame = client.capture_pane_ansi(&pane_id, request.history_lines)?;
+        let frame = prepare_frame_for_classification(&frame);
         let frame_choice = choose_frame_for_reconcile(&pane_id, reason, entry, &frame);
         let classification = frame_choice.classification;
         let signature = ServeSnapshotSignature::from_snapshot(&pane, &classification);

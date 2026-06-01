@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::app::{AppError, AppResult, focused_frame_source};
-use crate::classifier::{Classification, Classifier};
+use crate::classifier::{Classification, Classifier, prepare_frame_for_classification};
 use crate::tmux::TmuxClient;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +137,8 @@ pub fn collect_observation(
     };
 
     let live_excerpt = pane_output.remove(&target_pane).unwrap_or_default();
-    let captured_frame = client.capture_pane(&target_pane, request.history_lines)?;
+    let captured_frame = client.capture_pane_ansi(&target_pane, request.history_lines)?;
+    let captured_frame = prepare_frame_for_classification(&captured_frame);
     let classification = Classifier.classify(&target_pane, &focused_frame_source(&captured_frame));
 
     Ok(CollectedObservation {

@@ -152,6 +152,13 @@ pub struct Classifier;
 
 impl Classifier {
     pub fn classify(&self, source: &str, frame_text: &str) -> Classification {
+        let prepared_frame;
+        let frame_text = if frame_text.contains('\x1b') {
+            prepared_frame = prepare_frame_for_classification(frame_text);
+            prepared_frame.as_str()
+        } else {
+            frame_text
+        };
         let normalized = normalize(frame_text);
         let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
         let recap = detect_recap(frame_text, &normalized);
@@ -442,6 +449,29 @@ impl Classifier {
             signals,
         }
     }
+}
+
+pub(crate) fn prepare_frame_for_classification(frame_text: &str) -> String {
+    let without_dim_suggestions = frame_text
+        .lines()
+        .map(collapse_claude_dim_suggested_prompt_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::agy::strip_ansi(&without_dim_suggestions).into_owned()
+}
+
+fn collapse_claude_dim_suggested_prompt_line(line: &str) -> String {
+    let Some((prefix_idx, prefix)) = line.char_indices().find(|(_, ch)| matches!(ch, '❯' | '›'))
+    else {
+        return line.to_string();
+    };
+
+    let rest = &line[prefix_idx + prefix.len_utf8()..];
+    if rest.contains("\x1b[7m") && rest.contains("\x1b[0;2m") {
+        return format!("{}{}", &line[..prefix_idx], prefix);
+    }
+
+    line.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1442,6 +1472,14 @@ mod tests {
                 "round-trip failed for {rendered}",
             );
         }
+    }
+
+    #[test]
+    fn claude_dim_suggested_prompt_is_chat_ready_not_prompt_editing() {
+        let frame = "────────────────\n❯\u{a0}\x1b[7mA\x1b[0;2mfrican or European?\x1b[0m\n────────────────\n  auto mode on";
+        let result = Classifier.classify("test", frame);
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
     }
 
     #[test]

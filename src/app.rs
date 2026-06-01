@@ -23,7 +23,7 @@ use crate::automation::{
 };
 use crate::classifier::{
     Classification, Classifier, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
-    SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
+    SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState, prepare_frame_for_classification,
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
@@ -892,7 +892,8 @@ fn run_status(args: StatusArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane =
         normalize_dashboard_window_name(&client, &resolve_pane_by_id(&client, &args.pane_id)?)?;
-    let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
+    let frame = client.capture_pane_ansi(&pane.pane_id, args.history_lines)?;
+    let frame = prepare_frame_for_classification(&frame);
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
     let bindings = inspect_keybindings(None).map_err(AppError::new)?;
@@ -919,7 +920,8 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
             args.pane_id.as_deref(),
         )?,
     )?;
-    let frame = client.capture_pane(&pane.pane_id, args.history_lines)?;
+    let frame = client.capture_pane_ansi(&pane.pane_id, args.history_lines)?;
+    let frame = prepare_frame_for_classification(&frame);
     let focused = focused_frame_source(&frame);
     let classification = Classifier.classify(&pane.pane_id, &focused);
     let bindings = inspect_keybindings(args.bindings_path.as_deref()).map_err(AppError::new)?;
@@ -2306,6 +2308,11 @@ fn wait_for_prompt_pane_ready(
         if inspected.classification.state == SessionState::ChatReady {
             return Ok(inspected.classification);
         }
+        if !args.no_yolo && is_startup_enter_prompt(&inspected.focused_source) {
+            client.send_keys(&pane.pane_id, &["Enter"])?;
+            thread::sleep(Duration::from_millis(args.poll_ms));
+            continue;
+        }
         if inspected.classification.state == SessionState::Unknown {
             if Instant::now() >= deadline {
                 return Err(AppError::new(format!(
@@ -2987,7 +2994,8 @@ pub(crate) fn inspect_pane(
     pane_id: &str,
     history_lines: usize,
 ) -> AppResult<InspectedPane> {
-    let frame = client.capture_pane(pane_id, history_lines)?;
+    let frame = client.capture_pane_ansi(pane_id, history_lines)?;
+    let frame = prepare_frame_for_classification(&frame);
     let focused_source = focused_frame_source(&frame);
     Ok(InspectedPane {
         classification: Classifier.classify(pane_id, &focused_source),
@@ -3562,9 +3570,18 @@ pub(crate) fn classify_pane(
     pane_id: &str,
     history_lines: usize,
 ) -> AppResult<Classification> {
-    let frame = client.capture_pane(pane_id, history_lines)?;
+    let frame = client.capture_pane_ansi(pane_id, history_lines)?;
+    let frame = prepare_frame_for_classification(&frame);
     let focused = focused_frame_source(&frame);
     Ok(Classifier.classify(pane_id, &focused))
+}
+
+pub(crate) fn is_startup_enter_prompt(frame: &str) -> bool {
+    let lower = frame.to_ascii_lowercase();
+    lower.contains("press enter to confirm")
+        && (lower.contains("choose how you'd like codex to proceed")
+            || lower.contains("introducing gpt-")
+            || lower.contains("try new model"))
 }
 
 pub(crate) fn focused_frame_source(frame: &str) -> String {
@@ -4412,19 +4429,19 @@ mod tests {
         compose_prompt_run_content, ensure_pane_owned_by_automatable_provider,
         ensure_pane_owned_by_claude, ensure_pane_owned_by_yolo_provider, ensure_state_transition,
         extract_keep_going_response, extract_permission_prompt_details, focused_frame_source,
-        is_agy_command_permission_safe_to_approve, is_prompt_completion_state, is_usable_state,
-        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, pane_provider_label,
-        parse_env_value_from_environ_bytes, permission_manual_review_reason,
-        persistent_dashboard_child_command_with_target_socket, prompt_launch_command,
-        prompt_submission_started, raw_key_for_workflow, recovery_action_for_state,
-        render_babysit_action_event, render_babysit_output, render_babysit_start_event,
-        render_babysit_wait_event, render_doctor_recommendations, render_guarded_workflow_output,
-        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
-        render_observe_command_output, render_screen_excerpt, render_status_json,
-        render_status_report, resolve_keep_going_prompt, resolve_prompt_run_input,
-        run_prepare_prompt, shell_escape, strip_dashboard_window_prefixes,
-        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
-        write_prompt_instruction_temp_file, yolo_action_for_state,
+        is_agy_command_permission_safe_to_approve, is_prompt_completion_state,
+        is_startup_enter_prompt, is_usable_state, is_yolo_safe_to_approve,
+        keep_going_no_yolo_blocker, pane_provider_label, parse_env_value_from_environ_bytes,
+        permission_manual_review_reason, persistent_dashboard_child_command_with_target_socket,
+        prompt_launch_command, prompt_submission_started, raw_key_for_workflow,
+        recovery_action_for_state, render_babysit_action_event, render_babysit_output,
+        render_babysit_start_event, render_babysit_wait_event, render_doctor_recommendations,
+        render_guarded_workflow_output, render_keep_going_wait_message, render_list_panes,
+        render_next_safe_action, render_observe_command_output, render_screen_excerpt,
+        render_status_json, render_status_report, resolve_keep_going_prompt,
+        resolve_prompt_run_input, run_prepare_prompt, shell_escape,
+        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
+        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -4455,6 +4472,12 @@ mod tests {
             cursor_x: Some(0),
             cursor_y: Some(0),
         }
+    }
+
+    #[test]
+    fn codex_new_model_chooser_is_startup_enter_prompt() {
+        let frame = "Introducing GPT-5.5\nChoose how you'd like Codex to proceed.\n› 1. Try new model\n  2. Use existing model\nUse ↑/↓ to move, press enter to confirm";
+        assert!(is_startup_enter_prompt(frame));
     }
 
     fn sample_bindings(status: KeybindingsStatus) -> KeybindingsInspection {

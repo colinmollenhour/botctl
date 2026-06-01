@@ -24,7 +24,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agy::{is_agy_pane, resolve_agy_session_for_pane};
 use crate::app::AppResult;
-use crate::classifier::{Classifier, SIGNAL_CODEX_KEYWORDS, SessionState};
+use crate::classifier::{
+    Classifier, SIGNAL_CODEX_KEYWORDS, SessionState, prepare_frame_for_classification,
+};
 use crate::cli::DashboardArgs;
 use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::opencode::{pane_opencode_title, resolve_opencode_session_for_pane};
@@ -424,7 +426,8 @@ impl DashboardApp {
             }
             let frame = self
                 .client
-                .capture_pane(&pane.pane_id, self.history_lines)?;
+                .capture_pane_ansi(&pane.pane_id, self.history_lines)?;
+            let frame = prepare_frame_for_classification(&frame);
             let classification =
                 Classifier.classify(&pane.pane_id, &focused_dashboard_frame(&frame));
             // Resolve the agy session at most once per pane per refresh and
