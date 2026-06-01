@@ -137,13 +137,13 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "model": {"type":"string", "minLength":1},
+                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Claude model override. Prefer model_preset unless you need an exact provider model."},
+                    "model_preset": model_preset_schema("Claude"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "agent": {"type":"string", "minLength":1},
                     "permission_mode": permission_mode_schema(),
                     "settings": {"type":"string", "minLength":1, "description":"Settings JSON file path or JSON string passed to Claude --settings."},
                     "timeout_ms": {"type":"integer", "minimum":1000},
-                    "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
                 }
             }),
@@ -157,10 +157,10 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "model": {"type":"string", "minLength":1},
+                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Codex model override. Prefer model_preset unless you need an exact provider model."},
+                    "model_preset": model_preset_schema("Codex"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "timeout_ms": {"type":"integer", "minimum":1000},
-                    "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
                 }
             }),
@@ -175,7 +175,6 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
                     "timeout_ms": {"type":"integer", "minimum":1000},
-                    "initial_prompt": {"type":"string"},
                     "policy": policy_schema()
                 }
             }),
@@ -226,12 +225,16 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
             "one_shot",
             "Create a temporary managed session, run exactly one prompt to a terminal outcome, then always attempt to kill the window (best-effort cleanup). Uses managed auto-approval (no_yolo=false): only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block.",
             json!({
-                "type": "object", "required": ["cwd", "prompt"],
+                "type": "object",
                 "properties": {
-                    "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "prompt": {"type":"string", "minLength":1},
-                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Use claude by default. If agy, omit model/effort/agent/permission_mode/settings."},
-                    "model": {"type":"string", "minLength":1, "description":"Claude and Codex only. Do not pass when provider is agy."},
+                    "cwd": {"type":"string", "description":"Existing working directory for the managed agent. Defaults to the MCP server current directory when omitted or blank."},
+                    "prompt": {"type":"string", "minLength":1, "description":"Preferred prompt text field. The aliases text, message, input, and initial_prompt are also accepted at runtime."},
+                    "text": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                    "message": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                    "input": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Defaults to the first available provider binary in claude, codex, agy order. If agy, omit model/effort/agent/permission_mode/settings."},
+                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Claude/Codex model override. Prefer model_preset unless you need an exact provider model. Do not pass when provider is agy."},
+                    "model_preset": model_preset_schema("Claude/Codex"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"], "description":"Claude and Codex only. Do not pass when provider is agy."},
                     "agent": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
                     "permission_mode": permission_mode_schema(),
@@ -247,6 +250,14 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
 
 fn policy_schema() -> Value {
     json!({ "type":"object", "properties": { "no_yolo": { "type":"boolean" } } })
+}
+
+fn model_preset_schema(provider: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["best", "balanced", "fast", "cheap"],
+        "description": format!("Preferred model selector for {provider}. Defaults to best when both model and model_preset are omitted; raw model overrides this.")
+    })
 }
 
 /// Schema for the claude-only `--permission-mode` flag. Kept in sync with
@@ -337,10 +348,7 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "one_shot")
             .expect("catalog has one_shot");
-        assert_eq!(
-            one_shot["inputSchema"]["required"],
-            json!(["cwd", "prompt"])
-        );
+        assert!(one_shot["inputSchema"].get("required").is_none());
         assert_eq!(catalog.last().unwrap()["name"], "one_shot");
     }
 
@@ -376,6 +384,21 @@ mod tests {
                 .is_none()
         );
         assert!(
+            spawn_claude["inputSchema"]["properties"]
+                .get("initial_prompt")
+                .is_none()
+        );
+        assert!(
+            spawn_codex["inputSchema"]["properties"]
+                .get("initial_prompt")
+                .is_none()
+        );
+        assert!(
+            spawn_agy["inputSchema"]["properties"]
+                .get("initial_prompt")
+                .is_none()
+        );
+        assert!(
             spawn_codex["inputSchema"]["properties"]
                 .get("agent")
                 .is_none()
@@ -393,6 +416,21 @@ mod tests {
         assert!(
             spawn_agy["inputSchema"]["properties"]
                 .get("model")
+                .is_none()
+        );
+        assert!(
+            spawn_claude["inputSchema"]["properties"]
+                .get("model_preset")
+                .is_some()
+        );
+        assert!(
+            spawn_codex["inputSchema"]["properties"]
+                .get("model_preset")
+                .is_some()
+        );
+        assert!(
+            spawn_agy["inputSchema"]["properties"]
+                .get("model_preset")
                 .is_none()
         );
         assert!(

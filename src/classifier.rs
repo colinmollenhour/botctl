@@ -1380,12 +1380,12 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
         .unwrap_or(0);
     let lines = &lines[..tail_end];
 
-    let start = lines
+    let mut start = lines
         .iter()
         .rposition(|line| is_plain_chat_input_line(line))
         .map(|idx| idx.saturating_sub(8))
         .unwrap_or_else(|| lines.len().saturating_sub(8));
-    let start = if let Some(input_idx) = lines
+    start = if let Some(input_idx) = lines
         .iter()
         .rposition(|line| is_submitted_chat_input_line(line))
     {
@@ -1393,11 +1393,17 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
     } else {
         start
     };
-    let start = if let Some(recap_idx) = lines.iter().rposition(|line| is_recap_anchor(line)) {
+    start = if let Some(recap_idx) = lines.iter().rposition(|line| is_recap_anchor(line)) {
         start.max(recap_idx.saturating_add(1))
     } else {
         start
     };
+    if let Some(completed_idx) = (start..lines.len()).rev().find(|idx| {
+        is_claude_completed_status_line(lines[*idx].trim())
+            && assistant_output_after_latest_question(&lines[start..*idx])
+    }) {
+        start = start.max(completed_idx.saturating_add(1));
+    }
 
     let mut tail = lines[start..]
         .iter()
@@ -1413,6 +1419,21 @@ fn recent_chat_ready_tail(frame_text: &str) -> Vec<String> {
         tail = tail.split_off(tail.len() - 4);
     }
     tail
+}
+
+fn assistant_output_after_latest_question(lines: &[&str]) -> bool {
+    let Some(question_idx) = lines.iter().rposition(|line| {
+        let lower = line.to_ascii_lowercase();
+        line.contains('?') || contains_question_phrase(&lower)
+    }) else {
+        return false;
+    };
+
+    lines
+        .iter()
+        .skip(question_idx + 1)
+        .copied()
+        .any(|line| line.starts_with('●') || line.starts_with('⎿'))
 }
 
 fn is_terminal_status_line(line: &str) -> bool {
@@ -2221,6 +2242,15 @@ mod tests {
     #[test]
     fn ignores_question_before_latest_submitted_input() {
         let frame = "Want me to commit it? Once committed, run ./shell/scripts/sync-docs.sh push and it should take a handful of seconds and succeed.\n❯ yes\n● Committed as 37800bb8bd. Run ./shell/scripts/sync-docs.sh push now — should finish in seconds and succeed.\n※ recap: Goal was to sync DEV-2958 docs to the knowledge-base repo. All three fixes are committed. Next: run ./shell/scripts/sync-docs.sh push.\n❯\n~/Projects/shipstream/wms (master) ✅";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert!(!result.has_questions);
+    }
+
+    #[test]
+    fn answered_question_with_completed_status_is_chat_ready() {
+        let frame = "Want me to commit these and push, or hold?\n● I committed the changes and pushed the branch. No further action is needed.\n✻ Worked for 38s\n────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────\n~/Projects/botctl (main)\n🧠 Opus 4.7 (1M context) │ Ctx: 18%";
         let result = Classifier.classify("test", frame);
 
         assert_eq!(result.state, SessionState::ChatReady);
