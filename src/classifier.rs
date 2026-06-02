@@ -9,6 +9,7 @@ pub enum SessionState {
     PermissionDialog,
     PlanApprovalPrompt,
     FolderTrustPrompt,
+    StartupChoicePrompt,
     SurveyPrompt,
     ExternalEditorActive,
     DiffDialog,
@@ -33,6 +34,7 @@ impl SessionState {
         Self::PermissionDialog,
         Self::PlanApprovalPrompt,
         Self::FolderTrustPrompt,
+        Self::StartupChoicePrompt,
         Self::SurveyPrompt,
         Self::ExternalEditorActive,
         Self::DiffDialog,
@@ -51,6 +53,7 @@ impl SessionState {
             Self::PermissionDialog => "PermissionDialog",
             Self::PlanApprovalPrompt => "PlanApprovalPrompt",
             Self::FolderTrustPrompt => "FolderTrustPrompt",
+            Self::StartupChoicePrompt => "StartupChoicePrompt",
             Self::SurveyPrompt => "SurveyPrompt",
             Self::ExternalEditorActive => "ExternalEditorActive",
             Self::DiffDialog => "DiffDialog",
@@ -70,6 +73,7 @@ impl SessionState {
             "PermissionDialog" => Some(Self::PermissionDialog),
             "PlanApprovalPrompt" => Some(Self::PlanApprovalPrompt),
             "FolderTrustPrompt" => Some(Self::FolderTrustPrompt),
+            "StartupChoicePrompt" => Some(Self::StartupChoicePrompt),
             "SurveyPrompt" => Some(Self::SurveyPrompt),
             "ExternalEditorActive" => Some(Self::ExternalEditorActive),
             "DiffDialog" => Some(Self::DiffDialog),
@@ -88,6 +92,7 @@ pub const SIGNAL_CHAT_KEYWORDS: &str = "chat-keywords";
 pub const SIGNAL_AMBIGUOUS_PERMISSION_CHAT: &str = "ambiguous-permission-chat";
 pub const SIGNAL_FOLDER_TRUST_KEYWORDS: &str = "folder-trust-keywords";
 pub const SIGNAL_SURVEY_KEYWORDS: &str = "survey-keywords";
+pub const SIGNAL_STARTUP_CHOICE_KEYWORDS: &str = "startup-choice-keywords";
 pub const SIGNAL_EXTERNAL_EDITOR_KEYWORDS: &str = "external-editor-keywords";
 pub const SIGNAL_DIFF_KEYWORDS: &str = "diff-keywords";
 pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
@@ -245,6 +250,7 @@ impl Classifier {
             &active_permission_sensitive_source(&lines, &normalized, has_codex_keywords),
         );
         let has_survey_prompt = has_survey_prompt(&normalized, &lines);
+        let has_startup_choice_prompt = has_startup_choice_prompt(&normalized, &lines);
 
         let has_busy_interrupt_hint = contains_any(
             &normalized,
@@ -309,6 +315,12 @@ impl Classifier {
         } else if has_plan_approval_keywords {
             signals.push(String::from(SIGNAL_PLAN_APPROVAL_KEYWORDS));
             SessionState::PlanApprovalPrompt
+        } else if has_startup_choice_prompt {
+            signals.push(String::from(SIGNAL_STARTUP_CHOICE_KEYWORDS));
+            if has_codex_keywords || contains_any(&normalized, &["codex", "@openai/codex"]) {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
+            SessionState::StartupChoicePrompt
         } else if has_active_codex_permission_prompt {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
             signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
@@ -593,6 +605,51 @@ fn normalize(input: &str) -> String {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+pub(crate) fn has_startup_choice_prompt_text(frame: &str) -> bool {
+    let normalized = normalize(frame);
+    let lines = frame.lines().map(str::trim).collect::<Vec<_>>();
+    has_startup_choice_prompt(&normalized, &lines)
+}
+
+fn has_startup_choice_prompt(normalized: &str, lines: &[&str]) -> bool {
+    let has_confirm_footer = contains_any(
+        normalized,
+        &[
+            "press enter to confirm",
+            "press enter to continue",
+            "use ↑/↓ to move, press enter to confirm",
+        ],
+    );
+    let has_codex_model_choice = contains_any(
+        normalized,
+        &[
+            "choose how you'd like codex to proceed",
+            "introducing gpt-",
+            "try new model",
+            "use existing model",
+        ],
+    );
+    let has_update_choice = contains_any(
+        normalized,
+        &[
+            "update available",
+            "update now",
+            "skip until next version",
+            "run npm install -g @openai/codex to update",
+        ],
+    );
+    let has_numbered_choice = lines.iter().copied().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("1. try new model")
+            || lower.contains("2. use existing model")
+            || lower.contains("1. update now")
+            || lower.contains("2. skip")
+            || lower.contains("3. skip until next version")
+    });
+
+    has_confirm_footer && has_numbered_choice && (has_codex_model_choice || has_update_choice)
 }
 
 fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
@@ -1477,7 +1534,7 @@ mod tests {
         Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_CHAT_QUESTIONS,
         SIGNAL_CODEX_KEYWORDS, SIGNAL_DIFF_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
         SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
-        SIGNAL_SURVEY_KEYWORDS, SessionState,
+        SIGNAL_STARTUP_CHOICE_KEYWORDS, SIGNAL_SURVEY_KEYWORDS, SessionState,
     };
 
     #[test]
@@ -1608,6 +1665,37 @@ mod tests {
             result
                 .signals
                 .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_new_model_chooser_as_startup_choice_prompt() {
+        let frame = "Introducing GPT-5.5\n\nChoose how you'd like Codex to proceed.\n\n› 1. Try new model\n  2. Use existing model\n\nUse ↑/↓ to move, press enter to confirm";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::StartupChoicePrompt);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_STARTUP_CHOICE_KEYWORDS))
+        );
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CODEX_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_codex_update_chooser_as_startup_choice_prompt() {
+        let frame = "✨ Update available! 0.135.0 -> 0.136.0\n\nRelease notes: https://github.com/openai/codex/releases/latest\n\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n\nPress enter to continue";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::StartupChoicePrompt);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_STARTUP_CHOICE_KEYWORDS))
         );
     }
 

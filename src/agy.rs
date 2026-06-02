@@ -415,29 +415,38 @@ fn is_agy_command_permission_prompt(lines: &[&str]) -> bool {
 }
 
 /// Detect the agy *folder-trust* prompt shape (workspace trust gate shown the
-/// first time the CLI sees a new workspace). Synthetic — no verbatim live
-/// capture yet. Keys on either canonical question string (`Trust this
-/// workspace?` or `Trust this folder`), and a `[y/n]` / `(y/n)` tail fallback
-/// when the frame also mentions `workspace` or `folder` (handles frames where
-/// the verbatim `Trust this …` line has scrolled out of the captured window).
-/// Allocation-free.
+/// first time the CLI sees a new workspace). Keys on canonical `Trust this …`
+/// strings, the newer "Do you trust the contents of this project?" wording, and
+/// a `[y/n]` / `(y/n)` tail fallback when the frame also mentions workspace,
+/// folder, or project.
 fn is_agy_folder_trust_prompt(lines: &[&str]) -> bool {
-    let mut mentions_workspace_or_folder = false;
+    let mut mentions_workspace_folder_or_project = false;
     for line in lines {
         if line.contains("Trust this workspace?") || line.contains("Trust this folder") {
             return true;
         }
-        if !mentions_workspace_or_folder {
-            let lower = line.to_ascii_lowercase();
-            if lower.contains("workspace") || lower.contains("folder") {
-                mentions_workspace_or_folder = true;
-            }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("do you trust the contents of this project")
+            || lower.contains("yes, i trust this folder")
+            || (lower.contains("requires permission")
+                && lower.contains("read")
+                && lower.contains("edit")
+                && lower.contains("execute"))
+        {
+            return true;
+        }
+        if !mentions_workspace_folder_or_project
+            && (lower.contains("workspace")
+                || lower.contains("folder")
+                || lower.contains("project"))
+        {
+            mentions_workspace_folder_or_project = true;
         }
     }
     // Fallback: `[y/n]` / `(y/n)` tail plus a workspace/folder mention elsewhere.
     // Ordered BEFORE settings-persist's `[y/n]` fallback so tail-truncated
     // folder-trust frames are not misclassified as settings-persist.
-    if mentions_workspace_or_folder {
+    if mentions_workspace_folder_or_project {
         if let Some(last_non_blank) = lines.iter().rev().find(|line| !line.is_empty()) {
             let lower = last_non_blank.to_ascii_lowercase();
             if lower.ends_with("[y/n]") || lower.ends_with("(y/n)") {
@@ -948,6 +957,24 @@ mod tests {
             "Trust this workspace?\n",
             "[y/N]\n",
             "? for shortcuts\n",
+        );
+        assert_eq!(
+            classify_agy_state(frame),
+            Some(SessionState::AgyFolderTrustPrompt)
+        );
+    }
+
+    #[test]
+    fn classify_agy_project_trust_prompt_returns_agy_folder_trust() {
+        let frame = concat!(
+            "Accessing workspace:\n",
+            "/home/colin/Projects/shipstream/thespider\n",
+            "Do you trust the contents of this project?\n",
+            "Antigravity CLI requires permission to read, edit, and execute files here.\n",
+            "> Yes, I trust this folder\n",
+            "  No, exit\n",
+            "  ↑/↓ Navigate · enter Confirm\n",
+            "                                                         Gemini 3.5 Flash (High)\n",
         );
         assert_eq!(
             classify_agy_state(frame),

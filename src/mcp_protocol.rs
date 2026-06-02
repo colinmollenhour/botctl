@@ -137,10 +137,10 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Claude model override. Prefer model_preset unless you need an exact provider model."},
+                    "model": raw_model_schema("Claude"),
                     "model_preset": model_preset_schema("Claude"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
-                    "agent": {"type":"string", "minLength":1},
+                    "agent": claude_agent_schema(),
                     "permission_mode": permission_mode_schema(),
                     "settings": {"type":"string", "minLength":1, "description":"Settings JSON file path or JSON string passed to Claude --settings."},
                     "timeout_ms": {"type":"integer", "minimum":1000},
@@ -157,7 +157,7 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "type": "object", "required": ["cwd"],
                 "properties": {
                     "cwd": {"type":"string", "description":"Existing working directory for the managed agent."},
-                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Codex model override. Prefer model_preset unless you need an exact provider model."},
+                    "model": raw_model_schema("Codex"),
                     "model_preset": model_preset_schema("Codex"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                     "timeout_ms": {"type":"integer", "minimum":1000},
@@ -233,10 +233,10 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                     "message": {"type":"string", "minLength":1, "description":"Alias for prompt."},
                     "input": {"type":"string", "minLength":1, "description":"Alias for prompt."},
                     "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Defaults to the first available provider binary in claude, codex, agy order. If agy, omit model/effort/agent/permission_mode/settings."},
-                    "model": {"type":"string", "minLength":1, "description":"Advanced raw Claude/Codex model override. Prefer model_preset unless you need an exact provider model. Do not pass when provider is agy."},
+                    "model": raw_model_schema("Claude/Codex"),
                     "model_preset": model_preset_schema("Claude/Codex"),
                     "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"], "description":"Claude and Codex only. Do not pass when provider is agy."},
-                    "agent": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
+                    "agent": claude_agent_schema(),
                     "permission_mode": permission_mode_schema(),
                     "settings": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
                     "timeout_ms": {"type":"integer", "minimum":1000},
@@ -256,7 +256,28 @@ fn model_preset_schema(provider: &str) -> Value {
     json!({
         "type": "string",
         "enum": ["best", "balanced", "fast", "cheap"],
-        "description": format!("Preferred model selector for {provider}. Defaults to best when both model and model_preset are omitted; raw model overrides this.")
+        "description": format!("Optional {provider} model preference. Leave unset unless the user explicitly asks for a model speed/cost/quality preference. Do not pass both model and model_preset; use model only for an exact downstream provider model override. Omitting both model and model_preset uses botctl's default.")
+    })
+}
+
+fn raw_model_schema(provider: &str) -> Value {
+    let provider_note = if provider == "Claude/Codex" {
+        "Must be valid for the selected provider. Do not pass when provider is agy."
+    } else {
+        "Must be valid for this provider."
+    };
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "description": format!("Advanced raw {provider} model override. Leave unset unless the user explicitly requested an exact downstream provider model. Do not pass both model and model_preset; if the user only asks for best/balanced/fast/cheap, use model_preset instead. Omitting both model and model_preset uses botctl's default. {provider_note} Do not copy the caller/orchestrator model ID into this field; for example, openai/gpt-5.5 is not a Claude model.")
+    })
+}
+
+fn claude_agent_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "description": "Claude only. Do not pass for normal Claude sessions; omitting agent lets Claude use its default build agent. Only pass when the user explicitly requests a specific Claude subagent. Do not pass when provider is codex or agy."
     })
 }
 
@@ -438,6 +459,56 @@ mod tests {
                 .get("effort")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn model_schemas_tell_callers_to_omit_unrequested_models() {
+        let catalog = tool_catalog();
+        for tool_name in ["spawn_claude", "spawn_codex", "one_shot"] {
+            let tool = catalog
+                .iter()
+                .find(|t| t["name"] == tool_name)
+                .expect("tool exists");
+            let description = tool["inputSchema"]["properties"]["model"]["description"]
+                .as_str()
+                .expect("model description is text");
+            let preset_description =
+                tool["inputSchema"]["properties"]["model_preset"]["description"]
+                    .as_str()
+                    .expect("model_preset description is text");
+
+            assert!(description.contains("Leave unset unless the user explicitly requested"));
+            assert!(description.contains("Do not pass both model and model_preset"));
+            assert!(
+                description.contains("Omitting both model and model_preset uses botctl's default")
+            );
+            assert!(description.contains("Do not copy the caller/orchestrator model ID"));
+            assert!(description.contains("openai/gpt-5.5 is not a Claude model"));
+            assert!(preset_description.contains("Leave unset unless the user explicitly asks"));
+            assert!(preset_description.contains("Do not pass both model and model_preset"));
+            assert!(
+                preset_description
+                    .contains("Omitting both model and model_preset uses botctl's default")
+            );
+        }
+    }
+
+    #[test]
+    fn claude_agent_schema_tells_callers_to_omit_normal_agent() {
+        let catalog = tool_catalog();
+        for tool_name in ["spawn_claude", "one_shot"] {
+            let tool = catalog
+                .iter()
+                .find(|t| t["name"] == tool_name)
+                .expect("tool exists");
+            let description = tool["inputSchema"]["properties"]["agent"]["description"]
+                .as_str()
+                .expect("agent description is text");
+
+            assert!(description.contains("Do not pass for normal Claude sessions"));
+            assert!(description.contains("default build agent"));
+            assert!(description.contains("Only pass when the user explicitly requests"));
+        }
     }
 
     #[test]

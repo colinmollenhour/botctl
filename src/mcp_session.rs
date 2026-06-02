@@ -644,6 +644,7 @@ impl McpSessionService {
                 }
                 SessionState::PermissionDialog
                 | SessionState::FolderTrustPrompt
+                | SessionState::StartupChoicePrompt
                 | SessionState::SurveyPrompt
                 | SessionState::PlanApprovalPrompt
                 | SessionState::DiffDialog
@@ -1301,6 +1302,14 @@ mod tests {
         let out = outcome("timeout", None, Some("answer text\n\n\n"), Some("timeout"));
 
         assert_eq!(out["snapshot"], json!("answer text"));
+    }
+
+    #[test]
+    fn startup_choice_prompt_maps_to_blocked_outcome() {
+        assert_eq!(
+            outcome_for_state(SessionState::StartupChoicePrompt),
+            "blocked"
+        );
     }
 
     #[test]

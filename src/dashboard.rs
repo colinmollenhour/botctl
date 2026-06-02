@@ -1818,6 +1818,7 @@ fn detail_body_kind(pane: &PaneEntry) -> DetailBodyKind {
         | SessionState::UserQuestionPrompt
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
+        | SessionState::StartupChoicePrompt
         | SessionState::SurveyPrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
@@ -2334,6 +2335,7 @@ fn is_attention_state(state: SessionState) -> bool {
             | SessionState::UserQuestionPrompt
             | SessionState::PlanApprovalPrompt
             | SessionState::FolderTrustPrompt
+            | SessionState::StartupChoicePrompt
             | SessionState::SurveyPrompt
             | SessionState::ExternalEditorActive
             | SessionState::DiffDialog
@@ -2396,6 +2398,7 @@ fn state_marker(state: SessionState, has_questions: bool) -> &'static str {
         SessionState::PermissionDialog => "P",
         SessionState::PlanApprovalPrompt => "A",
         SessionState::FolderTrustPrompt => "F",
+        SessionState::StartupChoicePrompt => "C",
         SessionState::SurveyPrompt => "S",
         SessionState::ExternalEditorActive => "V",
         SessionState::DiffDialog => "D",
@@ -2421,6 +2424,7 @@ fn state_emoji(state: SessionState, has_questions: bool) -> &'static str {
         SessionState::PermissionDialog => "🔐",
         SessionState::PlanApprovalPrompt => "❓",
         SessionState::FolderTrustPrompt => "📁",
+        SessionState::StartupChoicePrompt => "🔀",
         SessionState::SurveyPrompt => "📝",
         SessionState::ExternalEditorActive => "✏️",
         SessionState::DiffDialog => "🧾",

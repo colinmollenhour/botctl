@@ -23,7 +23,8 @@ use crate::automation::{
 };
 use crate::classifier::{
     Classification, Classifier, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
-    SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState, prepare_frame_for_classification,
+    SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState, has_startup_choice_prompt_text,
+    prepare_frame_for_classification,
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
@@ -792,14 +793,14 @@ fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
     } else {
         panes
             .iter()
-            .filter(|pane| is_pane_command_claude(pane))
+            .filter(|pane| is_default_list_pane(pane))
             .collect::<Vec<_>>()
     };
     if panes.is_empty() {
         return if include_all {
             String::from("no panes found")
         } else {
-            String::from("no claude panes found")
+            String::from("no managed agent panes found")
         };
     }
 
@@ -830,7 +831,7 @@ fn render_list_panes(panes: &[TmuxPane], include_all: bool) -> String {
 fn render_list_panes_json(panes: &[TmuxPane], include_all: bool) -> AppResult<String> {
     let panes = panes
         .iter()
-        .filter(|pane| include_all || is_pane_command_claude(pane))
+        .filter(|pane| include_all || is_default_list_pane(pane))
         .map(|pane| {
             serde_json::json!({
                 "pane_id": pane.pane_id,
@@ -1652,6 +1653,7 @@ fn prompt_submission_started(
         | SessionState::PermissionDialog
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
+        | SessionState::StartupChoicePrompt
         | SessionState::SurveyPrompt
         | SessionState::DiffDialog => return true,
         SessionState::PromptEditing
@@ -2782,6 +2784,7 @@ pub(crate) fn yolo_action_for_state(state: SessionState) -> YoloAction {
         | SessionState::BusyResponding
         | SessionState::PlanApprovalPrompt
         | SessionState::FolderTrustPrompt
+        | SessionState::StartupChoicePrompt
         | SessionState::ExternalEditorActive
         | SessionState::DiffDialog
         | SessionState::AgyFolderTrustPrompt
@@ -3579,6 +3582,7 @@ pub(crate) fn classify_pane(
 pub(crate) fn is_startup_enter_prompt(frame: &str) -> bool {
     let lower = frame.to_ascii_lowercase();
     lower.contains("press enter to confirm")
+        && !has_startup_choice_prompt_text(frame)
         && (lower.contains("choose how you'd like codex to proceed")
             || lower.contains("introducing gpt-")
             || lower.contains("try new model"))
@@ -3731,6 +3735,9 @@ fn recovery_action_for_state(state: SessionState) -> AppResult<Option<RecoveryAc
         )),
         SessionState::SurveyPrompt => Ok(Some(RecoveryAction::DismissSurvey)),
         SessionState::FolderTrustPrompt => Ok(Some(RecoveryAction::ConfirmFolderTrust)),
+        SessionState::StartupChoicePrompt => Err(AppError::new(
+            "no safe automatic recovery is defined for StartupChoicePrompt; choose the startup option manually",
+        )),
         SessionState::DiffDialog => Err(AppError::new(
             "no safe automatic recovery is defined for DiffDialog; review the pane manually",
         )),
@@ -4121,6 +4128,9 @@ pub(crate) fn render_next_safe_action(
         }
         SessionState::SurveyPrompt => String::from("safe-action: dismiss-survey (0)"),
         SessionState::FolderTrustPrompt => String::from("safe-action: approve (Enter)"),
+        SessionState::StartupChoicePrompt => {
+            String::from("manual-review: startup choice prompt needs operator selection")
+        }
         SessionState::DiffDialog => {
             String::from("manual-review: diff dialog needs operator confirmation")
         }
@@ -4213,6 +4223,14 @@ fn is_pane_command_claude(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("claude")
 }
 
+fn is_default_list_pane(pane: &TmuxPane) -> bool {
+    is_pane_command_claude(pane) || is_botctl_mcp_managed_pane(pane)
+}
+
+fn is_botctl_mcp_managed_pane(pane: &TmuxPane) -> bool {
+    pane.session_name == "botctl-mcp" && pane.window_name.starts_with("botctl-mcp-")
+}
+
 fn is_pane_likely_codex(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("codex")
 }
@@ -4226,6 +4244,10 @@ fn pane_provider_label(pane: &TmuxPane) -> &'static str {
         "Claude"
     } else if is_pane_command_opencode(pane) {
         "OpenCode"
+    } else if pane.window_name.starts_with("botctl-mcp-codex-") {
+        "Codex"
+    } else if pane.window_name.starts_with("botctl-mcp-agy-") {
+        "Antigravity"
     } else if is_pane_likely_codex(pane) {
         "Codex"
     } else if is_pane_command_agy(pane) {
@@ -4475,9 +4497,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_new_model_chooser_is_startup_enter_prompt() {
+    fn codex_new_model_chooser_is_not_auto_entered() {
         let frame = "Introducing GPT-5.5\nChoose how you'd like Codex to proceed.\n› 1. Try new model\n  2. Use existing model\nUse ↑/↓ to move, press enter to confirm";
-        assert!(is_startup_enter_prompt(frame));
+        assert!(!is_startup_enter_prompt(frame));
     }
 
     fn sample_bindings(status: KeybindingsStatus) -> KeybindingsInspection {
@@ -5131,11 +5153,23 @@ mod tests {
     }
 
     #[test]
-    fn list_panes_defaults_to_claude_only_output() {
+    fn list_panes_defaults_to_claude_and_managed_mcp_output() {
         let output = render_list_panes(&[sample_pane("claude"), sample_pane("bash")], false);
         assert!(output.contains("command=claude"));
         assert!(output.contains("pid=123"));
         assert!(!output.contains("command=bash"));
+    }
+
+    #[test]
+    fn list_panes_default_includes_managed_mcp_node_panes() {
+        let mut pane = sample_pane("node");
+        pane.session_name = String::from("botctl-mcp");
+        pane.window_name = String::from("botctl-mcp-codex-12345678");
+
+        let output = render_list_panes(&[pane], false);
+
+        assert!(output.contains("command=node"));
+        assert!(output.contains("provider=Codex"));
     }
 
     #[test]
@@ -5146,9 +5180,9 @@ mod tests {
     }
 
     #[test]
-    fn list_panes_claude_only_reports_empty_state() {
+    fn list_panes_default_reports_empty_state() {
         let output = render_list_panes(&[sample_pane("bash")], false);
-        assert_eq!(output, "no claude panes found");
+        assert_eq!(output, "no managed agent panes found");
     }
 
     #[test]
