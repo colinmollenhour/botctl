@@ -106,7 +106,6 @@ const PERMISSION_KEYWORDS: &[&str] = &[
     "allow once",
     "allow for session",
     "permission",
-    "do you want to proceed",
     "do you want to allow claude to",
     "claude wants to",
     "don't ask again",
@@ -204,7 +203,9 @@ impl Classifier {
             || has_codex_footer
             || has_codex_permission_confirm_footer
             || has_codex_permission_options;
-        let has_permission_words = contains_any(&normalized, PERMISSION_KEYWORDS)
+        let has_permission_question = lines.iter().copied().any(is_permission_question_line);
+        let has_permission_words = (contains_any(&normalized, PERMISSION_KEYWORDS)
+            || has_permission_question)
             && contains_any(&normalized, PERMISSION_CONFIRM_KEYWORDS);
         let has_permission_anchor = lines
             .iter()
@@ -251,6 +252,9 @@ impl Classifier {
         );
         let has_survey_prompt = has_survey_prompt(&normalized, &lines);
         let has_startup_choice_prompt = has_startup_choice_prompt(&normalized, &lines);
+        let has_user_question_selector_prompt = has_user_question_selector_prompt(&lines);
+        let has_user_question_choice_prompt =
+            has_user_question_selector_prompt || has_user_question_option_prompt(&lines);
 
         let has_busy_interrupt_hint = contains_any(
             &normalized,
@@ -321,6 +325,8 @@ impl Classifier {
                 signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
             }
             SessionState::StartupChoicePrompt
+        } else if has_user_question_choice_prompt {
+            SessionState::UserQuestionPrompt
         } else if has_active_codex_permission_prompt {
             signals.push(String::from(SIGNAL_PERMISSION_KEYWORDS));
             signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
@@ -444,7 +450,9 @@ impl Classifier {
                 state,
                 SessionState::ChatReady | SessionState::UserQuestionPrompt
             )
-            && (chat_ready_has_questions(frame_text) || recap_has_user_question(&recap));
+            && (has_user_question_choice_prompt
+                || chat_ready_has_questions(frame_text)
+                || recap_has_user_question(&recap));
         if has_questions {
             signals.push(String::from(SIGNAL_CHAT_QUESTIONS));
             if state == SessionState::ChatReady {
@@ -667,6 +675,57 @@ fn has_startup_choice_prompt(normalized: &str, lines: &[&str]) -> bool {
     has_confirm_footer && has_numbered_choice && (has_codex_model_choice || has_update_choice)
 }
 
+fn has_user_question_selector_prompt(lines: &[&str]) -> bool {
+    let Some(footer_idx) = lines.iter().rposition(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("enter to select") && lower.contains("esc to cancel")
+    }) else {
+        return false;
+    };
+
+    lines[..footer_idx]
+        .iter()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(14)
+        .filter(|line| is_option_line(line))
+        .count()
+        >= 2
+}
+
+fn has_user_question_option_prompt(lines: &[&str]) -> bool {
+    let tail_start = lines.len().saturating_sub(24);
+    let tail = &lines[tail_start..];
+    if tail.iter().copied().any(is_permission_anchor_line) {
+        return false;
+    }
+
+    let Some(question_idx) = tail.iter().rposition(|line| {
+        let lower = line.to_ascii_lowercase();
+        (line.contains('?') || contains_question_phrase(&lower))
+            && !is_permission_question_line(line)
+    }) else {
+        return false;
+    };
+
+    let after_question = &tail[question_idx + 1..];
+    if after_question.iter().copied().any(|line| {
+        is_submitted_chat_input_line(line)
+            || is_plain_chat_input_line(line)
+            || is_codex_chat_input_line(line)
+    }) {
+        return false;
+    }
+
+    after_question
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .take(14)
+        .filter(|line| is_option_line(line))
+        .count()
+        >= 1
+}
+
 fn has_survey_prompt(normalized: &str, lines: &[&str]) -> bool {
     let has_survey_keywords = contains_any(
         normalized,
@@ -860,7 +919,6 @@ fn is_permission_anchor_line(line: &str) -> bool {
         &[
             "allow once",
             "allow for session",
-            "do you want to proceed",
             "do you want to allow claude to",
             "would you like to allow codex",
             "claude wants to",
@@ -872,7 +930,8 @@ fn is_permission_anchor_line(line: &str) -> bool {
             "would you like to run the following command",
             "would you like to run this command",
         ],
-    ) || lower.starts_with("claude code needs permission")
+    ) || is_permission_question_line(line)
+        || lower.starts_with("claude code needs permission")
         || is_permission_choice_line(line)
         || contains_any(
             &lower,
@@ -883,6 +942,15 @@ fn is_permission_anchor_line(line: &str) -> bool {
                 "escape to cancel",
             ],
         )
+}
+
+fn is_permission_question_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("do you want to proceed")
+        || lower.starts_with("do you want to allow claude to")
+        || lower.starts_with("would you like to allow codex")
+        || lower.starts_with("would you like to run the following command")
+        || lower.starts_with("would you like to run this command")
 }
 
 fn has_codex_permission_confirm_footer_at_live_tail(lines: &[&str]) -> bool {
@@ -1415,6 +1483,7 @@ fn contains_question_phrase(normalized: &str) -> bool {
             "would you like",
             "do you want",
             "want me to",
+            "how do you want",
             "how would you like",
             "which option",
             "which approach",
@@ -2316,6 +2385,39 @@ mod tests {
             result
                 .signals
                 .contains(&String::from(SIGNAL_CHAT_QUESTIONS))
+        );
+    }
+
+    #[test]
+    fn classifies_boxed_direction_selector_as_user_question_prompt() {
+        let frame = "● I found a harness issue around permission_mode handling.\n  ⎿  Allowed by auto mode classifier\n\n────────────────────────────────────────────────────────────────────────────────\n ☐ Direction\n\nThe dominant failure needs your call before changing behavior. How do you want to proceed?\n\n❯ 1. Fix QPS bug + code root-cause\n     Apply the verifiable fix and inspect failover logic.\n  2. Drive a live cluster\n     Reproduce against the real playground.\n  3. Stabilize the gate\n     Quarantine the flaky scenarios while keeping coverage.\n  4. Diagnosis only\n     Stop here.\n  5. Type something.\n────────────────────────────────────────────────────────────────────────────────\n  6. Chat about this\n\nEnter to select · ↑/↓ to navigate · Esc to cancel";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
+        assert!(result.has_questions);
+        assert!(
+            result
+                .signals
+                .contains(&String::from(SIGNAL_CHAT_QUESTIONS))
+        );
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
+        );
+    }
+
+    #[test]
+    fn classifies_truncated_direction_selector_as_user_question_prompt() {
+        let frame = "there's no cluster here, and make test-e2e requires a prepared cluster context.\nI can fix the permission_mode issue locally.\nGiven the linked failure won't be turned green by the one locally-fixable bug, I want your call on direction before changing anything:\n────────────────────────────────────────────────────────────────────────────────\n ☐ Direction\nThe nightly/release E2E gate has never been green. How do you want to proceed?\n❯ 1. Fix QPS bug + code root-cause\n     Apply the verifiable QPS/Burst fix to kube/client.go on a branch.";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::UserQuestionPrompt);
+        assert!(result.has_questions);
+        assert!(
+            !result
+                .signals
+                .contains(&String::from(SIGNAL_PERMISSION_KEYWORDS))
         );
     }
 
