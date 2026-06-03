@@ -400,6 +400,9 @@ impl McpRegistry {
 
     pub fn is_cleanup_candidate(record: &McpSessionRecord, now_ms: i64, min_age_ms: i64) -> bool {
         let cutoff = now_ms.saturating_sub(min_age_ms);
+        if record.created_at_ms > cutoff {
+            return false;
+        }
         match record.lifecycle_state {
             LifecycleState::Blocked => record.blocked_at_ms.is_some_and(|at| at <= cutoff),
             LifecycleState::Starting => record.updated_at_ms <= cutoff,
@@ -839,6 +842,9 @@ mod tests {
         };
 
         assert!(McpRegistry::is_cleanup_candidate(&record, 61_000, 30_000));
+        record.created_at_ms = 60_000;
+        assert!(!McpRegistry::is_cleanup_candidate(&record, 61_000, 30_000));
+        record.created_at_ms = 1_000;
         record.blocked_at_ms = Some(60_000);
         assert!(!McpRegistry::is_cleanup_candidate(&record, 61_000, 30_000));
         record.lifecycle_state = LifecycleState::Ready;

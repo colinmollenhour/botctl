@@ -33,6 +33,11 @@ pub struct McpSessionService {
     server_id: String,
 }
 
+enum ResurrectionReady {
+    Ready(McpSessionRecord),
+    Blocked(Value),
+}
+
 impl McpSessionService {
     pub fn new(registry: McpRegistry, server_id: String) -> Self {
         Self {
@@ -157,7 +162,13 @@ impl McpSessionService {
             return self.busy_result(&id);
         };
         let mut record = self.get_record(&id)?;
-        record = self.resurrect_for_prompt_if_needed(record)?;
+        match self.resurrect_for_prompt_if_needed(record)? {
+            ResurrectionReady::Ready(resurrected) => record = resurrected,
+            ResurrectionReady::Blocked(result) => {
+                self.cleanup_stale_managed_sessions_logged();
+                return Ok(result);
+            }
+        }
         let ready = self.wait_inner(
             &record,
             timeout_ms,
@@ -748,7 +759,7 @@ impl McpSessionService {
     fn resurrect_for_prompt_if_needed(
         &self,
         record: McpSessionRecord,
-    ) -> AppResult<McpSessionRecord> {
+    ) -> AppResult<ResurrectionReady> {
         let client = TmuxClient::default();
         let pane = client.pane_by_id(&record.tmux_pane_id)?;
         if let Some(pane) = &pane
@@ -756,8 +767,9 @@ impl McpSessionService {
         {
             let out = outcome("blocked", None, None, Some("ambiguous_target"));
             self.record_outcome(&record.id, &out)?;
-            return Err(AppError::new(
-                "ambiguous_target: managed pane no longer belongs to recorded window",
+            let record = self.registry.get(&record.id)?.unwrap_or(record);
+            return Ok(ResurrectionReady::Blocked(
+                json!({ "agent": agent_ref_with_health(&record, Some(pane)), "outcome": out }),
             ));
         }
         if pane.is_some()
@@ -766,7 +778,7 @@ impl McpSessionService {
                 LifecycleState::Dead | LifecycleState::Killed
             )
         {
-            return Ok(record);
+            return Ok(ResurrectionReady::Ready(record));
         }
         if pane.is_some() {
             if let Err(error) = client.kill_window(&record.tmux_window_id) {
@@ -774,12 +786,13 @@ impl McpSessionService {
                     "warning: failed to kill stale live MCP pane before resurrection for {}: {error}",
                     record.id
                 );
-                self.registry.update_state(
+                self.registry.update_blocked(
                     &record.id,
-                    LifecycleState::Running,
                     record.last_state.as_deref(),
+                    "unknown_state",
+                    None,
                 )?;
-                return self.get_record(&record.id);
+                return self.get_record(&record.id).map(ResurrectionReady::Ready);
             }
         }
 
@@ -812,7 +825,7 @@ impl McpSessionService {
             let _ = client.kill_window(&started.window_id);
             return Err(error);
         }
-        self.get_record(&record.id)
+        self.get_record(&record.id).map(ResurrectionReady::Ready)
     }
 
     fn cleanup_stale_managed_sessions_logged(&self) {
@@ -855,7 +868,7 @@ impl McpSessionService {
                 )?;
                 continue;
             }
-            let frame = client.capture_pane_ansi(&pane.pane_id, 2000)?;
+            let frame = client.capture_pane_ansi(&pane.pane_id, LAST_MESSAGE_HISTORY_LINES)?;
             let frame = prepare_frame_for_classification(&frame);
             let classification = Classifier.classify(&pane.pane_id, &frame);
             let reason =
