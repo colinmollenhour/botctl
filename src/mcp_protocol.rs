@@ -183,7 +183,7 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
     tools.extend([
         tool(
             "prompt",
-            "Primary tool for sending a natural-language prompt/message to an existing managed session. Use this for asking the agent to do work; waits for a terminal outcome and returns the transcript-backed reply while keeping the session alive.",
+            "Primary tool for sending a natural-language prompt/message to an existing managed session. Use this for asking the agent to do work; waits for a terminal outcome and returns the transcript-backed reply while keeping the session alive. If the managed pane is killed/dead/missing, prompt may resurrect the same registry id before submission.",
             json!({
                 "type": "object", "required": ["id", "prompt"],
                 "properties": { "id": {"type":"string"}, "prompt": {"type":"string"}, "timeout_ms": {"type":"integer", "minimum":1000}, "policy": policy_schema() }
@@ -207,7 +207,7 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
         ),
         tool(
             "snapshot",
-            "Capture and classify the current managed pane.",
+            "Capture and classify the current managed pane. Does not resurrect missing panes. Responses may include outcome.blocked_reason and agent.command_health for managed Codex panes.",
             json!({
                 "type":"object", "required":["id"],
                 "properties": { "id":{"type":"string"}, "capture_lines":{"type":"integer", "minimum":1, "maximum":5000} }

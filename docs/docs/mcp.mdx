@@ -34,11 +34,11 @@ Tool names are unprefixed; MCP clients typically expose them under the server na
   - Claude: `model` → `--model`, `effort` → `--effort`, `agent` → `--agent`, `permission_mode` → `--permission-mode`, `settings` → `--settings`.
   - Codex: `model` → `-m`, `effort` → `-c model_reasoning_effort=<v>`. `agent`, `permission_mode`, and `settings` are rejected.
   - Agy: `model`/`effort`/`agent`/`permission_mode`/`settings` are all rejected (no matching CLI flags).
-- `prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive.
-- `wait` — wait for an existing managed session to reach a terminal outcome.
+- `prompt` — submit one prompt to that managed ID, wait for completion, and keep the tmux window alive. If the registry row is `killed`/`dead` or its recorded pane is missing, `prompt` can resurrect the same ID by starting a replacement pane from the persisted launch configuration before submitting the prompt. If the recorded pane ID exists but belongs to a different tmux window, the call blocks as `ambiguous_target` instead of overwriting identity.
+- `wait` — wait for an existing managed session to reach a terminal outcome. It does not resurrect missing panes.
 - `kill` — kill only the verified managed tmux window; idempotent when already gone.
-- `snapshot` — capture raw pane text and classifier state for diagnostics. `pane_text` is the raw tmux capture, while `recent_lines` and structured `outcome.snapshot` drop only trailing blank terminal padding and then return the last useful lines from that same capture. Calling `snapshot` also refreshes the persisted `agent.state` from the live classified state.
-- `send_keys` — unsafe operator escape hatch scoped to the managed ID.
+- `snapshot` — capture raw pane text and classifier state for diagnostics. `pane_text` is the raw tmux capture, while `recent_lines` and structured `outcome.snapshot` drop only trailing blank terminal padding and then return the last useful lines from that same capture. Calling `snapshot` also refreshes the persisted `agent.state` from the live classified state. It does not resurrect missing panes.
+- `send_keys` — unsafe operator escape hatch scoped to the managed ID. It does not resurrect missing panes.
 - `one_shot` — create a temporary managed session, run **exactly one** prompt to a terminal outcome, then **always attempt to kill** the window (best-effort cleanup). Preferred arg: `prompt` (non-empty); aliases `text`, `message`, `input`, and `initial_prompt` are accepted. Optional: `cwd` (defaults to the MCP server current directory), `provider` (defaults to the first available provider binary in `claude`, `codex`, `agy` order), `model_preset` (`best` by default for Claude/Codex), advanced raw `model`, `effort`/`agent`/`permission_mode`/`settings`/`timeout_ms`/`policy` (same provider validation as persistent spawns; `permission_mode`/`settings` are claude-only). It is implemented by composing session creation + prompt + `kill`, so the prompt is submitted exactly once.
   - **Timeout (per-phase):** `timeout_ms` applies independently to the spawn-ready wait and the prompt turn; `kill` uses its own default. Worst case ≈ `2×timeout_ms` + kill.
   - **Auto-approval policy:** uses managed auto-approval (`no_yolo=false`) — only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block. A caller MAY set `policy.no_yolo:true` to be more conservative; it can never broaden beyond the existing gate.
@@ -48,10 +48,21 @@ Tool names are unprefixed; MCP clients typically expose them under the server na
 
 Sessions are addressed by generated public IDs, not tmux names. The registry stores exact tmux session/window/pane IDs (and the chosen provider) under the botctl state directory and uses SQLite lock rows so concurrent prompt/wait/kill/snapshot/send operations on the same ID return `busy` instead of racing.
 
+## Lifecycle resilience
+
+Blocked outcomes use stable lower-snake-case reasons in `outcome.warnings`, `outcome.blocked_reason`, and the registry's current blocked fields. Current reasons are `startup_choice_prompt`, `agy_folder_trust_prompt`, `agy_settings_persist_prompt`, `agy_command_permission_prompt`, `folder_trust_prompt`, `permission_dialog`, `survey_prompt`, `plan_approval_prompt`, `diff_dialog`, `provider_error`, `ambiguous_target`, and `unknown_state`.
+
+For blocked/provider-error/unknown outcomes, the registry persists only current evidence: `blocked_reason`, `blocked_at_ms`, and a bounded `blocked_snapshot` excerpt equivalent to the last 20 useful lines. It does not store full pane captures in blocked fields. Blocked fields are cleared when the session transitions back to ready/running/dead/killed, except cleanup-killed rows preserve the evidence that justified the automatic kill.
+
+Normal lifecycle calls run conservative best-effort cleanup for stale managed rows. Cleanup may kill only aged, unlocked panes whose live recapture still shows a known blocker/provider error. It does not kill persistent ready sessions, running sessions, active response/editing states, unknown states, ambiguous targets, or newly-created rows.
+
+Managed Codex responses include `agent.command_health` where botctl can verify registry identity. `ok_codex` means the verified pane command is `codex`; `ok_node_codex_managed` means the verified registry-backed Codex pane is currently running `node`; `unexpected_command` means the verified pane has another command; `dead` and `ambiguous_target` report missing or mismatched identity; `not_applicable` is used for non-Codex providers or when no live lookup was performed.
+
 ## Safety notes
 
 - `prompt` CLI behavior is unchanged: one-shot `botctl prompt` still cleans up its managed window after success.
 - MCP sessions are persistent: `prompt` does not auto-kill after a reply.
+- Only `prompt` resurrects killed/dead/missing managed IDs; `wait`, `snapshot`, and `send_keys` report current state instead.
 - Automation resolves the managed ID back to one exact tmux pane before acting.
 - `Unknown` and unsupported blocker states return structured outcomes instead of guessing.
 - Visible Codex provider/API errors return structured `provider_error` outcomes with `error_excerpt`; this is a tool result, not a JSON-RPC transport error.

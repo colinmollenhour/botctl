@@ -24,6 +24,8 @@ const DEFAULT_CAPTURE_LINES: usize = 200;
 const LAST_MESSAGE_HISTORY_LINES: usize = 2000;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const LOCK_REFRESH_INTERVAL_MS: u64 = 30_000;
+const CLEANUP_MIN_AGE_MS: i64 = 30_000;
+const CLEANUP_CANDIDATE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct McpSessionService {
@@ -69,6 +71,8 @@ impl McpSessionService {
             model,
             effort,
             agent,
+            permission_mode,
+            settings,
             command,
             ..
         } = validated;
@@ -91,6 +95,8 @@ impl McpSessionService {
             model: model.clone(),
             effort: effort.clone(),
             agent: agent.clone(),
+            permission_mode: permission_mode.clone(),
+            settings: settings.clone(),
             tmux_session_name: started.session_name,
             tmux_window_id: started.window_id,
             tmux_window_name: started.window_name,
@@ -118,11 +124,7 @@ impl McpSessionService {
         let timeout_ms = validated.timeout_ms;
         let no_yolo = validated.no_yolo;
         let outcome = self.wait_inner(record, timeout_ms, false, no_yolo, None, true, None)?;
-        self.registry.update_state(
-            &record.id,
-            lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
-            outcome["classified_state"].as_str(),
-        )?;
+        self.record_outcome(&record.id, &outcome)?;
         let record = self
             .registry
             .get(&record.id)?
@@ -139,6 +141,7 @@ impl McpSessionService {
             }))?;
             result["initial_prompt"] = prompt_result;
         }
+        self.cleanup_stale_managed_sessions_logged();
         Ok(result)
     }
 
@@ -153,7 +156,8 @@ impl McpSessionService {
         let Some(lock) = self.registry.acquire_lock(&id, &self.server_id, "prompt")? else {
             return self.busy_result(&id);
         };
-        let record = self.get_record(&id)?;
+        let mut record = self.get_record(&id)?;
+        record = self.resurrect_for_prompt_if_needed(record)?;
         let ready = self.wait_inner(
             &record,
             timeout_ms,
@@ -164,13 +168,11 @@ impl McpSessionService {
             Some(&lock),
         )?;
         if ready["outcome"] != "ready" {
-            self.registry.update_state(
-                &id,
-                lifecycle_from_outcome(ready["outcome"].as_str().unwrap_or("unknown")),
-                ready["classified_state"].as_str(),
-            )?;
+            self.record_outcome(&id, &ready)?;
             let record = self.registry.get(&id)?.unwrap_or(record);
-            return Ok(json!({ "agent": agent_ref(&record), "outcome": ready }));
+            let result = json!({ "agent": agent_ref(&record), "outcome": ready });
+            self.cleanup_stale_managed_sessions_logged();
+            return Ok(result);
         }
         let pane = self.verify_pane(&record)?;
         let baseline =
@@ -200,11 +202,11 @@ impl McpSessionService {
             );
             remove_snapshot_for_transcript_outcome(&mut outcome);
         }
-        let state = lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown"));
-        self.registry
-            .update_state(&id, state, outcome["classified_state"].as_str())?;
+        self.record_outcome(&id, &outcome)?;
         let record = self.registry.get(&id)?.unwrap_or(record);
-        Ok(json!({ "agent": agent_ref(&record), "outcome": outcome }))
+        let result = json!({ "agent": agent_ref(&record), "outcome": outcome });
+        self.cleanup_stale_managed_sessions_logged();
+        Ok(result)
     }
 
     pub fn wait(&self, args: &Value) -> AppResult<Value> {
@@ -227,13 +229,11 @@ impl McpSessionService {
             false,
             Some(&lock),
         )?;
-        self.registry.update_state(
-            &id,
-            lifecycle_from_outcome(outcome["outcome"].as_str().unwrap_or("unknown")),
-            outcome["classified_state"].as_str(),
-        )?;
+        self.record_outcome(&id, &outcome)?;
         let record = self.registry.get(&id)?.unwrap_or(record);
-        Ok(json!({ "agent": agent_ref(&record), "outcome": outcome }))
+        let result = json!({ "agent": agent_ref(&record), "outcome": outcome });
+        self.cleanup_stale_managed_sessions_logged();
+        Ok(result)
     }
 
     pub fn kill(&self, args: &Value) -> AppResult<Value> {
@@ -259,7 +259,10 @@ impl McpSessionService {
         self.registry
             .update_state(&id, LifecycleState::Killed, None)?;
         let record = self.registry.get(&id)?.unwrap_or(record);
-        Ok(json!({ "agent": agent_ref(&record), "killed": true, "already_gone": already_gone }))
+        let result =
+            json!({ "agent": agent_ref(&record), "killed": true, "already_gone": already_gone });
+        self.cleanup_stale_managed_sessions_logged();
+        Ok(result)
     }
 
     /// Create a temporary managed session, run exactly one prompt to a terminal
@@ -353,6 +356,7 @@ impl McpSessionService {
                 if let Some(error) = result["kill"].get("error").cloned() {
                     result["error"] = error;
                 }
+                self.cleanup_stale_managed_sessions_logged();
                 Ok(result)
             }
             Err(e) => {
@@ -362,7 +366,7 @@ impl McpSessionService {
                 let killed = kill["status"] == "ok" && kill["killed"] == json!(true);
                 // The phase-2 error is the primary cause; the kill outcome (incl.
                 // any kill error) is still reported under `kill`.
-                Ok(json!({
+                let result = json!({
                     "agent": agent_ref(&record),
                     "spawn_outcome": Value::Null,
                     "outcome": "unknown",
@@ -371,7 +375,9 @@ impl McpSessionService {
                     "killed": killed,
                     "kill": kill,
                     "error": e.to_string(),
-                }))
+                });
+                self.cleanup_stale_managed_sessions_logged();
+                Ok(result)
             }
         }
     }
@@ -408,32 +414,50 @@ impl McpSessionService {
         let Some(pane) = client.pane_by_id(&record.tmux_pane_id)? else {
             self.registry
                 .update_state(&id, LifecycleState::Dead, None)?;
-            return Ok(
-                json!({ "agent": agent_ref(&record), "outcome": outcome("dead", None, None, None), "pane_text":"", "recent_lines": [] }),
-            );
+            let record = self.registry.get(&id)?.unwrap_or(record);
+            let result = json!({ "agent": agent_ref(&record), "outcome": outcome("dead", None, None, None), "pane_text":"", "recent_lines": [] });
+            self.cleanup_stale_managed_sessions_logged();
+            return Ok(result);
         };
         if pane.window_id != record.tmux_window_id {
-            return Err(AppError::new(
-                "ambiguous_target: managed pane no longer belongs to recorded window",
-            ));
+            let out = outcome("blocked", None, None, Some("ambiguous_target"));
+            self.record_outcome(&id, &out)?;
+            let record = self.registry.get(&id)?.unwrap_or(record);
+            let result = json!({
+                "agent": agent_ref_with_health(&record, Some(&pane)),
+                "outcome": out,
+                "pane_text": "",
+                "recent_lines": [],
+            });
+            self.cleanup_stale_managed_sessions_logged();
+            return Ok(result);
         }
         let pane_text = client.capture_pane_ansi(&pane.pane_id, capture_lines)?;
         let pane_text = prepare_frame_for_classification(&pane_text);
         let classification = Classifier.classify(&pane.pane_id, &pane_text);
         let outcome_kind = outcome_for_state(classification.state);
-        self.registry.update_state(
-            &id,
-            lifecycle_from_outcome(outcome_kind),
-            Some(classification.state.as_str()),
-        )?;
+        let blocked_reason =
+            blocked_reason_for_state(classification.state).or(match classification.state {
+                SessionState::Unknown => Some("unknown_state"),
+                _ => None,
+            });
+        let out = outcome(
+            outcome_kind,
+            Some(&classification),
+            Some(&pane_text),
+            blocked_reason,
+        );
+        self.record_outcome(&id, &out)?;
         let record = self.registry.get(&id)?.unwrap_or(record);
         let recent_lines = useful_recent_lines(&pane_text, 20);
-        Ok(json!({
-            "agent": agent_ref(&record),
-            "outcome": outcome(outcome_kind, Some(&classification), Some(&pane_text), None),
+        let result = json!({
+            "agent": agent_ref_with_health(&record, Some(&pane)),
+            "outcome": out,
             "pane_text": pane_text,
             "recent_lines": recent_lines,
-        }))
+        });
+        self.cleanup_stale_managed_sessions_logged();
+        Ok(result)
     }
 
     pub fn send_keys(&self, args: &Value) -> AppResult<Value> {
@@ -464,9 +488,9 @@ impl McpSessionService {
         if !keys.is_empty() {
             client.send_keys(&pane.pane_id, &keys)?;
         }
-        Ok(
-            json!({ "agent": agent_ref(&record), "sent": true, "warning": "unsafe_operator_escape_hatch_no_progress_implied" }),
-        )
+        let result = json!({ "agent": agent_ref_with_health(&record, Some(&pane)), "sent": true, "warning": "unsafe_operator_escape_hatch_no_progress_implied" });
+        self.cleanup_stale_managed_sessions_logged();
+        Ok(result)
     }
 
     fn get_record(&self, id: &str) -> AppResult<McpSessionRecord> {
@@ -553,11 +577,6 @@ impl McpSessionService {
                 );
                 out["error_excerpt"] = json!(error_excerpt);
                 return Ok(out);
-            }
-            if !no_yolo && is_startup_enter_prompt(&frame) {
-                client.send_keys(&pane.pane_id, &["Enter"])?;
-                thread::sleep(Duration::from_millis(DEFAULT_POLL_MS));
-                continue;
             }
             if !matches!(classification.state, SessionState::Unknown) {
                 last_unknown_frame = None;
@@ -655,14 +674,21 @@ impl McpSessionService {
                 | SessionState::AgyCommandPermissionPrompt
                 | SessionState::AgyFolderTrustPrompt
                 | SessionState::AgySettingsPersistPrompt => {
+                    let reason = blocked_reason_for_state(classification.state)
+                        .unwrap_or("unknown_state");
                     return Ok(outcome(
                         "blocked",
                         Some(&classification),
                         Some(&frame),
-                        Some("blocked_state"),
+                        Some(reason),
                     ));
                 }
                 SessionState::Unknown => {
+                    if !no_yolo && is_startup_enter_prompt(&frame) {
+                        client.send_keys(&pane.pane_id, &["Enter"])?;
+                        thread::sleep(Duration::from_millis(DEFAULT_POLL_MS));
+                        continue;
+                    }
                     if frame_is_blank(&frame) || wait_unknown_until_deadline {
                         last_unknown_frame = Some((classification.clone(), frame.clone()));
                     } else {
@@ -706,6 +732,197 @@ impl McpSessionService {
             json!({ "agent": agent_ref(&record), "outcome": outcome("busy", None, None, Some("busy")) }),
         )
     }
+
+    fn record_outcome(&self, id: &str, outcome: &Value) -> AppResult<()> {
+        let kind = outcome["outcome"].as_str().unwrap_or("unknown");
+        let last_state = outcome["classified_state"].as_str();
+        if let Some(reason) = outcome.get("blocked_reason").and_then(Value::as_str) {
+            self.registry
+                .update_blocked(id, last_state, reason, outcome["snapshot"].as_str())
+        } else {
+            self.registry
+                .update_state(id, lifecycle_from_outcome(kind), last_state)
+        }
+    }
+
+    fn resurrect_for_prompt_if_needed(
+        &self,
+        record: McpSessionRecord,
+    ) -> AppResult<McpSessionRecord> {
+        let client = TmuxClient::default();
+        let pane = client.pane_by_id(&record.tmux_pane_id)?;
+        if let Some(pane) = &pane
+            && pane.window_id != record.tmux_window_id
+        {
+            let out = outcome("blocked", None, None, Some("ambiguous_target"));
+            self.record_outcome(&record.id, &out)?;
+            return Err(AppError::new(
+                "ambiguous_target: managed pane no longer belongs to recorded window",
+            ));
+        }
+        if pane.is_some()
+            && !matches!(
+                record.lifecycle_state,
+                LifecycleState::Dead | LifecycleState::Killed
+            )
+        {
+            return Ok(record);
+        }
+        if pane.is_some() {
+            if let Err(error) = client.kill_window(&record.tmux_window_id) {
+                eprintln!(
+                    "warning: failed to kill stale live MCP pane before resurrection for {}: {error}",
+                    record.id
+                );
+                self.registry.update_state(
+                    &record.id,
+                    LifecycleState::Running,
+                    record.last_state.as_deref(),
+                )?;
+                return self.get_record(&record.id);
+            }
+        }
+
+        let command = build_launch_command_from_record(&record)?;
+        let cwd = PathBuf::from(&record.cwd);
+        if !cwd.is_dir() {
+            return Err(AppError::new(
+                "not_resurrectable: recorded cwd is not an existing directory",
+            ));
+        }
+        let window_name = format!(
+            "botctl-mcp-{}-{}",
+            record.provider.as_str(),
+            &self.server_id[..8.min(self.server_id.len())]
+        );
+        let started = client.start_window_in_session(&StartWindowRequest {
+            session_name: DEFAULT_SESSION_NAME.to_string(),
+            window_name,
+            cwd,
+            command,
+        })?;
+        if let Err(error) = self.registry.replace_tmux_identity_for_resurrection(
+            &record.id,
+            &started.session_name,
+            &started.window_id,
+            &started.window_name,
+            &started.pane_id,
+            &self.server_id,
+        ) {
+            let _ = client.kill_window(&started.window_id);
+            return Err(error);
+        }
+        self.get_record(&record.id)
+    }
+
+    fn cleanup_stale_managed_sessions_logged(&self) {
+        if let Err(error) = self.cleanup_stale_managed_sessions() {
+            eprintln!("warning: MCP stale-session cleanup failed: {error}");
+        }
+    }
+
+    fn cleanup_stale_managed_sessions(&self) -> AppResult<()> {
+        let now = crate::mcp_registry::now_ms()?;
+        let candidates =
+            self.registry
+                .cleanup_candidates(now, CLEANUP_MIN_AGE_MS, CLEANUP_CANDIDATE_LIMIT)?;
+        let client = TmuxClient::default();
+        for record in candidates {
+            let Some(_lock) = self
+                .registry
+                .acquire_lock(&record.id, &self.server_id, "cleanup")?
+            else {
+                continue;
+            };
+            let now = crate::mcp_registry::now_ms()?;
+            let Some(record) = self.registry.get(&record.id)? else {
+                continue;
+            };
+            if !McpRegistry::is_cleanup_candidate(&record, now, CLEANUP_MIN_AGE_MS) {
+                continue;
+            }
+            let Some(pane) = client.pane_by_id(&record.tmux_pane_id)? else {
+                self.registry
+                    .update_state(&record.id, LifecycleState::Dead, None)?;
+                continue;
+            };
+            if pane.window_id != record.tmux_window_id {
+                self.registry.update_blocked(
+                    &record.id,
+                    record.last_state.as_deref(),
+                    "ambiguous_target",
+                    None,
+                )?;
+                continue;
+            }
+            let frame = client.capture_pane_ansi(&pane.pane_id, 2000)?;
+            let frame = prepare_frame_for_classification(&frame);
+            let classification = Classifier.classify(&pane.pane_id, &frame);
+            let reason =
+                if record.provider == Provider::Codex && provider_error_excerpt(&frame).is_some() {
+                    Some("provider_error")
+                } else {
+                    blocked_reason_for_state(classification.state)
+                };
+            if reason == Some("provider_error") {
+                let snapshot = useful_recent_lines(&frame, 20).join("\n");
+                self.registry.update_blocked(
+                    &record.id,
+                    Some(classification.state.as_str()),
+                    "provider_error",
+                    Some(&snapshot),
+                )?;
+                client.kill_window(&record.tmux_window_id)?;
+                self.registry
+                    .mark_cleanup_killed_preserving_blocked(&record.id)?;
+                continue;
+            }
+            match classification.state {
+                SessionState::ChatReady | SessionState::UserQuestionPrompt => {
+                    self.registry.update_state(
+                        &record.id,
+                        LifecycleState::Ready,
+                        Some(classification.state.as_str()),
+                    )?;
+                }
+                SessionState::BusyResponding
+                | SessionState::PromptEditing
+                | SessionState::ExternalEditorActive => {
+                    self.registry.update_state(
+                        &record.id,
+                        LifecycleState::Running,
+                        Some(classification.state.as_str()),
+                    )?;
+                }
+                SessionState::Unknown => {
+                    let snapshot = useful_recent_lines(&frame, 20).join("\n");
+                    self.registry.update_blocked(
+                        &record.id,
+                        Some(classification.state.as_str()),
+                        "unknown_state",
+                        Some(&snapshot),
+                    )?;
+                }
+                _ => {
+                    if let Some(reason) = reason
+                        && cleanup_reason_is_kill_eligible(reason)
+                    {
+                        let snapshot = useful_recent_lines(&frame, 20).join("\n");
+                        self.registry.update_blocked(
+                            &record.id,
+                            Some(classification.state.as_str()),
+                            reason,
+                            Some(&snapshot),
+                        )?;
+                        client.kill_window(&record.tmux_window_id)?;
+                        self.registry
+                            .mark_cleanup_killed_preserving_blocked(&record.id)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Fully-validated `spawn` arguments. Produced by `validate_spawn_args` so that
@@ -720,6 +937,8 @@ struct ValidatedSpawnArgs {
     model: Option<String>,
     effort: Option<String>,
     agent: Option<String>,
+    permission_mode: Option<String>,
+    settings: Option<String>,
     command: String,
     timeout_ms: u64,
     no_yolo: bool,
@@ -765,6 +984,8 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
         model,
         effort,
         agent,
+        permission_mode,
+        settings,
         command,
         timeout_ms,
         no_yolo,
@@ -1007,6 +1228,17 @@ fn build_launch_command(
     Ok(parts.join(" "))
 }
 
+fn build_launch_command_from_record(record: &McpSessionRecord) -> AppResult<String> {
+    build_launch_command(
+        record.provider,
+        record.model.as_deref(),
+        record.effort.as_deref(),
+        record.agent.as_deref(),
+        record.permission_mode.as_deref(),
+        record.settings.as_deref(),
+    )
+}
+
 fn shell_escape_arg(value: &str) -> String {
     if value
         .chars()
@@ -1058,6 +1290,11 @@ fn canonical_dir(path: &str) -> AppResult<PathBuf> {
 }
 
 fn agent_ref(record: &McpSessionRecord) -> Value {
+    agent_ref_with_health(record, None)
+}
+
+fn agent_ref_with_health(record: &McpSessionRecord, pane: Option<&TmuxPane>) -> Value {
+    let command_health = command_health(record, pane);
     json!({
         "id": record.id,
         "provider": record.provider.as_str(),
@@ -1074,7 +1311,34 @@ fn agent_ref(record: &McpSessionRecord) -> Value {
         },
         "created_at_ms": record.created_at_ms,
         "updated_at_ms": record.updated_at_ms,
+        "command_health": command_health,
     })
+}
+
+fn command_health(record: &McpSessionRecord, pane: Option<&TmuxPane>) -> Value {
+    if record.provider != Provider::Codex {
+        return json!({ "status": "not_applicable", "identity_verified": false });
+    }
+    let Some(pane) = pane else {
+        let status = if matches!(
+            record.lifecycle_state,
+            LifecycleState::Dead | LifecycleState::Killed
+        ) {
+            "dead"
+        } else {
+            "not_applicable"
+        };
+        return json!({ "status": status, "registry_provider": "codex", "identity_verified": false });
+    };
+    if pane.window_id != record.tmux_window_id {
+        return json!({ "status": "ambiguous_target", "registry_provider": "codex", "command": pane.current_command, "identity_verified": false });
+    }
+    let status = match pane.current_command.as_str() {
+        "codex" => "ok_codex",
+        "node" => "ok_node_codex_managed",
+        _ => "unexpected_command",
+    };
+    json!({ "status": status, "registry_provider": "codex", "command": pane.current_command, "identity_verified": true })
 }
 
 fn outcome(
@@ -1083,13 +1347,19 @@ fn outcome(
     snapshot: Option<&str>,
     reason: Option<&str>,
 ) -> Value {
-    json!({
+    let mut out = json!({
         "outcome": kind,
         "classified_state": classification.map(|c| c.state.as_str()),
         "message": Value::Null,
         "warnings": reason.map(|r| vec![r]).unwrap_or_default(),
         "snapshot": snapshot.map(|s| useful_recent_lines(s, 20).join("\n")),
-    })
+    });
+    if matches!(kind, "blocked" | "provider_error" | "unknown")
+        && let Some(reason) = reason
+    {
+        out["blocked_reason"] = json!(reason);
+    }
+    out
 }
 
 fn useful_recent_lines(frame: &str, limit: usize) -> Vec<String> {
@@ -1202,6 +1472,37 @@ fn outcome_for_state(state: SessionState) -> &'static str {
     }
 }
 
+fn blocked_reason_for_state(state: SessionState) -> Option<&'static str> {
+    match state {
+        SessionState::StartupChoicePrompt => Some("startup_choice_prompt"),
+        SessionState::AgyFolderTrustPrompt => Some("agy_folder_trust_prompt"),
+        SessionState::AgySettingsPersistPrompt => Some("agy_settings_persist_prompt"),
+        SessionState::AgyCommandPermissionPrompt => Some("agy_command_permission_prompt"),
+        SessionState::FolderTrustPrompt => Some("folder_trust_prompt"),
+        SessionState::PermissionDialog => Some("permission_dialog"),
+        SessionState::SurveyPrompt => Some("survey_prompt"),
+        SessionState::PlanApprovalPrompt => Some("plan_approval_prompt"),
+        SessionState::DiffDialog => Some("diff_dialog"),
+        _ => None,
+    }
+}
+
+fn cleanup_reason_is_kill_eligible(reason: &str) -> bool {
+    matches!(
+        reason,
+        "startup_choice_prompt"
+            | "agy_folder_trust_prompt"
+            | "agy_settings_persist_prompt"
+            | "agy_command_permission_prompt"
+            | "folder_trust_prompt"
+            | "permission_dialog"
+            | "survey_prompt"
+            | "plan_approval_prompt"
+            | "diff_dialog"
+            | "provider_error"
+    )
+}
+
 fn lifecycle_from_outcome(outcome: &str) -> LifecycleState {
     match outcome {
         "ready" | "needs_user_input" => LifecycleState::Ready,
@@ -1310,6 +1611,69 @@ mod tests {
             outcome_for_state(SessionState::StartupChoicePrompt),
             "blocked"
         );
+        assert_eq!(
+            blocked_reason_for_state(SessionState::StartupChoicePrompt),
+            Some("startup_choice_prompt")
+        );
+        let out = outcome(
+            "blocked",
+            None,
+            Some("chooser\n"),
+            Some("startup_choice_prompt"),
+        );
+        assert_eq!(out["warnings"], json!(["startup_choice_prompt"]));
+        assert_eq!(out["blocked_reason"], json!("startup_choice_prompt"));
+    }
+
+    #[test]
+    fn maps_all_known_blocked_reasons() {
+        let cases = [
+            (
+                SessionState::AgyFolderTrustPrompt,
+                "agy_folder_trust_prompt",
+            ),
+            (
+                SessionState::AgySettingsPersistPrompt,
+                "agy_settings_persist_prompt",
+            ),
+            (
+                SessionState::AgyCommandPermissionPrompt,
+                "agy_command_permission_prompt",
+            ),
+            (SessionState::FolderTrustPrompt, "folder_trust_prompt"),
+            (SessionState::PermissionDialog, "permission_dialog"),
+            (SessionState::SurveyPrompt, "survey_prompt"),
+            (SessionState::PlanApprovalPrompt, "plan_approval_prompt"),
+            (SessionState::DiffDialog, "diff_dialog"),
+        ];
+        for (state, reason) in cases {
+            assert_eq!(blocked_reason_for_state(state), Some(reason));
+            assert!(cleanup_reason_is_kill_eligible(reason));
+        }
+        assert_eq!(blocked_reason_for_state(SessionState::Unknown), None);
+        assert!(!cleanup_reason_is_kill_eligible("unknown_state"));
+        assert!(!cleanup_reason_is_kill_eligible("ambiguous_target"));
+    }
+
+    #[test]
+    fn provider_error_outcome_includes_blocked_reason() {
+        let out = outcome(
+            "provider_error",
+            None,
+            Some("error"),
+            Some("provider_error"),
+        );
+
+        assert_eq!(out["blocked_reason"], json!("provider_error"));
+        assert_eq!(out["warnings"], json!(["provider_error"]));
+    }
+
+    #[test]
+    fn unknown_outcome_includes_blocked_reason_for_persistence() {
+        let out = outcome("unknown", None, Some("mystery"), Some("unknown_state"));
+
+        assert_eq!(out["blocked_reason"], json!("unknown_state"));
+        assert_eq!(out["warnings"], json!(["unknown_state"]));
     }
 
     #[test]
@@ -1425,6 +1789,56 @@ gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used"#;
     }
 
     #[test]
+    fn launch_command_from_record_replays_persisted_options() {
+        let mut record = fake_record_for_health(Provider::Claude, "claude");
+        record.model = Some("opus".into());
+        record.effort = Some("high".into());
+        record.agent = Some("reviewer".into());
+        record.permission_mode = Some("acceptEdits".into());
+        record.settings = Some("/tmp/settings.json".into());
+
+        assert_eq!(
+            build_launch_command_from_record(&record).unwrap(),
+            "claude --model opus --effort high --agent reviewer --permission-mode acceptEdits --settings /tmp/settings.json"
+        );
+    }
+
+    #[test]
+    fn codex_command_health_requires_registry_identity() {
+        let mut record = fake_record_for_health(Provider::Codex, "codex");
+        let mut pane = fake_pane("node", &record.tmux_window_id);
+
+        assert_eq!(
+            command_health(&record, Some(&pane))["status"],
+            json!("ok_node_codex_managed")
+        );
+        pane.current_command = "bash".into();
+        assert_eq!(
+            command_health(&record, Some(&pane))["status"],
+            json!("unexpected_command")
+        );
+        pane.window_id = "@different".into();
+        assert_eq!(
+            command_health(&record, Some(&pane))["status"],
+            json!("ambiguous_target")
+        );
+        let claude = fake_record_for_health(Provider::Claude, "claude");
+        assert_eq!(
+            command_health(&claude, Some(&fake_pane("node", &claude.tmux_window_id)))["status"],
+            json!("not_applicable")
+        );
+
+        assert_eq!(
+            command_health(&record, None)["status"],
+            json!("not_applicable")
+        );
+        record.lifecycle_state = LifecycleState::Dead;
+        assert_eq!(command_health(&record, None)["status"], json!("dead"));
+        record.lifecycle_state = LifecycleState::Killed;
+        assert_eq!(command_health(&record, None)["status"], json!("dead"));
+    }
+
+    #[test]
     fn launch_command_rejects_unsupported_combos() {
         let err = build_launch_command(Provider::Codex, None, None, Some("reviewer"), None, None)
             .expect_err("codex agent should fail");
@@ -1487,6 +1901,58 @@ gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used"#;
     fn test_service(state_dir: &Path) -> McpSessionService {
         let registry = McpRegistry::open(state_dir).unwrap();
         McpSessionService::new(registry, "test-server-id-0000".to_string())
+    }
+
+    fn fake_record_for_health(provider: Provider, command: &str) -> McpSessionRecord {
+        McpSessionRecord {
+            id: "id".into(),
+            owner_server_id: "server".into(),
+            provider,
+            model: None,
+            effort: None,
+            agent: None,
+            permission_mode: None,
+            settings: None,
+            tmux_session_name: "botctl-mcp".into(),
+            tmux_window_id: "@1".into(),
+            tmux_window_name: format!("botctl-mcp-{command}"),
+            tmux_pane_id: "%1".into(),
+            cwd: "/tmp".into(),
+            lifecycle_state: LifecycleState::Ready,
+            last_state: None,
+            last_message_id: None,
+            last_message_text: None,
+            last_message_seen_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            dead_at_ms: None,
+            killed_at_ms: None,
+            blocked_reason: None,
+            blocked_snapshot: None,
+            blocked_at_ms: None,
+            resurrected_at_ms: None,
+            resurrection_count: 0,
+        }
+    }
+
+    fn fake_pane(command: &str, window_id: &str) -> TmuxPane {
+        TmuxPane {
+            pane_id: "%1".into(),
+            pane_tty: "/dev/pts/1".into(),
+            pane_pid: Some(123),
+            session_id: "$1".into(),
+            session_name: "botctl-mcp".into(),
+            window_id: window_id.into(),
+            window_index: 1,
+            window_name: "mcp".into(),
+            pane_index: 0,
+            current_command: command.into(),
+            current_path: "/tmp".into(),
+            pane_title: "title".into(),
+            pane_active: true,
+            cursor_x: None,
+            cursor_y: None,
+        }
     }
 
     #[test]

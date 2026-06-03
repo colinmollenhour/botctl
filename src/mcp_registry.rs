@@ -99,6 +99,8 @@ pub struct McpSessionRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub agent: Option<String>,
+    pub permission_mode: Option<String>,
+    pub settings: Option<String>,
     pub tmux_session_name: String,
     pub tmux_window_id: String,
     pub tmux_window_name: String,
@@ -113,6 +115,11 @@ pub struct McpSessionRecord {
     pub updated_at_ms: i64,
     pub dead_at_ms: Option<i64>,
     pub killed_at_ms: Option<i64>,
+    pub blocked_reason: Option<String>,
+    pub blocked_snapshot: Option<String>,
+    pub blocked_at_ms: Option<i64>,
+    pub resurrected_at_ms: Option<i64>,
+    pub resurrection_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +129,8 @@ pub struct NewSessionRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub agent: Option<String>,
+    pub permission_mode: Option<String>,
+    pub settings: Option<String>,
     pub tmux_session_name: String,
     pub tmux_window_id: String,
     pub tmux_window_name: String,
@@ -191,6 +200,8 @@ impl McpRegistry {
                 model TEXT,
                 effort TEXT,
                 agent TEXT,
+                permission_mode TEXT,
+                settings TEXT,
                 tmux_session_name TEXT NOT NULL,
                 tmux_window_id TEXT NOT NULL,
                 tmux_window_name TEXT NOT NULL,
@@ -204,7 +215,12 @@ impl McpRegistry {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 dead_at_ms INTEGER,
-                killed_at_ms INTEGER
+                killed_at_ms INTEGER,
+                blocked_reason TEXT,
+                blocked_snapshot TEXT,
+                blocked_at_ms INTEGER,
+                resurrected_at_ms INTEGER,
+                resurrection_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS mcp_session_locks (
                 session_id TEXT PRIMARY KEY,
@@ -219,6 +235,13 @@ impl McpRegistry {
             "ALTER TABLE mcp_sessions ADD COLUMN model TEXT",
             "ALTER TABLE mcp_sessions ADD COLUMN effort TEXT",
             "ALTER TABLE mcp_sessions ADD COLUMN agent TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN permission_mode TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN settings TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN blocked_reason TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN blocked_snapshot TEXT",
+            "ALTER TABLE mcp_sessions ADD COLUMN blocked_at_ms INTEGER",
+            "ALTER TABLE mcp_sessions ADD COLUMN resurrected_at_ms INTEGER",
+            "ALTER TABLE mcp_sessions ADD COLUMN resurrection_count INTEGER NOT NULL DEFAULT 0",
         ] {
             match conn.execute(stmt, []) {
                 Ok(_) => {}
@@ -242,6 +265,8 @@ impl McpRegistry {
                 model: new.model.clone(),
                 effort: new.effort.clone(),
                 agent: new.agent.clone(),
+                permission_mode: new.permission_mode.clone(),
+                settings: new.settings.clone(),
                 tmux_session_name: new.tmux_session_name.clone(),
                 tmux_window_id: new.tmux_window_id.clone(),
                 tmux_window_name: new.tmux_window_name.clone(),
@@ -256,6 +281,11 @@ impl McpRegistry {
                 updated_at_ms: now,
                 dead_at_ms: None,
                 killed_at_ms: None,
+                blocked_reason: None,
+                blocked_snapshot: None,
+                blocked_at_ms: None,
+                resurrected_at_ms: None,
+                resurrection_count: 0,
             };
             match self.insert_record(&record) {
                 Ok(()) => return Ok(record),
@@ -267,16 +297,16 @@ impl McpRegistry {
 
     fn insert_record(&self, r: &McpSessionRecord) -> AppResult<()> {
         self.conn()?.execute(
-            "INSERT INTO mcp_sessions (id, owner_server_id, provider, model, effort, agent, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![r.id, r.owner_server_id, r.provider.as_str(), r.model, r.effort, r.agent, r.tmux_session_name, r.tmux_window_id, r.tmux_window_name, r.tmux_pane_id, r.cwd, r.lifecycle_state.as_str(), r.created_at_ms, r.updated_at_ms],
+            "INSERT INTO mcp_sessions (id, owner_server_id, provider, model, effort, agent, permission_mode, settings, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, created_at_ms, updated_at_ms, resurrection_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![r.id, r.owner_server_id, r.provider.as_str(), r.model, r.effort, r.agent, r.permission_mode, r.settings, r.tmux_session_name, r.tmux_window_id, r.tmux_window_name, r.tmux_pane_id, r.cwd, r.lifecycle_state.as_str(), r.created_at_ms, r.updated_at_ms, r.resurrection_count],
         )?;
         Ok(())
     }
 
     pub fn get(&self, id: &str) -> AppResult<Option<McpSessionRecord>> {
         self.conn()?.query_row(
-            "SELECT id, owner_server_id, provider, model, effort, agent, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, last_state, last_message_id, last_message_text, last_message_seen_at_ms, created_at_ms, updated_at_ms, dead_at_ms, killed_at_ms FROM mcp_sessions WHERE id=?1",
+            "SELECT id, owner_server_id, provider, model, effort, agent, permission_mode, settings, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, last_state, last_message_id, last_message_text, last_message_seen_at_ms, created_at_ms, updated_at_ms, dead_at_ms, killed_at_ms, blocked_reason, blocked_snapshot, blocked_at_ms, resurrected_at_ms, resurrection_count FROM mcp_sessions WHERE id=?1",
             params![id],
             row_to_record,
         ).optional().map_err(AppError::from)
@@ -295,10 +325,86 @@ impl McpRegistry {
             _ => (None, None),
         };
         self.conn()?.execute(
-            "UPDATE mcp_sessions SET lifecycle_state=?2, last_state=COALESCE(?3,last_state), updated_at_ms=?4, dead_at_ms=COALESCE(?5, dead_at_ms), killed_at_ms=COALESCE(?6, killed_at_ms) WHERE id=?1",
+            "UPDATE mcp_sessions SET lifecycle_state=?2, last_state=COALESCE(?3,last_state), updated_at_ms=?4, dead_at_ms=COALESCE(?5, dead_at_ms), killed_at_ms=COALESCE(?6, killed_at_ms), blocked_reason=NULL, blocked_snapshot=NULL, blocked_at_ms=NULL WHERE id=?1",
             params![id, state.as_str(), last_state, now, dead_at, killed_at],
         )?;
         Ok(())
+    }
+
+    pub fn update_blocked(
+        &self,
+        id: &str,
+        last_state: Option<&str>,
+        reason: &str,
+        snapshot: Option<&str>,
+    ) -> AppResult<()> {
+        let now = now_ms()?;
+        self.conn()?.execute(
+            "UPDATE mcp_sessions SET lifecycle_state='blocked', last_state=COALESCE(?2,last_state), blocked_reason=?3, blocked_snapshot=?4, blocked_at_ms=?5, updated_at_ms=?5 WHERE id=?1",
+            params![id, last_state, reason, snapshot, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_cleanup_killed_preserving_blocked(&self, id: &str) -> AppResult<()> {
+        let now = now_ms()?;
+        self.conn()?.execute(
+            "UPDATE mcp_sessions SET lifecycle_state='killed', updated_at_ms=?2, killed_at_ms=COALESCE(killed_at_ms, ?2) WHERE id=?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_tmux_identity_for_resurrection(
+        &self,
+        id: &str,
+        session_name: &str,
+        window_id: &str,
+        window_name: &str,
+        pane_id: &str,
+        owner_server_id: &str,
+    ) -> AppResult<()> {
+        let now = now_ms()?;
+        self.conn()?.execute(
+            "UPDATE mcp_sessions SET owner_server_id=?7, tmux_session_name=?2, tmux_window_id=?3, tmux_window_name=?4, tmux_pane_id=?5, lifecycle_state='starting', last_state=NULL, dead_at_ms=NULL, killed_at_ms=NULL, blocked_reason=NULL, blocked_snapshot=NULL, blocked_at_ms=NULL, resurrected_at_ms=?6, resurrection_count=resurrection_count+1, updated_at_ms=?6 WHERE id=?1",
+            params![id, session_name, window_id, window_name, pane_id, now, owner_server_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_candidates(
+        &self,
+        now_ms: i64,
+        min_age_ms: i64,
+        limit: usize,
+    ) -> AppResult<Vec<McpSessionRecord>> {
+        let cutoff = now_ms.saturating_sub(min_age_ms);
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, owner_server_id, provider, model, effort, agent, permission_mode, settings, tmux_session_name, tmux_window_id, tmux_window_name, tmux_pane_id, cwd, lifecycle_state, last_state, last_message_id, last_message_text, last_message_seen_at_ms, created_at_ms, updated_at_ms, dead_at_ms, killed_at_ms, blocked_reason, blocked_snapshot, blocked_at_ms, resurrected_at_ms, resurrection_count
+             FROM mcp_sessions
+              WHERE id NOT IN (SELECT session_id FROM mcp_session_locks WHERE expires_at_ms>=?1)
+                AND created_at_ms<=?2
+                AND ((lifecycle_state='blocked' AND blocked_at_ms IS NOT NULL AND blocked_at_ms<=?2)
+                  OR (lifecycle_state='starting' AND updated_at_ms<=?2))
+              ORDER BY COALESCE(blocked_at_ms, updated_at_ms, created_at_ms) ASC
+              LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![now_ms, cutoff, limit as i64], row_to_record)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    pub fn is_cleanup_candidate(record: &McpSessionRecord, now_ms: i64, min_age_ms: i64) -> bool {
+        let cutoff = now_ms.saturating_sub(min_age_ms);
+        match record.lifecycle_state {
+            LifecycleState::Blocked => record.blocked_at_ms.is_some_and(|at| at <= cutoff),
+            LifecycleState::Starting => record.updated_at_ms <= cutoff,
+            _ => false,
+        }
     }
 
     pub fn update_cursor(&self, id: &str, msg_id: Option<&str>, text: &str) -> AppResult<()> {
@@ -376,9 +482,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpSessionRecord> 
     let provider = Provider::from_db(&provider_str).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
     })?;
-    let state: String = row.get(11)?;
+    let state: String = row.get(13)?;
     let lifecycle_state = LifecycleState::from_str(&state).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(13, Type::Text, Box::new(error))
     })?;
     Ok(McpSessionRecord {
         id: row.get(0)?,
@@ -387,20 +493,27 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpSessionRecord> 
         model: row.get(3)?,
         effort: row.get(4)?,
         agent: row.get(5)?,
-        tmux_session_name: row.get(6)?,
-        tmux_window_id: row.get(7)?,
-        tmux_window_name: row.get(8)?,
-        tmux_pane_id: row.get(9)?,
-        cwd: row.get(10)?,
+        permission_mode: row.get(6)?,
+        settings: row.get(7)?,
+        tmux_session_name: row.get(8)?,
+        tmux_window_id: row.get(9)?,
+        tmux_window_name: row.get(10)?,
+        tmux_pane_id: row.get(11)?,
+        cwd: row.get(12)?,
         lifecycle_state,
-        last_state: row.get(12)?,
-        last_message_id: row.get(13)?,
-        last_message_text: row.get(14)?,
-        last_message_seen_at_ms: row.get(15)?,
-        created_at_ms: row.get(16)?,
-        updated_at_ms: row.get(17)?,
-        dead_at_ms: row.get(18)?,
-        killed_at_ms: row.get(19)?,
+        last_state: row.get(14)?,
+        last_message_id: row.get(15)?,
+        last_message_text: row.get(16)?,
+        last_message_seen_at_ms: row.get(17)?,
+        created_at_ms: row.get(18)?,
+        updated_at_ms: row.get(19)?,
+        dead_at_ms: row.get(20)?,
+        killed_at_ms: row.get(21)?,
+        blocked_reason: row.get(22)?,
+        blocked_snapshot: row.get(23)?,
+        blocked_at_ms: row.get(24)?,
+        resurrected_at_ms: row.get(25)?,
+        resurrection_count: row.get(26)?,
     })
 }
 
@@ -502,6 +615,237 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn old_schema_migrates_lifecycle_columns() {
+        let root =
+            std::env::temp_dir().join(format!("botctl-mcp-reg-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("mcp.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mcp_sessions (
+                id TEXT PRIMARY KEY,
+                owner_server_id TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'claude',
+                model TEXT,
+                effort TEXT,
+                agent TEXT,
+                tmux_session_name TEXT NOT NULL,
+                tmux_window_id TEXT NOT NULL,
+                tmux_window_name TEXT NOT NULL,
+                tmux_pane_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                last_state TEXT,
+                last_message_id TEXT,
+                last_message_text TEXT,
+                last_message_seen_at_ms INTEGER,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                dead_at_ms INTEGER,
+                killed_at_ms INTEGER
+            );",
+        )
+        .unwrap();
+        drop(conn);
+        let registry = McpRegistry::open(&root).unwrap();
+        let record = registry.insert_session(fake_new("%1", "@1")).unwrap();
+        assert_eq!(record.permission_mode, None);
+        assert_eq!(record.settings, None);
+        assert_eq!(record.blocked_reason, None);
+        assert_eq!(record.resurrection_count, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blocked_fields_persist_and_clear() {
+        let root =
+            std::env::temp_dir().join(format!("botctl-mcp-reg-blocked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let registry = McpRegistry::open(&root).unwrap();
+        let record = registry.insert_session(fake_new("%1", "@1")).unwrap();
+
+        registry
+            .update_blocked(
+                &record.id,
+                Some("StartupChoicePrompt"),
+                "startup_choice_prompt",
+                Some("bounded excerpt"),
+            )
+            .unwrap();
+        let blocked = registry.get(&record.id).unwrap().unwrap();
+        assert_eq!(blocked.lifecycle_state, LifecycleState::Blocked);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("startup_choice_prompt")
+        );
+        assert_eq!(blocked.blocked_snapshot.as_deref(), Some("bounded excerpt"));
+        assert!(blocked.blocked_at_ms.is_some());
+
+        registry
+            .update_state(&record.id, LifecycleState::Ready, Some("ChatReady"))
+            .unwrap();
+        let ready = registry.get(&record.id).unwrap().unwrap();
+        assert_eq!(ready.blocked_reason, None);
+        assert_eq!(ready.blocked_snapshot, None);
+        assert_eq!(ready.blocked_at_ms, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resurrection_replaces_identity_and_increments_count() {
+        let root =
+            std::env::temp_dir().join(format!("botctl-mcp-reg-resurrect-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let registry = McpRegistry::open(&root).unwrap();
+        let record = registry.insert_session(fake_new("%1", "@1")).unwrap();
+        registry
+            .update_blocked(&record.id, Some("DiffDialog"), "diff_dialog", Some("diff"))
+            .unwrap();
+        registry
+            .update_state(&record.id, LifecycleState::Killed, None)
+            .unwrap();
+
+        registry
+            .replace_tmux_identity_for_resurrection(
+                &record.id,
+                "botctl-mcp",
+                "@9",
+                "mcp-new",
+                "%9",
+                "server-b",
+            )
+            .unwrap();
+        let updated = registry.get(&record.id).unwrap().unwrap();
+        assert_eq!(updated.id, record.id);
+        assert_eq!(updated.owner_server_id, "server-b");
+        assert_eq!(updated.tmux_window_id, "@9");
+        assert_eq!(updated.tmux_pane_id, "%9");
+        assert_eq!(updated.lifecycle_state, LifecycleState::Starting);
+        assert_eq!(updated.killed_at_ms, None);
+        assert_eq!(updated.blocked_reason, None);
+        assert_eq!(updated.resurrection_count, 1);
+        assert!(updated.resurrected_at_ms.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_candidates_are_aged_unlocked_blocked_or_starting_only() {
+        let root =
+            std::env::temp_dir().join(format!("botctl-mcp-reg-cleanup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let registry = McpRegistry::open(&root).unwrap();
+        let blocked = registry.insert_session(fake_new("%1", "@1")).unwrap();
+        let ready = registry.insert_session(fake_new("%2", "@2")).unwrap();
+        let locked = registry.insert_session(fake_new("%3", "@3")).unwrap();
+        let starting = registry.insert_session(fake_new("%4", "@4")).unwrap();
+        registry
+            .update_blocked(&blocked.id, Some("DiffDialog"), "diff_dialog", Some("diff"))
+            .unwrap();
+        registry
+            .update_state(&ready.id, LifecycleState::Ready, Some("ChatReady"))
+            .unwrap();
+        registry
+            .update_blocked(&locked.id, Some("DiffDialog"), "diff_dialog", Some("diff"))
+            .unwrap();
+        let lock = registry
+            .acquire_lock(&locked.id, "server-a", "prompt")
+            .unwrap();
+        let now = now_ms().unwrap();
+        registry.conn().unwrap().execute(
+            "UPDATE mcp_sessions SET created_at_ms=?2, updated_at_ms=?2, blocked_at_ms=?2 WHERE id IN (?1, ?3)",
+            params![blocked.id, now - 60_000, locked.id],
+        ).unwrap();
+        registry
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE mcp_sessions SET created_at_ms=?2, updated_at_ms=?2 WHERE id=?1",
+                params![starting.id, now - 60_000],
+            )
+            .unwrap();
+
+        let ids = registry
+            .cleanup_candidates(now, 30_000, 100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&blocked.id));
+        assert!(ids.contains(&starting.id));
+        assert!(!ids.contains(&ready.id));
+        assert!(!ids.contains(&locked.id));
+        drop(lock);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_kill_preserves_blocked_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-reg-cleanup-kill-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let registry = McpRegistry::open(&root).unwrap();
+        let record = registry.insert_session(fake_new("%1", "@1")).unwrap();
+        registry
+            .update_blocked(&record.id, Some("DiffDialog"), "diff_dialog", Some("diff"))
+            .unwrap();
+
+        registry
+            .mark_cleanup_killed_preserving_blocked(&record.id)
+            .unwrap();
+
+        let killed = registry.get(&record.id).unwrap().unwrap();
+        assert_eq!(killed.lifecycle_state, LifecycleState::Killed);
+        assert!(killed.killed_at_ms.is_some());
+        assert_eq!(killed.blocked_reason.as_deref(), Some("diff_dialog"));
+        assert_eq!(killed.blocked_snapshot.as_deref(), Some("diff"));
+        assert!(killed.blocked_at_ms.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_candidate_recheck_respects_current_state_and_age() {
+        let mut record = McpSessionRecord {
+            id: "id".into(),
+            owner_server_id: "server".into(),
+            provider: Provider::Claude,
+            model: None,
+            effort: None,
+            agent: None,
+            permission_mode: None,
+            settings: None,
+            tmux_session_name: "botctl".into(),
+            tmux_window_id: "@1".into(),
+            tmux_window_name: "mcp".into(),
+            tmux_pane_id: "%1".into(),
+            cwd: "/tmp".into(),
+            lifecycle_state: LifecycleState::Blocked,
+            last_state: None,
+            last_message_id: None,
+            last_message_text: None,
+            last_message_seen_at_ms: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            dead_at_ms: None,
+            killed_at_ms: None,
+            blocked_reason: Some("unknown_state".into()),
+            blocked_snapshot: None,
+            blocked_at_ms: Some(1_000),
+            resurrected_at_ms: None,
+            resurrection_count: 0,
+        };
+
+        assert!(McpRegistry::is_cleanup_candidate(&record, 61_000, 30_000));
+        record.blocked_at_ms = Some(60_000);
+        assert!(!McpRegistry::is_cleanup_candidate(&record, 61_000, 30_000));
+        record.lifecycle_state = LifecycleState::Ready;
+        record.blocked_at_ms = Some(1_000);
+        assert!(!McpRegistry::is_cleanup_candidate(&record, 61_000, 30_000));
+    }
+
     fn fake_new(pane: &str, window: &str) -> NewSessionRecord {
         NewSessionRecord {
             owner_server_id: "server-a".into(),
@@ -509,6 +853,8 @@ mod tests {
             model: None,
             effort: None,
             agent: None,
+            permission_mode: None,
+            settings: None,
             tmux_session_name: "botctl".into(),
             tmux_window_id: window.into(),
             tmux_window_name: "mcp".into(),
