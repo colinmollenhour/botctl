@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use crate::app::{AppError, AppResult, is_startup_enter_prompt};
 use crate::automation::{AutomationAction, load_resolved_keybindings};
 use crate::classifier::{
-    Classification, Classifier, SessionState, prepare_frame_for_classification,
+    Classification, Classifier, SessionState, has_codex_update_skip_choice,
+    prepare_frame_for_classification,
 };
 use crate::last_message::{LastAgentMessage, load_last_agent_message};
 use crate::mcp_registry::{
@@ -154,10 +155,7 @@ impl McpSessionService {
         let id = required_str(args, "id")?.to_string();
         let prompt = required_str(args, "prompt")?;
         let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_TURN_TIMEOUT_MS)?;
-        let no_yolo = args
-            .pointer("/policy/no_yolo")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let (no_yolo, _) = optional_policy(args)?;
         let Some(lock) = self.registry.acquire_lock(&id, &self.server_id, "prompt")? else {
             return self.busy_result(&id);
         };
@@ -672,9 +670,28 @@ impl McpSessionService {
                 {
                     client.send_keys(&pane.pane_id, &["Enter"])?
                 }
+                SessionState::StartupChoicePrompt => {
+                    if let Some(keys) = codex_update_skip_keys(
+                        record.provider,
+                        no_yolo,
+                        &classification,
+                        &frame,
+                    ) {
+                        client.send_keys(&pane.pane_id, keys)?;
+                        thread::sleep(Duration::from_millis(DEFAULT_POLL_MS));
+                        continue;
+                    }
+                    let reason = blocked_reason_for_state(classification.state)
+                        .unwrap_or("unknown_state");
+                    return Ok(outcome(
+                        "blocked",
+                        Some(&classification),
+                        Some(&frame),
+                        Some(reason),
+                    ));
+                }
                 SessionState::PermissionDialog
                 | SessionState::FolderTrustPrompt
-                | SessionState::StartupChoicePrompt
                 | SessionState::SurveyPrompt
                 | SessionState::PlanApprovalPrompt
                 | SessionState::DiffDialog
@@ -980,17 +997,13 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
         settings.as_deref(),
     )?;
     let timeout_ms = optional_u64(args, "timeout_ms", DEFAULT_SPAWN_TIMEOUT_MS)?;
-    let no_yolo = args
-        .pointer("/policy/no_yolo")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let (no_yolo, policy) = optional_policy(args)?;
     let initial_prompt = args
         .get("initial_prompt")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let policy = args.get("policy").cloned().unwrap_or(Value::Null);
     Ok(ValidatedSpawnArgs {
         cwd,
         provider,
@@ -1005,6 +1018,42 @@ fn validate_spawn_args(args: &Value) -> AppResult<ValidatedSpawnArgs> {
         initial_prompt,
         policy,
     })
+}
+
+fn optional_policy(args: &Value) -> AppResult<(bool, Value)> {
+    match args.get("policy") {
+        Some(Value::Null) | None => Ok((false, Value::Null)),
+        Some(Value::Object(policy)) => {
+            let no_yolo = match policy.get("no_yolo") {
+                Some(Value::Null) | None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(AppError::new(
+                        "invalid_params: policy.no_yolo must be a boolean",
+                    ));
+                }
+            };
+            Ok((no_yolo, Value::Object(policy.clone())))
+        }
+        Some(_) => Err(AppError::new("invalid_params: policy must be an object")),
+    }
+}
+
+fn codex_update_skip_keys(
+    provider: Provider,
+    no_yolo: bool,
+    classification: &Classification,
+    frame: &str,
+) -> Option<&'static [&'static str]> {
+    if provider == Provider::Codex
+        && !no_yolo
+        && classification.state == SessionState::StartupChoicePrompt
+        && has_codex_update_skip_choice(frame)
+    {
+        Some(&["2", "Enter"])
+    } else {
+        None
+    }
 }
 
 /// Build the `spawn` arguments for a `one_shot` call. Forwards only the keys
@@ -1898,6 +1947,87 @@ gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used"#;
         assert_eq!(v.initial_prompt, None);
     }
 
+    #[test]
+    fn optional_policy_validates_shape_and_preserves_object() {
+        assert_eq!(optional_policy(&json!({})).unwrap(), (false, Value::Null));
+        assert_eq!(
+            optional_policy(&json!({ "policy": null })).unwrap(),
+            (false, Value::Null)
+        );
+        assert_eq!(
+            optional_policy(&json!({ "policy": { "no_yolo": true, "future": 1 } })).unwrap(),
+            (true, json!({ "no_yolo": true, "future": 1 }))
+        );
+        assert_eq!(
+            optional_policy(&json!({ "policy": { "no_yolo": null } })).unwrap(),
+            (false, json!({ "no_yolo": null }))
+        );
+
+        let err = optional_policy(&json!({ "policy": true })).unwrap_err();
+        assert!(err.to_string().contains("policy must be an object"));
+        let err = optional_policy(&json!({ "policy": { "no_yolo": "yes" } })).unwrap_err();
+        assert!(err.to_string().contains("policy.no_yolo must be a boolean"));
+    }
+
+    #[test]
+    fn validate_spawn_args_rejects_malformed_policy() {
+        assert!(validate_spawn_args(&json!({ "cwd": "/tmp", "policy": [] })).is_err());
+        assert!(
+            validate_spawn_args(&json!({ "cwd": "/tmp", "policy": { "no_yolo": 1 } })).is_err()
+        );
+    }
+
+    #[test]
+    fn prompt_rejects_malformed_policy_before_missing_session_lookup() {
+        let root = temp_state_dir("prompt-policy");
+        let service = test_service(&root);
+        let err = service
+            .prompt(&json!({ "id": "missing", "prompt": "hi", "policy": [] }))
+            .expect_err("malformed policy should fail before id lookup");
+        assert!(err.to_string().contains("policy must be an object"));
+        assert!(!err.to_string().contains("not_found"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_update_skip_keys_are_narrowly_gated() {
+        let update = "✨ Update available! 0.135.0 -> 0.136.0\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version\n\nPress enter to continue";
+        let model = "Introducing GPT-5.5\n\n› 1. Try new model\n  2. Use existing model\n\nUse ↑/↓ to move, press enter to confirm";
+        let classification = Classification {
+            source: "test".into(),
+            state: SessionState::StartupChoicePrompt,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: Vec::new(),
+        };
+        let ready = Classification {
+            state: SessionState::ChatReady,
+            ..classification.clone()
+        };
+
+        assert_eq!(
+            codex_update_skip_keys(Provider::Codex, false, &classification, update),
+            Some(&["2", "Enter"][..])
+        );
+        assert_eq!(
+            codex_update_skip_keys(Provider::Codex, true, &classification, update),
+            None
+        );
+        assert_eq!(
+            codex_update_skip_keys(Provider::Claude, false, &classification, update),
+            None
+        );
+        assert_eq!(
+            codex_update_skip_keys(Provider::Codex, false, &classification, model),
+            None
+        );
+        assert_eq!(
+            codex_update_skip_keys(Provider::Codex, false, &ready, update),
+            None
+        );
+    }
+
     fn temp_state_dir(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "botctl-mcp-session-{tag}-{}-{:?}",
@@ -2126,6 +2256,11 @@ gpt-5.5 high · ~/Projects/botctl · Ready · Context 1% used"#;
                 )
                 .is_err()
         );
+        // Malformed policy is rejected by validate_spawn_args before spawn.
+        let err = service
+            .one_shot(&json!({ "cwd": "/tmp", "prompt": "hi", "policy": "invalid" }))
+            .expect_err("malformed policy should fail before spawn");
+        assert!(err.to_string().contains("policy must be an object"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

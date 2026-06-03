@@ -42,15 +42,15 @@ impl ToolAvailability {
         if self.agy {
             names.push("spawn_agy");
         }
-        names.extend([
-            "prompt",
-            "wait",
-            "kill",
-            "snapshot",
-            "send_keys",
-            "one_shot",
-        ]);
+        names.extend(["prompt", "wait", "kill", "snapshot", "send_keys"]);
+        if self.any_provider() {
+            names.push("one_shot");
+        }
         names
+    }
+
+    pub fn any_provider(self) -> bool {
+        self.claude || self.codex || self.agy
     }
 }
 
@@ -221,35 +221,41 @@ pub fn tool_catalog_for(availability: ToolAvailability) -> Vec<Value> {
                 "properties": { "id":{"type":"string"}, "keys":{"type":"array", "items":{"type":"string"}}, "text":{"type":"string"}, "paste":{"type":"boolean"} }
             }),
         ),
-        tool(
-            "one_shot",
-            "Create a temporary managed session, run exactly one prompt to a terminal outcome, then always attempt to kill the window (best-effort cleanup). Uses managed auto-approval (no_yolo=false): only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cwd": {"type":"string", "description":"Existing working directory for the managed agent. Defaults to the MCP server current directory when omitted or blank."},
-                    "prompt": {"type":"string", "minLength":1, "description":"Preferred prompt text field. The aliases text, message, input, and initial_prompt are also accepted at runtime."},
-                    "text": {"type":"string", "minLength":1, "description":"Alias for prompt."},
-                    "message": {"type":"string", "minLength":1, "description":"Alias for prompt."},
-                    "input": {"type":"string", "minLength":1, "description":"Alias for prompt."},
-                    "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Defaults to the first available provider binary in claude, codex, agy order. If agy, omit model/effort/agent/permission_mode/settings."},
-                    "model": raw_model_schema("Claude/Codex"),
-                    "model_preset": model_preset_schema("Claude/Codex"),
-                    "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"], "description":"Claude and Codex only. Do not pass when provider is agy."},
-                    "agent": claude_agent_schema(),
-                    "permission_mode": permission_mode_schema(),
-                    "settings": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
-                    "timeout_ms": {"type":"integer", "minimum":1000},
-                    "policy": policy_schema()
-                }
-            }),
-        ),
     ]);
+    if availability.any_provider() {
+        tools.push(one_shot_tool());
+    }
     tools
 }
 
 fn policy_schema() -> Value {
     json!({ "type":"object", "properties": { "no_yolo": { "type":"boolean" } } })
+}
+
+fn one_shot_tool() -> Value {
+    tool(
+        "one_shot",
+        "Create a temporary managed session, run exactly one prompt to a terminal outcome, then always attempt to kill the window (best-effort cleanup). Uses managed auto-approval (no_yolo=false): only folder-trust and gated agy command-permission prompts auto-advance; all other approvals block.",
+        json!({
+            "type": "object",
+            "properties": {
+                "cwd": {"type":"string", "description":"Existing working directory for the managed agent. Defaults to the MCP server current directory when omitted or blank."},
+                "prompt": {"type":"string", "minLength":1, "description":"Preferred prompt text field. The aliases text, message, input, and initial_prompt are also accepted at runtime."},
+                "text": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                "message": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                "input": {"type":"string", "minLength":1, "description":"Alias for prompt."},
+                "provider": {"type":"string", "enum": ["claude", "codex", "agy"], "description":"Agent provider to launch. Defaults to the first available provider binary in claude, codex, agy order. If agy, omit model/effort/agent/permission_mode/settings."},
+                "model": raw_model_schema("Claude/Codex"),
+                "model_preset": model_preset_schema("Claude/Codex"),
+                "effort": {"type":"string", "enum": ["low", "medium", "high", "xhigh", "max"], "description":"Claude and Codex only. Do not pass when provider is agy."},
+                "agent": claude_agent_schema(),
+                "permission_mode": permission_mode_schema(),
+                "settings": {"type":"string", "minLength":1, "description":"Claude only. Do not pass when provider is codex or agy."},
+                "timeout_ms": {"type":"integer", "minimum":1000},
+                "policy": policy_schema()
+            }
+        }),
+    )
 }
 
 fn model_preset_schema(provider: &str) -> Value {
@@ -371,6 +377,23 @@ mod tests {
             .expect("catalog has one_shot");
         assert!(one_shot["inputSchema"].get("required").is_none());
         assert_eq!(catalog.last().unwrap()["name"], "one_shot");
+    }
+
+    #[test]
+    fn one_shot_is_hidden_when_no_provider_is_available() {
+        let availability = ToolAvailability {
+            claude: false,
+            codex: false,
+            agy: false,
+        };
+        assert!(!availability.any_provider());
+        assert!(!availability.tool_names().contains(&"one_shot"));
+        let names = tool_catalog_for(availability)
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"one_shot".to_string()));
+        assert!(TOOL_NAMES.contains(&"one_shot"));
     }
 
     #[test]

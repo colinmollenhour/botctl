@@ -72,24 +72,11 @@ impl McpService {
         }
         match self.handle_result(&request) {
             Ok(result) => Some(success(id, result)),
-            Err(err) if err.to_string().starts_with("invalid_params:") => Some(error(
-                id,
-                -32602,
-                "invalid_params",
-                Some(json!({ "detail": err.to_string() })),
-            )),
-            Err(err) if err.to_string().starts_with("method_not_found:") => Some(error(
-                id,
-                -32601,
-                "method_not_found",
-                Some(json!({ "detail": err.to_string() })),
-            )),
-            Err(err) => Some(error(
-                id,
-                -32603,
-                "internal_error",
-                Some(json!({ "detail": err.to_string() })),
-            )),
+            Err(err) => {
+                let detail = err.to_string();
+                let (code, message) = json_rpc_error_kind(&detail);
+                Some(error(id, code, message, Some(json!({ "detail": detail }))))
+            }
         }
     }
 
@@ -149,6 +136,27 @@ impl McpService {
             "structuredContent": result,
             "isError": false,
         }))
+    }
+}
+
+fn json_rpc_error_kind(detail: &str) -> (i64, &'static str) {
+    if detail.starts_with("method_not_found:") {
+        (-32601, "method_not_found")
+    } else if [
+        "invalid_params:",
+        "bad_cwd:",
+        "not_found:",
+        "dead_pane:",
+        "ambiguous_target:",
+        "not_resurrectable:",
+        "missing_keybinding:",
+    ]
+    .iter()
+    .any(|prefix| detail.starts_with(prefix))
+    {
+        (-32602, "invalid_params")
+    } else {
+        (-32603, "internal_error")
     }
 }
 
@@ -495,6 +503,62 @@ mod tests {
     }
 
     #[test]
+    fn maps_caller_lifecycle_errors_to_json_rpc_invalid_params() {
+        for detail in [
+            "invalid_params: bad",
+            "bad_cwd: cwd is not an existing directory",
+            "not_found: unknown MCP session id missing",
+            "dead_pane: managed pane is gone",
+            "ambiguous_target: pane moved",
+            "not_resurrectable: recorded cwd is gone",
+            "missing_keybinding: submit",
+        ] {
+            assert_eq!(json_rpc_error_kind(detail), (-32602, "invalid_params"));
+        }
+        assert_eq!(
+            json_rpc_error_kind("method_not_found: nope"),
+            (-32601, "method_not_found")
+        );
+        assert_eq!(
+            json_rpc_error_kind("tmux capture-pane failed"),
+            (-32603, "internal_error")
+        );
+    }
+
+    #[test]
+    fn missing_session_kill_returns_invalid_params() {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-service-missing-kill-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = McpService::new_with_availability(
+            Some(&root),
+            PROTOCOL_VERSION,
+            ToolAvailability::all(),
+        )
+        .unwrap();
+        let response = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(4)),
+                method: "tools/call".into(),
+                params: json!({ "name": "kill", "arguments": { "id": "missing" } }),
+            })
+            .unwrap();
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["message"], "invalid_params");
+        assert!(
+            response["error"]["data"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("not_found:")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn notifications_emit_no_response() {
         let root =
             std::env::temp_dir().join(format!("botctl-mcp-service-notify-{}", std::process::id()));
@@ -624,6 +688,58 @@ mod tests {
         .expect_err("missing provider with no available binary should fail");
 
         assert!(err.to_string().contains("no available provider binaries"));
+    }
+
+    #[test]
+    fn explicit_one_shot_call_is_known_but_unavailable_without_providers() {
+        let root = std::env::temp_dir().join(format!(
+            "botctl-mcp-service-one-shot-unavailable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = McpService::new_with_availability(
+            Some(&root),
+            PROTOCOL_VERSION,
+            ToolAvailability {
+                claude: false,
+                codex: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+
+        let tools = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(2)),
+                method: "tools/list".into(),
+                params: json!({}),
+            })
+            .unwrap();
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"one_shot"));
+
+        let response = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(3)),
+                method: "tools/call".into(),
+                params: json!({ "name": "one_shot", "arguments": { "prompt": "hi" } }),
+            })
+            .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["data"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable tool one_shot")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

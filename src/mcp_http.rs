@@ -270,15 +270,7 @@ fn negotiate_accept(accept: Option<&str>) -> Result<(), HttpResponse> {
     let Some(accept) = accept else {
         return Ok(());
     };
-    let acceptable = accept.split(',').any(|part| {
-        let media = part.split(';').next().unwrap_or("").trim();
-        media.eq_ignore_ascii_case("*/*")
-            || media.eq_ignore_ascii_case("application/*")
-            || media.eq_ignore_ascii_case("application/json")
-            // We ignore the SSE token and always return JSON (D1; the spec permits
-            // a JSON response for a single result).
-            || media.eq_ignore_ascii_case("text/event-stream")
-    });
+    let acceptable = accept.split(',').any(accept_range_is_supported);
     if acceptable {
         Ok(())
     } else {
@@ -287,6 +279,32 @@ fn negotiate_accept(accept: Option<&str>) -> Result<(), HttpResponse> {
             &json!({ "error": "only application/json is produced" }),
         ))
     }
+}
+
+fn accept_range_is_supported(part: &str) -> bool {
+    let mut pieces = part.split(';');
+    let media = pieces.next().unwrap_or("").trim();
+    let q = pieces
+        .map(str::trim)
+        .find_map(|param| {
+            let (name, value) = param.split_once('=')?;
+            if name.trim().eq_ignore_ascii_case("q") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+        .map(str::parse::<f32>)
+        .unwrap_or(Ok(1.0));
+    if !q.is_ok_and(|q| q > 0.0 && q <= 1.0) {
+        return false;
+    }
+    media.eq_ignore_ascii_case("*/*")
+        || media.eq_ignore_ascii_case("application/*")
+        || media.eq_ignore_ascii_case("application/json")
+        // We ignore the SSE token and always return JSON (D1; the spec permits
+        // a JSON response for a single result).
+        || media.eq_ignore_ascii_case("text/event-stream")
 }
 
 /// Lenient `Content-Type` validation. Missing is OK; present must be
@@ -798,6 +816,54 @@ mod tests {
     fn accept_text_plain_only_406() {
         let err = negotiate_accept(Some("text/plain")).unwrap_err();
         assert_eq!(err.status, 406);
+    }
+    #[test]
+    fn accept_q_zero_rejects_matching_ranges() {
+        assert_eq!(
+            negotiate_accept(Some("application/json;q=0"))
+                .unwrap_err()
+                .status,
+            406
+        );
+        assert_eq!(
+            negotiate_accept(Some("application/json;q=0,text/plain;q=1"))
+                .unwrap_err()
+                .status,
+            406
+        );
+        assert_eq!(negotiate_accept(Some("*/*;q=0")).unwrap_err().status, 406);
+        assert_eq!(
+            negotiate_accept(Some("application/json; Q = 0"))
+                .unwrap_err()
+                .status,
+            406
+        );
+    }
+    #[test]
+    fn accept_q_positive_and_invalid_values() {
+        assert!(negotiate_accept(Some("application/json;q=0.1")).is_ok());
+        assert!(negotiate_accept(Some("APPLICATION/JSON; Q = 1")).is_ok());
+        assert!(negotiate_accept(Some("application/*;q=1")).is_ok());
+        assert!(negotiate_accept(Some("text/event-stream;q=0.5")).is_ok());
+        assert_eq!(
+            negotiate_accept(Some("application/json;q=bogus"))
+                .unwrap_err()
+                .status,
+            406
+        );
+        assert_eq!(
+            negotiate_accept(Some("application/json;q=2"))
+                .unwrap_err()
+                .status,
+            406
+        );
+        assert_eq!(
+            negotiate_accept(Some("application/json;q=-0.5"))
+                .unwrap_err()
+                .status,
+            406
+        );
+        assert!(negotiate_accept(Some("application/json;q=bogus, application/*;q=1")).is_ok());
     }
 
     // Content-Type.

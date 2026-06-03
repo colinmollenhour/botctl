@@ -613,6 +613,21 @@ pub(crate) fn has_startup_choice_prompt_text(frame: &str) -> bool {
     has_startup_choice_prompt(&normalized, &lines)
 }
 
+pub(crate) fn has_codex_update_skip_choice(frame: &str) -> bool {
+    let normalized = normalize(frame);
+    let lines = frame.lines().map(str::trim).collect::<Vec<_>>();
+    contains_any(&normalized, &["update available"])
+        && contains_any(
+            &normalized,
+            &["press enter to confirm", "press enter to continue"],
+        )
+        && lines.iter().copied().any(|line| {
+            line.trim_start_matches(['›', '❯', '>'])
+                .trim()
+                .eq_ignore_ascii_case("2. skip")
+        })
+}
+
 fn has_startup_choice_prompt(normalized: &str, lines: &[&str]) -> bool {
     let has_confirm_footer = contains_any(
         normalized,
@@ -1697,6 +1712,13 @@ mod tests {
                 .signals
                 .contains(&String::from(SIGNAL_STARTUP_CHOICE_KEYWORDS))
         );
+        assert!(super::has_codex_update_skip_choice(frame));
+        assert!(!super::has_codex_update_skip_choice(
+            "✨ Update available!\n\n› 1. Update now\n\nPress enter to continue"
+        ));
+        assert!(!super::has_codex_update_skip_choice(
+            "Introducing GPT-5.5\n\n› 1. Try new model\n  2. Use existing model\n\nUse ↑/↓ to move, press enter to confirm"
+        ));
     }
 
     #[test]
