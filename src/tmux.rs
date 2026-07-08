@@ -201,6 +201,10 @@ impl TmuxClient {
 
     pub fn start_session(&self, request: &StartSessionRequest) -> AppResult<StartedSession> {
         self.run_status(self.plan_start_session(request).args)?;
+        if let Err(error) = self.disable_session_status(&request.session_name) {
+            let _ = self.kill_session(&request.session_name);
+            return Err(error);
+        }
         Ok(StartedSession {
             session_name: request.session_name.clone(),
             window_name: request.window_name.clone(),
@@ -218,7 +222,13 @@ impl TmuxClient {
         request: &StartWindowRequest,
     ) -> AppResult<StartedWindow> {
         let output = self.run_output(self.plan_start_window_as_session(request).args)?;
-        Self::started_window_from_output(request, &output)
+        match self.disable_session_status(&request.session_name) {
+            Ok(()) => Self::started_window_from_output(request, &output),
+            Err(error) => {
+                let _ = self.kill_session(&request.session_name);
+                Err(error)
+            }
+        }
     }
 
     pub fn start_window_in_session(
@@ -505,6 +515,25 @@ impl TmuxClient {
             name.to_string(),
             value.to_string(),
         ])
+    }
+
+    pub fn set_session_option(
+        &self,
+        target_session: &str,
+        name: &str,
+        value: &str,
+    ) -> AppResult<()> {
+        self.run_status(vec![
+            String::from("set-option"),
+            String::from("-t"),
+            target_session.to_string(),
+            name.to_string(),
+            value.to_string(),
+        ])
+    }
+
+    fn disable_session_status(&self, target_session: &str) -> AppResult<()> {
+        self.set_session_option(target_session, "status", "off")
     }
 
     pub fn kill_session(&self, target_session: &str) -> AppResult<()> {
@@ -871,6 +900,26 @@ mod tests {
 
         assert!(rendered.contains("-L botctl-dashboard"));
         assert!(rendered.contains("set-option -g status off"));
+    }
+
+    #[test]
+    fn set_session_option_targets_session_without_global_scope() {
+        let client = TmuxClient::with_socket("botctl-dashboard");
+        let rendered = TmuxCommandPlan {
+            program: String::from("tmux"),
+            args: client.with_socket_args(vec![
+                String::from("set-option"),
+                String::from("-t"),
+                String::from("botctl-runtime"),
+                String::from("status"),
+                String::from("off"),
+            ]),
+        }
+        .render();
+
+        assert!(rendered.contains("-L botctl-dashboard"));
+        assert!(rendered.contains("set-option -t botctl-runtime status off"));
+        assert!(!rendered.contains("set-option -g"));
     }
 
     #[test]

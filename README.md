@@ -109,7 +109,7 @@ botctl runtime
 botctl dashboard
 ```
 
-By default, `dashboard`, `yolo`, and `serve` run in managed mode. If no runtime is available, they auto-start one in a hidden tmux session and connect to it. The runtime stays alive while managed clients still need it, and you can manage it directly with:
+By default, `dashboard`, `yolo`, and `serve` run in managed mode. If no runtime is available, they auto-start one in a hidden tmux session and connect to it. Botctl-created hidden sessions disable tmux `status` inside that session so user statusline scripts do not run there. The runtime stays alive while managed clients still need it, and you can manage it directly with:
 
 ```bash
 cargo run -- runtime
@@ -201,7 +201,7 @@ printf 'Summarize this input' | cargo run -- prompt --stdin
 cargo run -- prompt --text "Say hi" -- --model sonnet --name "Just testing"
 ```
 
-`prompt` does not use `claude -p` or `--prompt`; it creates a new window in the owning tmux session, creates that session first when needed, waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, waits for a fresh final assistant message, kills only that captured prompt window on success, and prints assistant text only on stdout. The owning session defaults to `botctl`; pass `--session NAME` to override it. Failed prompt windows stay alive for inspection. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
+`prompt` does not use `claude -p` or `--prompt`; it creates a new window in the owning tmux session, creates that session first when needed, waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, waits for a fresh final assistant message, kills only that captured prompt window on success, and prints assistant text only on stdout. The owning session defaults to `botctl`; pass `--session NAME` to override it. When `prompt` creates the owning session, it disables tmux `status` only for that session. Failed prompt windows stay alive for inspection. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
 
 Run the observer and a localhost HTTP API for a web UI:
 

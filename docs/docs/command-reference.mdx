@@ -51,6 +51,7 @@ Notes:
 
 - listens on `<state-dir>/runtime.sock`
 - starts a hidden tmux-backed runtime session by default
+- disables tmux `status` in botctl-created hidden sessions so user statusline commands do not run there
 - `stop` shuts down the current runtime
 - `--foreground` runs the runtime in the current process instead of the hidden tmux session
 - `dashboard`, `yolo`, and `serve` connect to this process instead of running independent long-lived control loops; in managed mode they auto-start it when needed
@@ -103,6 +104,7 @@ Output and safety:
 - with `--verbose`, progress, temp paths, and wait status go to stderr; cleanup warnings always go to stderr.
 - successful runs load a fresh assistant message first, then kill only the captured prompt window.
 - failed prompt windows are left alive for inspection.
+- when `prompt` creates the owning tmux session, it disables tmux `status` only for that session; existing user-provided sessions are not changed.
 - submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 
