@@ -158,10 +158,10 @@ Quick tmux popup binding:
 bind-key C-c display-popup -E -w 80% -h 40% botctl dashboard --persistent
 ```
 
-If tmux reports `Height too large` on a short laptop display, clamp the popup height from the current client height in your `.tmux.conf`:
+If tmux reports `Height too large` on a short laptop display, compute the popup height from the current client height in your `.tmux.conf`. This uses 60% on taller displays and 90% on shorter displays, while still clamping below tmux's maximum popup height:
 
 ```tmux
-bind-key C-c run-shell -b 'height=$((#{client_height} * 40 / 100)); max=$((#{client_height} - 2)); [ "$height" -lt 12 ] && height=12; [ "$height" -gt "$max" ] && height="$max"; [ "$height" -lt 1 ] && height=1; tmux display-popup -E -w 80% -h "$height" "botctl dashboard --persistent"'
+bind-key C-c run-shell -b 'client_height=#{client_height}; percent=60; [ "$client_height" -lt 40 ] && percent=90; height=$((client_height * percent / 100)); max=$((client_height - 2)); [ "$height" -gt "$max" ] && height="$max"; [ "$height" -lt 1 ] && height=1; tmux display-popup -E -w 80% -h "$height" "botctl dashboard --persistent"'
 ```
 
 The popup size is owned by `tmux display-popup`; if tmux rejects the requested dimensions, the dashboard has not started yet and cannot resize itself.
