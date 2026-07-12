@@ -1,0 +1,17 @@
+● Agent(Write second-draft plan)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+
+● Status: Phase 3 planner running. It will write plans/second-draft.md with a Readiness verdict.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────── megamind ──
+❯
+──────────────────────────────────────────────────────────────────────────────────────
+  Fable*•xhigh [megamind] │ thespider-saas │ main ✚1 │ +422
+  ▓▓░░░░░░░░░░░░░░░░░▒ 123k/1m (↻96%) │ 5h:36% (3h8m) │ $19 │ 28m
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+  ● main
+  ◯ general-purpose  Reading test helpers and seed.ts  1m 19s · ↓ 117.9k tokens

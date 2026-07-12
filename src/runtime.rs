@@ -23,7 +23,7 @@ use crate::app::{
     resolve_workspace_for_pane, submit_prompt_for_pane, yolo_action_for_state,
 };
 use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection};
-use crate::classifier::{Classification, SessionState};
+use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
 use crate::screen_model::ScreenModel;
@@ -1197,14 +1197,26 @@ fn reconcile_all(
     config: &RuntimeServerConfig,
     shared: &Arc<Mutex<RuntimeShared>>,
 ) -> AppResult<()> {
-    let current_panes = client
+    let mut current_panes = Vec::new();
+    for pane in client
         .list_panes()?
         .into_iter()
         .filter(is_runtime_discovery_candidate)
-        .collect::<Vec<_>>();
+    {
+        let inspected = if pane.current_command.eq_ignore_ascii_case("node") {
+            let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
+            if !is_verified_runtime_discovery_candidate(&pane, &inspected.classification) {
+                continue;
+            }
+            Some(inspected)
+        } else {
+            None
+        };
+        current_panes.push((pane, inspected));
+    }
     let current_ids = current_panes
         .iter()
-        .map(|pane| pane.pane_id.clone())
+        .map(|(pane, _)| pane.pane_id.clone())
         .collect::<BTreeSet<_>>();
 
     let removed = {
@@ -1248,10 +1260,13 @@ fn reconcile_all(
         }
     }
 
-    for pane in current_panes {
+    for (pane, inspected) in current_panes {
         let workspace =
             resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
-        let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
+        let inspected = match inspected {
+            Some(inspected) => inspected,
+            None => inspect_pane(client, &pane.pane_id, config.history_lines)?,
+        };
         let claude_session_id =
             sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
         let codex_session_id = if is_yolo_candidate_pane(&pane) {
@@ -1571,6 +1586,17 @@ fn is_runtime_discovery_candidate(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("claude")
         || pane.current_command.eq_ignore_ascii_case("agy")
         || is_yolo_candidate_pane(pane)
+}
+
+fn is_verified_runtime_discovery_candidate(
+    pane: &TmuxPane,
+    classification: &Classification,
+) -> bool {
+    !pane.current_command.eq_ignore_ascii_case("node")
+        || classification
+            .signals
+            .iter()
+            .any(|signal| signal == SIGNAL_CODEX_KEYWORDS)
 }
 
 fn is_yolo_candidate_pane(pane: &TmuxPane) -> bool {
@@ -1947,9 +1973,10 @@ pub fn build_instance_detail_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeEvent, RuntimeResponse, is_runtime_discovery_candidate, is_yolo_candidate_pane,
-        runtime_socket_path,
+        RuntimeEvent, RuntimeResponse, is_runtime_discovery_candidate,
+        is_verified_runtime_discovery_candidate, is_yolo_candidate_pane, runtime_socket_path,
     };
+    use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::tmux::TmuxPane;
     use std::path::Path;
 
@@ -1991,6 +2018,35 @@ mod tests {
     fn is_runtime_discovery_candidate_rejects_bash_pane() {
         assert!(!is_runtime_discovery_candidate(&sample_pane("bash")));
         assert!(!is_runtime_discovery_candidate(&sample_pane("zsh")));
+    }
+
+    #[test]
+    fn node_runtime_candidate_requires_codex_screen_evidence() {
+        let node = sample_pane("node");
+        let mut classification = Classification {
+            source: String::from("test"),
+            state: SessionState::Unknown,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: Vec::new(),
+        };
+
+        assert!(!is_verified_runtime_discovery_candidate(
+            &node,
+            &classification
+        ));
+        classification
+            .signals
+            .push(String::from(SIGNAL_CODEX_KEYWORDS));
+        assert!(is_verified_runtime_discovery_candidate(
+            &node,
+            &classification
+        ));
+        assert!(is_verified_runtime_discovery_candidate(
+            &sample_pane("claude"),
+            &classification
+        ));
     }
 
     #[test]

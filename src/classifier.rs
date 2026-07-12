@@ -1214,8 +1214,17 @@ fn is_busy_status_line(line: &str) -> bool {
     is_claude_spinner_status_line(trimmed, &lower)
         || stripped.starts_with("waiting for task")
         || lower.contains("waiting for task (esc to give additional instructions)")
+        || (stripped.starts_with("waiting for ")
+            && stripped.contains(" background agent")
+            && stripped.ends_with(" to finish"))
+        || is_active_claude_agent_row(trimmed)
         || lower.contains(" monitor still running")
         || lower.contains(" monitors still running")
+}
+
+fn is_active_claude_agent_row(trimmed: &str) -> bool {
+    let row = trimmed.strip_prefix("❯ ").unwrap_or(trimmed);
+    row.starts_with("◯ ") && row.contains(" · ↓ ") && row.contains(" tokens")
 }
 
 fn has_live_busy_status(lines: &[&str]) -> bool {
@@ -2496,6 +2505,37 @@ mod tests {
         assert_eq!(result.state, SessionState::BusyResponding);
         assert!(!result.has_questions);
         assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn classifies_waiting_background_agent_and_active_roster_as_busy() {
+        for status in [
+            "✻ Waiting for 1 background agent to finish",
+            "  ◯ general-purpose  Reading test helpers and seed.ts  1m 19s · ↓ 117.9k tokens",
+            "❯ ◯ general-purpose  Verifying invoice spec passes  28m 57s · ↓ 262.9k tokens",
+        ] {
+            let frame = format!(
+                "● The planner is running.\n{status}\n────────────────────────────────\n❯\n────────────────────────────────\n  Fable*•xhigh │ project │ main\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+            );
+            let result = Classifier.classify("test", &frame);
+
+            assert_eq!(result.state, SessionState::BusyResponding, "{status}");
+            assert!(!result.has_questions, "{status}");
+        }
+    }
+
+    #[test]
+    fn completed_or_prose_agent_text_does_not_classify_as_busy() {
+        for text in [
+            "● Agent \"Review tests\" finished · 2m 3s",
+            "● We were waiting for 1 background agent to finish, but it is done.",
+            "● The ◯ symbol and · ↓ tokens text are documented here.",
+        ] {
+            let frame = format!("{text}\n✻ Worked for 3m 2s\n❯\n~/Projects/botctl");
+            let result = Classifier.classify("test", &frame);
+
+            assert_eq!(result.state, SessionState::ChatReady, "{text}");
+        }
     }
 
     #[test]
