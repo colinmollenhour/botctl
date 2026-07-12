@@ -276,6 +276,9 @@ impl Classifier {
             ],
         );
         let has_busy_status_banner = has_live_busy_status(&lines);
+        let has_live_busy = has_busy_status_banner
+            || (has_busy_interrupt_hint && has_busy_keywords)
+            || has_claude_streaming_output;
 
         // Agy fingerprint check runs BEFORE the rest of the chain. Once a
         // frame fingerprints as agy (Antigravity banner / box-drawing
@@ -355,6 +358,10 @@ impl Classifier {
         } else if has_survey_prompt {
             signals.push(String::from(SIGNAL_SURVEY_KEYWORDS));
             SessionState::SurveyPrompt
+        } else if has_permission_keywords && has_plain_chat_prompt_after_permission && has_live_busy
+        {
+            signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
+            SessionState::BusyResponding
         } else if has_permission_keywords && has_plain_chat_prompt_after_permission {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             if has_codex_keywords {
@@ -387,6 +394,12 @@ impl Classifier {
                 signals.push(String::from(SIGNAL_SENSITIVE_CLAUDE_PATH));
             }
             SessionState::PermissionDialog
+        } else if has_live_busy {
+            signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
+            if has_codex_keywords {
+                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
+            }
+            SessionState::BusyResponding
         } else if has_unanchored_permission_words && (has_chat_input || has_codex_keywords) {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             if has_codex_keywords {
@@ -418,15 +431,6 @@ impl Classifier {
         } else if has_diff_dialog_keywords(frame_text) {
             signals.push(String::from(SIGNAL_DIFF_KEYWORDS));
             SessionState::DiffDialog
-        } else if has_busy_status_banner
-            || (has_busy_interrupt_hint && has_busy_keywords)
-            || has_claude_streaming_output
-        {
-            signals.push(String::from(SIGNAL_BUSY_KEYWORDS));
-            if has_codex_keywords {
-                signals.push(String::from(SIGNAL_CODEX_KEYWORDS));
-            }
-            SessionState::BusyResponding
         } else if has_chat_input || contains_any(&normalized, &["claude"]) || has_codex_keywords {
             signals.push(String::from(SIGNAL_CHAT_KEYWORDS));
             if has_codex_keywords {
@@ -2504,6 +2508,15 @@ mod tests {
 
         assert_eq!(result.state, SessionState::BusyResponding);
         assert!(!result.has_questions);
+        assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
+    }
+
+    #[test]
+    fn live_monitor_wins_over_permission_words_in_completed_response() {
+        let frame = "The MR description flags product sign-off before flipping the permission flag.\n✻ Worked for 55m 58s · 1 monitor still running\n────────────────────────────────\n❯\n────────────────────────────────\nFable*•high │ project │ main";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
         assert!(result.signals.contains(&String::from(SIGNAL_BUSY_KEYWORDS)));
     }
 

@@ -319,6 +319,7 @@ impl DashboardApp {
                 snapshot.classification.state,
                 self.previous_frames.get(&pane.pane_id),
                 &snapshot.raw_source,
+                None,
             );
             let source = if is_claude_pane(&pane) {
                 PaneSource::Claude
@@ -430,6 +431,8 @@ impl DashboardApp {
             let frame = prepare_frame_for_classification(&frame);
             let classification =
                 Classifier.classify(&pane.pane_id, &focused_dashboard_frame(&frame));
+            let opencode_state =
+                resolve_opencode_session_for_pane(&pane).map(|session| session.state);
             // Resolve the agy session at most once per pane per refresh and
             // thread the result into both visibility and source construction
             // to avoid duplicate fd-walk + history-tail parsing.
@@ -453,6 +456,7 @@ impl DashboardApp {
                 classification.state,
                 self.previous_frames.get(&pane.pane_id),
                 &frame,
+                opencode_state,
             );
             let source = pane_source_for_non_runtime_pane_with(
                 &pane,
@@ -2112,8 +2116,11 @@ fn dashboard_display_state(
     classified_state: SessionState,
     previous_frame: Option<&String>,
     current_frame: &str,
+    authoritative_state: Option<SessionState>,
 ) -> SessionState {
-    if classified_state == SessionState::ChatReady
+    if let Some(authoritative_state) = authoritative_state {
+        authoritative_state
+    } else if classified_state == SessionState::ChatReady
         && previous_frame.is_some_and(|previous_frame| previous_frame != current_frame)
     {
         SessionState::BusyResponding
@@ -3664,13 +3671,41 @@ mod tests {
             dashboard_display_state(
                 SessionState::ChatReady,
                 Some(&String::from("before")),
-                "after"
+                "after",
+                None,
             ),
             SessionState::BusyResponding
         );
         assert_eq!(
-            dashboard_display_state(SessionState::ChatReady, Some(&String::from("same")), "same"),
+            dashboard_display_state(
+                SessionState::ChatReady,
+                Some(&String::from("same")),
+                "same",
+                None,
+            ),
             SessionState::ChatReady
+        );
+    }
+
+    #[test]
+    fn authoritative_provider_state_wins_over_frame_motion() {
+        assert_eq!(
+            dashboard_display_state(
+                SessionState::ChatReady,
+                Some(&String::from("before")),
+                "after",
+                Some(SessionState::ChatReady),
+            ),
+            SessionState::ChatReady
+        );
+        assert_eq!(
+            dashboard_display_state(
+                SessionState::ChatReady,
+                Some(&String::from("same")),
+                "same",
+                Some(SessionState::BusyResponding),
+            ),
+            SessionState::BusyResponding
         );
     }
 
