@@ -8,10 +8,6 @@ It can also dump the latest persisted assistant message from a Claude, Codex, Op
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
-## Why the 🧌 emoji for Codex?
-
-![A totally unrelated discussion about choosing the Codex dashboard emoji](https://snips.t3.tigrisfiles.io/colin/clipboard-2026-05-08T18-18-14.webp)
-
 ## Install
 
 The recommended install method is Cargo:
@@ -152,6 +148,10 @@ Keep the dashboard alive in a dedicated tmux-backed popup session:
 ```bash
 cargo run -- dashboard --persistent
 ```
+
+When no client is attached to the persistent dashboard session, botctl pauses terminal drawing, git lookup, process resource sampling, and full dashboard enrichment. Runtime events continue updating tmux window state prefixes, while passive fallback providers are checked on a bounded three-second cadence. Reattaching forces a complete refresh before the first new frame is drawn; CPU percentages are unavailable for that first sample while botctl establishes a fresh baseline.
+
+Cook and wait durations for runtime-backed panes come from the central runtime and advance locally while the runtime's authoritative classification remains cooking or waiting. The dashboard only writes duration state for fallback-only panes.
 
 Quick tmux popup binding:
 

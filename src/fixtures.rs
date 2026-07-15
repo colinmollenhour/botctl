@@ -181,6 +181,7 @@ fn render_expected(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_metadata(
     session_name: &str,
     target_pane: &str,

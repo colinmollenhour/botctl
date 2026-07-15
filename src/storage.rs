@@ -74,6 +74,7 @@ pub struct InstanceRuntimeState {
 pub struct TmuxRuntimeDurations {
     pub wait_duration: Option<Duration>,
     pub cook_duration: Option<Duration>,
+    pub sampled_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -833,6 +834,7 @@ fn ensure_v5_required_columns(connection: &Connection) -> AppResult<()> {
 /// All three callers (wait, cook, claude-session) write to the same row, so
 /// going through this helper keeps the column list and conflict clause in
 /// sync.
+#[allow(clippy::too_many_arguments)]
 fn upsert_instance_runtime_state(
     connection: &Connection,
     instance_id: &str,
@@ -998,6 +1000,7 @@ pub fn sync_tmux_runtime_state(
     Ok(TmuxRuntimeDurations {
         wait_duration,
         cook_duration,
+        sampled_at_unix_ms: now_ms,
     })
 }
 
@@ -1992,11 +1995,11 @@ pub fn resolve_workspace(
     cwd: &Path,
 ) -> AppResult<WorkspaceRecord> {
     let connection = open_bootstrapped_state_db(state_dir)?;
-    if let Some(selector) = selector.filter(|value| !value.trim().is_empty()) {
-        if Uuid::parse_str(selector).is_ok() {
-            return load_workspace_by_id(&connection, selector)?
-                .ok_or_else(|| AppError::new(format!("unknown workspace id: {selector}")));
-        }
+    if let Some(selector) = selector.filter(|value| !value.trim().is_empty())
+        && Uuid::parse_str(selector).is_ok()
+    {
+        return load_workspace_by_id(&connection, selector)?
+            .ok_or_else(|| AppError::new(format!("unknown workspace id: {selector}")));
     }
 
     let requested_path = match selector {
@@ -2601,12 +2604,12 @@ fn new_uuid() -> String {
 }
 
 fn current_unix_ms() -> AppResult<i64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| AppError::new(error.to_string()))?
         .as_millis()
         .try_into()
-        .map_err(|_| AppError::new("system clock timestamp overflowed i64"))?)
+        .map_err(|_| AppError::new("system clock timestamp overflowed i64"))
 }
 
 fn artifact_path(
@@ -2881,7 +2884,7 @@ mod tests {
             .expect("workspace should resolve");
 
         let pane = sample_pane();
-        let first = sync_tmux_runtime_state(
+        let first_sample = sync_tmux_runtime_state(
             &state_dir,
             &workspace.id,
             &pane,
@@ -2890,11 +2893,13 @@ mod tests {
             false,
             None,
         )
-        .expect("first sync should succeed")
-        .wait_duration
-        .expect("first sync should return duration");
+        .expect("first sync should succeed");
+        let first_sampled_at = first_sample.sampled_at_unix_ms;
+        let first = first_sample
+            .wait_duration
+            .expect("first sync should return duration");
         std::thread::sleep(Duration::from_millis(20));
-        let second = sync_tmux_runtime_state(
+        let second_sample = sync_tmux_runtime_state(
             &state_dir,
             &workspace.id,
             &pane,
@@ -2903,9 +2908,11 @@ mod tests {
             false,
             None,
         )
-        .expect("second sync should succeed")
-        .wait_duration
-        .expect("second sync should return duration");
+        .expect("second sync should succeed");
+        let second_sampled_at = second_sample.sampled_at_unix_ms;
+        let second = second_sample
+            .wait_duration
+            .expect("second sync should return duration");
         let cleared = sync_tmux_runtime_state(
             &state_dir,
             &workspace.id,
@@ -2919,6 +2926,7 @@ mod tests {
         .wait_duration;
 
         assert!(second >= first);
+        assert!(second_sampled_at >= first_sampled_at);
         assert!(cleared.is_none());
 
         let _ = fs::remove_dir_all(&state_dir);

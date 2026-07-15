@@ -84,6 +84,7 @@ impl KeybindingsStatus {
 }
 
 impl AutomationAction {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "clear-input" => Some(Self::ClearInput),
@@ -528,10 +529,11 @@ fn parse_chord(chord: &str) -> Result<String, String> {
         _ => {}
     }
 
-    if let Some(rest) = normalized.strip_prefix('f') {
-        if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
-            return Ok(format!("F{rest}"));
-        }
+    if let Some(rest) = normalized.strip_prefix('f')
+        && !rest.is_empty()
+        && rest.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Ok(format!("F{rest}"));
     }
 
     if normalized.len() == 1 {

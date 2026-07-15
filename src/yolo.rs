@@ -210,19 +210,17 @@ mod tests {
             vec![String::from("%1"), String::from("%22")]
         );
 
-        assert_eq!(
-            read_yolo_record(&state_dir, &first.pane_id)
+        assert!(
+            !read_yolo_record(&state_dir, &first.pane_id)
                 .expect("disabled record should load")
                 .expect("disabled record should still exist")
-                .enabled,
-            false
+                .enabled
         );
-        assert_eq!(
+        assert!(
             read_yolo_record(&state_dir, &second.pane_id)
                 .expect("second record should load")
                 .expect("second record should still exist")
-                .enabled,
-            true
+                .enabled
         );
 
         let _ = fs::remove_dir_all(&state_dir);

@@ -200,7 +200,7 @@ fn resolve_claude_transcript_in_projects_root(
     pane: &TmuxPane,
     projects_root: &Path,
 ) -> AppResult<Option<(String, PathBuf)>> {
-    for project_dir in candidate_claude_project_dirs(&projects_root, &pane.current_path) {
+    for project_dir in candidate_claude_project_dirs(projects_root, &pane.current_path) {
         if let Some(pid) = pane.pane_pid
             && let Some(transcript) = transcript_from_process_fds(pid, &project_dir, "jsonl")?
             && let Some(session_id) = claude_session_id_from_transcript(&transcript, &project_dir)
