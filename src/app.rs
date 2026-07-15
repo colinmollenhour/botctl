@@ -3816,6 +3816,8 @@ fn is_focus_prompt_line(line: &&str) -> bool {
         || trimmed.starts_with("› 3.")
         || (trimmed.starts_with("› ")
             && !starts_with_numbered_focus_option(trimmed.trim_start_matches('›').trim()))
+        // Grok Build TUI prompt rows: `│ ❯` or `│ ❯ Build anything`
+        || (trimmed.contains('│') && trimmed.contains('❯') && !trimmed.contains("❯ 1."))
 }
 
 fn starts_with_numbered_focus_option(line: &str) -> bool {
@@ -4242,6 +4244,10 @@ fn pane_provider_label(pane: &TmuxPane) -> &'static str {
         "Claude"
     } else if is_pane_command_opencode(pane) {
         "OpenCode"
+    } else if is_pane_command_pi(pane) {
+        "Pi"
+    } else if is_pane_command_grok(pane) {
+        "Grok"
     } else if pane.window_name.starts_with("botctl-mcp-codex-") {
         "Codex"
     } else if pane.window_name.starts_with("botctl-mcp-agy-") {
@@ -4257,6 +4263,14 @@ fn pane_provider_label(pane: &TmuxPane) -> &'static str {
 
 fn is_pane_command_agy(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("agy")
+}
+
+fn is_pane_command_pi(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("pi")
+}
+
+fn is_pane_command_grok(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("grok")
 }
 
 fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool {
@@ -4284,11 +4298,23 @@ fn is_classified_agy(classification: &Classification, pane: &TmuxPane) -> bool {
             .any(|signal| signal == crate::classifier::SIGNAL_AGY_KEYWORDS)
 }
 
+fn is_classified_grok(classification: &Classification, pane: &TmuxPane) -> bool {
+    is_pane_command_grok(pane)
+        || classification
+            .signals
+            .iter()
+            .any(|signal| signal == crate::classifier::SIGNAL_GROK_KEYWORDS)
+}
+
 fn classification_provider_label(classification: &Classification, pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
     } else if is_pane_command_opencode(pane) {
         "OpenCode"
+    } else if is_pane_command_pi(pane) {
+        "Pi"
+    } else if is_classified_grok(classification, pane) {
+        "Grok"
     } else if is_classified_codex(classification, pane) {
         "Codex"
     } else if is_classified_agy(classification, pane) {

@@ -707,7 +707,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
     let (name, purpose, usage, examples, options, safety) = match topic {
         "dashboard" => (
             "dashboard",
-            "Open live TUI across Claude, Codex, OpenCode, Pi, and Antigravity panes.",
+            "Open live TUI across Claude, Codex, OpenCode, Pi, Grok, and Antigravity panes.",
             "botctl dashboard [--poll-ms N] [--history-lines N] [--state-dir PATH] [--exit-on-navigate] [--persistent] [--unmanaged]",
             &[
                 "botctl dashboard",
@@ -839,7 +839,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         ),
         "last-message" => (
             "last-message",
-            "Dump the latest assistant message from a pane transcript (Claude/Codex/OpenCode/Pi) or pane scrollback (Antigravity).",
+            "Dump the latest assistant message from a pane transcript (Claude/Codex/OpenCode/Pi/Grok) or pane scrollback (Antigravity).",
             "botctl last-message --pane %ID|session:window.pane [--out PATH] [--history-lines N]",
             &[
                 "botctl last-message --pane %19",
@@ -853,7 +853,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--history-lines N",
                 "--no-color",
             ][..],
-            "Reads provider transcript storage for Claude, Codex, OpenCode, Pi, and pane-scrape for Antigravity. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout. --history-lines (default: 2000) widens the captured scrollback for Antigravity pane-scrape extraction; non-agy providers ignore it.",
+            "Reads provider transcript storage for Claude, Codex, OpenCode, Pi, Grok (updates.jsonl), and pane-scrape for Antigravity. Without --out, writes MESSAGE_<provider-session-id>.md in the current directory and prints only the line count plus file path. Use --out - to write the markdown body to stdout. --history-lines (default: 2000) widens the captured scrollback for Antigravity pane-scrape extraction; non-agy providers ignore it.",
         ),
         "status" => (
             "status",
@@ -1095,7 +1095,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "send-action" => "Advanced plumbing: send one named automation action to a pane.",
         "dismiss-survey" => "Dismiss a survey prompt. Canonical name: dismiss-survey.",
         "last-message" => {
-            "Dump the latest assistant message for a Claude, Codex, OpenCode, Pi, or Antigravity pane (Antigravity messages are scraped from pane scrollback, not persisted transcripts)."
+            "Dump the latest assistant message for a Claude, Codex, OpenCode, Pi, Grok, or Antigravity pane (Antigravity messages are scraped from pane scrollback, not persisted transcripts)."
         }
         "editor-helper" => {
             "Advanced prompt plumbing: generate an editor target file for prompt handoff."

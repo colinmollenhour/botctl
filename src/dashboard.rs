@@ -31,6 +31,7 @@ use crate::classifier::{
     Classifier, SIGNAL_CODEX_KEYWORDS, SessionState, prepare_frame_for_classification,
 };
 use crate::cli::DashboardArgs;
+use crate::grok::{is_grok_pane, resolve_grok_session_for_pane};
 use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::opencode::{pane_opencode_title, resolve_opencode_session_for_pane};
 use crate::pi::resolve_pi_session_for_pane;
@@ -363,6 +364,10 @@ enum PaneSource {
     },
     Pi {
         session_id: String,
+    },
+    Grok {
+        session_id: Option<String>,
+        title: Option<String>,
     },
     Agy {
         session_id: Option<String>,
@@ -1161,6 +1166,7 @@ fn detached_fallback_title_pass(
             PaneSource::Codex => codex_session_id.as_deref(),
             PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
             PaneSource::Pi { session_id } => Some(session_id.as_str()),
+            PaneSource::Grok { session_id, .. } => session_id.as_deref(),
             PaneSource::Agy { session_id } => session_id.as_deref(),
         };
         sync_tmux_runtime_state(
@@ -1195,6 +1201,7 @@ fn fallback_process_tree_with(
         .any(|pane| {
             pane.current_command.eq_ignore_ascii_case("pi")
                 || pane.current_command.eq_ignore_ascii_case("agy")
+                || pane.current_command.eq_ignore_ascii_case("grok")
         })
         .then(scanner)
 }
@@ -1279,6 +1286,16 @@ impl DashboardApp {
                     resolve_agy_session_for_pane(&pane, &snapshot.raw_source, &process_tree)?
                         .and_then(|session| session.id);
                 PaneSource::Agy { session_id }
+            } else if is_grok_pane(&pane) {
+                let session =
+                    resolve_grok_session_for_pane(&pane, &snapshot.raw_source, &process_tree)?;
+                PaneSource::Grok {
+                    session_id: session
+                        .as_ref()
+                        .map(|session| session.id.clone())
+                        .filter(|id| !id.is_empty()),
+                    title: session.and_then(|session| session.title),
+                }
             } else if let Some(source) = opencode_source_for_pane(&pane) {
                 source
             } else if let Some(pi_session) = resolve_pi_session_for_pane(&pane, &process_tree)? {
@@ -1425,6 +1442,7 @@ impl DashboardApp {
                 PaneSource::Codex => codex_session_id.as_deref(),
                 PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
                 PaneSource::Pi { session_id } => Some(session_id.as_str()),
+                PaneSource::Grok { session_id, .. } => session_id.as_deref(),
                 PaneSource::Agy { session_id } => session_id.as_deref(),
             };
             let duration_state = opencode_state.unwrap_or(classification.state);
@@ -2290,6 +2308,12 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             )));
         }
         if let PaneSource::OpenCode { title, .. } = &pane.source {
+            details.push(Line::from(format!("Title: {title}")));
+        }
+        if let PaneSource::Grok {
+            title: Some(title), ..
+        } = &pane.source
+        {
             details.push(Line::from(format!("Title: {title}")));
         }
         details.push(Line::from(format!(
@@ -3267,6 +3291,7 @@ fn pane_provider_label(pane: &PaneEntry) -> &str {
         PaneSource::Codex => "Codex",
         PaneSource::OpenCode { .. } => "OpenCode",
         PaneSource::Pi { .. } => "Pi",
+        PaneSource::Grok { .. } => "Grok",
         PaneSource::Agy { .. } => "Antigravity",
     }
 }
@@ -3277,6 +3302,8 @@ fn agent_emoji(pane: &PaneEntry) -> &'static str {
         PaneSource::Codex => "🞇",
         PaneSource::OpenCode { .. } => "⧈",
         PaneSource::Pi { .. } => "π",
+        // BLACK FOUR POINTED STAR (U+2726) — single-width in terminal fonts.
+        PaneSource::Grok { .. } => "✦",
         PaneSource::Agy { .. } => "⚛",
     }
 }
@@ -3288,6 +3315,7 @@ fn agent_marker(pane: &PaneEntry) -> &'static str {
         PaneSource::Codex => "X",
         PaneSource::OpenCode { .. } => "O",
         PaneSource::Pi { .. } => "P",
+        PaneSource::Grok { .. } => "G",
         PaneSource::Agy { .. } => "A",
     }
 }
@@ -3298,6 +3326,7 @@ fn pane_session_id(pane: &PaneEntry) -> Option<&str> {
         PaneSource::Codex => None,
         PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
         PaneSource::Pi { session_id } => Some(session_id.as_str()),
+        PaneSource::Grok { session_id, .. } => session_id.as_deref(),
         PaneSource::Agy { session_id } => session_id.as_deref(),
     }
 }
@@ -3781,6 +3810,7 @@ fn is_dashboard_fallback_candidate(pane: &TmuxPane) -> bool {
         || is_opencode_candidate_pane(pane)
         || pane.current_command.eq_ignore_ascii_case("pi")
         || pane.current_command.eq_ignore_ascii_case("agy")
+        || pane.current_command.eq_ignore_ascii_case("grok")
 }
 
 fn is_dashboard_visible_non_runtime_pane_with(
@@ -3791,13 +3821,13 @@ fn is_dashboard_visible_non_runtime_pane_with(
     resolver: &dyn ChildResolver,
 ) -> AppResult<bool> {
     // Mirror the short-circuit in `pane_source_for_non_runtime_pane_with`:
-    // when the pane's current command is `agy` we treat it as a visible
-    // Antigravity pane even if `agy_session` is None. This keeps the new
-    // `PaneSource::Agy { session_id: None }` variant actually reachable on
-    // the non-runtime path; otherwise unresolved agy panes (no protobuf FD
-    // and no history.jsonl cwd match) would silently disappear from the
-    // dashboard despite being valid agy panes.
+    // when the pane's current command is `agy`/`grok` we treat it as a visible
+    // pane even if session resolution returned nothing. This keeps
+    // `PaneSource::Agy { session_id: None }` / `Grok { session_id: None }`
+    // reachable on the non-runtime path; otherwise unresolved panes would
+    // silently disappear from the dashboard.
     Ok(is_agy_pane(pane)
+        || is_grok_pane(pane)
         || is_opencode_candidate_pane(pane)
         || is_codex_screen(frame, signals)
         || resolve_pi_session_for_pane(pane, resolver)?.is_some()
@@ -3819,6 +3849,16 @@ fn pane_source_for_non_runtime_pane_with(
         // pane (AGENTS.md guardrail).
         return Ok(PaneSource::Agy {
             session_id: agy_session.and_then(|session| session.id),
+        });
+    }
+    if is_grok_pane(pane) {
+        let session = resolve_grok_session_for_pane(pane, frame, resolver)?;
+        return Ok(PaneSource::Grok {
+            session_id: session
+                .as_ref()
+                .map(|session| session.id.clone())
+                .filter(|id| !id.is_empty()),
+            title: session.and_then(|session| session.title),
         });
     }
     if let Some(source) = opencode_source_for_pane(pane) {
@@ -3843,6 +3883,14 @@ fn focused_dashboard_frame(frame: &str) -> String {
             line.contains("╭") || line.contains("┌") || line.contains(">_") || line.contains("❯")
         })
         .unwrap_or(0);
+    // Grok renders the busy status line (spinner / "command still running")
+    // immediately above the prompt box. Pull a few preceding lines so that
+    // chrome remains visible without re-including the whole scrollback.
+    let start = if crate::grok::frame_has_grok_fingerprint(frame) {
+        start.saturating_sub(8)
+    } else {
+        start
+    };
     lines[start..].join("\n")
 }
 
@@ -4305,6 +4353,13 @@ mod tests {
             },
             ..sample_pane_entry(SessionState::ChatReady, false, false, "")
         };
+        let grok = PaneEntry {
+            source: PaneSource::Grok {
+                session_id: Some(String::from("019f67b2-f34f-7b61-9d9f-2eb5554ace8a")),
+                title: Some(String::from("Add Grok Support")),
+            },
+            ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        };
         let agy = PaneEntry {
             source: PaneSource::Agy {
                 session_id: Some(String::from("agy-uuid")),
@@ -4316,12 +4371,21 @@ mod tests {
         assert_eq!(agent_emoji(&opencode), "⧈");
         assert_eq!(agent_emoji(&codex), "🞇");
         assert_eq!(agent_emoji(&pi), "π");
+        assert_eq!(agent_emoji(&grok), "✦");
         assert_eq!(agent_emoji(&agy), "⚛");
         assert_eq!(agent_marker(&claude), "C");
         assert_eq!(agent_marker(&opencode), "O");
         assert_eq!(agent_marker(&codex), "X");
         assert_eq!(agent_marker(&pi), "P");
+        assert_eq!(agent_marker(&grok), "G");
         assert_eq!(agent_marker(&agy), "A");
+    }
+
+    #[test]
+    fn grok_glyph_is_single_width() {
+        use unicode_width::UnicodeWidthChar;
+        let glyph: char = "✦".chars().next().unwrap();
+        assert_eq!(glyph.width(), Some(1), "grok glyph must be single-width");
     }
 
     #[test]
@@ -4819,7 +4883,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_fallback_scans_proc_only_for_pi_or_antigravity_candidates() {
+    fn detached_fallback_scans_proc_only_for_pi_antigravity_or_grok_candidates() {
         let calls = std::cell::Cell::new(0);
         let no_process_candidates = vec![
             sample_tmux_pane("opencode", "OC | demo"),
@@ -4837,6 +4901,17 @@ mod tests {
         let process_candidates = vec![sample_tmux_pane("pi", "Pi")];
         assert!(
             fallback_process_tree_with(&process_candidates, || {
+                calls.set(calls.get() + 1);
+                ProcessTreeSnapshot::from_process_snapshots(&[])
+            })
+            .is_some()
+        );
+        assert_eq!(calls.get(), 1);
+
+        calls.set(0);
+        let grok_candidates = vec![sample_tmux_pane("grok", "Demo - grok")];
+        assert!(
+            fallback_process_tree_with(&grok_candidates, || {
                 calls.set(calls.get() + 1);
                 ProcessTreeSnapshot::from_process_snapshots(&[])
             })

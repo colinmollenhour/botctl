@@ -5,6 +5,7 @@ pub mod classifier;
 pub mod cli;
 pub mod dashboard;
 pub mod fixtures;
+pub mod grok;
 pub mod http_api;
 pub mod last_message;
 pub mod mcp;

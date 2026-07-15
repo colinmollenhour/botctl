@@ -100,6 +100,7 @@ pub const SIGNAL_BUSY_KEYWORDS: &str = "busy-keywords";
 pub const SIGNAL_CHAT_QUESTIONS: &str = "chat-questions";
 pub const SIGNAL_CODEX_KEYWORDS: &str = "codex-keywords";
 pub const SIGNAL_AGY_KEYWORDS: &str = "agy-keywords";
+pub const SIGNAL_GROK_KEYWORDS: &str = "grok-keywords";
 pub const SIGNAL_SELF_SETTINGS_LANGUAGE: &str = "self-settings-language";
 pub const SIGNAL_SENSITIVE_CLAUDE_PATH: &str = "sensitive-claude-path";
 
@@ -281,18 +282,17 @@ impl Classifier {
             || (has_busy_interrupt_hint && has_busy_keywords)
             || has_claude_streaming_output;
 
-        // Agy fingerprint check runs BEFORE the rest of the chain. Once a
-        // frame fingerprints as agy (Antigravity banner / box-drawing
-        // banner / `1 artifact · /artifact to review` / unique
-        // `(esc to cancel|? for shortcuts) … Gemini ` footer), the agy
-        // classifier owns the result: it has its own permission-prompt
-        // detector and its own busy/ready rules. Letting the Claude
-        // permission / busy chain run first risks misclassifying a real
-        // agy command-permission prompt as a Claude `PermissionDialog`
-        // (whose YOLO/approval paths do not apply to agy).
+        // Provider-owned fingerprint checks run BEFORE the rest of the chain.
+        // Once a frame fingerprints as agy or Grok, that provider owns the
+        // result. Letting the Claude permission / busy chain run first risks
+        // misclassifying their busy chrome or permission shapes as Claude
+        // dialogs (whose YOLO/approval paths do not apply).
         let mut state = if crate::agy::frame_has_agy_fingerprint(frame_text) {
             signals.push(String::from(SIGNAL_AGY_KEYWORDS));
             crate::agy::classify_agy_state(frame_text).unwrap_or(SessionState::Unknown)
+        } else if crate::grok::frame_has_grok_fingerprint(frame_text) {
+            signals.push(String::from(SIGNAL_GROK_KEYWORDS));
+            crate::grok::classify_grok_state(frame_text).unwrap_or(SessionState::Unknown)
         } else if contains_any(
             &normalized,
             &[
@@ -446,11 +446,13 @@ impl Classifier {
             SessionState::Unknown
         };
 
-        // Agy pane-scrape doesn't currently support reliable question detection;
-        // the operator-question path is Claude/Codex specific (it keys on chat
-        // input markers and recap excerpts that agy does not produce).
-        let is_agy_state = signals.iter().any(|s| s == SIGNAL_AGY_KEYWORDS);
-        let has_questions = !is_agy_state
+        // Agy/Grok don't currently support reliable screen-only question
+        // detection; the operator-question path is Claude/Codex specific (it
+        // keys on chat input markers and recap excerpts those TUIs do not share).
+        let is_provider_owned_state = signals.iter().any(|s| {
+            s == SIGNAL_AGY_KEYWORDS || s == SIGNAL_GROK_KEYWORDS
+        });
+        let has_questions = !is_provider_owned_state
             && matches!(
                 state,
                 SessionState::ChatReady | SessionState::UserQuestionPrompt
