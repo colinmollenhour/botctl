@@ -969,19 +969,29 @@ fn parse_length_prefixed_fields(
                 "malformed length prefix in tmux structured output",
             ));
         }
-        let length = std::str::from_utf8(&bytes[length_start..*offset])
+        // tmux `#{n:field}` is a Unicode scalar (character) count, not a byte
+        // count — multi-byte UTF-8 (emoji, accents) must advance by chars.
+        let char_len = std::str::from_utf8(&bytes[length_start..*offset])
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .ok_or_else(|| AppError::new("invalid field length in tmux structured output"))?;
         *offset += 1;
-        let end = (*offset)
-            .checked_add(length)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| AppError::new("truncated field in tmux structured output"))?;
-        let value = std::str::from_utf8(&bytes[*offset..end])
+        let rest = std::str::from_utf8(&bytes[*offset..])
             .map_err(|_| AppError::new("tmux structured output field was not valid UTF-8"))?;
+        let mut chars = rest.char_indices();
+        let mut end_in_rest = 0;
+        for _ in 0..char_len {
+            let Some((idx, ch)) = chars.next() else {
+                return Err(AppError::new("truncated field in tmux structured output"));
+            };
+            end_in_rest = idx + ch.len_utf8();
+        }
+        if char_len == 0 {
+            end_in_rest = 0;
+        }
+        let value = &rest[..end_in_rest];
         fields.push(value.to_string());
-        *offset = end;
+        *offset += end_in_rest;
     }
     Ok(fields)
 }
@@ -990,7 +1000,8 @@ fn parse_length_prefixed_fields(
 fn encode_pane_record_for_test(fields: &[&str]) -> String {
     let mut output = fields
         .iter()
-        .map(|field| format!("{}:{field}", field.len()))
+        // Match tmux `#{n:...}` character counts, not UTF-8 byte lengths.
+        .map(|field| format!("{}:{field}", field.chars().count()))
         .collect::<String>();
     output.push('\n');
     output
@@ -1372,6 +1383,33 @@ mod tests {
         assert_eq!(panes[0].window_name, "window\nname");
         assert_eq!(panes[0].current_path, "/tmp/tab\tline\nnext");
         assert_eq!(panes[0].pane_title, "title\twith\nlines");
+    }
+
+    #[test]
+    fn pane_inventory_advances_by_unicode_characters_not_bytes() {
+        // "⚙" is one Unicode scalar (3 UTF-8 bytes); tmux prefixes use char count.
+        let encoded = encode_pane_record_for_test(&[
+            "%1",
+            "/dev/pts/1",
+            "123",
+            "$1",
+            "demo",
+            "@2",
+            "3",
+            "⚙ bloodraven",
+            "1",
+            "claude",
+            "/tmp/demo",
+            "title 🚀",
+            "1",
+            "12",
+            "4",
+        ]);
+        let panes = parse_inventory_panes(&encoded).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window_name, "⚙ bloodraven");
+        assert_eq!(panes[0].pane_title, "title 🚀");
+        assert_eq!(panes[0].pane_id, "%1");
     }
 
     #[test]
