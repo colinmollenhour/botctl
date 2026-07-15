@@ -8,10 +8,6 @@ It can also dump the latest persisted assistant message from a Claude, Codex, Op
 
 The project is built around a simple rule: terminal automation is only safe when tmux transport, live observation, classification, and action policy stay separate. Sending keys alone is not enough.
 
-## Why the 🧌 emoji for Codex?
-
-![A totally unrelated discussion about choosing the Codex dashboard emoji](https://snips.t3.tigrisfiles.io/colin/clipboard-2026-05-08T18-18-14.webp)
-
 ## Install
 
 The recommended install method is Cargo:
