@@ -47,6 +47,8 @@ const SCHEDULER_TICK_MS: u64 = 50;
 const TOPOLOGY_SCAN_INTERVAL_MS: u64 = 15_000;
 const MIN_FULL_SAFETY_INTERVAL_MS: u64 = 10_000;
 const SUBSCRIBER_CAPACITY: usize = 128;
+const OBSERVER_CHANNEL_CAPACITY: usize = 256;
+const OBSERVER_BATCH_SIZE: usize = 256;
 const SUBSCRIPTION_WRITE_TIMEOUT_MS: u64 = 1_000;
 const DIAGNOSTIC_THROTTLE_MS: u64 = 30_000;
 
@@ -76,6 +78,8 @@ pub struct RuntimePaneSnapshot {
     pub wait_duration_ms: Option<u64>,
     #[serde(default)]
     pub cook_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_sampled_at_unix_ms: Option<i64>,
     pub claude_session_id: Option<String>,
     pub workspace_id: String,
     pub workspace_root: String,
@@ -587,9 +591,25 @@ struct TrackedPane {
 
 #[derive(Debug)]
 enum ObserverMessage {
-    Opened(String),
-    Line { session_name: String, line: String },
-    Closed(String),
+    Opened {
+        session_id: String,
+        generation: u64,
+    },
+    Line {
+        session_id: String,
+        generation: u64,
+        line: String,
+    },
+    Closed {
+        session_id: String,
+        generation: u64,
+    },
+}
+
+#[derive(Debug)]
+struct ActiveObserver {
+    generation: u64,
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1012,6 +1032,7 @@ fn handle_run_action(
     let result = execute_runtime_action(&client, config, &current, action, session_name)?;
     let refreshed = refresh_action_snapshot(
         &client,
+        config,
         shared,
         pane_id,
         session_name,
@@ -1069,6 +1090,7 @@ fn handle_submit_prompt(
     };
     let refreshed = refresh_action_snapshot(
         &client,
+        config,
         shared,
         pane_id,
         Some(session_name),
@@ -1285,36 +1307,50 @@ fn spawn_observer(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let client = runtime_tmux_client();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(OBSERVER_CHANNEL_CAPACITY);
         let mut scheduler = RuntimeScheduler::new(Instant::now(), config.reconcile_ms);
         let mut known_candidates = BTreeMap::<String, TmuxPane>::new();
         let mut pending = BTreeMap::<String, PendingReconcile>::new();
-        let mut observed_sessions = BTreeSet::new();
+        let mut active_observers = BTreeMap::<String, ActiveObserver>::new();
         let mut observer_retries = BTreeMap::<String, (u8, Instant)>::new();
+        let mut next_observer_generation = 0u64;
         let mut diagnostics = DiagnosticThrottle::default();
 
         while !stop.load(Ordering::SeqCst) {
-            while let Ok(message) = rx.try_recv() {
+            for _ in 0..OBSERVER_BATCH_SIZE {
+                let Ok(message) = rx.try_recv() else {
+                    break;
+                };
                 match message {
-                    ObserverMessage::Opened(session_name) => {
-                        observer_retries.remove(&session_name);
+                    ObserverMessage::Opened {
+                        session_id,
+                        generation,
+                    } if observer_is_current(&active_observers, &session_id, generation) => {
+                        observer_retries.remove(&session_id);
                     }
-                    ObserverMessage::Line { session_name, line } => {
-                        observer_retries.remove(&session_name);
-                        if handle_control_line_shared(&shared, &line)
+                    ObserverMessage::Line {
+                        session_id,
+                        generation,
+                        line,
+                    } if observer_is_current(&active_observers, &session_id, generation) => {
+                        observer_retries.remove(&session_id);
+                        if handle_queued_control_line_shared(&shared, &line)
                             == ControlLineEffect::Reconcile
                         {
                             scheduler.request_topology_scan();
                         }
                     }
-                    ObserverMessage::Closed(session_name) => {
-                        observed_sessions.remove(&session_name);
+                    ObserverMessage::Closed {
+                        session_id,
+                        generation,
+                    } if observer_is_current(&active_observers, &session_id, generation) => {
+                        active_observers.remove(&session_id);
                         let attempt = observer_retries
-                            .get(&session_name)
+                            .get(&session_id)
                             .map(|(attempt, _)| *attempt)
                             .unwrap_or(0);
                         observer_retries.insert(
-                            session_name,
+                            session_id,
                             (
                                 attempt.saturating_add(1),
                                 Instant::now() + retry_delay(attempt),
@@ -1322,6 +1358,7 @@ fn spawn_observer(
                         );
                         scheduler.request_topology_scan();
                     }
+                    _ => {}
                 }
             }
 
@@ -1342,6 +1379,15 @@ fn spawn_observer(
                                 PendingReconcile::new(ReconcileReason::Topology)
                             });
                         }
+                        let candidate_session_ids = known_candidates
+                            .values()
+                            .map(|pane| pane.session_id.clone())
+                            .collect::<BTreeSet<_>>();
+                        retain_candidate_observers(
+                            &mut active_observers,
+                            &mut observer_retries,
+                            &candidate_session_ids,
+                        );
                     }
                     Err(error) => {
                         scheduler.finish_topology_scan(now, false);
@@ -1361,18 +1407,32 @@ fn spawn_observer(
 
             let candidate_sessions = known_candidates
                 .values()
-                .map(|pane| pane.session_name.clone())
+                .map(|pane| pane.session_id.clone())
                 .collect::<BTreeSet<_>>();
-            for session_name in candidate_sessions {
+            for session_id in candidate_sessions {
                 let retry_due = observer_retries
-                    .get(&session_name)
+                    .get(&session_id)
                     .is_none_or(|(_, retry_at)| *retry_at <= now);
-                if !observed_sessions.contains(&session_name) && retry_due {
-                    observed_sessions.insert(session_name.clone());
+                if !active_observers.contains_key(&session_id) && retry_due {
+                    next_observer_generation = next_observer_generation.wrapping_add(1);
+                    let generation = next_observer_generation;
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    active_observers.insert(
+                        session_id.clone(),
+                        ActiveObserver {
+                            generation,
+                            cancel: Arc::clone(&cancel),
+                        },
+                    );
                     let tx = tx.clone();
                     let client = client.clone();
                     let stop = Arc::clone(&stop);
-                    thread::spawn(move || observe_session_lines(client, &session_name, tx, stop));
+                    let shared = Arc::clone(&shared);
+                    thread::spawn(move || {
+                        observe_session_lines(
+                            client, session_id, generation, tx, stop, cancel, shared,
+                        )
+                    });
                 }
             }
 
@@ -1427,29 +1487,65 @@ fn spawn_observer(
     })
 }
 
+fn observer_is_current(
+    active_observers: &BTreeMap<String, ActiveObserver>,
+    session_id: &str,
+    generation: u64,
+) -> bool {
+    active_observers
+        .get(session_id)
+        .is_some_and(|observer| observer.generation == generation)
+}
+
+fn retain_candidate_observers(
+    active_observers: &mut BTreeMap<String, ActiveObserver>,
+    observer_retries: &mut BTreeMap<String, (u8, Instant)>,
+    candidate_session_ids: &BTreeSet<String>,
+) {
+    active_observers.retain(|session_id, observer| {
+        let retain = candidate_session_ids.contains(session_id);
+        if !retain {
+            observer.cancel.store(true, Ordering::SeqCst);
+        }
+        retain
+    });
+    observer_retries.retain(|session_id, _| candidate_session_ids.contains(session_id));
+}
+
 fn observe_session_lines(
     client: TmuxClient,
-    session_name: &str,
-    tx: mpsc::Sender<ObserverMessage>,
+    session_id: String,
+    generation: u64,
+    tx: mpsc::SyncSender<ObserverMessage>,
     stop: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    shared: Arc<Mutex<RuntimeShared>>,
 ) {
-    let Ok(mut control) = client.control_mode_session(session_name) else {
-        let _ = tx.send(ObserverMessage::Closed(session_name.to_string()));
+    let Ok(mut control) = client.control_mode_session(&session_id) else {
+        let _ = tx.send(ObserverMessage::Closed {
+            session_id,
+            generation,
+        });
         return;
     };
     if tx
-        .send(ObserverMessage::Opened(session_name.to_string()))
+        .send(ObserverMessage::Opened {
+            session_id: session_id.clone(),
+            generation,
+        })
         .is_err()
     {
         return;
     }
 
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && !cancel.load(Ordering::SeqCst) {
         match control.recv_timeout(Duration::from_millis(CONTROL_POLL_MS)) {
             Ok(ControlModeReceive::Line(line)) => {
+                mark_control_output_activity_shared(&shared, &line);
                 if tx
                     .send(ObserverMessage::Line {
-                        session_name: session_name.to_string(),
+                        session_id: session_id.clone(),
+                        generation,
                         line,
                     })
                     .is_err()
@@ -1462,10 +1558,16 @@ fn observe_session_lines(
         }
     }
 
-    let _ = tx.send(ObserverMessage::Closed(session_name.to_string()));
+    let _ = tx.send(ObserverMessage::Closed {
+        session_id,
+        generation,
+    });
 }
 
-fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) -> ControlLineEffect {
+fn handle_queued_control_line_shared(
+    shared: &Arc<Mutex<RuntimeShared>>,
+    line: &str,
+) -> ControlLineEffect {
     let mut shared = shared.lock().unwrap();
     match parse_control_line(line) {
         Some(ControlEvent::Output { pane_id, payload })
@@ -1473,7 +1575,6 @@ fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) ->
             pane_id, payload, ..
         }) => {
             if let Some(tracked) = shared.panes.get_mut(&pane_id) {
-                let now = Instant::now();
                 let decoded = decode_tmux_escaped(&payload);
                 let model = tracked
                     .screen_model
@@ -1481,9 +1582,6 @@ fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) ->
                 model.ingest(&decoded);
                 tracked.snapshot.live_excerpt =
                     trim_visible_block(&model.render(), MAX_LIVE_EXCERPT_LINES);
-                tracked.stream_generation = tracked.stream_generation.wrapping_add(1);
-                tracked.dirty_since.get_or_insert(now);
-                tracked.last_stream_activity = Some(now);
             }
             ControlLineEffect::None
         }
@@ -1496,6 +1594,25 @@ fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) ->
         }
         None => ControlLineEffect::None,
     }
+}
+
+fn mark_control_output_activity_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) {
+    let Some(ControlEvent::Output { pane_id, .. } | ControlEvent::ExtendedOutput { pane_id, .. }) =
+        parse_control_line(line)
+    else {
+        return;
+    };
+    let mut shared = shared.lock().unwrap();
+    if let Some(tracked) = shared.panes.get_mut(&pane_id) {
+        mark_stream_activity(tracked);
+    }
+}
+
+fn mark_stream_activity(tracked: &mut TrackedPane) {
+    let now = Instant::now();
+    tracked.stream_generation = tracked.stream_generation.wrapping_add(1);
+    tracked.dirty_since.get_or_insert(now);
+    tracked.last_stream_activity = Some(now);
 }
 
 fn topology_scan(
@@ -1711,6 +1828,7 @@ fn reconcile_pane(
         cook_duration_ms: runtime_durations
             .cook_duration
             .map(|duration| duration.as_millis() as u64),
+        duration_sampled_at_unix_ms: Some(runtime_durations.sampled_at_unix_ms),
         claude_session_id,
         workspace_id: workspace.id.clone(),
         workspace_root: workspace.workspace_root.clone(),
@@ -2100,6 +2218,7 @@ fn commit_post_yolo_snapshot(
     tracked.snapshot.cook_duration_ms = runtime_durations
         .cook_duration
         .map(|duration| duration.as_millis() as u64);
+    tracked.snapshot.duration_sampled_at_unix_ms = Some(runtime_durations.sampled_at_unix_ms);
     tracked.snapshot.last_action = Some(last_action);
     tracked.snapshot.revision = revision;
     tracked.snapshot.updated_at_unix_ms = updated_at_unix_ms;
@@ -2231,12 +2350,40 @@ fn get_snapshot(
 
 fn refresh_action_snapshot(
     client: &TmuxClient,
+    config: &RuntimeServerConfig,
     shared: &Arc<Mutex<RuntimeShared>>,
     pane_id: &str,
     session_name: Option<&str>,
     last_action: Option<String>,
 ) -> AppResult<RuntimePaneSnapshot> {
     let inspected = inspect_pane(client, pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let (pane, workspace_id, provider_session_id) = {
+        let shared = shared.lock().unwrap();
+        let tracked = shared
+            .panes
+            .get(pane_id)
+            .ok_or_else(|| AppError::with_exit_code(format!("pane not found: {pane_id}"), 404))?;
+        if !session_matches(&tracked.snapshot, session_name) {
+            return Err(AppError::with_exit_code(
+                format!("pane {} is not tracked for requested session", pane_id),
+                404,
+            ));
+        }
+        (
+            tracked.pane.clone(),
+            tracked.workspace.id.clone(),
+            tracked.signature.provider_session_id.clone(),
+        )
+    };
+    let runtime_durations = sync_tmux_runtime_state(
+        &config.state_dir,
+        &workspace_id,
+        &pane,
+        inspected.classification.state.as_str(),
+        is_waiting_state(inspected.classification.state),
+        inspected.classification.state == SessionState::BusyResponding,
+        provider_session_id.as_deref(),
+    )?;
     let mut shared = shared.lock().unwrap();
     let revision = next_revision(&mut shared);
     let tracked = shared
@@ -2254,6 +2401,13 @@ fn refresh_action_snapshot(
     tracked.snapshot.raw_source = inspected.raw_source.clone();
     tracked.snapshot.live_excerpt =
         trim_visible_block(&inspected.focused_source, MAX_LIVE_EXCERPT_LINES);
+    tracked.snapshot.wait_duration_ms = runtime_durations
+        .wait_duration
+        .map(|duration| duration.as_millis() as u64);
+    tracked.snapshot.cook_duration_ms = runtime_durations
+        .cook_duration
+        .map(|duration| duration.as_millis() as u64);
+    tracked.snapshot.duration_sampled_at_unix_ms = Some(runtime_durations.sampled_at_unix_ms);
     tracked.snapshot.last_action = last_action;
     tracked.snapshot.revision = revision;
     tracked.snapshot.updated_at_unix_ms = now_unix_ms();
@@ -2533,6 +2687,7 @@ pub fn build_instance_detail_json(
             "last_stop_reason": snapshot.last_stop_reason,
             "wait_duration_ms": snapshot.wait_duration_ms,
             "cook_duration_ms": snapshot.cook_duration_ms,
+            "duration_sampled_at_unix_ms": snapshot.duration_sampled_at_unix_ms,
             "claude_session_id": snapshot.claude_session_id,
             "revision": snapshot.revision,
             "updated_at_unix_ms": snapshot.updated_at_unix_ms,
@@ -2543,15 +2698,17 @@ pub fn build_instance_detail_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionGuard, ControlLineEffect, PendingReconcile, ReconcileReason, RuntimeEvent,
-        RuntimePaneSnapshot, RuntimeResponse, RuntimeScheduler, RuntimeShared, RuntimeSubscription,
-        SnapshotSignature, TrackedPane, commit_post_yolo_snapshot, complete_reconcile_generation,
-        dirty_reconcile_due, emit_shared_event, handle_control_line_shared, handle_subscribe,
-        is_runtime_discovery_candidate, is_verified_runtime_discovery_candidate, is_waiting_state,
-        is_yolo_candidate_pane, notification_requires_reconcile, post_approve_guard_matches,
-        queue_full_state_safety_pass, reconcile_clears_dirty, retry_delay,
-        run_automatic_action_if_generation_stable, runtime_socket_path, same_pane_identity,
-        topology_delta, update_yolo_runtime_state, write_message, yolo_workflow,
+        ActionGuard, ActiveObserver, ControlLineEffect, PendingReconcile, ReconcileReason,
+        RuntimeEvent, RuntimePaneSnapshot, RuntimeResponse, RuntimeScheduler, RuntimeShared,
+        RuntimeSubscription, SnapshotSignature, TrackedPane, commit_post_yolo_snapshot,
+        complete_reconcile_generation, dirty_reconcile_due, emit_shared_event,
+        handle_queued_control_line_shared, handle_subscribe, is_runtime_discovery_candidate,
+        is_verified_runtime_discovery_candidate, is_waiting_state, is_yolo_candidate_pane,
+        mark_control_output_activity_shared, notification_requires_reconcile, observer_is_current,
+        post_approve_guard_matches, queue_full_state_safety_pass, reconcile_clears_dirty,
+        retain_candidate_observers, retry_delay, run_automatic_action_if_generation_stable,
+        runtime_socket_path, same_pane_identity, topology_delta, update_yolo_runtime_state,
+        write_message, yolo_workflow,
     };
     use crate::app::InspectedPane;
     use crate::automation::GuardedWorkflow;
@@ -2563,7 +2720,11 @@ mod tests {
     use std::io::BufReader;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2607,6 +2768,7 @@ mod tests {
             live_excerpt: String::from("ready"),
             wait_duration_ms: Some(10),
             cook_duration_ms: Some(20),
+            duration_sampled_at_unix_ms: Some(90),
             claude_session_id: Some(String::from("session")),
             workspace_id: String::from("workspace"),
             workspace_root: String::from("/tmp/demo"),
@@ -2999,12 +3161,20 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(2);
         shared.lock().unwrap().subscribers.push(tx);
 
+        mark_control_output_activity_shared(&shared, "%output %1 new-output");
+        assert_eq!(shared.lock().unwrap().panes["%1"].stream_generation, 2);
         assert_eq!(
-            handle_control_line_shared(&shared, "%output %1 new-output"),
+            handle_queued_control_line_shared(&shared, "%output %1 new-output"),
             ControlLineEffect::None
         );
         let shared = shared.lock().unwrap();
         assert_eq!(shared.panes["%1"].stream_generation, 2);
+        assert!(
+            shared.panes["%1"]
+                .snapshot
+                .live_excerpt
+                .contains("new-output")
+        );
         assert!(rx.try_recv().is_err());
     }
 
@@ -3017,6 +3187,7 @@ mod tests {
         timing_only.updated_at_unix_ms += 1;
         timing_only.wait_duration_ms = Some(999);
         timing_only.cook_duration_ms = Some(999);
+        timing_only.duration_sampled_at_unix_ms = Some(999);
         assert_eq!(
             signature,
             SnapshotSignature::from_snapshot(&timing_only, Some(String::from("provider")))
@@ -3078,6 +3249,57 @@ mod tests {
 
         let decoded: RuntimePaneSnapshot = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.cook_duration_ms, None);
+    }
+
+    #[test]
+    fn snapshot_decodes_without_additive_duration_sample_time() {
+        let mut encoded = serde_json::to_value(sample_snapshot()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("duration_sampled_at_unix_ms");
+
+        let decoded: RuntimePaneSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.duration_sampled_at_unix_ms, None);
+    }
+
+    #[test]
+    fn observer_lifecycle_uses_stable_ids_and_ignores_stale_generations() {
+        let removed_cancel = Arc::new(AtomicBool::new(false));
+        let retained_cancel = Arc::new(AtomicBool::new(false));
+        let mut active = BTreeMap::from([
+            (
+                String::from("$1"),
+                ActiveObserver {
+                    generation: 7,
+                    cancel: Arc::clone(&removed_cancel),
+                },
+            ),
+            (
+                String::from("$2"),
+                ActiveObserver {
+                    generation: 9,
+                    cancel: Arc::clone(&retained_cancel),
+                },
+            ),
+        ]);
+        let mut retries = BTreeMap::from([
+            (String::from("$1"), (1, Instant::now())),
+            (String::from("$2"), (1, Instant::now())),
+        ]);
+
+        retain_candidate_observers(
+            &mut active,
+            &mut retries,
+            &BTreeSet::from([String::from("$2")]),
+        );
+
+        assert!(removed_cancel.load(Ordering::SeqCst));
+        assert!(!retained_cancel.load(Ordering::SeqCst));
+        assert!(!active.contains_key("$1"));
+        assert!(!retries.contains_key("$1"));
+        assert!(observer_is_current(&active, "$2", 9));
+        assert!(!observer_is_current(&active, "$2", 8));
     }
 
     #[test]
@@ -3209,6 +3431,7 @@ mod tests {
         let snapshot = update_yolo_runtime_state(&shared, "%1", Some(true), true, None).unwrap();
         assert!(snapshot.desired_yolo_enabled);
         assert!(snapshot.actual_yolo_enabled);
+        assert_eq!(snapshot.duration_sampled_at_unix_ms, Some(90));
         let shared = shared.lock().unwrap();
         assert_eq!(
             shared.panes["%1"].signature,
@@ -3249,6 +3472,7 @@ mod tests {
             TmuxRuntimeDurations {
                 wait_duration: None,
                 cook_duration: Some(Duration::from_millis(75)),
+                sampled_at_unix_ms: 1_900,
             },
             2_000,
         )
@@ -3259,6 +3483,7 @@ mod tests {
         );
         assert_eq!(busy_snapshot.wait_duration_ms, None);
         assert_eq!(busy_snapshot.cook_duration_ms, Some(75));
+        assert_eq!(busy_snapshot.duration_sampled_at_unix_ms, Some(1_900));
         assert_eq!(busy_snapshot.updated_at_unix_ms, 2_000);
         assert_eq!(busy_snapshot.revision, 11);
 
@@ -3275,6 +3500,7 @@ mod tests {
             TmuxRuntimeDurations {
                 wait_duration: Some(Duration::from_millis(5)),
                 cook_duration: Some(Duration::from_millis(80)),
+                sampled_at_unix_ms: 2_900,
             },
             3_000,
         )
@@ -3282,6 +3508,7 @@ mod tests {
         assert_eq!(ready_snapshot.classification.state, SessionState::ChatReady);
         assert_eq!(ready_snapshot.wait_duration_ms, Some(5));
         assert_eq!(ready_snapshot.cook_duration_ms, Some(80));
+        assert_eq!(ready_snapshot.duration_sampled_at_unix_ms, Some(2_900));
         assert_eq!(ready_snapshot.updated_at_unix_ms, 3_000);
         assert_eq!(ready_snapshot.revision, 12);
         let locked = shared.lock().unwrap();

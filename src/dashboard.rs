@@ -263,7 +263,11 @@ impl ProcessTreeSnapshot {
     fn descendants(&self, root_pid: u32) -> Vec<&ProcessSnapshot> {
         let mut descendants = Vec::new();
         let mut stack = vec![root_pid];
+        let mut visited = HashSet::new();
         while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
             if let Some(snapshot) = self.snapshots.get(&pid) {
                 descendants.push(snapshot);
             }
@@ -551,21 +555,21 @@ impl WindowTitleSynchronizer {
             .map(|(_, window_id)| window_id.clone())
             .collect::<HashSet<_>>();
 
-        for ((session_name, window_id), panes) in windows {
+        for ((_session_name, window_id), panes) in windows {
             let first = panes[0];
             let prefix = panes
                 .iter()
                 .map(|pane| pane_window_prefix(pane.state, pane.has_questions, pane.yolo_enabled))
                 .collect::<String>();
-            let managed = self
-                .managed
-                .entry(window_id)
-                .or_insert_with(|| ManagedWindowName {
-                    target: format!("{session_name}:{}", first.pane.window_index),
-                    base_name: derive_base_window_name(&first.pane.window_name, &prefix),
-                    applied_name: None,
-                });
-            managed.target = format!("{session_name}:{}", first.pane.window_index);
+            let managed =
+                self.managed
+                    .entry(window_id.clone())
+                    .or_insert_with(|| ManagedWindowName {
+                        target: window_id.clone(),
+                        base_name: derive_base_window_name(&first.pane.window_name, &prefix),
+                        applied_name: None,
+                    });
+            managed.target = window_id;
             managed.base_name = current_base_window_name(
                 &first.pane.window_name,
                 managed.applied_name.as_deref(),
@@ -616,9 +620,7 @@ impl WindowTitleSynchronizer {
                 }
                 let cleaned_name = cleanup_dashboard_window_name(&window);
                 if cleaned_name != window.window_name
-                    && let Err(error) = self
-                        .client
-                        .rename_window(&window_target(&window), &cleaned_name)
+                    && let Err(error) = self.client.rename_window(&window.window_id, &cleaned_name)
                 {
                     self.retry_at = Some(Instant::now() + Duration::from_secs(1));
                     return Err(error);
@@ -1338,7 +1340,7 @@ impl DashboardApp {
                 age,
                 cook_duration,
                 wait_duration,
-                runtime_duration_sample_at_unix_ms: Some(snapshot.updated_at_unix_ms),
+                runtime_duration_sample_at_unix_ms: snapshot.duration_sampled_at_unix_ms,
                 runtime_cook_active: snapshot.cook_duration_ms.is_some()
                     && is_cooking_state(snapshot.classification.state),
                 runtime_wait_active: is_waiting_state(snapshot.classification.state),
@@ -3114,10 +3116,6 @@ fn cleanup_dashboard_window_name(window: &TmuxWindow) -> String {
     }
 }
 
-fn window_target(window: &TmuxWindow) -> String {
-    format!("{}:{}", window.session_name, window.window_index)
-}
-
 fn dashboard_display_state(
     classified_state: SessionState,
     previous_frame: Option<&String>,
@@ -3902,8 +3900,7 @@ mod tests {
         select_tail_lines_for_rows, set_runtime_subscription_capability, should_return_navigation,
         split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
         subscription_connection_is_stable, tmux_object_id_order, visibility_from_attached_count,
-        window_target, workspace_group_key, workspace_group_label, yes_count_key,
-        yolo_column_contains,
+        workspace_group_key, workspace_group_label, yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
     use crate::runtime::{RuntimeClient, RuntimeEvent, RuntimePaneSnapshot};
@@ -4778,6 +4775,30 @@ mod tests {
     }
 
     #[test]
+    fn process_tree_counts_each_pid_once_when_parent_links_cycle() {
+        let mut snapshots = vec![
+            test_process_snapshot(10, 20, 10, 10, "bash", 100, &[]),
+            test_process_snapshot(20, 10, 20, 20, "claude", 200, &[]),
+        ];
+        snapshots[0].cpu_ticks = 3;
+        snapshots[0].rss_pages = 5;
+        snapshots[1].cpu_ticks = 7;
+        snapshots[1].rss_pages = 11;
+        let tree = ProcessTreeSnapshot::from_process_snapshots_with_system(
+            &snapshots,
+            Some(10.0),
+            Some(100),
+            Some(4096),
+        );
+
+        let descendants = tree.descendants(10);
+        assert_eq!(descendants.len(), 2);
+        let usage = tree.usage(10).expect("cyclic root should resolve");
+        assert_eq!(usage.cpu_ticks, 10);
+        assert_eq!(usage.memory_bytes, 16 * 4096);
+    }
+
+    #[test]
     fn process_tree_supplies_age_and_multiple_panes_from_one_scan() {
         let calls = std::cell::Cell::new(0);
         let snapshots = vec![
@@ -5102,7 +5123,6 @@ mod tests {
         };
 
         assert_eq!(cleanup_dashboard_window_name(&window), "bloodraven");
-        assert_eq!(window_target(&window), "work:3");
     }
 
     #[test]
@@ -5172,7 +5192,7 @@ mod tests {
             (
                 String::from("@missing"),
                 ManagedWindowName {
-                    target: String::from("demo:1"),
+                    target: String::from("@missing"),
                     base_name: String::from("missing"),
                     applied_name: Some(String::from("💤 missing")),
                 },
@@ -5180,7 +5200,7 @@ mod tests {
             (
                 String::from("@existing"),
                 ManagedWindowName {
-                    target: String::from("demo:2"),
+                    target: String::from("@existing"),
                     base_name: String::from("existing"),
                     applied_name: Some(String::from("💤 existing")),
                 },
@@ -5495,6 +5515,7 @@ mod tests {
             live_excerpt: String::new(),
             wait_duration_ms: Some(0),
             cook_duration_ms: Some(0),
+            duration_sampled_at_unix_ms: Some(0),
             claude_session_id: None,
             workspace_id: String::from("workspace-1"),
             workspace_root: String::from("/tmp/demo"),

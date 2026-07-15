@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{AppError, AppResult};
 
+const CONTROL_STREAM_CAPACITY: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct StartSessionRequest {
     pub session_name: String,
@@ -98,7 +100,7 @@ pub enum ControlModeReceive {
 }
 
 pub struct ControlModeSession {
-    session_name: String,
+    target_session: String,
     child: Child,
     stdout_rx: mpsc::Receiver<ControlStreamItem>,
     stderr_rx: mpsc::Receiver<String>,
@@ -339,8 +341,8 @@ impl TmuxClient {
         Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
     }
 
-    pub fn control_mode_session(&self, session_name: &str) -> AppResult<ControlModeSession> {
-        let control_command = self.control_mode_command(session_name);
+    pub fn control_mode_session(&self, target_session: &str) -> AppResult<ControlModeSession> {
+        let control_command = self.control_mode_command(target_session);
 
         let mut child = Command::new("script")
             .arg("-q")
@@ -361,7 +363,7 @@ impl TmuxClient {
             .take()
             .ok_or_else(|| AppError::new("failed to capture tmux control mode stderr"))?;
 
-        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel(CONTROL_STREAM_CAPACITY);
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -379,23 +381,22 @@ impl TmuxClient {
             }
         });
 
-        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(CONTROL_STREAM_CAPACITY);
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 match line {
-                    Ok(line) => {
-                        if stderr_tx.send(line).is_err() {
-                            return;
-                        }
-                    }
+                    Ok(line) => match stderr_tx.try_send(line) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => return,
+                    },
                     Err(_) => return,
                 }
             }
         });
 
         Ok(ControlModeSession {
-            session_name: session_name.to_string(),
+            target_session: target_session.to_string(),
             child,
             stdout_rx,
             stderr_rx,
@@ -650,14 +651,14 @@ impl TmuxClient {
         )))
     }
 
-    fn control_mode_command(&self, session_name: &str) -> String {
+    fn control_mode_command(&self, target_session: &str) -> String {
         TmuxCommandPlan {
             program: self.program.clone(),
             args: self.with_socket_args(vec![
                 String::from("-C"),
                 String::from("attach-session"),
                 String::from("-t"),
-                session_name.to_string(),
+                target_session.to_string(),
             ]),
         }
         .render()
@@ -727,7 +728,7 @@ impl ControlModeSession {
                 };
                 Err(AppError::new(format!(
                     "tmux control mode attach failed for session {}: {}",
-                    self.session_name, stderr_text
+                    self.target_session, stderr_text
                 )))
             }
             Some(_) => Ok(ControlModeReceive::Closed),
@@ -1107,6 +1108,13 @@ mod tests {
             TmuxClient::with_socket_path("/tmp/outer.sock").control_mode_command("work session");
 
         assert!(command.contains("-S /tmp/outer.sock -C attach-session -t 'work session'"));
+    }
+
+    #[test]
+    fn control_mode_command_accepts_stable_session_id() {
+        let command = TmuxClient::default().control_mode_command("$7");
+
+        assert!(command.contains("-C attach-session -t '$7'"));
     }
 
     #[test]
