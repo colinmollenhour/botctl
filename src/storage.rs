@@ -556,6 +556,7 @@ fn ensure_v4_tables(connection: &Connection) -> AppResult<()> {
 /// All three callers (wait, cook, claude-session) write to the same row, so
 /// going through this helper keeps the column list and conflict clause in
 /// sync.
+#[allow(clippy::too_many_arguments)]
 fn upsert_instance_runtime_state(
     connection: &Connection,
     instance_id: &str,
@@ -834,12 +835,11 @@ pub fn resolve_workspace(
     cwd: &Path,
 ) -> AppResult<WorkspaceRecord> {
     let connection = open_bootstrapped_state_db(state_dir)?;
-    if let Some(selector) = selector.filter(|value| !value.trim().is_empty()) {
-        if Uuid::parse_str(selector).is_ok() {
+    if let Some(selector) = selector.filter(|value| !value.trim().is_empty())
+        && Uuid::parse_str(selector).is_ok() {
             return load_workspace_by_id(&connection, selector)?
                 .ok_or_else(|| AppError::new(format!("unknown workspace id: {selector}")));
         }
-    }
 
     let requested_path = match selector {
         Some(raw) => {
@@ -1435,12 +1435,12 @@ fn new_uuid() -> String {
 }
 
 fn current_unix_ms() -> AppResult<i64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| AppError::new(error.to_string()))?
         .as_millis()
         .try_into()
-        .map_err(|_| AppError::new("system clock timestamp overflowed i64"))?)
+        .map_err(|_| AppError::new("system clock timestamp overflowed i64"))
 }
 
 fn artifact_path(

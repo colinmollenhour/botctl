@@ -35,7 +35,7 @@ pub struct McpSessionService {
 }
 
 enum ResurrectionReady {
-    Ready(McpSessionRecord),
+    Ready(Box<McpSessionRecord>),
     Blocked(Value),
 }
 
@@ -161,7 +161,7 @@ impl McpSessionService {
         };
         let mut record = self.get_record(&id)?;
         match self.resurrect_for_prompt_if_needed(record)? {
-            ResurrectionReady::Ready(resurrected) => record = resurrected,
+            ResurrectionReady::Ready(resurrected) => record = *resurrected,
             ResurrectionReady::Blocked(result) => {
                 self.cleanup_stale_managed_sessions_logged();
                 return Ok(result);
@@ -537,6 +537,7 @@ impl McpSessionService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wait_inner(
         &self,
         record: &McpSessionRecord,
@@ -795,22 +796,24 @@ impl McpSessionService {
                 LifecycleState::Dead | LifecycleState::Killed
             )
         {
-            return Ok(ResurrectionReady::Ready(record));
+            return Ok(ResurrectionReady::Ready(Box::new(record)));
         }
-        if pane.is_some() {
-            if let Err(error) = client.kill_window(&record.tmux_window_id) {
-                eprintln!(
-                    "warning: failed to kill stale live MCP pane before resurrection for {}: {error}",
-                    record.id
-                );
-                self.registry.update_blocked(
-                    &record.id,
-                    record.last_state.as_deref(),
-                    "unknown_state",
-                    None,
-                )?;
-                return self.get_record(&record.id).map(ResurrectionReady::Ready);
-            }
+        if pane.is_some()
+            && let Err(error) = client.kill_window(&record.tmux_window_id)
+        {
+            eprintln!(
+                "warning: failed to kill stale live MCP pane before resurrection for {}: {error}",
+                record.id
+            );
+            self.registry.update_blocked(
+                &record.id,
+                record.last_state.as_deref(),
+                "unknown_state",
+                None,
+            )?;
+            return self
+                .get_record(&record.id)
+                .map(|record| ResurrectionReady::Ready(Box::new(record)));
         }
 
         let command = build_launch_command_from_record(&record)?;
@@ -842,7 +845,8 @@ impl McpSessionService {
             let _ = client.kill_window(&started.window_id);
             return Err(error);
         }
-        self.get_record(&record.id).map(ResurrectionReady::Ready)
+        self.get_record(&record.id)
+            .map(|record| ResurrectionReady::Ready(Box::new(record)))
     }
 
     fn cleanup_stale_managed_sessions_logged(&self) {

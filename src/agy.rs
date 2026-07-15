@@ -446,14 +446,13 @@ fn is_agy_folder_trust_prompt(lines: &[&str]) -> bool {
     // Fallback: `[y/n]` / `(y/n)` tail plus a workspace/folder mention elsewhere.
     // Ordered BEFORE settings-persist's `[y/n]` fallback so tail-truncated
     // folder-trust frames are not misclassified as settings-persist.
-    if mentions_workspace_folder_or_project {
-        if let Some(last_non_blank) = lines.iter().rev().find(|line| !line.is_empty()) {
+    if mentions_workspace_folder_or_project
+        && let Some(last_non_blank) = lines.iter().rev().find(|line| !line.is_empty()) {
             let lower = last_non_blank.to_ascii_lowercase();
             if lower.ends_with("[y/n]") || lower.ends_with("(y/n)") {
                 return true;
             }
         }
-    }
     false
 }
 
@@ -635,9 +634,9 @@ pub(crate) fn extract_last_assistant_text(frame: &str) -> Option<String> {
     // The assistant turn lives between `prior_rule` (exclusive) and
     // `input_box_top` (exclusive). If there is no prior rule we still need
     // two visible rules to satisfy the contract.
-    let (start, end) = match prior_rule {
-        Some(prior) => (prior + 1, input_box_top),
-        None => return None,
+    let (start, end) = {
+        let prior = prior_rule?;
+        (prior + 1, input_box_top)
     };
     if end <= start {
         return None;

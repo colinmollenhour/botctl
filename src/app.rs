@@ -674,8 +674,8 @@ fn stop_runtime_process(state_dir: &Path) -> AppResult<()> {
         }
     }
 
-    if let Some(metadata) = load_runtime_manager_metadata(state_dir)? {
-        if let Some(session_name) = metadata.session_name {
+    if let Some(metadata) = load_runtime_manager_metadata(state_dir)?
+        && let Some(session_name) = metadata.session_name {
             let tmux_client = match metadata.tmux_socket_path {
                 Some(socket_path) => TmuxClient::with_socket_path(socket_path),
                 None => TmuxClient::default(),
@@ -684,7 +684,6 @@ fn stop_runtime_process(state_dir: &Path) -> AppResult<()> {
                 tmux_client.kill_session(&session_name)?;
             }
         }
-    }
     remove_runtime_manager_metadata(state_dir)?;
     Ok(())
 }
@@ -1836,14 +1835,13 @@ fn extract_keep_going_response(
 }
 
 fn keep_going_body_start(lines: &[&str], token_idx: usize, prompt_anchor: Option<&str>) -> usize {
-    if let Some(anchor) = prompt_anchor.filter(|anchor| !anchor.trim().is_empty()) {
-        if let Some(prompt_idx) = lines[..token_idx]
+    if let Some(anchor) = prompt_anchor.filter(|anchor| !anchor.trim().is_empty())
+        && let Some(prompt_idx) = lines[..token_idx]
             .iter()
             .rposition(|line| line.contains(anchor))
         {
             return prompt_idx + 1;
         }
-    }
 
     lines[..token_idx]
         .iter()
@@ -2937,6 +2935,7 @@ fn babysit_prompt_json(details: Option<&PermissionPromptDetails>) -> serde_json:
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn render_babysit_start_event(
     pane_label: &str,
     pane_id: &str,
@@ -3037,11 +3036,8 @@ pub(crate) fn extract_permission_prompt_details(
         content_lines.push(normalize_permission_content_line(line));
     }
 
-    if question.is_none() {
-        return None;
-    }
+    question.as_ref()?;
 
-    let mut content_lines = content_lines;
     if let Some(aside) = content_lines
         .last()
         .filter(|line| is_permission_annotation_line(line))
@@ -3143,13 +3139,11 @@ fn is_plausible_permission_prompt_title(title: &str) -> bool {
 }
 
 fn parse_permission_prompt_title(title: &str) -> (String, Option<String>) {
-    if let Some((label, suffix)) = title.rsplit_once(" (") {
-        if let Some(mode) = suffix.strip_suffix(')') {
-            if matches!(mode, "sandboxed" | "unsandboxed") {
+    if let Some((label, suffix)) = title.rsplit_once(" (")
+        && let Some(mode) = suffix.strip_suffix(')')
+            && matches!(mode, "sandboxed" | "unsandboxed") {
                 return (label.to_string(), Some(mode.to_string()));
             }
-        }
-    }
     (title.to_string(), None)
 }
 
@@ -3508,6 +3502,7 @@ fn render_babysit_wait_event(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn render_babysit_action_event(
     pane_label: &str,
     pane_id: &str,
@@ -3796,7 +3791,7 @@ fn focus_live_frame(frame: &str, max_non_empty_lines: usize) -> String {
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>();
 
-    if let Some(prompt_idx) = lines.iter().rposition(|line| is_focus_prompt_line(line)) {
+    if let Some(prompt_idx) = lines.iter().rposition(is_focus_prompt_line) {
         let trailing = (max_non_empty_lines / 5).max(1);
         let start = prompt_idx.saturating_sub(max_non_empty_lines.saturating_sub(trailing));
         let end = (prompt_idx + trailing + 1).min(lines.len());
@@ -3879,10 +3874,10 @@ pub(crate) fn load_automation_keybindings(path: Option<&Path>) -> AppResult<Reso
     load_resolved_keybindings(path).map_err(AppError::new)
 }
 
-pub(crate) fn keys_for_action<'a>(
-    bindings: &'a ResolvedKeybindings,
+pub(crate) fn keys_for_action(
+    bindings: &ResolvedKeybindings,
     action: AutomationAction,
-) -> AppResult<&'a [String]> {
+) -> AppResult<&[String]> {
     bindings.keys_for(action).ok_or_else(|| {
         AppError::new(format!(
             "Claude keybindings at {} do not define action {}; run doctor to inspect the missing automation bindings",
@@ -4150,6 +4145,7 @@ pub(crate) fn render_next_safe_action(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_guarded_workflow_output(
     workflow: GuardedWorkflow,
     pane_label: &str,

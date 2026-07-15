@@ -63,7 +63,7 @@ pub enum ServeEvent {
         target_pane: Option<String>,
         tracked_panes: Vec<String>,
     },
-    Snapshot(ServePaneSnapshot),
+    Snapshot(Box<ServePaneSnapshot>),
     Notification(String),
     PaneRemoved {
         pane_id: String,
@@ -198,8 +198,8 @@ where
             }
         }
 
-        if has_ready_dirty_panes(&tracked, stream_debounce) {
-            if let Some(reason) = reconcile_panes(
+        if has_ready_dirty_panes(&tracked, stream_debounce)
+            && let Some(reason) = reconcile_panes(
                 client,
                 request,
                 &mut tracked,
@@ -209,7 +209,6 @@ where
                 emit(ServeEvent::Stopped { reason })?;
                 return Ok(());
             }
-        }
 
         if last_periodic.elapsed() >= periodic_interval {
             if let Some(reason) = reconcile_panes(
@@ -294,11 +293,10 @@ fn note_stream_output(
     pane_id: &str,
     payload: &str,
 ) {
-    if let Some(target_pane) = &request.target_pane {
-        if target_pane != pane_id {
+    if let Some(target_pane) = &request.target_pane
+        && target_pane != pane_id {
             return;
         }
-    }
 
     let entry = tracked.entry(pane_id.to_string()).or_default();
     let decoded = decode_tmux_escaped(payload);
@@ -404,8 +402,10 @@ where
     F: FnMut(ServeEvent) -> AppResult<()>,
 {
     let current_panes = list_requested_panes(client, request)?;
-    if request.target_pane.is_some() && current_panes.is_empty() {
-        let pane_id = request.target_pane.as_ref().unwrap().clone();
+    if let Some(pane_id) = request.target_pane.as_ref()
+        && current_panes.is_empty()
+    {
+        let pane_id = pane_id.clone();
         if tracked.remove(&pane_id).is_some() {
             emit(ServeEvent::PaneRemoved {
                 pane_id: pane_id.clone(),
@@ -464,13 +464,13 @@ where
         }
 
         if should_emit_snapshot(reason, changed, had_previous) {
-            emit(ServeEvent::Snapshot(ServePaneSnapshot {
+            emit(ServeEvent::Snapshot(Box::new(ServePaneSnapshot {
                 pane,
                 classification,
                 live_excerpt: frame_choice.live_excerpt,
                 changed,
                 reason,
-            }))?;
+            })))?;
             if reason == ServeSnapshotReason::StreamActivity {
                 entry.live_excerpt.clear();
             }
@@ -652,8 +652,10 @@ mod tests {
 
     #[test]
     fn stream_activity_falls_back_to_capture_without_seeded_model() {
-        let mut entry = TrackedServePane::default();
-        entry.screen_model = Some(crate::screen_model::ScreenModel::new(20));
+        let mut entry = TrackedServePane {
+            screen_model: Some(crate::screen_model::ScreenModel::new(20)),
+            ..Default::default()
+        };
         entry
             .screen_model
             .as_mut()
