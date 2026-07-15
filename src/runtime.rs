@@ -5,7 +5,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::app::{
     ACTION_GUARD_HISTORY_LINES, AppError, AppResult, ContinueOutcome, InspectedPane,
@@ -26,12 +27,22 @@ use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection
 use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
+use crate::recovery::{
+    RecoveryLifecycle, RecoveryMatchState, RecoveryTarget, build_recovery_command,
+    match_recoveries, offer_from_record,
+};
 use crate::screen_model::ScreenModel;
 use crate::storage::{
-    WorkspaceRecord, list_babysit_registration_pane_ids, resolve_workspace,
-    resolve_workspace_for_path, sync_tmux_claude_session_id, sync_tmux_runtime_state,
+    VerifiedClaudeRecoveryEvidence, WorkspaceRecord, apply_recovery_inventory_evidence,
+    begin_runtime_run, claim_recovery_for_staging, dismiss_recovery, finish_runtime_run_clean,
+    list_babysit_registration_pane_ids, list_nonterminal_recoveries, load_recovery,
+    mark_recovery_staged, mark_recovery_uncertain, mark_stale_staging_uncertain,
+    release_known_failed_staging_claim, resolve_live_claude_session_id, resolve_workspace,
+    resolve_workspace_for_path, sync_tmux_runtime_state,
 };
-use crate::tmux::{ControlModeReceive, TmuxClient, TmuxPane};
+use crate::tmux::{ControlModeReceive, TmuxClient, TmuxInventory, TmuxPane};
+
+pub use crate::recovery::RuntimeRecoveryOffer;
 use crate::yolo::{YoloRecord, disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const SOCKET_FILENAME: &str = "runtime.sock";
@@ -41,6 +52,83 @@ const SUBSCRIPTION_READ_TIMEOUT_MS: u64 = 200;
 const RUNTIME_TIMEOUT_EXIT_CODE: i32 = 408;
 const STREAM_DEBOUNCE_MS: u64 = 200;
 const MAX_LIVE_EXCERPT_LINES: usize = 20;
+pub const RUNTIME_PROTOCOL_VERSION: u32 = 2;
+pub const RUNTIME_SCHEMA_VERSION: i64 = crate::storage::CURRENT_SCHEMA_VERSION;
+
+struct ShutdownState {
+    result: Option<Result<(), String>>,
+    acknowledged: bool,
+}
+
+#[derive(Clone)]
+struct MutationGate {
+    state: Arc<(Mutex<MutationState>, Condvar)>,
+}
+
+struct MutationState {
+    stopping: bool,
+    active: usize,
+}
+
+struct MutationPermit {
+    gate: MutationGate,
+}
+
+impl MutationGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(MutationState {
+                    stopping: false,
+                    active: 0,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn acquire(&self) -> AppResult<MutationPermit> {
+        let (state, _) = &*self.state;
+        let mut state = state.lock().unwrap();
+        if state.stopping {
+            return Err(AppError::with_exit_code(
+                "runtime shutdown has begun; refusing new mutating request",
+                409,
+            ));
+        }
+        state.active += 1;
+        Ok(MutationPermit { gate: self.clone() })
+    }
+
+    fn begin_stop(&self) -> bool {
+        let (state, _) = &*self.state;
+        let mut state = state.lock().unwrap();
+        if state.stopping {
+            return false;
+        }
+        state.stopping = true;
+        true
+    }
+
+    fn wait_for_drain(&self) {
+        let (state, ready) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while state.active != 0 {
+            state = ready.wait(state).unwrap();
+        }
+    }
+}
+
+impl Drop for MutationPermit {
+    fn drop(&mut self) {
+        let (state, ready) = &*self.gate.state;
+        let mut state = state.lock().unwrap();
+        state.active -= 1;
+        if state.active == 0 {
+            ready.notify_all();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeServerConfig {
@@ -51,11 +139,27 @@ pub struct RuntimeServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    pub protocol_version: u32,
+    pub schema_version: i64,
     pub socket_path: String,
     pub boot_time_unix_ms: i64,
     pub revision: u64,
     pub pane_count: usize,
     pub tmux_socket_path: Option<String>,
+}
+
+impl RuntimeStatus {
+    pub fn is_compatible(&self) -> bool {
+        self.protocol_version == RUNTIME_PROTOCOL_VERSION
+            && self.schema_version == RUNTIME_SCHEMA_VERSION
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeProbe {
+    Compatible(RuntimeStatus),
+    Incompatible(String),
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +241,13 @@ enum RuntimeRequest {
         prompt_text: String,
         submit_delay_ms: u64,
     },
+    ListRecoveries,
+    StageRecovery {
+        recovery_id: String,
+    },
+    DismissRecovery {
+        recovery_id: String,
+    },
     Stop,
     Subscribe,
 }
@@ -145,16 +256,40 @@ enum RuntimeRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RuntimeResponse {
     Ok,
-    Status { status: RuntimeStatus },
-    Panes { panes: Vec<RuntimePaneSnapshot> },
-    Pane { pane: Option<RuntimePaneSnapshot> },
-    YoloUpdated { updated: Vec<String> },
-    Action { result: RuntimeActionResult },
-    Error { message: String, exit_code: i32 },
-    Event { event: RuntimeEvent },
+    Status {
+        status: RuntimeStatus,
+    },
+    Panes {
+        panes: Vec<RuntimePaneSnapshot>,
+    },
+    Pane {
+        pane: Option<RuntimePaneSnapshot>,
+    },
+    YoloUpdated {
+        updated: Vec<String>,
+    },
+    Action {
+        result: RuntimeActionResult,
+    },
+    Recoveries {
+        recoveries: Vec<RuntimeRecoveryOffer>,
+    },
+    RecoveryStaged {
+        recovery: RuntimeRecoveryOffer,
+    },
+    RecoveryDismissed {
+        recovery_id: String,
+    },
+    Error {
+        message: String,
+        exit_code: i32,
+    },
+    Event {
+        event: RuntimeEvent,
+    },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RuntimeClient {
     socket_path: PathBuf,
 }
@@ -175,6 +310,65 @@ impl RuntimeClient {
         match self.request(RuntimeRequest::GetStatus)? {
             RuntimeResponse::Status { status } => Ok(status),
             other => Err(unexpected_response("status", &other)),
+        }
+    }
+
+    pub fn probe(&self) -> AppResult<RuntimeProbe> {
+        let mut stream = match UnixStream::connect(&self.socket_path) {
+            Ok(stream) => stream,
+            Err(_) => return Ok(RuntimeProbe::Unavailable),
+        };
+        write_message(&mut stream, &RuntimeRequest::GetStatus)?;
+        let mut line = String::new();
+        if BufReader::new(stream).read_line(&mut line)? == 0 {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime closed the capability handshake".to_string(),
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(line.trim_end()).map_err(|error| {
+            AppError::new(format!(
+                "failed to decode runtime capability response: {error}"
+            ))
+        })?;
+        let Some(status) = value.get("status") else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime status omitted capability metadata".to_string(),
+            ));
+        };
+        let Some(protocol_version) = status
+            .get("protocol_version")
+            .and_then(|value| value.as_u64())
+        else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime status has no protocol_version; restart the runtime with this botctl version"
+                    .to_string(),
+            ));
+        };
+        let Some(schema_version) = status
+            .get("schema_version")
+            .and_then(|value| value.as_i64())
+        else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime status has no schema_version; restart the runtime with this botctl version"
+                    .to_string(),
+            ));
+        };
+        let response: RuntimeResponse = serde_json::from_value(value).map_err(|error| {
+            AppError::new(format!(
+                "failed to decode runtime capability response: {error}"
+            ))
+        })?;
+        let RuntimeResponse::Status { status } = response else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime returned an unexpected capability response".to_string(),
+            ));
+        };
+        if status.is_compatible() {
+            Ok(RuntimeProbe::Compatible(status))
+        } else {
+            Ok(RuntimeProbe::Incompatible(format!(
+                "runtime protocol/schema is {protocol_version}/{schema_version}, but this botctl requires {RUNTIME_PROTOCOL_VERSION}/{RUNTIME_SCHEMA_VERSION}"
+            )))
         }
     }
 
@@ -274,6 +468,31 @@ impl RuntimeClient {
         })
     }
 
+    pub fn list_recoveries(&self) -> AppResult<Vec<RuntimeRecoveryOffer>> {
+        match self.request(RuntimeRequest::ListRecoveries)? {
+            RuntimeResponse::Recoveries { recoveries } => Ok(recoveries),
+            other => Err(unexpected_response("recoveries", &other)),
+        }
+    }
+
+    pub fn stage_recovery(&self, recovery_id: &str) -> AppResult<RuntimeRecoveryOffer> {
+        match self.request(RuntimeRequest::StageRecovery {
+            recovery_id: recovery_id.to_string(),
+        })? {
+            RuntimeResponse::RecoveryStaged { recovery } => Ok(recovery),
+            other => Err(unexpected_response("stage_recovery", &other)),
+        }
+    }
+
+    pub fn dismiss_recovery(&self, recovery_id: &str) -> AppResult<()> {
+        match self.request(RuntimeRequest::DismissRecovery {
+            recovery_id: recovery_id.to_string(),
+        })? {
+            RuntimeResponse::RecoveryDismissed { .. } => Ok(()),
+            other => Err(unexpected_response("dismiss_recovery", &other)),
+        }
+    }
+
     pub fn stop(&self) -> AppResult<()> {
         match self.request(RuntimeRequest::Stop)? {
             RuntimeResponse::Ok => Ok(()),
@@ -358,8 +577,19 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
-    let shared = Arc::new(Mutex::new(RuntimeShared::new(&socket_path)));
+    let run_id = begin_runtime_run(&config.state_dir)?;
+    mark_stale_staging_uncertain(&config.state_dir, &run_id)?;
+    let shared = Arc::new(Mutex::new(RuntimeShared::new(&socket_path, run_id.clone())));
     let stop = Arc::new(AtomicBool::new(false));
+    let graceful_stop = Arc::new(AtomicBool::new(false));
+    let mutation_gate = MutationGate::new();
+    let shutdown_result = Arc::new((
+        Mutex::new(ShutdownState {
+            result: None,
+            acknowledged: false,
+        }),
+        Condvar::new(),
+    ));
     let observer = spawn_observer(config.clone(), Arc::clone(&shared), Arc::clone(&stop));
     emit_shared_event(
         &shared,
@@ -376,8 +606,19 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
                 let shared = Arc::clone(&shared);
                 let config = config.clone();
                 let stop = Arc::clone(&stop);
+                let graceful_stop = Arc::clone(&graceful_stop);
+                let shutdown_result = Arc::clone(&shutdown_result);
+                let mutation_gate = mutation_gate.clone();
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, shared, config, Arc::clone(&stop)) {
+                    if let Err(error) = handle_client(
+                        stream,
+                        shared,
+                        config,
+                        Arc::clone(&stop),
+                        graceful_stop,
+                        shutdown_result,
+                        mutation_gate,
+                    ) {
                         eprintln!("warning: runtime client failed: {error}");
                     }
                 });
@@ -387,18 +628,50 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
             }
             Err(error) => {
                 stop.store(true, Ordering::SeqCst);
+                mutation_gate.begin_stop();
                 let _ = observer.join();
+                mutation_gate.wait_for_drain();
+                let message = format!("runtime socket accept failed: {error}");
+                if graceful_stop.load(Ordering::SeqCst) {
+                    let (shutdown, ready) = &*shutdown_result;
+                    let mut shutdown = shutdown.lock().unwrap();
+                    shutdown.result = Some(Err(message.clone()));
+                    ready.notify_all();
+                    while !shutdown.acknowledged {
+                        shutdown = ready.wait(shutdown).unwrap();
+                    }
+                }
                 let _ = fs::remove_file(&socket_path);
-                return Err(AppError::new(format!(
-                    "runtime socket accept failed: {error}"
-                )));
+                return Err(AppError::new(message));
             }
         }
     }
 
-    let _ = observer.join();
+    let observer_result = observer
+        .join()
+        .map_err(|_| AppError::new("runtime observer thread panicked"));
+    mutation_gate.wait_for_drain();
+    let finalization = if graceful_stop.load(Ordering::SeqCst) {
+        observer_result.and_then(|_| finish_runtime_run_clean(&config.state_dir, &run_id))
+    } else {
+        observer_result
+    };
+    if graceful_stop.load(Ordering::SeqCst) {
+        let (shutdown, ready) = &*shutdown_result;
+        let mut shutdown = shutdown.lock().unwrap();
+        shutdown.result = Some(
+            finalization
+                .as_ref()
+                .map(|_| ())
+                .map_err(ToString::to_string),
+        );
+        ready.notify_all();
+        while !shutdown.acknowledged {
+            shutdown = ready.wait(shutdown).unwrap();
+        }
+    }
     let _ = fs::remove_file(&socket_path);
-    Ok(String::new())
+    finalization.map(|_| String::new())
 }
 
 #[derive(Debug)]
@@ -410,10 +683,12 @@ struct RuntimeShared {
     panes: BTreeMap<String, TrackedPane>,
     subscribers: Vec<mpsc::Sender<RuntimeEvent>>,
     in_flight_actions: HashSet<String>,
+    in_flight_recoveries: HashSet<String>,
+    run_id: String,
 }
 
 impl RuntimeShared {
-    fn new(socket_path: &Path) -> Self {
+    fn new(socket_path: &Path, run_id: String) -> Self {
         Self {
             socket_path: socket_path.display().to_string(),
             boot_time_unix_ms: now_unix_ms(),
@@ -422,11 +697,15 @@ impl RuntimeShared {
             panes: BTreeMap::new(),
             subscribers: Vec::new(),
             in_flight_actions: HashSet::new(),
+            in_flight_recoveries: HashSet::new(),
+            run_id,
         }
     }
 
     fn status(&self) -> RuntimeStatus {
         RuntimeStatus {
+            protocol_version: RUNTIME_PROTOCOL_VERSION,
+            schema_version: RUNTIME_SCHEMA_VERSION,
             socket_path: self.socket_path.clone(),
             boot_time_unix_ms: self.boot_time_unix_ms,
             revision: self.next_revision,
@@ -478,6 +757,9 @@ fn handle_client(
     shared: Arc<Mutex<RuntimeShared>>,
     config: RuntimeServerConfig,
     stop: Arc<AtomicBool>,
+    graceful_stop: Arc<AtomicBool>,
+    shutdown_result: Arc<(Mutex<ShutdownState>, Condvar)>,
+    mutation_gate: MutationGate,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
     let request = read_request(&mut reader)?;
@@ -518,6 +800,7 @@ fn handle_client(
             all,
             enabled,
         } => {
+            let _mutation = mutation_gate.acquire()?;
             let updated =
                 handle_set_yolo(&config.state_dir, &shared, pane_id, workspace, all, enabled)?;
             write_message(&mut stream, &RuntimeResponse::YoloUpdated { updated })
@@ -527,6 +810,7 @@ fn handle_client(
             session_name,
             action,
         } => {
+            let _mutation = mutation_gate.acquire()?;
             let result =
                 handle_run_action(&config, &shared, &pane_id, session_name.as_deref(), &action)?;
             write_message(&mut stream, &RuntimeResponse::Action { result })
@@ -538,6 +822,7 @@ fn handle_client(
             prompt_text,
             submit_delay_ms,
         } => {
+            let _mutation = mutation_gate.acquire()?;
             let result = handle_submit_prompt(
                 &config,
                 &shared,
@@ -549,9 +834,80 @@ fn handle_client(
             )?;
             write_message(&mut stream, &RuntimeResponse::Action { result })
         }
+        RuntimeRequest::ListRecoveries => {
+            match recovery_offers(&config.state_dir, &runtime_tmux_client()) {
+                Ok(recoveries) => {
+                    write_message(&mut stream, &RuntimeResponse::Recoveries { recoveries })
+                }
+                Err(error) => write_runtime_error(&mut stream, &error),
+            }
+        }
+        RuntimeRequest::StageRecovery { recovery_id } => {
+            let _mutation = match mutation_gate.acquire() {
+                Ok(permit) => permit,
+                Err(error) => return write_runtime_error(&mut stream, &error),
+            };
+            match handle_stage_recovery(&config, &shared, &recovery_id) {
+                Ok(recovery) => {
+                    write_message(&mut stream, &RuntimeResponse::RecoveryStaged { recovery })
+                }
+                Err(error) => write_runtime_error(&mut stream, &error),
+            }
+        }
+        RuntimeRequest::DismissRecovery { recovery_id } => {
+            let _mutation = match mutation_gate.acquire() {
+                Ok(permit) => permit,
+                Err(error) => return write_runtime_error(&mut stream, &error),
+            };
+            let result = RecoveryGuard::acquire(&shared, &recovery_id)
+                .and_then(|_guard| dismiss_recovery(&config.state_dir, &recovery_id));
+            match result {
+                Ok(_) => write_message(
+                    &mut stream,
+                    &RuntimeResponse::RecoveryDismissed { recovery_id },
+                ),
+                Err(error) => write_runtime_error(&mut stream, &error),
+            }
+        }
         RuntimeRequest::Stop => {
+            if !mutation_gate.begin_stop() || graceful_stop.swap(true, Ordering::SeqCst) {
+                return write_message(
+                    &mut stream,
+                    &RuntimeResponse::Error {
+                        message: "runtime stop is already in progress".to_string(),
+                        exit_code: 409,
+                    },
+                );
+            }
             stop.store(true, Ordering::SeqCst);
-            write_message(&mut stream, &RuntimeResponse::Ok)
+            let (shutdown, ready) = &*shutdown_result;
+            let result = {
+                let mut shutdown = shutdown.lock().unwrap();
+                while shutdown.result.is_none() {
+                    shutdown = ready.wait(shutdown).unwrap();
+                }
+                shutdown
+                    .result
+                    .as_ref()
+                    .expect("shutdown result should be set")
+                    .clone()
+            };
+            let response = match result {
+                Ok(()) => write_message(&mut stream, &RuntimeResponse::Ok),
+                Err(message) => write_message(
+                    &mut stream,
+                    &RuntimeResponse::Error {
+                        message,
+                        exit_code: 1,
+                    },
+                ),
+            };
+            {
+                let mut shutdown = shutdown.lock().unwrap();
+                shutdown.acknowledged = true;
+                ready.notify_all();
+            }
+            response
         }
         RuntimeRequest::Subscribe => handle_subscribe(stream, &shared),
     }
@@ -1013,6 +1369,288 @@ fn ensure_same_numbered_option_dialog(
     Ok(())
 }
 
+fn recovery_offers(state_dir: &Path, client: &TmuxClient) -> AppResult<Vec<RuntimeRecoveryOffer>> {
+    let inventory = client.inventory()?;
+    recovery_offers_for_inventory(state_dir, &inventory)
+}
+
+fn recovery_offers_for_inventory(
+    state_dir: &Path,
+    inventory: &TmuxInventory,
+) -> AppResult<Vec<RuntimeRecoveryOffer>> {
+    let mut recoveries = list_nonterminal_recoveries(state_dir)?;
+    let mut stale_targets = BTreeSet::new();
+    for recovery in &mut recoveries {
+        let Some(target) = recovery.target.as_mut() else {
+            continue;
+        };
+        if let Some(current) = verified_persisted_target(inventory, target) {
+            target.pane = current.clone();
+        } else {
+            stale_targets.insert(recovery.id.clone());
+            recovery.target = None;
+        }
+    }
+    let mut matched = match_recoveries(&recoveries, inventory);
+    Ok(recoveries
+        .iter()
+        .filter_map(|record| {
+            matched.remove(&record.id).map(|mut result| {
+                if stale_targets.contains(&record.id) {
+                    result.target = None;
+                    result.disabled_reason = Some(
+                        "persisted recovery target is not verified in the current stable tmux inventory; navigation is disabled"
+                            .to_string(),
+                    );
+                }
+                offer_from_record(record, result)
+            })
+        })
+        .collect())
+}
+
+fn verified_persisted_target<'a>(
+    inventory: &'a TmuxInventory,
+    target: &RecoveryTarget,
+) -> Option<&'a TmuxPane> {
+    if target.server != inventory.server {
+        return None;
+    }
+    inventory.panes.iter().find(|pane| {
+        pane.pane_id == target.pane.pane_id
+            && pane.session_id == target.pane.session_id
+            && pane.window_id == target.pane.window_id
+            && pane.session_name == target.pane.session_name
+            && pane.window_index == target.pane.window_index
+            && pane.window_name == target.pane.window_name
+            && pane.pane_index == target.pane.pane_index
+            && pane.current_path == target.pane.current_path
+    })
+}
+
+fn handle_stage_recovery(
+    config: &RuntimeServerConfig,
+    shared: &Arc<Mutex<RuntimeShared>>,
+    recovery_id: &str,
+) -> AppResult<RuntimeRecoveryOffer> {
+    let _recovery_guard = RecoveryGuard::acquire(shared, recovery_id)?;
+    let client = runtime_tmux_client();
+    let run_id = shared.lock().unwrap().run_id.clone();
+    let store = SqliteRecoveryStageStore {
+        state_dir: &config.state_dir,
+    };
+    let hooks = RuntimeRecoveryStageHooks { shared };
+    let staged = stage_recovery_with(&client, &store, &hooks, &run_id, recovery_id)?;
+    Ok(offer_from_record(
+        &staged,
+        crate::recovery::RecoveryMatch {
+            state: RecoveryMatchState::NotStageable,
+            target: staged.target.clone(),
+            disabled_reason: Some("command was staged without Enter".to_string()),
+        },
+    ))
+}
+
+trait RecoveryStageTransport {
+    fn inventory(&self) -> AppResult<TmuxInventory>;
+    fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()>;
+}
+
+impl RecoveryStageTransport for TmuxClient {
+    fn inventory(&self) -> AppResult<TmuxInventory> {
+        TmuxClient::inventory(self)
+    }
+
+    fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()> {
+        TmuxClient::paste_text(self, pane_id, text)
+    }
+}
+
+trait RecoveryStageStore {
+    fn list(&self) -> AppResult<Vec<crate::recovery::RecoveryRecord>>;
+    fn claim(
+        &self,
+        recovery_id: &str,
+        run_id: &str,
+        token: &str,
+        target: &RecoveryTarget,
+        command: &str,
+    ) -> AppResult<()>;
+    fn release(&self, recovery_id: &str, token: &str) -> AppResult<bool>;
+    fn mark_staged(&self, recovery_id: &str, token: &str) -> AppResult<bool>;
+    fn mark_uncertain(&self, recovery_id: &str, token: &str) -> AppResult<bool>;
+    fn load(&self, recovery_id: &str) -> AppResult<Option<crate::recovery::RecoveryRecord>>;
+}
+
+struct SqliteRecoveryStageStore<'a> {
+    state_dir: &'a Path,
+}
+
+impl RecoveryStageStore for SqliteRecoveryStageStore<'_> {
+    fn list(&self) -> AppResult<Vec<crate::recovery::RecoveryRecord>> {
+        list_nonterminal_recoveries(self.state_dir)
+    }
+
+    fn claim(
+        &self,
+        recovery_id: &str,
+        run_id: &str,
+        token: &str,
+        target: &RecoveryTarget,
+        command: &str,
+    ) -> AppResult<()> {
+        claim_recovery_for_staging(self.state_dir, recovery_id, run_id, token, target, command)
+    }
+
+    fn release(&self, recovery_id: &str, token: &str) -> AppResult<bool> {
+        release_known_failed_staging_claim(self.state_dir, recovery_id, token)
+    }
+
+    fn mark_staged(&self, recovery_id: &str, token: &str) -> AppResult<bool> {
+        mark_recovery_staged(self.state_dir, recovery_id, token)
+    }
+
+    fn mark_uncertain(&self, recovery_id: &str, token: &str) -> AppResult<bool> {
+        mark_recovery_uncertain(self.state_dir, recovery_id, token)
+    }
+
+    fn load(&self, recovery_id: &str) -> AppResult<Option<crate::recovery::RecoveryRecord>> {
+        load_recovery(self.state_dir, recovery_id)
+    }
+}
+
+trait RecoveryStageHooks {
+    type TargetGuard;
+
+    fn target_selected(&self, target: &RecoveryTarget) -> AppResult<Self::TargetGuard>;
+    fn before_claim(&self) {}
+    fn before_paste(&self) {}
+}
+
+struct RuntimeRecoveryStageHooks<'a> {
+    shared: &'a Arc<Mutex<RuntimeShared>>,
+}
+
+impl RecoveryStageHooks for RuntimeRecoveryStageHooks<'_> {
+    type TargetGuard = ActionGuard;
+
+    fn target_selected(&self, target: &RecoveryTarget) -> AppResult<Self::TargetGuard> {
+        ActionGuard::acquire(self.shared, &target.pane.pane_id)
+    }
+}
+
+fn stage_recovery_with<T, S, H>(
+    transport: &T,
+    store: &S,
+    hooks: &H,
+    run_id: &str,
+    recovery_id: &str,
+) -> AppResult<crate::recovery::RecoveryRecord>
+where
+    T: RecoveryStageTransport,
+    S: RecoveryStageStore,
+    H: RecoveryStageHooks,
+{
+    let first_inventory = transport.inventory()?;
+    let first_records = store.list()?;
+    let first_matches = match_recoveries(&first_records, &first_inventory);
+    let record = first_records
+        .iter()
+        .find(|record| record.id == recovery_id)
+        .ok_or_else(|| {
+            AppError::with_exit_code(format!("recovery not found: {recovery_id}"), 404)
+        })?;
+    if record.lifecycle != RecoveryLifecycle::Crashed {
+        return Err(AppError::with_exit_code(
+            "recovery is not available for staging",
+            409,
+        ));
+    }
+    let first_match = first_matches
+        .get(recovery_id)
+        .ok_or_else(|| AppError::with_exit_code("recovery has no current matching result", 409))?;
+    if first_match.state != RecoveryMatchState::Ready {
+        return Err(AppError::with_exit_code(
+            first_match
+                .disabled_reason
+                .clone()
+                .unwrap_or_else(|| "recovery target is not ready".to_string()),
+            409,
+        ));
+    }
+    let target = first_match
+        .target
+        .clone()
+        .ok_or_else(|| AppError::with_exit_code("recovery has no unique target", 409))?;
+    let _target_guard = hooks.target_selected(&target)?;
+
+    let second_inventory = transport.inventory()?;
+    let second_records = store.list()?;
+    let second_matches = match_recoveries(&second_records, &second_inventory);
+    let second_target = second_matches
+        .get(recovery_id)
+        .filter(|matched| matched.state == RecoveryMatchState::Ready)
+        .and_then(|matched| matched.target.as_ref())
+        .ok_or_else(|| AppError::with_exit_code("recovery target changed before claim", 409))?;
+    if second_target != &target {
+        return Err(AppError::with_exit_code(
+            "recovery target identity changed before claim",
+            409,
+        ));
+    }
+
+    let command = build_recovery_command(
+        &record.provider,
+        &record.original.cwd,
+        &record.provider_session_id,
+    )?;
+    let token = Uuid::now_v7().to_string();
+    hooks.before_claim();
+    store.claim(recovery_id, run_id, &token, &target, &command)?;
+
+    let current_inventory = match transport.inventory() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            let _ = store.release(recovery_id, &token);
+            return Err(error);
+        }
+    };
+    if !inventory_contains_exact_target(&current_inventory, &target) {
+        let _ = store.release(recovery_id, &token);
+        return Err(AppError::with_exit_code(
+            "recovery target changed immediately before paste",
+            409,
+        ));
+    }
+    hooks.before_paste();
+    if let Err(error) = transport.paste_text(&target.pane.pane_id, &command) {
+        let _ = store.release(recovery_id, &token);
+        return Err(error);
+    }
+    match store.mark_staged(recovery_id, &token) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = store.mark_uncertain(recovery_id, &token);
+            return Err(AppError::new(
+                "command was pasted but recovery staging could not be confirmed",
+            ));
+        }
+        Err(error) => {
+            let _ = store.mark_uncertain(recovery_id, &token);
+            return Err(AppError::new(format!(
+                "command was pasted but recovery staging could not be confirmed: {error}"
+            )));
+        }
+    }
+    store
+        .load(recovery_id)?
+        .ok_or_else(|| AppError::new("staged recovery disappeared"))
+}
+
+fn inventory_contains_exact_target(inventory: &TmuxInventory, target: &RecoveryTarget) -> bool {
+    inventory.server == target.server && inventory.panes.iter().any(|pane| pane == &target.pane)
+}
+
 fn spawn_observer(
     config: RuntimeServerConfig,
     shared: Arc<Mutex<RuntimeShared>>,
@@ -1197,10 +1835,12 @@ fn reconcile_all(
     config: &RuntimeServerConfig,
     shared: &Arc<Mutex<RuntimeShared>>,
 ) -> AppResult<()> {
+    let inventory = client.inventory()?;
     let mut current_panes = Vec::new();
-    for pane in client
-        .list_panes()?
-        .into_iter()
+    for pane in inventory
+        .panes
+        .iter()
+        .cloned()
         .filter(is_runtime_discovery_candidate)
     {
         let inspected = if pane.current_command.eq_ignore_ascii_case("node") {
@@ -1212,11 +1852,52 @@ fn reconcile_all(
         } else {
             None
         };
-        current_panes.push((pane, inspected));
+        let workspace =
+            resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
+        let inspected = match inspected {
+            Some(inspected) => inspected,
+            None => inspect_pane(client, &pane.pane_id, config.history_lines)?,
+        };
+        let claude_session_id = if pane.current_command.eq_ignore_ascii_case("claude") {
+            resolve_live_claude_session_id(&pane)?
+        } else {
+            None
+        };
+        let codex_session_id = if is_yolo_candidate_pane(&pane) {
+            resolve_codex_session_id_for_pane(&pane)?
+        } else {
+            None
+        };
+        current_panes.push((
+            pane,
+            inspected,
+            workspace,
+            claude_session_id,
+            codex_session_id,
+        ));
     }
+
+    let run_id = shared.lock().unwrap().run_id.clone();
+    // Evidence changes begin only after the complete raw inventory and all
+    // provider/classifier lookups for this pass have succeeded.
+    let verified_claude = current_panes
+        .iter()
+        .filter_map(|(pane, _, workspace, claude_session_id, _)| {
+            let claude_session_id = claude_session_id
+                .as_ref()
+                .filter(|session_id| Uuid::parse_str(session_id).is_ok())?;
+            Some(VerifiedClaudeRecoveryEvidence {
+                workspace_id: workspace.id.clone(),
+                pane: pane.clone(),
+                claude_session_id: claude_session_id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    apply_recovery_inventory_evidence(&config.state_dir, &run_id, &inventory, &verified_claude)?;
+
     let current_ids = current_panes
         .iter()
-        .map(|(pane, _)| pane.pane_id.clone())
+        .map(|(pane, _, _, _, _)| pane.pane_id.clone())
         .collect::<BTreeSet<_>>();
 
     let removed = {
@@ -1260,20 +1941,7 @@ fn reconcile_all(
         }
     }
 
-    for (pane, inspected) in current_panes {
-        let workspace =
-            resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
-        let inspected = match inspected {
-            Some(inspected) => inspected,
-            None => inspect_pane(client, &pane.pane_id, config.history_lines)?,
-        };
-        let claude_session_id =
-            sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
-        let codex_session_id = if is_yolo_candidate_pane(&pane) {
-            resolve_codex_session_id_for_pane(&pane)?
-        } else {
-            None
-        };
+    for (pane, inspected, workspace, claude_session_id, codex_session_id) in current_panes {
         let runtime_durations = sync_tmux_runtime_state(
             &config.state_dir,
             &workspace.id,
@@ -1733,6 +2401,37 @@ struct ActionGuard {
     pane_id: String,
 }
 
+struct RecoveryGuard {
+    shared: Arc<Mutex<RuntimeShared>>,
+    recovery_id: String,
+}
+
+impl RecoveryGuard {
+    fn acquire(shared: &Arc<Mutex<RuntimeShared>>, recovery_id: &str) -> AppResult<Self> {
+        let mut locked = shared.lock().unwrap();
+        if !locked.in_flight_recoveries.insert(recovery_id.to_string()) {
+            return Err(AppError::with_exit_code(
+                format!("recovery {recovery_id} already has an in-flight action"),
+                409,
+            ));
+        }
+        Ok(Self {
+            shared: Arc::clone(shared),
+            recovery_id: recovery_id.to_string(),
+        })
+    }
+}
+
+impl Drop for RecoveryGuard {
+    fn drop(&mut self) {
+        self.shared
+            .lock()
+            .unwrap()
+            .in_flight_recoveries
+            .remove(&self.recovery_id);
+    }
+}
+
 impl ActionGuard {
     fn acquire(shared: &Arc<Mutex<RuntimeShared>>, pane_id: &str) -> AppResult<Self> {
         let mut shared_lock = shared.lock().unwrap();
@@ -1837,6 +2536,16 @@ fn write_message<T: Serialize>(stream: &mut UnixStream, value: &T) -> AppResult<
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn write_runtime_error(stream: &mut UnixStream, error: &AppError) -> AppResult<()> {
+    write_message(
+        stream,
+        &RuntimeResponse::Error {
+            message: error.to_string(),
+            exit_code: error.exit_code(),
+        },
+    )
 }
 
 fn unexpected_response(expected: &str, response: &RuntimeResponse) -> AppError {
@@ -1972,13 +2681,25 @@ pub fn build_instance_detail_json(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
     use super::{
-        RuntimeEvent, RuntimeResponse, is_runtime_discovery_candidate,
-        is_verified_runtime_discovery_candidate, is_yolo_candidate_pane, runtime_socket_path,
+        MutationGate, RecoveryStageHooks, RecoveryStageStore, RecoveryStageTransport, RuntimeEvent,
+        RuntimeRequest, RuntimeResponse, is_runtime_discovery_candidate,
+        is_verified_runtime_discovery_candidate, is_yolo_candidate_pane,
+        recovery_offers_for_inventory, runtime_socket_path, stage_recovery_with,
     };
     use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
-    use crate::tmux::TmuxPane;
+    use crate::recovery::{
+        RecoveryLifecycle, RecoveryOriginalIdentity, RecoveryRecord, RecoveryTarget,
+    };
+    use crate::tmux::{TmuxInventory, TmuxPane, TmuxServerIdentity};
     use std::path::Path;
+
+    const CLAUDE_ID: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
 
     fn sample_pane(current_command: &str) -> TmuxPane {
         TmuxPane {
@@ -1997,6 +2718,209 @@ mod tests {
             pane_active: true,
             cursor_x: Some(0),
             cursor_y: Some(0),
+        }
+    }
+
+    fn sample_server(pid: u32) -> TmuxServerIdentity {
+        TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid,
+            start_time: 100,
+        }
+    }
+
+    fn sample_recovery() -> RecoveryRecord {
+        let pane = sample_pane("claude");
+        RecoveryRecord {
+            id: "recovery-1".to_string(),
+            source_observation_id: "observation-1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_root: "/tmp/demo".to_string(),
+            lifecycle: RecoveryLifecycle::Crashed,
+            provider: "claude".to_string(),
+            provider_session_id: CLAUDE_ID.to_string(),
+            original: RecoveryOriginalIdentity::from_inventory(&sample_server(1), &pane),
+            crashed_at_unix_ms: 1,
+            staging_run_id: None,
+            staging_token: None,
+            staging_started_at_unix_ms: None,
+            target: None,
+            staged_command: None,
+            staged_at_unix_ms: None,
+            resolved_at_unix_ms: None,
+            dismissed_at_unix_ms: None,
+        }
+    }
+
+    fn matching_inventory() -> TmuxInventory {
+        let mut pane = sample_pane("bash");
+        pane.pane_id = "%9".to_string();
+        pane.session_id = "$9".to_string();
+        pane.window_id = "@9".to_string();
+        TmuxInventory {
+            server: sample_server(2),
+            panes: vec![pane],
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeTransport {
+        inventories: Arc<Mutex<VecDeque<Result<TmuxInventory, String>>>>,
+        paste_error: Arc<Mutex<Option<String>>>,
+        pastes: Arc<Mutex<Vec<(String, String)>>>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeTransport {
+        fn new(
+            inventories: Vec<Result<TmuxInventory, String>>,
+            events: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                inventories: Arc::new(Mutex::new(inventories.into())),
+                paste_error: Arc::new(Mutex::new(None)),
+                pastes: Arc::new(Mutex::new(Vec::new())),
+                events,
+            }
+        }
+    }
+
+    impl RecoveryStageTransport for FakeTransport {
+        fn inventory(&self) -> crate::app::AppResult<TmuxInventory> {
+            self.events.lock().unwrap().push("inventory".to_string());
+            self.inventories
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test inventory should exist")
+                .map_err(crate::app::AppError::new)
+        }
+
+        fn paste_text(&self, pane_id: &str, text: &str) -> crate::app::AppResult<()> {
+            self.events.lock().unwrap().push("paste".to_string());
+            self.pastes
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            match self.paste_error.lock().unwrap().clone() {
+                Some(error) => Err(crate::app::AppError::new(error)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeStore {
+        record: Arc<Mutex<RecoveryRecord>>,
+        claim_error: Arc<Mutex<Option<String>>>,
+        mark_staged_error: Arc<Mutex<Option<String>>>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeStore {
+        fn new(record: RecoveryRecord, events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                record: Arc::new(Mutex::new(record)),
+                claim_error: Arc::new(Mutex::new(None)),
+                mark_staged_error: Arc::new(Mutex::new(None)),
+                events,
+            }
+        }
+    }
+
+    impl RecoveryStageStore for FakeStore {
+        fn list(&self) -> crate::app::AppResult<Vec<RecoveryRecord>> {
+            Ok(vec![self.record.lock().unwrap().clone()])
+        }
+
+        fn claim(
+            &self,
+            _recovery_id: &str,
+            run_id: &str,
+            token: &str,
+            target: &RecoveryTarget,
+            command: &str,
+        ) -> crate::app::AppResult<()> {
+            self.events.lock().unwrap().push("claim".to_string());
+            if let Some(error) = self.claim_error.lock().unwrap().clone() {
+                return Err(crate::app::AppError::with_exit_code(error, 409));
+            }
+            let mut record = self.record.lock().unwrap();
+            record.lifecycle = RecoveryLifecycle::Staging;
+            record.staging_run_id = Some(run_id.to_string());
+            record.staging_token = Some(token.to_string());
+            record.target = Some(target.clone());
+            record.staged_command = Some(command.to_string());
+            Ok(())
+        }
+
+        fn release(&self, _recovery_id: &str, _token: &str) -> crate::app::AppResult<bool> {
+            self.events.lock().unwrap().push("release".to_string());
+            let mut record = self.record.lock().unwrap();
+            if record.lifecycle != RecoveryLifecycle::Staging {
+                return Ok(false);
+            }
+            record.lifecycle = RecoveryLifecycle::Crashed;
+            record.target = None;
+            record.staging_token = None;
+            Ok(true)
+        }
+
+        fn mark_staged(&self, _recovery_id: &str, _token: &str) -> crate::app::AppResult<bool> {
+            self.events.lock().unwrap().push("mark-staged".to_string());
+            if let Some(error) = self.mark_staged_error.lock().unwrap().clone() {
+                return Err(crate::app::AppError::new(error));
+            }
+            self.record.lock().unwrap().lifecycle = RecoveryLifecycle::Staged;
+            Ok(true)
+        }
+
+        fn mark_uncertain(&self, _recovery_id: &str, _token: &str) -> crate::app::AppResult<bool> {
+            self.events
+                .lock()
+                .unwrap()
+                .push("mark-uncertain".to_string());
+            self.record.lock().unwrap().lifecycle = RecoveryLifecycle::Uncertain;
+            Ok(true)
+        }
+
+        fn load(&self, _recovery_id: &str) -> crate::app::AppResult<Option<RecoveryRecord>> {
+            Ok(Some(self.record.lock().unwrap().clone()))
+        }
+    }
+
+    struct NoopHooks;
+
+    impl RecoveryStageHooks for NoopHooks {
+        type TargetGuard = ();
+
+        fn target_selected(&self, _target: &RecoveryTarget) -> crate::app::AppResult<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingHooks {
+        before_claim_reached: mpsc::Sender<()>,
+        before_claim_release: Mutex<mpsc::Receiver<()>>,
+        before_paste_reached: mpsc::Sender<()>,
+        before_paste_release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl RecoveryStageHooks for BlockingHooks {
+        type TargetGuard = ();
+
+        fn target_selected(&self, _target: &RecoveryTarget) -> crate::app::AppResult<()> {
+            Ok(())
+        }
+
+        fn before_claim(&self) {
+            self.before_claim_reached.send(()).unwrap();
+            self.before_claim_release.lock().unwrap().recv().unwrap();
+        }
+
+        fn before_paste(&self) {
+            self.before_paste_reached.send(()).unwrap();
+            self.before_paste_release.lock().unwrap().recv().unwrap();
         }
     }
 
@@ -2089,5 +3013,362 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn recovery_requests_round_trip_as_dedicated_protocol_variants() {
+        for request in [
+            RuntimeRequest::ListRecoveries,
+            RuntimeRequest::StageRecovery {
+                recovery_id: "recovery-1".to_string(),
+            },
+            RuntimeRequest::DismissRecovery {
+                recovery_id: "recovery-1".to_string(),
+            },
+        ] {
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: RuntimeRequest = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(request).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn stage_recovery_repeats_inventory_and_pastes_exactly_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inventory = matching_inventory();
+        let transport = FakeTransport::new(
+            vec![Ok(inventory.clone()), Ok(inventory.clone()), Ok(inventory)],
+            Arc::clone(&events),
+        );
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        let staged =
+            stage_recovery_with(&transport, &store, &NoopHooks, "run-1", "recovery-1").unwrap();
+        assert_eq!(staged.lifecycle, RecoveryLifecycle::Staged);
+        let pastes = transport.pastes.lock().unwrap();
+        assert_eq!(pastes.len(), 1);
+        assert_eq!(pastes[0].0, "%9");
+        assert_eq!(
+            pastes[0].1,
+            "cd '/tmp/demo' && claude --resume '4d8dc7f8-a842-438a-b2c2-4d39ad509a53'"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "inventory",
+                "inventory",
+                "claim",
+                "inventory",
+                "paste",
+                "mark-staged"
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_recovery_refuses_changed_target_without_claim_or_paste() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first = matching_inventory();
+        let mut changed = first.clone();
+        changed.panes[0].pane_title = "changed".to_string();
+        let transport = FakeTransport::new(vec![Ok(first), Ok(changed)], Arc::clone(&events));
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        assert!(
+            stage_recovery_with(&transport, &store, &NoopHooks, "run-1", "recovery-1").is_err()
+        );
+        assert!(transport.pastes.lock().unwrap().is_empty());
+        assert_eq!(
+            store.record.lock().unwrap().lifecycle,
+            RecoveryLifecycle::Crashed
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["inventory", "inventory"]);
+    }
+
+    #[test]
+    fn stage_recovery_known_failures_release_to_crashed() {
+        for failure in ["inventory", "paste"] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let inventory = matching_inventory();
+            let transport = FakeTransport::new(
+                vec![
+                    Ok(inventory.clone()),
+                    Ok(inventory.clone()),
+                    if failure == "inventory" {
+                        Err("inventory failed".to_string())
+                    } else {
+                        Ok(inventory)
+                    },
+                ],
+                Arc::clone(&events),
+            );
+            if failure == "paste" {
+                *transport.paste_error.lock().unwrap() = Some("paste failed".to_string());
+            }
+            let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+            assert!(
+                stage_recovery_with(&transport, &store, &NoopHooks, "run-1", "recovery-1").is_err()
+            );
+            assert_eq!(
+                store.record.lock().unwrap().lifecycle,
+                RecoveryLifecycle::Crashed
+            );
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "release")
+            );
+        }
+    }
+
+    #[test]
+    fn stage_recovery_immediate_target_change_releases_without_paste() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inventory = matching_inventory();
+        let mut changed = inventory.clone();
+        changed.panes[0].cursor_x = Some(99);
+        let transport = FakeTransport::new(
+            vec![Ok(inventory.clone()), Ok(inventory), Ok(changed)],
+            Arc::clone(&events),
+        );
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        assert!(
+            stage_recovery_with(&transport, &store, &NoopHooks, "run-1", "recovery-1").is_err()
+        );
+        assert!(transport.pastes.lock().unwrap().is_empty());
+        assert_eq!(
+            store.record.lock().unwrap().lifecycle,
+            RecoveryLifecycle::Crashed
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "release")
+        );
+    }
+
+    #[test]
+    fn stage_recovery_post_paste_commit_failure_is_not_retryable() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inventory = matching_inventory();
+        let transport = FakeTransport::new(
+            vec![Ok(inventory.clone()), Ok(inventory.clone()), Ok(inventory)],
+            Arc::clone(&events),
+        );
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        *store.mark_staged_error.lock().unwrap() = Some("commit failed".to_string());
+        assert!(
+            stage_recovery_with(&transport, &store, &NoopHooks, "run-1", "recovery-1").is_err()
+        );
+        assert_eq!(transport.pastes.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.record.lock().unwrap().lifecycle,
+            RecoveryLifecycle::Uncertain
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "release")
+        );
+    }
+
+    #[test]
+    fn stage_recovery_claim_conflict_never_pastes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inventory = matching_inventory();
+        let transport = FakeTransport::new(
+            vec![Ok(inventory.clone()), Ok(inventory)],
+            Arc::clone(&events),
+        );
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        *store.claim_error.lock().unwrap() = Some("target conflict".to_string());
+        let error =
+            stage_recovery_with(&transport, &store, &NoopHooks, "run-1", "recovery-1").unwrap_err();
+        assert_eq!(error.exit_code(), 409);
+        assert!(transport.pastes.lock().unwrap().is_empty());
+        assert_eq!(
+            store.record.lock().unwrap().lifecycle,
+            RecoveryLifecycle::Crashed
+        );
+    }
+
+    #[test]
+    fn stage_recovery_protocol_returns_guarded_conflict_without_paste() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "botctl-stage-protocol-conflict-{}-{}",
+            std::process::id(),
+            super::now_unix_ms()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let socket_path = state_dir.join("runtime.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inventory = matching_inventory();
+        let transport = FakeTransport::new(
+            vec![Ok(inventory.clone()), Ok(inventory)],
+            Arc::clone(&events),
+        );
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        *store.claim_error.lock().unwrap() = Some("target conflict".to_string());
+        let server_transport = transport.clone();
+        let server_store = store.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let request = super::read_request(&mut reader).unwrap();
+            assert!(matches!(
+                request,
+                RuntimeRequest::StageRecovery { ref recovery_id } if recovery_id == "recovery-1"
+            ));
+            let mut stream = reader.into_inner();
+            let error = stage_recovery_with(
+                &server_transport,
+                &server_store,
+                &NoopHooks,
+                "run-1",
+                "recovery-1",
+            )
+            .unwrap_err();
+            super::write_runtime_error(&mut stream, &error).unwrap();
+        });
+
+        let client = super::RuntimeClient::with_socket_path(socket_path);
+        let error = client.stage_recovery("recovery-1").unwrap_err();
+        assert_eq!(error.exit_code(), 409);
+        assert!(error.to_string().contains("target conflict"));
+        server.join().unwrap();
+        assert!(transport.pastes.lock().unwrap().is_empty());
+        assert_eq!(
+            store.record.lock().unwrap().lifecycle,
+            RecoveryLifecycle::Crashed
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn stop_waits_for_accepted_stage_before_claim_and_paste() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inventory = matching_inventory();
+        let transport = FakeTransport::new(
+            vec![Ok(inventory.clone()), Ok(inventory.clone()), Ok(inventory)],
+            Arc::clone(&events),
+        );
+        let store = FakeStore::new(sample_recovery(), Arc::clone(&events));
+        let gate = MutationGate::new();
+        let permit = gate.acquire().unwrap();
+        let (claim_reached_tx, claim_reached_rx) = mpsc::channel();
+        let (claim_release_tx, claim_release_rx) = mpsc::channel();
+        let (paste_reached_tx, paste_reached_rx) = mpsc::channel();
+        let (paste_release_tx, paste_release_rx) = mpsc::channel();
+        let hooks = BlockingHooks {
+            before_claim_reached: claim_reached_tx,
+            before_claim_release: Mutex::new(claim_release_rx),
+            before_paste_reached: paste_reached_tx,
+            before_paste_release: Mutex::new(paste_release_rx),
+        };
+        let stage = thread::spawn(move || {
+            let result = stage_recovery_with(&transport, &store, &hooks, "run-1", "recovery-1");
+            drop(permit);
+            result
+        });
+        claim_reached_rx.recv().unwrap();
+        assert!(gate.begin_stop());
+        assert!(gate.acquire().is_err());
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stop_gate = gate.clone();
+        let stop = thread::spawn(move || {
+            stop_gate.wait_for_drain();
+            stopped_tx.send(()).unwrap();
+        });
+        assert!(stopped_rx.try_recv().is_err());
+        claim_release_tx.send(()).unwrap();
+        paste_reached_rx.recv().unwrap();
+        assert!(stopped_rx.try_recv().is_err());
+        paste_release_tx.send(()).unwrap();
+        stage.join().unwrap().unwrap();
+        stopped_rx.recv().unwrap();
+        stop.join().unwrap();
+        assert!(gate.acquire().is_err());
+    }
+
+    #[test]
+    fn replacement_server_removes_persisted_navigation_target() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "botctl-runtime-stale-target-{}-{}",
+            std::process::id(),
+            crate::runtime::now_unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace =
+            crate::storage::resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let old_server = sample_server(1);
+        let mut original = sample_pane("claude");
+        original.current_path = workspace_root.display().to_string();
+        let abandoned = crate::storage::begin_runtime_run(&state_dir).unwrap();
+        crate::storage::checkpoint_claude_observation(
+            &state_dir,
+            &abandoned,
+            &workspace.id,
+            &old_server,
+            &original,
+            CLAUDE_ID,
+        )
+        .unwrap();
+        let run = crate::storage::begin_runtime_run(&state_dir).unwrap();
+        crate::storage::reconcile_abandoned_observations(
+            &state_dir,
+            &run,
+            &TmuxInventory {
+                server: old_server.clone(),
+                panes: Vec::new(),
+            },
+        )
+        .unwrap();
+        let recovery = crate::storage::list_nonterminal_recoveries(&state_dir)
+            .unwrap()
+            .remove(0);
+        let mut target_pane = original;
+        target_pane.current_command = "bash".to_string();
+        let old_target = RecoveryTarget {
+            server: old_server,
+            pane: target_pane,
+        };
+        let command =
+            crate::recovery::build_recovery_command("claude", &recovery.original.cwd, CLAUDE_ID)
+                .unwrap();
+        crate::storage::claim_recovery_for_staging(
+            &state_dir,
+            &recovery.id,
+            &run,
+            "token",
+            &old_target,
+            &command,
+        )
+        .unwrap();
+        crate::storage::mark_recovery_staged(&state_dir, &recovery.id, "token").unwrap();
+        let replacement = TmuxInventory {
+            server: sample_server(2),
+            panes: vec![old_target.pane.clone()],
+        };
+        let offers = recovery_offers_for_inventory(&state_dir, &replacement).unwrap();
+        assert_eq!(offers.len(), 1);
+        assert!(offers[0].target.is_none());
+        assert!(
+            offers[0]
+                .disabled_reason
+                .as_deref()
+                .unwrap()
+                .contains("navigation is disabled")
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }

@@ -18,6 +18,7 @@ pub mod opencode;
 pub mod pi;
 pub mod proc_fd;
 pub mod prompt;
+pub mod recovery;
 pub mod runtime;
 pub mod screen_model;
 pub mod serve;

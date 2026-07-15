@@ -32,7 +32,7 @@ For the most useful commands, start here:
 
 ### `runtime`
 
-Purpose: start the central local runtime that owns live observation, guarded actions, and yolo supervision.
+Purpose: start the central local runtime that owns live observation, guarded actions, yolo supervision, and durable verified-Claude recovery checkpoints.
 
 Syntax:
 ```bash
@@ -56,6 +56,10 @@ Notes:
 - `--foreground` runs the runtime in the current process instead of the hidden tmux session
 - `dashboard`, `yolo`, and `serve` connect to this process instead of running independent long-lived control loops; in managed mode they auto-start it when needed
 - one runtime should own one local state root and tmux socket at a time
+- each runtime invocation journals its run and checkpoints only verified Claude panes with valid Claude session UUIDs
+- a graceful stop retires that run's outstanding checkpoints; an abandoned run is reconciled only after a later successful stable all-pane tmux inventory
+- a `Crashed` recovery means the checkpointed original pane object was absent from that inventory; it does not infer whether the pane disappeared intentionally
+- failed, malformed, or unstable inventories create no crash record and make no recovery matching decision
 
 ### `prompt`
 
@@ -170,7 +174,7 @@ Notes:
 
 ### `dashboard`
 
-Purpose: open the runtime-backed live TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, Pi panes, and Antigravity panes, grouped by workspace, with per-pane and per-workspace YOLO controls for Claude and Codex.
+Purpose: open the runtime-backed live TUI for supported agent panes and conservative Claude-only recovery offers after an external tool recreates missing tmux shell panes.
 
 Syntax:
 ```bash
@@ -203,6 +207,14 @@ Notes:
 - shows current classified state, age, wait time, branch, workspace grouping, pane PID, process-tree average CPU, memory, and observed active `Cook` time persisted across dashboard restarts
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
 - queries the central runtime for shared pane state and yolo policy
+- fetches recovery offers independently from live classifier panes and leaves their PID, CPU, memory, cook, wait, YOLO, and classifier columns blank
+- recovery requires an external tool to recreate the tmux server, sessions, windows, and shell panes first; botctl does not restore tmux objects or layouts
+- matches only the exact original object on the same server or one exact logical pane by socket path, session name, window index/name, pane index, and cwd; cwd-only, fuzzy, ambiguous, incompatible-shell, and globally conflicting matches remain disabled
+- recovery rows are Claude-only and preview the exact `cd <cwd> && claude --resume <uuid>` command, original identity, lifecycle, target, or precise disabled reason
+- lowercase `r` refreshes; uppercase `R` stages one selected ready `Crashed` recovery; uppercase `D` dismisses a selected `Crashed`, `Staged`, or `Uncertain` recovery; a current `Staging` recovery cannot be dismissed
+- `Enter` only navigates to a live pane or uniquely matched recovery target; it never stages or submits a command
+- staging pastes the exact preview without a newline or Enter; botctl does not clear shell input, and the operator must inspect the pane and press Enter manually
+- `Staged` and `Uncertain` records are not pasted again automatically
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 - auto-starts a managed runtime unless `--unmanaged` is set
 
@@ -456,7 +468,7 @@ botctl doctor --session demo --plain
 
 ### `dashboard`
 
-Purpose: open the live dashboard TUI for Claude Code panes, screen-detected Codex CLI panes, passively resolvable OpenCode panes, Pi panes, and Claude/Codex YOLO toggles.
+Purpose: open the live dashboard TUI for supported agent panes and Claude-only recovery offers after an external tool recreates missing tmux shell panes.
 
 Syntax:
 ```bash
@@ -476,6 +488,10 @@ Targeting: no explicit pane target; scans all Claude Code panes, likely Codex CL
 Safety:
 - rejects `--poll-ms 0`
 - rejects `--persistent --exit-on-navigate` because persistent mode is intended to keep the dashboard process alive
+- recovery rows are not live classifier panes and never receive pane YOLO or unstick actions
+- exact same-object or logical coordinates-plus-cwd matching must identify one compatible shell target; fuzzy, cwd-only, missing, ambiguous, and conflicting candidates remain disabled
+- lowercase `r` refreshes, uppercase `R` stages one ready `Crashed` recovery without Enter, uppercase `D` dismisses eligible records, and `Enter` only navigates
+- inspect the exact displayed command and target after staging, then press Enter yourself; botctl never submits it or automatically retries `Staged`/`Uncertain` records
 
 Persistent mode behavior:
 - creates or reuses a dedicated tmux session named `botctl-dashboard` on a separate tmux socket also named `botctl-dashboard`

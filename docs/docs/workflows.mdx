@@ -34,6 +34,7 @@ botctl last-message --pane 0:6.0 --out -
 | --- | --- |
 | You want `botctl` to launch Claude Code | [Managed session flow](#managed-session-flow) |
 | Claude Code is already running in tmux | [Resolve an existing pane](#resolve-an-existing-pane) |
+| An external tool recreated tmux after a verified Claude pane disappeared | [Recover a missing Claude session](#recover-a-missing-claude-session) |
 | A pane is blocked on a known prompt | [Blocker recovery flow](#blocker-recovery-flow) |
 | You need to stage or submit prompt text | [Prompt flow overview](#prompt-flow-overview) |
 | You want a one-shot Claude answer but still want TUI observability | [TUI-backed one-shot prompt](#tui-backed-one-shot-prompt) |
@@ -116,6 +117,23 @@ MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
 ```
 
 Use `--out -` to stream the raw Markdown body to stdout for piping. Claude reads `~/.claude/projects`, Codex reads `~/.codex/sessions`, OpenCode reads the latest assistant text parts from its SQLite storage after resolving the pane title and cwd, Pi reads the latest assistant text blocks from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`), and Antigravity uses pane-scrape extraction (requires three horizontal-rule lines to be visible in the pane scrollback: one above the last assistant turn, plus the two that bracket the live input box). The export contains assistant-visible text, not tool calls or transcript metadata.
+
+## Recover a missing Claude session
+
+Use this only after another tool recreates the tmux server, sessions, windows, and shell panes. Botctl does not recreate tmux objects, restore layouts or scrollback, launch Claude automatically, clear shell input, or press Enter.
+
+Recovery offers are Claude-only. Botctl must previously have checkpointed a verified Claude pane with a valid Claude session UUID. A `Crashed` row means a later successful stable all-pane inventory did not contain that original pane object. It is conservative evidence of absence, not an inference that a human or crash closed the pane. An inventory failure, malformed server identity, or unstable server identity creates no recovery record.
+
+1. Use your external tmux restoration tool to recreate the shell pane at its original coordinates and cwd.
+2. Open `botctl dashboard` and select the recovery row under its original workspace.
+3. Review the original identity, Claude UUID, exact `cd <cwd> && claude --resume <uuid>` command, target, and lifecycle in the details panel.
+4. If the row is ready, press uppercase `R` once to stage that exact command in the matched shell pane without Enter.
+5. Press `Enter` on the recovery row only to navigate to the matched target. This navigation never stages or submits the command.
+6. Inspect the pane and its editing buffer. Press Enter yourself only when the displayed command and target are correct.
+
+Matching is deliberately exact. Botctl accepts the exact original pane object on the same tmux server or one exact logical pane matching socket path, session name, window index and name, pane index, and cwd. Cwd alone is insufficient. Renamed, reordered, missing, duplicate, incompatible-shell, or globally conflicting candidates remain disabled rather than guessed.
+
+Lowercase `r` only refreshes. Uppercase `D` dismisses a selected `Crashed`, `Staged`, or `Uncertain` row; a currently owned `Staging` row cannot be dismissed. A `Staged` row means the command was pasted without Enter. An `Uncertain` row means a prior staging owner ended without a durable paste result, so inspect the target carefully. Botctl never automatically pastes `Staged` or `Uncertain` records again.
 
 ## Blocker recovery flow
 

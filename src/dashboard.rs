@@ -6,8 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,22 +33,29 @@ use crate::opencode::{pane_opencode_title, resolve_opencode_session_for_pane};
 use crate::pi::resolve_pi_session_for_pane;
 use crate::proc_fd::ChildResolver;
 use crate::prompt::resolve_state_dir;
+use crate::recovery::{RecoveryLifecycle, RecoveryMatchState, RuntimeRecoveryOffer};
 use crate::runtime::RuntimeClient;
 use crate::storage::{WorkspaceRecord, bootstrap_state_db, sync_tmux_runtime_state};
 use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
 
 const FOOTER_LINE1: &[(&str, &str)] = &[
     ("Arrows/jk", "move"),
-    ("y", "toggle pane"),
-    ("Enter", "open"),
-    ("A", "all on"),
+    ("Click", "select/open"),
+    ("Enter", "open only"),
     ("q", "quit"),
 ];
 const FOOTER_LINE2: &[(&str, &str)] = &[
-    ("Click", "select/open"),
+    ("y", "toggle pane"),
     ("Y", "toggle workspace"),
     ("u", "unstick"),
+    ("A", "all on"),
     ("N", "all off"),
+];
+const FOOTER_LINE3: &[(&str, &str)] = &[
+    ("R", "stage, no Enter"),
+    ("Then", "inspect + Enter yourself"),
+    ("D", "dismiss"),
+    ("r", "refresh"),
 ];
 const FOOTER_LINE2_PERSISTENT_END: &[(&str, &str)] = &[("q", "detach"), ("X", "kill server")];
 const FOOTER_INDENT: &str = "  ";
@@ -122,8 +129,10 @@ struct DashboardApp {
     poll_ms: u64,
     history_lines: usize,
     panes: Vec<PaneEntry>,
+    recoveries: Vec<RuntimeRecoveryOffer>,
     rows: Vec<RowItem>,
     selected_pane_id: Option<String>,
+    selected_recovery_id: Option<String>,
     selection: usize,
     first_seen: HashMap<String, Instant>,
     previous_frames: HashMap<String, String>,
@@ -249,9 +258,64 @@ enum DetailBodyKind {
     Context,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RowItem {
     WorkspaceHeader { label: String },
     Pane { pane_id: String },
+    Recovery { recovery_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardIntent {
+    None,
+    Quit,
+    KillServer,
+    MoveNext,
+    MovePrevious,
+    Navigate,
+    Refresh,
+    StageRecovery,
+    DismissRecovery,
+    UnstickPane,
+    TogglePaneYolo,
+    ToggleWorkspaceYolo,
+    EnableAllYolo,
+    DisableAllYolo,
+}
+
+fn is_selectable_row(row: &RowItem) -> bool {
+    matches!(row, RowItem::Pane { .. } | RowItem::Recovery { .. })
+}
+
+fn key_to_intent(code: KeyCode) -> DashboardIntent {
+    match code {
+        KeyCode::Char('q') => DashboardIntent::Quit,
+        KeyCode::Char('X') => DashboardIntent::KillServer,
+        KeyCode::Down | KeyCode::Char('j') => DashboardIntent::MoveNext,
+        KeyCode::Up | KeyCode::Char('k') => DashboardIntent::MovePrevious,
+        KeyCode::Enter => DashboardIntent::Navigate,
+        KeyCode::Char('r') => DashboardIntent::Refresh,
+        KeyCode::Char('R') => DashboardIntent::StageRecovery,
+        KeyCode::Char('D') => DashboardIntent::DismissRecovery,
+        KeyCode::Char('u') => DashboardIntent::UnstickPane,
+        KeyCode::Char('y') => DashboardIntent::TogglePaneYolo,
+        KeyCode::Char('Y') => DashboardIntent::ToggleWorkspaceYolo,
+        KeyCode::Char('A') => DashboardIntent::EnableAllYolo,
+        KeyCode::Char('N') => DashboardIntent::DisableAllYolo,
+        _ => DashboardIntent::None,
+    }
+}
+
+fn recovery_can_stage(recovery: &RuntimeRecoveryOffer) -> bool {
+    recovery.lifecycle == RecoveryLifecycle::Crashed
+        && recovery.match_state == RecoveryMatchState::Ready
+}
+
+fn recovery_can_dismiss(recovery: &RuntimeRecoveryOffer) -> bool {
+    matches!(
+        recovery.lifecycle,
+        RecoveryLifecycle::Crashed | RecoveryLifecycle::Staged | RecoveryLifecycle::Uncertain
+    )
 }
 
 struct ManagedWindowName {
@@ -285,8 +349,10 @@ impl DashboardApp {
             poll_ms,
             history_lines,
             panes: Vec::new(),
+            recoveries: Vec::new(),
             rows: Vec::new(),
             selected_pane_id: None,
+            selected_recovery_id: None,
             selection: 0,
             first_seen: HashMap::new(),
             previous_frames: HashMap::new(),
@@ -303,6 +369,7 @@ impl DashboardApp {
 
     fn refresh(&mut self) -> AppResult<()> {
         let now = Instant::now();
+        let recoveries = self.runtime.list_recoveries()?;
         let mut panes = Vec::new();
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
@@ -573,6 +640,7 @@ impl DashboardApp {
         }
 
         self.panes = panes;
+        self.recoveries = recoveries;
         self.rebuild_rows();
         self.apply_window_name_prefixes()?;
         self.last_refresh = Instant::now();
@@ -588,25 +656,65 @@ impl DashboardApp {
     }
 
     fn rebuild_rows(&mut self) {
-        let previous = self.selected_pane_id.clone();
+        let previous_pane = self.selected_pane_id.clone();
+        let previous_recovery = self.selected_recovery_id.clone();
         self.rows.clear();
 
-        let mut last_workspace = None::<String>;
+        let mut recovery_groups = BTreeMap::<String, Vec<&RuntimeRecoveryOffer>>::new();
+        let mut recovery_labels = HashMap::<String, String>::new();
+        for recovery in &self.recoveries {
+            let (key, label) = self.recovery_workspace_group(recovery);
+            recovery_groups
+                .entry(key.clone())
+                .or_default()
+                .push(recovery);
+            recovery_labels.entry(key).or_insert(label);
+        }
+
+        let mut workspace_order = Vec::<String>::new();
         for pane in &self.panes {
-            if last_workspace.as_deref() != Some(&pane.workspace_group_key) {
-                self.rows.push(RowItem::WorkspaceHeader {
-                    label: pane.workspace_group_label.clone(),
-                });
-                last_workspace = Some(pane.workspace_group_key.clone());
+            if workspace_order.last() != Some(&pane.workspace_group_key) {
+                workspace_order.push(pane.workspace_group_key.clone());
             }
-            self.rows.push(RowItem::Pane {
-                pane_id: pane.pane.pane_id.clone(),
-            });
+        }
+        for workspace_key in &workspace_order {
+            let label = self
+                .panes
+                .iter()
+                .find(|pane| &pane.workspace_group_key == workspace_key)
+                .map(|pane| pane.workspace_group_label.clone())
+                .unwrap_or_else(|| workspace_group_label(workspace_key));
+            self.rows.push(RowItem::WorkspaceHeader { label });
+            self.rows.extend(
+                self.panes
+                    .iter()
+                    .filter(|pane| &pane.workspace_group_key == workspace_key)
+                    .map(|pane| RowItem::Pane {
+                        pane_id: pane.pane.pane_id.clone(),
+                    }),
+            );
+            if let Some(recoveries) = recovery_groups.remove(workspace_key) {
+                self.rows
+                    .extend(recoveries.into_iter().map(|recovery| RowItem::Recovery {
+                        recovery_id: recovery.recovery_id.clone(),
+                    }));
+            }
+        }
+        for (workspace_key, recoveries) in recovery_groups {
+            let label = recovery_labels
+                .remove(&workspace_key)
+                .unwrap_or_else(|| workspace_group_label(&workspace_key));
+            self.rows.push(RowItem::WorkspaceHeader { label });
+            self.rows
+                .extend(recoveries.into_iter().map(|recovery| RowItem::Recovery {
+                    recovery_id: recovery.recovery_id.clone(),
+                }));
         }
 
         if self.rows.is_empty() {
             self.selection = 0;
             self.selected_pane_id = None;
+            self.selected_recovery_id = None;
             return;
         }
 
@@ -616,20 +724,27 @@ impl DashboardApp {
                 .iter()
                 .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == &pane_id))
             {
-                self.selection = index;
-                self.selected_pane_id = Some(pane_id);
+                self.set_selection(index);
                 return;
             }
         }
 
-        if let Some(pane_id) = previous {
+        if let Some(pane_id) = previous_pane {
             if let Some(index) = self
                 .rows
                 .iter()
                 .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == &pane_id))
             {
-                self.selection = index;
-                self.selected_pane_id = Some(pane_id);
+                self.set_selection(index);
+                return;
+            }
+        }
+
+        if let Some(recovery_id) = previous_recovery {
+            if let Some(index) = self.rows.iter().position(
+                |row| matches!(row, RowItem::Recovery { recovery_id: row_recovery_id } if row_recovery_id == &recovery_id),
+            ) {
+                self.set_selection(index);
                 return;
             }
         }
@@ -660,16 +775,39 @@ impl DashboardApp {
                 RowItem::Pane { pane_id } if self.is_blocked_pane_id(pane_id) => Some(index),
                 _ => None,
             })
-            .or_else(|| {
-                self.rows
-                    .iter()
-                    .position(|row| matches!(row, RowItem::Pane { .. }))
-            })
+            .or_else(|| self.rows.iter().position(is_selectable_row))
             .unwrap_or(0);
-        self.selected_pane_id = match &self.rows[self.selection] {
-            RowItem::Pane { pane_id } => Some(pane_id.clone()),
-            RowItem::WorkspaceHeader { .. } => None,
-        };
+        self.update_selected_ids();
+    }
+
+    fn recovery_workspace_group(&self, recovery: &RuntimeRecoveryOffer) -> (String, String) {
+        self.panes
+            .iter()
+            .find(|pane| pane.workspace.id == recovery.workspace_id)
+            .map(|pane| {
+                (
+                    pane.workspace_group_key.clone(),
+                    pane.workspace_group_label.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    recovery.workspace_root.clone(),
+                    workspace_group_label(&recovery.workspace_root),
+                )
+            })
+    }
+
+    fn update_selected_ids(&mut self) {
+        self.selected_pane_id = None;
+        self.selected_recovery_id = None;
+        match self.rows.get(self.selection) {
+            Some(RowItem::Pane { pane_id }) => self.selected_pane_id = Some(pane_id.clone()),
+            Some(RowItem::Recovery { recovery_id }) => {
+                self.selected_recovery_id = Some(recovery_id.clone());
+            }
+            _ => {}
+        }
     }
 
     fn nearest_selectable_row(&self, index: usize) -> Option<usize> {
@@ -678,25 +816,22 @@ impl DashboardApp {
         }
 
         let clamped = index.min(self.rows.len().saturating_sub(1));
-        if matches!(self.rows.get(clamped), Some(RowItem::Pane { .. })) {
+        if self.rows.get(clamped).is_some_and(is_selectable_row) {
             return Some(clamped);
         }
         for forward in clamped + 1..self.rows.len() {
-            if matches!(self.rows.get(forward), Some(RowItem::Pane { .. })) {
+            if self.rows.get(forward).is_some_and(is_selectable_row) {
                 return Some(forward);
             }
         }
         (0..clamped)
             .rev()
-            .find(|candidate| matches!(self.rows.get(*candidate), Some(RowItem::Pane { .. })))
+            .find(|candidate| self.rows.get(*candidate).is_some_and(is_selectable_row))
     }
 
     fn set_selection(&mut self, index: usize) {
         self.selection = index;
-        self.selected_pane_id = match &self.rows[self.selection] {
-            RowItem::Pane { pane_id } => Some(pane_id.clone()),
-            RowItem::WorkspaceHeader { .. } => None,
-        };
+        self.update_selected_ids();
     }
 
     fn is_blocked_pane_id(&self, pane_id: &str) -> bool {
@@ -811,6 +946,76 @@ impl DashboardApp {
         self.panes.iter().find(|pane| &pane.pane.pane_id == pane_id)
     }
 
+    fn selected_recovery(&self) -> Option<&RuntimeRecoveryOffer> {
+        let recovery_id = self.selected_recovery_id.as_ref()?;
+        self.recoveries
+            .iter()
+            .find(|recovery| &recovery.recovery_id == recovery_id)
+    }
+
+    fn selected_navigation_pane(&mut self) -> AppResult<Option<TmuxPane>> {
+        let runtime = self.runtime.clone();
+        self.selected_navigation_pane_with_recovery_refresh(move || runtime.list_recoveries())
+    }
+
+    fn selected_navigation_pane_with_recovery_refresh<F>(
+        &mut self,
+        refresh_recoveries: F,
+    ) -> AppResult<Option<TmuxPane>>
+    where
+        F: FnOnce() -> AppResult<Vec<RuntimeRecoveryOffer>>,
+    {
+        if let Some(pane) = self.selected_pane() {
+            return Ok(Some(pane.pane.clone()));
+        }
+
+        let Some(recovery_id) = self.selected_recovery_id.clone() else {
+            return Ok(None);
+        };
+        let previous_target = self
+            .selected_recovery()
+            .and_then(|recovery| recovery.target.clone());
+        let recoveries = match refresh_recoveries() {
+            Ok(recoveries) => recoveries,
+            Err(error) => {
+                self.message = format!(
+                    "Recovery {recovery_id} target refresh failed; navigation refused: {error}"
+                );
+                return Ok(None);
+            }
+        };
+        let refreshed_recovery = recoveries
+            .iter()
+            .find(|recovery| recovery.recovery_id == recovery_id)
+            .cloned();
+        self.recoveries = recoveries;
+        self.rebuild_rows();
+
+        let Some(refreshed_recovery) = refreshed_recovery else {
+            self.message = format!(
+                "Recovery {recovery_id} is no longer available after refresh; navigation refused"
+            );
+            return Ok(None);
+        };
+        let Some(refreshed_target) = refreshed_recovery.target else {
+            self.message = format!(
+                "Recovery {recovery_id} no longer has a current target after refresh; navigation refused"
+            );
+            return Ok(None);
+        };
+        if previous_target
+            .as_ref()
+            .is_some_and(|previous| previous != &refreshed_target)
+        {
+            self.message = format!(
+                "Recovery {recovery_id} target changed during refresh; review the refreshed target before navigating"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(refreshed_target.pane))
+    }
+
     fn pane_for_row(&self, index: usize) -> Option<&PaneEntry> {
         let RowItem::Pane { pane_id } = self.rows.get(index)? else {
             return None;
@@ -834,9 +1039,8 @@ impl DashboardApp {
         let mut index = self.selection as isize;
         for _ in 0..self.rows.len() {
             index = (index + delta).rem_euclid(self.rows.len() as isize);
-            if let RowItem::Pane { pane_id } = &self.rows[index as usize] {
-                self.selection = index as usize;
-                self.selected_pane_id = Some(pane_id.clone());
+            if is_selectable_row(&self.rows[index as usize]) {
+                self.set_selection(index as usize);
                 self.persist_selection()?;
                 return Ok(());
             }
@@ -845,7 +1049,7 @@ impl DashboardApp {
     }
 
     fn select_row(&mut self, index: usize) -> AppResult<bool> {
-        if !matches!(self.rows.get(index), Some(RowItem::Pane { .. })) {
+        if !self.rows.get(index).is_some_and(is_selectable_row) {
             return Ok(false);
         }
         self.set_selection(index);
@@ -887,6 +1091,51 @@ impl DashboardApp {
             self.increment_yes_count(&pane);
         }
         Ok(())
+    }
+
+    fn stage_selected_recovery(&mut self) -> AppResult<()> {
+        let Some(recovery) = self.selected_recovery().cloned() else {
+            return Ok(());
+        };
+        if !recovery_can_stage(&recovery) {
+            self.message = recovery.disabled_reason.unwrap_or_else(|| {
+                format!(
+                    "recovery {} cannot be staged in lifecycle {}",
+                    recovery.recovery_id,
+                    recovery.lifecycle.as_str()
+                )
+            });
+            return Ok(());
+        }
+
+        let staged = self.runtime.stage_recovery(&recovery.recovery_id)?;
+        self.message = format!(
+            "Staged without Enter: {}. Inspect the target pane and press Enter yourself.",
+            staged.command
+        );
+        self.refresh()
+    }
+
+    fn dismiss_selected_recovery(&mut self) -> AppResult<()> {
+        let Some(recovery) = self.selected_recovery().cloned() else {
+            return Ok(());
+        };
+        if !recovery_can_dismiss(&recovery) {
+            self.message = if recovery.lifecycle == RecoveryLifecycle::Staging {
+                String::from("A recovery currently being staged cannot be dismissed")
+            } else {
+                format!(
+                    "recovery {} cannot be dismissed in lifecycle {}",
+                    recovery.recovery_id,
+                    recovery.lifecycle.as_str()
+                )
+            };
+            return Ok(());
+        }
+
+        self.runtime.dismiss_recovery(&recovery.recovery_id)?;
+        self.message = format!("dismissed recovery {}", recovery.recovery_id);
+        self.refresh()
     }
 
     fn increment_yes_count(&mut self, pane: &PaneEntry) {
@@ -1097,17 +1346,8 @@ fn run_dashboard_loop(
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    let code = match key.code {
-                        KeyCode::Char(c)
-                            if c.is_ascii_uppercase()
-                                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
-                            KeyCode::Char(c.to_ascii_lowercase())
-                        }
-                        other => other,
-                    };
-                    match code {
-                        KeyCode::Char('q') => {
+                    match key_to_intent(key.code) {
+                        DashboardIntent::Quit => {
                             app.persist_selection()?;
                             if persistent {
                                 app.host_client.detach_client()?;
@@ -1115,17 +1355,16 @@ fn run_dashboard_loop(
                             }
                             return Ok(None);
                         }
-                        KeyCode::Char('X') => {
+                        DashboardIntent::KillServer => {
                             if persistent {
                                 kill_persistent_dashboard_server()?;
                                 return Ok(None);
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
-                        KeyCode::Up | KeyCode::Char('k') => app.select_previous()?,
-                        KeyCode::Enter => {
-                            let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone())
-                            else {
+                        DashboardIntent::MoveNext => app.select_next()?,
+                        DashboardIntent::MovePrevious => app.select_previous()?,
+                        DashboardIntent::Navigate => {
+                            let Some(pane) = app.selected_navigation_pane()? else {
                                 continue;
                             };
                             if let Some(pane) =
@@ -1134,13 +1373,15 @@ fn run_dashboard_loop(
                                 return Ok(Some(pane));
                             }
                         }
-                        KeyCode::Char('r') => app.refresh()?,
-                        KeyCode::Char('u') => app.unstick_selected_pane()?,
-                        KeyCode::Char('y') => app.toggle_selected_yolo()?,
-                        KeyCode::Char('Y') => app.toggle_workspace_yolo()?,
-                        KeyCode::Char('A') => app.set_all_yolo(true)?,
-                        KeyCode::Char('N') => app.set_all_yolo(false)?,
-                        _ => {}
+                        DashboardIntent::Refresh => app.refresh()?,
+                        DashboardIntent::StageRecovery => app.stage_selected_recovery()?,
+                        DashboardIntent::DismissRecovery => app.dismiss_selected_recovery()?,
+                        DashboardIntent::UnstickPane => app.unstick_selected_pane()?,
+                        DashboardIntent::TogglePaneYolo => app.toggle_selected_yolo()?,
+                        DashboardIntent::ToggleWorkspaceYolo => app.toggle_workspace_yolo()?,
+                        DashboardIntent::EnableAllYolo => app.set_all_yolo(true)?,
+                        DashboardIntent::DisableAllYolo => app.set_all_yolo(false)?,
+                        DashboardIntent::None => {}
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -1203,7 +1444,7 @@ fn handle_mouse_event(
                 return Ok(None);
             }
             if was_selected {
-                let Some(pane) = app.selected_pane().map(|pane| pane.pane.clone()) else {
+                let Some(pane) = app.selected_navigation_pane()? else {
                     return Ok(None);
                 };
                 return open_dashboard_pane(app, pane, exit_on_navigate, persistent);
@@ -1318,6 +1559,33 @@ fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 trim: matches!(body_kind, DetailBodyKind::Recap),
             });
         frame.render_widget(body, details_layout[1]);
+    } else if let Some(recovery) = app.selected_recovery() {
+        let details = recovery_summary_lines(recovery)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        let details_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(details_panel_height(details.len())),
+                Constraint::Min(3),
+            ])
+            .split(body[1]);
+        frame.render_widget(
+            Paragraph::new(details).block(rounded_block(Some("Claude Recovery"))),
+            details_layout[0],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                recovery_body_lines(recovery)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .block(rounded_block(Some("Command Preview")))
+            .wrap(Wrap { trim: false }),
+            details_layout[1],
+        );
     } else {
         let details_layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1352,7 +1620,7 @@ fn dashboard_layout(area: Rect) -> DashboardLayout {
         .constraints([
             Constraint::Min(10),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(area);
     DashboardLayout {
@@ -1405,24 +1673,31 @@ fn footer_lines(persistent: bool) -> Vec<Line<'static>> {
     } else {
         FOOTER_LINE1
     };
-    let mut line2 = FOOTER_LINE2.to_vec();
+    let line2 = FOOTER_LINE2.to_vec();
+    let mut line3 = FOOTER_LINE3.to_vec();
     if persistent {
-        line2.extend_from_slice(FOOTER_LINE2_PERSISTENT_END);
+        line3.extend_from_slice(FOOTER_LINE2_PERSISTENT_END);
     }
-    let column_widths = footer_column_widths(line1, &line2);
+    let column_widths = footer_column_widths_many(&[line1, &line2, &line3]);
     vec![
         footer_help_line(line1, &column_widths),
         footer_help_line(&line2, &column_widths),
+        footer_help_line(&line3, &column_widths),
     ]
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn footer_column_widths(line1: &[(&str, &str)], line2: &[(&str, &str)]) -> Vec<usize> {
-    let columns = line1.len().max(line2.len());
+    footer_column_widths_many(&[line1, line2])
+}
+
+fn footer_column_widths_many(lines: &[&[(&str, &str)]]) -> Vec<usize> {
+    let columns = lines.iter().map(|line| line.len()).max().unwrap_or(0);
     (0..columns)
         .map(|idx| {
-            [line1.get(idx), line2.get(idx)]
-                .into_iter()
-                .flatten()
+            lines
+                .iter()
+                .filter_map(|line| line.get(idx))
                 .map(|(key, description)| {
                     UnicodeWidthStr::width(format!("{key} {description}").as_str())
                 })
@@ -1599,6 +1874,23 @@ fn render_pane_list(
                     row_style,
                 );
                 render_cell(frame, rect_at_y(rects.branch, y), &pane.branch, row_style);
+            }
+            RowItem::Recovery { recovery_id } => {
+                let Some(recovery) = app
+                    .recoveries
+                    .iter()
+                    .find(|recovery| &recovery.recovery_id == recovery_id)
+                else {
+                    continue;
+                };
+                render_cell(frame, rect_at_y(rects.state, y), "↻", row_style);
+                render_cell(frame, rect_at_y(rects.agent, y), "❋", row_style);
+                render_cell(
+                    frame,
+                    rect_at_y(rects.branch, y),
+                    &format!("Recovery: {}", recovery.lifecycle.as_str()),
+                    row_style.fg(Color::Yellow),
+                );
             }
         }
     }
@@ -1813,6 +2105,117 @@ fn render_workspace_header_line(label: &str, width: usize) -> Line<'static> {
 fn split_workspace_header(label: &str) -> Option<(&str, &str)> {
     let (name, path) = label.rsplit_once("  (")?;
     Some((name, path.strip_suffix(')')?))
+}
+
+fn recovery_summary_lines(recovery: &RuntimeRecoveryOffer) -> Vec<String> {
+    let original = &recovery.original;
+    let target = recovery.target.as_ref().map_or_else(
+        || String::from("-"),
+        |target| {
+            format!(
+                "{} ({}, command {})",
+                target.pane.pane_id,
+                pane_target_label(&target.pane),
+                target.pane.current_command
+            )
+        },
+    );
+    vec![
+        format!(
+            "Workspace: {}",
+            abbreviate_home_path(&recovery.workspace_root)
+        ),
+        format!(
+            "Provider: Claude recovery | Lifecycle: {}",
+            recovery.lifecycle.as_str()
+        ),
+        format!(
+            "Match: {} | Disabled: {}",
+            recovery_match_state_label(recovery.match_state),
+            recovery.disabled_reason.as_deref().unwrap_or("-")
+        ),
+        format!(
+            "Original: pane={} session={}/{} window={}:{}({}) pane-index={}",
+            original.pane_id,
+            original.session_name,
+            original.session_id,
+            original.window_index,
+            original.window_id,
+            original.window_name,
+            original.pane_index
+        ),
+        format!(
+            "Original process: tty={} pid={} | Server: {} pid={} start={}",
+            original.pane_tty,
+            format_pid(original.pane_pid),
+            original.server.socket_path,
+            original.server.pid,
+            original.server.start_time
+        ),
+        format!("Original cwd: {}", original.cwd),
+        format!("Claude UUID: {}", recovery.provider_session_id),
+        format!("Target: {target}"),
+        format!(
+            "Times (unix ms): crashed={} staged={} resolved={} dismissed={}",
+            recovery.crashed_at_unix_ms,
+            recovery
+                .staged_at_unix_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("-")),
+            recovery
+                .resolved_at_unix_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("-")),
+            recovery
+                .dismissed_at_unix_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("-"))
+        ),
+    ]
+}
+
+fn recovery_body_lines(recovery: &RuntimeRecoveryOffer) -> Vec<String> {
+    vec![
+        String::from("Exact command:"),
+        recovery.command.clone(),
+        String::new(),
+        recovery_instruction(recovery).to_string(),
+        String::from("Botctl does not clear input, append a newline, or press Enter."),
+    ]
+}
+
+fn recovery_instruction(recovery: &RuntimeRecoveryOffer) -> &'static str {
+    match recovery.lifecycle {
+        RecoveryLifecycle::Crashed if recovery.match_state == RecoveryMatchState::Ready => {
+            "External pane recreation comes first. Press R to stage, inspect the pane, then press Enter yourself."
+        }
+        RecoveryLifecycle::Crashed => {
+            "External pane recreation comes first. Exact matching is not ready, so staging is disabled."
+        }
+        RecoveryLifecycle::Staging => {
+            "The runtime currently owns this staging attempt; wait for its confirmed result."
+        }
+        RecoveryLifecycle::Staged => {
+            "Command staged without Enter; inspect the pane and press Enter yourself."
+        }
+        RecoveryLifecycle::Uncertain => {
+            "A prior staging attempt ended without confirmation; inspect the target. Botctl will not paste again."
+        }
+        RecoveryLifecycle::Resolved => "The same Claude UUID was observed in the target pane.",
+        RecoveryLifecycle::Dismissed => "This recovery was dismissed.",
+    }
+}
+
+fn recovery_match_state_label(state: RecoveryMatchState) -> &'static str {
+    match state {
+        RecoveryMatchState::Ready => "ready",
+        RecoveryMatchState::Unmatched => "unmatched",
+        RecoveryMatchState::Ambiguous => "ambiguous",
+        RecoveryMatchState::Conflict => "conflict",
+        RecoveryMatchState::Incompatible => "incompatible",
+        RecoveryMatchState::NotStageable => "not stageable",
+        RecoveryMatchState::InvalidMetadata => "invalid metadata",
+    }
 }
 
 fn detail_body_kind(pane: &PaneEntry) -> DetailBodyKind {
@@ -2949,18 +3352,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
+        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DashboardIntent, DetailBodyKind, ICON_GAP,
         PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
-        ProcessSnapshot, ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji,
+        ProcessSnapshot, ResourceUsage, RowItem, SavedSelection, abbreviate_home_path, agent_emoji,
         agent_marker, cleanup_dashboard_window_name, context_lines_above_input,
         current_base_window_name, dashboard_body_sections, dashboard_display_state,
         dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
         detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
         footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
         format_memory_gauge, is_attention_state, is_codex_candidate_pane, is_codex_screen,
-        is_cooking_state, is_opencode_candidate_pane, is_waiting_state, load_saved_selection,
-        pad_display_right, pane_list_columns, pane_list_content_area,
+        is_cooking_state, is_opencode_candidate_pane, is_waiting_state, key_to_intent,
+        load_saved_selection, pad_display_right, pane_list_columns, pane_list_content_area,
         pane_source_for_non_runtime_pane_with, pane_window_prefix, parse_process_stat, recap_lines,
+        recovery_body_lines, recovery_can_dismiss, recovery_can_stage, recovery_summary_lines,
         rect_contains, render_workspace_header_line, repo_root_from_repo_key, save_selection,
         select_agent_process, select_tail_lines_for_rows, should_return_navigation,
         split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
@@ -2968,9 +3372,14 @@ mod tests {
         yes_count_key, yolo_column_contains,
     };
     use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
+    use crate::recovery::{
+        RecoveryLifecycle, RecoveryMatchState, RecoveryOriginalIdentity, RecoveryTarget,
+        RuntimeRecoveryOffer,
+    };
     use crate::runtime::RuntimeClient;
     use crate::storage::WorkspaceRecord;
-    use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
+    use crate::tmux::{TmuxClient, TmuxPane, TmuxServerIdentity, TmuxWindow};
+    use crossterm::event::KeyCode;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
@@ -3461,6 +3870,217 @@ mod tests {
     }
 
     #[test]
+    fn recovery_rows_remain_selectable_without_live_panes() {
+        let mut app = make_test_app("dashboard-recovery-only");
+        app.recoveries = vec![sample_recovery(
+            RecoveryLifecycle::Crashed,
+            RecoveryMatchState::Ready,
+        )];
+
+        app.rebuild_rows();
+
+        assert!(app.selected_pane().is_none());
+        assert_eq!(
+            app.selected_recovery()
+                .map(|recovery| recovery.recovery_id.as_str()),
+            Some("recovery-1")
+        );
+        assert!(app.rows.iter().any(
+            |row| matches!(row, RowItem::Recovery { recovery_id } if recovery_id == "recovery-1")
+        ));
+    }
+
+    #[test]
+    fn recovery_navigation_refuses_a_target_removed_by_fresh_offer_refresh() {
+        let mut app = make_test_app("dashboard-recovery-navigation-removed");
+        app.recoveries = vec![sample_recovery(
+            RecoveryLifecycle::Crashed,
+            RecoveryMatchState::Ready,
+        )];
+        app.rebuild_rows();
+        let refreshed = sample_recovery(RecoveryLifecycle::Crashed, RecoveryMatchState::Unmatched);
+
+        let pane = app
+            .selected_navigation_pane_with_recovery_refresh(|| Ok(vec![refreshed]))
+            .expect("refresh should succeed");
+
+        assert!(pane.is_none());
+        assert!(app.message.contains("no longer has a current target"));
+        assert!(app.message.contains("navigation refused"));
+    }
+
+    #[test]
+    fn recovery_navigation_uses_a_still_current_target_after_refresh() {
+        let mut app = make_test_app("dashboard-recovery-navigation-current");
+        let recovery = sample_recovery(RecoveryLifecycle::Crashed, RecoveryMatchState::Ready);
+        app.recoveries = vec![recovery.clone()];
+        app.rebuild_rows();
+
+        let pane = app
+            .selected_navigation_pane_with_recovery_refresh(|| Ok(vec![recovery]))
+            .expect("refresh should succeed")
+            .expect("current recovery target should navigate");
+
+        assert_eq!(
+            pane.pane_id, "%9",
+            "the refreshed target must be used for navigation"
+        );
+    }
+
+    #[test]
+    fn recovery_navigation_refuses_a_target_changed_by_refresh() {
+        let mut app = make_test_app("dashboard-recovery-navigation-changed");
+        app.recoveries = vec![sample_recovery(
+            RecoveryLifecycle::Crashed,
+            RecoveryMatchState::Ready,
+        )];
+        app.rebuild_rows();
+        let mut refreshed = sample_recovery(RecoveryLifecycle::Crashed, RecoveryMatchState::Ready);
+        refreshed
+            .target
+            .as_mut()
+            .expect("ready recovery should have a target")
+            .pane
+            .pane_id = String::from("%10");
+
+        let pane = app
+            .selected_navigation_pane_with_recovery_refresh(|| Ok(vec![refreshed]))
+            .expect("refresh should succeed");
+
+        assert!(pane.is_none());
+        assert!(app.message.contains("target changed during refresh"));
+        assert!(app.message.contains("review the refreshed target"));
+    }
+
+    #[test]
+    fn live_pane_navigation_does_not_refresh_recovery_offers() {
+        let mut app = make_test_app("dashboard-live-navigation-no-recovery-refresh");
+        app.panes = vec![sample_pane_entry_with_id("%1")];
+        app.rebuild_rows();
+
+        let pane = app
+            .selected_navigation_pane_with_recovery_refresh(|| {
+                panic!("live pane navigation must not refresh recovery offers")
+            })
+            .expect("live pane navigation should succeed")
+            .expect("live pane should navigate");
+
+        assert_eq!(pane.pane_id, "%1");
+    }
+
+    #[test]
+    fn dashboard_keys_keep_refresh_stage_dismiss_and_enter_distinct() {
+        assert_eq!(key_to_intent(KeyCode::Char('r')), DashboardIntent::Refresh);
+        assert_eq!(
+            key_to_intent(KeyCode::Char('R')),
+            DashboardIntent::StageRecovery
+        );
+        assert_eq!(
+            key_to_intent(KeyCode::Char('D')),
+            DashboardIntent::DismissRecovery
+        );
+        assert_eq!(key_to_intent(KeyCode::Enter), DashboardIntent::Navigate);
+        assert_ne!(
+            key_to_intent(KeyCode::Enter),
+            DashboardIntent::StageRecovery
+        );
+    }
+
+    #[test]
+    fn only_ready_crashed_recoveries_can_stage_and_dismiss_rules_are_explicit() {
+        let ready = sample_recovery(RecoveryLifecycle::Crashed, RecoveryMatchState::Ready);
+        assert!(recovery_can_stage(&ready));
+        assert!(recovery_can_dismiss(&ready));
+
+        for state in [
+            RecoveryMatchState::Unmatched,
+            RecoveryMatchState::Ambiguous,
+            RecoveryMatchState::Conflict,
+            RecoveryMatchState::Incompatible,
+            RecoveryMatchState::InvalidMetadata,
+        ] {
+            assert!(!recovery_can_stage(&sample_recovery(
+                RecoveryLifecycle::Crashed,
+                state,
+            )));
+        }
+
+        for lifecycle in [RecoveryLifecycle::Staged, RecoveryLifecycle::Uncertain] {
+            let offer = sample_recovery(lifecycle, RecoveryMatchState::NotStageable);
+            assert!(!recovery_can_stage(&offer));
+            assert!(recovery_can_dismiss(&offer));
+        }
+        let staging = sample_recovery(RecoveryLifecycle::Staging, RecoveryMatchState::NotStageable);
+        assert!(!recovery_can_stage(&staging));
+        assert!(!recovery_can_dismiss(&staging));
+    }
+
+    #[test]
+    fn pane_only_actions_ignore_selected_recovery_rows() {
+        let mut app = make_test_app("dashboard-recovery-pane-actions");
+        app.recoveries = vec![sample_recovery(
+            RecoveryLifecycle::Crashed,
+            RecoveryMatchState::Ready,
+        )];
+        app.rebuild_rows();
+
+        app.toggle_selected_yolo()
+            .expect("recovery must not issue a yolo runtime request");
+        app.unstick_selected_pane()
+            .expect("recovery must not issue a pane action runtime request");
+        app.toggle_workspace_yolo()
+            .expect("recovery must not issue a workspace yolo runtime request");
+
+        assert!(app.message.is_empty());
+    }
+
+    #[test]
+    fn recovery_details_show_command_target_reasons_and_manual_submission() {
+        let ready = sample_recovery(RecoveryLifecycle::Crashed, RecoveryMatchState::Ready);
+        let ready_summary = recovery_summary_lines(&ready).join("\n");
+        let ready_body = recovery_body_lines(&ready).join("\n");
+        assert!(ready_summary.contains("Lifecycle: crashed"));
+        assert!(ready_summary.contains("Claude UUID:"));
+        assert!(ready_summary.contains("Target: %9"));
+        assert!(ready_summary.contains("command bash"));
+        assert!(ready_body.contains(&ready.command));
+        assert!(ready_body.contains("External pane recreation comes first"));
+        assert!(ready_body.contains("press Enter yourself"));
+        assert!(ready_body.contains("does not clear input"));
+
+        for state in [
+            RecoveryMatchState::Unmatched,
+            RecoveryMatchState::Ambiguous,
+            RecoveryMatchState::Incompatible,
+        ] {
+            let offer = sample_recovery(RecoveryLifecycle::Crashed, state);
+            let rendered = recovery_summary_lines(&offer).join("\n");
+            assert!(rendered.contains(offer.disabled_reason.as_deref().unwrap()));
+            assert!(
+                recovery_body_lines(&offer)
+                    .join("\n")
+                    .contains(&offer.command)
+            );
+        }
+
+        let staged = sample_recovery(RecoveryLifecycle::Staged, RecoveryMatchState::NotStageable);
+        assert!(
+            recovery_body_lines(&staged).join("\n").contains(
+                "Command staged without Enter; inspect the pane and press Enter yourself."
+            )
+        );
+        let uncertain = sample_recovery(
+            RecoveryLifecycle::Uncertain,
+            RecoveryMatchState::NotStageable,
+        );
+        assert!(
+            recovery_body_lines(&uncertain)
+                .join("\n")
+                .contains("Botctl will not paste again")
+        );
+    }
+
+    #[test]
     fn pane_list_content_area_excludes_borders() {
         let area = pane_list_content_area(Rect {
             x: 0,
@@ -3638,6 +4258,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(lines.iter().any(|line| line.contains("X kill server")));
+    }
+
+    #[test]
+    fn footer_says_recovery_is_staged_without_enter_and_manually_submitted() {
+        let rendered = footer_lines(false)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("R stage, no Enter"));
+        assert!(rendered.contains("Then inspect + Enter yourself"));
+        assert!(rendered.contains("r refresh"));
     }
 
     #[test]
@@ -4015,6 +4648,63 @@ mod tests {
                 ..sample_pane_entry(SessionState::ChatReady, false, false, "").pane
             },
             ..sample_pane_entry(SessionState::ChatReady, false, false, "")
+        }
+    }
+
+    fn sample_recovery(
+        lifecycle: RecoveryLifecycle,
+        match_state: RecoveryMatchState,
+    ) -> RuntimeRecoveryOffer {
+        let server = TmuxServerIdentity {
+            socket_path: String::from("/tmp/tmux/default"),
+            pid: 42,
+            start_time: 100,
+        };
+        let original_pane = sample_tmux_pane("claude", "Claude");
+        let target = if matches!(
+            match_state,
+            RecoveryMatchState::Ready
+                | RecoveryMatchState::Incompatible
+                | RecoveryMatchState::NotStageable
+        ) {
+            Some(RecoveryTarget {
+                server: server.clone(),
+                pane: TmuxPane {
+                    pane_id: String::from("%9"),
+                    current_command: if match_state == RecoveryMatchState::Incompatible {
+                        String::from("nvim")
+                    } else {
+                        String::from("bash")
+                    },
+                    ..original_pane.clone()
+                },
+            })
+        } else {
+            None
+        };
+        RuntimeRecoveryOffer {
+            recovery_id: String::from("recovery-1"),
+            workspace_id: String::from("workspace-1"),
+            workspace_root: String::from("/tmp/demo"),
+            lifecycle,
+            provider: String::from("claude"),
+            provider_session_id: String::from("4d8dc7f8-a842-438a-b2c2-4d39ad509a53"),
+            original: RecoveryOriginalIdentity::from_inventory(&server, &original_pane),
+            command: String::from(
+                "cd '/tmp/demo' && claude --resume '4d8dc7f8-a842-438a-b2c2-4d39ad509a53'",
+            ),
+            target,
+            match_state,
+            disabled_reason: (match_state != RecoveryMatchState::Ready).then(|| {
+                format!(
+                    "disabled for {}",
+                    super::recovery_match_state_label(match_state)
+                )
+            }),
+            crashed_at_unix_ms: 1000,
+            staged_at_unix_ms: (lifecycle == RecoveryLifecycle::Staged).then_some(2000),
+            resolved_at_unix_ms: None,
+            dismissed_at_unix_ms: None,
         }
     }
 
