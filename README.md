@@ -152,6 +152,10 @@ Keep the dashboard alive in a dedicated tmux-backed popup session:
 cargo run -- dashboard --persistent
 ```
 
+When no client is attached to the persistent dashboard session, botctl pauses terminal drawing, git lookup, process resource sampling, and full dashboard enrichment. Runtime events continue updating tmux window state prefixes, while passive fallback providers are checked on a bounded three-second cadence. Reattaching forces a complete refresh before the first new frame is drawn; CPU percentages are unavailable for that first sample while botctl establishes a fresh baseline.
+
+Cook and wait durations for runtime-backed panes come from the central runtime and advance locally while the runtime's authoritative classification remains cooking or waiting. The dashboard only writes duration state for fallback-only panes.
+
 Quick tmux popup binding:
 
 ```tmux

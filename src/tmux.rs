@@ -253,7 +253,7 @@ impl TmuxClient {
         request: &StartWindowRequest,
         output: &str,
     ) -> AppResult<StartedWindow> {
-        let (pane_id, window_id) = parse_created_pane_window(&output)
+        let (pane_id, window_id) = parse_created_pane_window(output)
             .ok_or_else(|| AppError::new("tmux launch did not return pane_id and window_id"))?;
         Ok(StartedWindow {
             session_name: request.session_name.clone(),
@@ -268,6 +268,14 @@ impl TmuxClient {
         self.list_panes_for_target(None)
     }
 
+    /// Scheduler-critical pane discovery. Unlike `list_panes`, any malformed
+    /// non-empty row fails the whole result so callers never interpret partial
+    /// tmux output as pane removal.
+    pub fn list_panes_strict(&self) -> AppResult<Vec<TmuxPane>> {
+        let output = self.run_output(list_panes_args(None))?;
+        parse_pane_listing_strict(&output)
+    }
+
     pub fn list_windows(&self) -> AppResult<Vec<TmuxWindow>> {
         let output = self.run_output(vec![
             String::from("list-windows"),
@@ -279,19 +287,7 @@ impl TmuxClient {
     }
 
     pub fn list_panes_for_target(&self, target: Option<&str>) -> AppResult<Vec<TmuxPane>> {
-        let mut args = vec![String::from("list-panes")];
-        if let Some(target) = target {
-            args.push(String::from("-t"));
-            args.push(target.to_string());
-        } else {
-            args.push(String::from("-a"));
-        }
-        args.push(String::from("-F"));
-        args.push(String::from(
-            "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
-        ));
-
-        let output = self.run_output(args)?;
+        let output = self.run_output(list_panes_args(target))?;
         let panes = output
             .lines()
             .filter_map(parse_pane_line)
@@ -332,12 +328,19 @@ impl TmuxClient {
         Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
     }
 
+    /// Refresh exactly one pane without invoking global `list-panes -a`.
+    /// Parsing is strict for the same reason as `list_panes_strict`.
+    pub fn pane_by_id_exact(&self, pane_id: &str) -> AppResult<Option<TmuxPane>> {
+        let Some(output) = self.run_output_allow_missing_pane(list_panes_args(Some(pane_id)))?
+        else {
+            return Ok(None);
+        };
+        let panes = parse_pane_listing_strict(&output)?;
+        Ok(panes.into_iter().find(|pane| pane.pane_id == pane_id))
+    }
+
     pub fn control_mode_session(&self, session_name: &str) -> AppResult<ControlModeSession> {
-        let control_command = format!(
-            "{} -C attach-session -t {}",
-            shell_escape(&self.program),
-            shell_escape(session_name)
-        );
+        let control_command = self.control_mode_command(session_name);
 
         let mut child = Command::new("script")
             .arg("-q")
@@ -594,6 +597,11 @@ impl TmuxClient {
             .to_string())
     }
 
+    pub fn session_attached_count(&self, target_session: &str) -> AppResult<u32> {
+        let output = self.run_output(session_attached_count_args(target_session))?;
+        parse_session_attached_count(&output)
+    }
+
     fn run_status(&self, args: Vec<String>) -> AppResult<()> {
         let args = self.with_socket_args(args);
         let status = Command::new(&self.program).args(&args).status()?;
@@ -621,6 +629,38 @@ impl TmuxClient {
 
         String::from_utf8(output.stdout)
             .map_err(|_| AppError::new("tmux output was not valid UTF-8"))
+    }
+
+    fn run_output_allow_missing_pane(&self, args: Vec<String>) -> AppResult<Option<String>> {
+        let args = self.with_socket_args(args);
+        let output = Command::new(&self.program).args(&args).output()?;
+        if output.status.success() {
+            return String::from_utf8(output.stdout)
+                .map(Some)
+                .map_err(|_| AppError::new("tmux output was not valid UTF-8"));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_ascii_lowercase().contains("can't find pane") {
+            return Ok(None);
+        }
+        Err(AppError::new(format!(
+            "tmux command failed: {} {}",
+            self.program,
+            args.join(" ")
+        )))
+    }
+
+    fn control_mode_command(&self, session_name: &str) -> String {
+        TmuxCommandPlan {
+            program: self.program.clone(),
+            args: self.with_socket_args(vec![
+                String::from("-C"),
+                String::from("attach-session"),
+                String::from("-t"),
+                session_name.to_string(),
+            ]),
+        }
+        .render()
     }
 
     fn match_explicit_pane_targets(&self, target: &str) -> AppResult<Vec<String>> {
@@ -734,6 +774,66 @@ fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     })
 }
 
+fn list_panes_args(target: Option<&str>) -> Vec<String> {
+    let mut args = vec![String::from("list-panes")];
+    if let Some(target) = target {
+        args.push(String::from("-t"));
+        args.push(target.to_string());
+    } else {
+        args.push(String::from("-a"));
+    }
+    args.push(String::from("-F"));
+    args.push(String::from(
+        "#{pane_id}\t#{pane_tty}\t#{pane_pid}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_active}\t#{cursor_x}\t#{cursor_y}",
+    ));
+    args
+}
+
+fn parse_pane_listing_strict(output: &str) -> AppResult<Vec<TmuxPane>> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(parse_pane_line_strict)
+        .collect()
+}
+
+fn parse_pane_line_strict(line: &str) -> AppResult<TmuxPane> {
+    let parts = line.split('\t').collect::<Vec<_>>();
+    let valid_optional_u32 = |value: &str| value.is_empty() || value.parse::<u32>().is_ok();
+    let valid_optional_u16 = |value: &str| value.is_empty() || value.parse::<u16>().is_ok();
+    let valid = parts.len() == 15
+        && valid_optional_u32(parts[2])
+        && matches!(parts[12], "0" | "1")
+        && valid_optional_u16(parts[13])
+        && valid_optional_u16(parts[14]);
+    if !valid {
+        return Err(AppError::new(format!(
+            "malformed tmux pane listing row: {line:?}"
+        )));
+    }
+    parse_pane_line(line)
+        .ok_or_else(|| AppError::new(format!("malformed tmux pane listing row: {line:?}")))
+}
+
+fn parse_session_attached_count(output: &str) -> AppResult<u32> {
+    output.trim().parse::<u32>().map_err(|_| {
+        AppError::new(format!(
+            "tmux returned invalid session attachment count: {:?}",
+            output.trim()
+        ))
+    })
+}
+
+fn session_attached_count_args(target_session: &str) -> Vec<String> {
+    vec![
+        String::from("display-message"),
+        String::from("-p"),
+        String::from("-t"),
+        target_session.to_string(),
+        String::from("#{session_attached}"),
+    ]
+}
+
 fn parse_window_line(line: &str) -> Option<TmuxWindow> {
     let parts = line.split('\t').collect::<Vec<_>>();
     if parts.len() != 4 {
@@ -816,9 +916,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        StartSessionRequest, StartWindowRequest, TmuxClient, TmuxCommandPlan,
+        StartSessionRequest, StartWindowRequest, TmuxClient, TmuxCommandPlan, list_panes_args,
         parse_created_pane_window, parse_explicit_pane_target_line, parse_pane_line,
-        parse_window_line, select_explicit_pane_target,
+        parse_pane_listing_strict, parse_session_attached_count, parse_window_line,
+        select_explicit_pane_target, session_attached_count_args,
     };
 
     #[test]
@@ -950,6 +1051,62 @@ mod tests {
         assert!(pane.pane_active);
         assert_eq!(pane.cursor_x, Some(12));
         assert_eq!(pane.cursor_y, Some(4));
+    }
+
+    #[test]
+    fn strict_pane_listing_rejects_partial_results() {
+        let output = concat!(
+            "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\tClaude\t1\t12\t4\n",
+            "malformed\n"
+        );
+        let error = parse_pane_listing_strict(output).expect_err("listing should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("malformed tmux pane listing row")
+        );
+
+        let invalid_pid = "%1\t/dev/pts/1\tnot-a-pid\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\tClaude\t1\t12\t4\n";
+        assert!(parse_pane_listing_strict(invalid_pid).is_err());
+        let invalid_active = "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\tClaude\tyes\t12\t4\n";
+        assert!(parse_pane_listing_strict(invalid_active).is_err());
+    }
+
+    #[test]
+    fn exact_pane_listing_targets_only_requested_pane() {
+        let args = list_panes_args(Some("%19"));
+
+        assert_eq!(args[0..3], ["list-panes", "-t", "%19"]);
+        assert!(!args.iter().any(|arg| arg == "-a"));
+    }
+
+    #[test]
+    fn parses_session_attachment_count() {
+        assert_eq!(parse_session_attached_count("2\n").unwrap(), 2);
+        assert!(parse_session_attached_count("attached").is_err());
+    }
+
+    #[test]
+    fn session_attachment_count_targets_private_session() {
+        assert_eq!(
+            session_attached_count_args("botctl-dashboard"),
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "botctl-dashboard",
+                "#{session_attached}"
+            ]
+        );
+    }
+
+    #[test]
+    fn control_mode_command_preserves_explicit_socket() {
+        let command =
+            TmuxClient::with_socket_path("/tmp/outer.sock").control_mode_command("work session");
+
+        assert!(command.contains("-S /tmp/outer.sock -C attach-session -t 'work session'"));
     }
 
     #[test]

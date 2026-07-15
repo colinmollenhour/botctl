@@ -3,6 +3,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -23,7 +26,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agy::{is_agy_pane, resolve_agy_session_for_pane};
-use crate::app::AppResult;
+use crate::app::{AppError, AppResult};
 use crate::classifier::{
     Classifier, SIGNAL_CODEX_KEYWORDS, SessionState, prepare_frame_for_classification,
 };
@@ -33,7 +36,7 @@ use crate::opencode::{pane_opencode_title, resolve_opencode_session_for_pane};
 use crate::pi::resolve_pi_session_for_pane;
 use crate::proc_fd::ChildResolver;
 use crate::prompt::resolve_state_dir;
-use crate::runtime::RuntimeClient;
+use crate::runtime::{RuntimeClient, RuntimeEvent, RuntimePaneSnapshot, RuntimeSubscription};
 use crate::storage::{WorkspaceRecord, bootstrap_state_db, sync_tmux_runtime_state};
 use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
 
@@ -55,6 +58,12 @@ const FOOTER_INDENT: &str = "  ";
 const FOOTER_COLUMN_GAP: &str = "    ";
 const PERSISTENT_DASHBOARD_SOCKET: &str = "botctl-dashboard";
 const PERSISTENT_DASHBOARD_SESSION: &str = "botctl-dashboard";
+const VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const DETACHED_FALLBACK_INTERVAL: Duration = Duration::from_secs(3);
+const DETACHED_RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_RECONNECT_MIN: Duration = Duration::from_millis(250);
+const RUNTIME_RECONNECT_MAX: Duration = Duration::from_secs(5);
+const RUNTIME_STABLE_CONNECTION: Duration = Duration::from_secs(5);
 const TABLE_GAP: &str = "  ";
 const COMPACT_TABLE_GAP: &str = " ";
 const ICON_GAP: &str = " ";
@@ -90,6 +99,8 @@ pub fn run(args: DashboardArgs) -> AppResult<String> {
         args.history_lines,
         preferred_pane_id,
     )?;
+    app.runtime_cache.start(app.runtime.clone());
+    app.runtime_cache.wait_for_initial(Duration::from_secs(2));
     let loop_result = run_dashboard_loop(
         &mut terminal,
         &mut app,
@@ -133,7 +144,10 @@ struct DashboardApp {
     previous_agy_model: HashMap<String, String>,
     cpu_samples: HashMap<String, CpuSample>,
     yes_counts: HashMap<String, u32>,
-    window_names: HashMap<String, ManagedWindowName>,
+    title_synchronizer: WindowTitleWorker,
+    fallback_title_states: HashMap<String, TitlePaneState>,
+    runtime_cache: RuntimeSnapshotCache,
+    detached_fallback: DetachedFallbackWorker,
     message: String,
     last_refresh: Instant,
     restored_selection: SavedSelection,
@@ -158,6 +172,9 @@ struct PaneEntry {
     age: Duration,
     cook_duration: Duration,
     wait_duration: Option<Duration>,
+    runtime_duration_sample_at_unix_ms: Option<i64>,
+    runtime_cook_active: bool,
+    runtime_wait_active: bool,
     yes_count: u32,
     claude_session_id: Option<String>,
     focused_source: String,
@@ -178,6 +195,7 @@ struct ResourceUsage {
 struct CpuSample {
     at: Instant,
     total_ticks: u64,
+    process_start_ticks: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -193,24 +211,128 @@ struct ProcessSnapshot {
     rss_pages: u64,
 }
 
-/// A pre-built `ppid → children` map derived from one call to
-/// `process_snapshots_with_cmdlines()`. Implementing `ChildResolver` lets the
-/// dashboard thread a single per-refresh `/proc` scan into every
-/// `resolve_agy_session_for_pane` and `resolve_pi_session_for_pane` call
-/// without re-scanning `/proc` for each pane.
 struct ProcessTreeSnapshot {
+    snapshots: HashMap<u32, ProcessSnapshot>,
     children: HashMap<u32, Vec<u32>>,
+    uptime_secs: Option<f64>,
+    ticks_per_second: Option<u64>,
+    page_size: Option<u64>,
 }
 
 impl ProcessTreeSnapshot {
-    /// Build the children map from an already-computed `Vec<ProcessSnapshot>`.
-    /// Does **not** re-scan `/proc`.
     fn from_process_snapshots(snapshots: &[ProcessSnapshot]) -> Self {
+        Self::from_process_snapshots_with_system(
+            snapshots,
+            process_uptime_secs(),
+            ticks_per_second(),
+            page_size(),
+        )
+    }
+
+    fn from_process_snapshots_with_system(
+        snapshots: &[ProcessSnapshot],
+        uptime_secs: Option<f64>,
+        ticks_per_second: Option<u64>,
+        page_size: Option<u64>,
+    ) -> Self {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for snap in snapshots {
             children.entry(snap.ppid).or_default().push(snap.pid);
         }
-        Self { children }
+        Self {
+            snapshots: snapshots
+                .iter()
+                .cloned()
+                .map(|snapshot| (snapshot.pid, snapshot))
+                .collect(),
+            children,
+            uptime_secs,
+            ticks_per_second,
+            page_size,
+        }
+    }
+
+    fn scan() -> Self {
+        Self::scan_with(process_snapshots_with_cmdlines)
+    }
+
+    fn scan_with(scanner: impl FnOnce() -> Vec<ProcessSnapshot>) -> Self {
+        Self::from_process_snapshots(&scanner())
+    }
+
+    fn descendants(&self, root_pid: u32) -> Vec<&ProcessSnapshot> {
+        let mut descendants = Vec::new();
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            if let Some(snapshot) = self.snapshots.get(&pid) {
+                descendants.push(snapshot);
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        descendants
+    }
+
+    fn select_agent_process(
+        &self,
+        root_pid: u32,
+        current_command: &str,
+    ) -> Option<&ProcessSnapshot> {
+        let root = self.snapshots.get(&root_pid)?;
+        let descendants = self.descendants(root_pid);
+        let foreground_pgrp = (root.tpgid > 0).then_some(root.tpgid);
+
+        foreground_pgrp
+            .and_then(|pgrp| {
+                oldest_matching_process(descendants.iter().copied().filter(|snapshot| {
+                    snapshot.pgrp == pgrp && process_matches_command(snapshot, current_command)
+                }))
+            })
+            .or_else(|| {
+                oldest_matching_process(
+                    descendants
+                        .iter()
+                        .copied()
+                        .filter(|snapshot| process_matches_command(snapshot, current_command)),
+                )
+            })
+            .or_else(|| {
+                foreground_pgrp.and_then(|pgrp| {
+                    oldest_matching_process(
+                        descendants
+                            .iter()
+                            .copied()
+                            .filter(|snapshot| snapshot.pgrp == pgrp),
+                    )
+                })
+            })
+            .or(Some(root))
+    }
+
+    fn pane_age(&self, pane: &TmuxPane) -> Option<Duration> {
+        let root_pid = pane.pane_pid?;
+        let snapshot = self.select_agent_process(root_pid, &pane.current_command)?;
+        let uptime_secs = self.uptime_secs?;
+        let ticks_per_second = self.ticks_per_second? as f64;
+        let start_secs = snapshot.start_ticks as f64 / ticks_per_second;
+        (uptime_secs >= start_secs).then(|| Duration::from_secs_f64(uptime_secs - start_secs))
+    }
+
+    fn usage(&self, root_pid: u32) -> Option<ProcessTreeUsage> {
+        let root = self.snapshots.get(&root_pid)?;
+        let page_size = self.page_size?;
+        let mut cpu_ticks = 0u64;
+        let mut rss_pages = 0u64;
+        for snapshot in self.descendants(root_pid) {
+            cpu_ticks = cpu_ticks.saturating_add(snapshot.cpu_ticks);
+            rss_pages = rss_pages.saturating_add(snapshot.rss_pages);
+        }
+        Some(ProcessTreeUsage {
+            cpu_ticks,
+            memory_bytes: rss_pages.saturating_mul(page_size),
+            process_start_ticks: root.start_ticks,
+        })
     }
 }
 
@@ -224,6 +346,7 @@ impl ChildResolver for ProcessTreeSnapshot {
 struct ProcessTreeUsage {
     cpu_ticks: u64,
     memory_bytes: u64,
+    process_start_ticks: u64,
 }
 
 #[derive(Clone)]
@@ -260,10 +383,818 @@ struct ManagedWindowName {
     applied_name: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TitlePaneState {
+    pane: TmuxPane,
+    state: SessionState,
+    has_questions: bool,
+    yolo_enabled: bool,
+}
+
+struct WindowTitleSynchronizer {
+    client: TmuxClient,
+    managed: HashMap<String, ManagedWindowName>,
+    desired: HashMap<String, TitlePaneState>,
+    retry_at: Option<Instant>,
+}
+
+#[derive(Clone, Default)]
+struct TitleSyncRequest {
+    desired: HashMap<String, TitlePaneState>,
+    topology_complete: bool,
+}
+
+struct WindowTitleWorker {
+    request: Arc<Mutex<TitleSyncRequest>>,
+    wake_tx: mpsc::SyncSender<()>,
+    error_rx: mpsc::Receiver<AppError>,
+    restore_tx: mpsc::Sender<mpsc::SyncSender<AppResult<()>>>,
+    stop: Arc<AtomicBool>,
+}
+
+trait WindowTitleIo: Send + 'static {
+    fn apply(
+        &mut self,
+        desired: HashMap<String, TitlePaneState>,
+        topology_complete: bool,
+    ) -> AppResult<()>;
+    fn retry_pending(&self) -> bool;
+    fn restore(&mut self) -> AppResult<()>;
+}
+
+struct DetachedFallbackWorker {
+    request_tx: mpsc::SyncSender<()>,
+    result_rx: mpsc::Receiver<AppResult<HashMap<String, TitlePaneState>>>,
+    stop: Arc<AtomicBool>,
+}
+
+struct EmptyChildResolver;
+
+impl ChildResolver for EmptyChildResolver {
+    fn children_of(&self, _pid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardVisibility {
+    Unknown,
+    Visible,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DashboardLoopEffects {
+    draw: bool,
+    full_refresh: bool,
+    detached_fallback: bool,
+}
+
+fn dashboard_loop_effects(
+    visibility: DashboardVisibility,
+    draw_requested: bool,
+    full_refresh_due: bool,
+    detached_fallback_due: bool,
+) -> DashboardLoopEffects {
+    if visibility == DashboardVisibility::Detached {
+        DashboardLoopEffects {
+            draw: false,
+            full_refresh: false,
+            detached_fallback: detached_fallback_due,
+        }
+    } else {
+        DashboardLoopEffects {
+            draw: draw_requested,
+            full_refresh: full_refresh_due,
+            detached_fallback: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeCacheState {
+    snapshots: HashMap<String, RuntimePaneSnapshot>,
+    generation: u64,
+    subscription_boundary_supported: bool,
+}
+
+struct RuntimeSnapshotCache {
+    shared: Arc<Mutex<RuntimeCacheState>>,
+    wake_rx: mpsc::Receiver<()>,
+    wake_tx: mpsc::SyncSender<()>,
+    stop: Arc<AtomicBool>,
+    started: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReconnectBackoff {
+    next: Duration,
+}
+
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
+        Self {
+            next: RUNTIME_RECONNECT_MIN,
+        }
+    }
+}
+
+impl ReconnectBackoff {
+    fn failure_delay(&mut self, stable_connection: bool) -> Duration {
+        if stable_connection {
+            self.next = RUNTIME_RECONNECT_MIN;
+        }
+        let delay = self.next;
+        self.next = if self.next >= Duration::from_secs(2) {
+            RUNTIME_RECONNECT_MAX
+        } else {
+            self.next * 2
+        };
+        delay
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SavedSelection {
     pane_id: Option<String>,
     row_index: Option<usize>,
+}
+
+impl WindowTitleSynchronizer {
+    fn new(client: TmuxClient) -> Self {
+        Self {
+            client,
+            managed: HashMap::new(),
+            desired: HashMap::new(),
+            retry_at: None,
+        }
+    }
+
+    fn publish(&mut self, panes: impl IntoIterator<Item = TitlePaneState>) {
+        self.desired = panes
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id.clone(), pane))
+            .collect();
+    }
+
+    fn synchronize(&mut self, topology_complete: bool) -> AppResult<()> {
+        if self
+            .retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return Ok(());
+        }
+
+        let windows = grouped_title_states(&self.desired);
+        let active_window_ids = windows
+            .keys()
+            .map(|(_, window_id)| window_id.clone())
+            .collect::<HashSet<_>>();
+
+        for ((session_name, window_id), panes) in windows {
+            let first = panes[0];
+            let prefix = panes
+                .iter()
+                .map(|pane| pane_window_prefix(pane.state, pane.has_questions, pane.yolo_enabled))
+                .collect::<String>();
+            let managed = self
+                .managed
+                .entry(window_id)
+                .or_insert_with(|| ManagedWindowName {
+                    target: format!("{session_name}:{}", first.pane.window_index),
+                    base_name: derive_base_window_name(&first.pane.window_name, &prefix),
+                    applied_name: None,
+                });
+            managed.target = format!("{session_name}:{}", first.pane.window_index);
+            managed.base_name = current_base_window_name(
+                &first.pane.window_name,
+                managed.applied_name.as_deref(),
+                &managed.base_name,
+                &prefix,
+            );
+            let target_name = format!("{prefix} {}", managed.base_name);
+            if managed.applied_name.as_deref() != Some(target_name.as_str()) {
+                if let Err(error) = self.client.rename_window(&managed.target, &target_name) {
+                    self.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                    return Err(error);
+                }
+                managed.applied_name = Some(target_name);
+            }
+        }
+
+        if topology_complete {
+            let windows = match self.client.list_windows() {
+                Ok(windows) => windows,
+                Err(error) => {
+                    self.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                    return Err(error);
+                }
+            };
+            let existing_window_ids = windows
+                .iter()
+                .map(|window| window.window_id.clone())
+                .collect::<HashSet<_>>();
+            let stale_to_restore = prune_missing_stale_managed_windows(
+                &mut self.managed,
+                &active_window_ids,
+                &existing_window_ids,
+            );
+            for window_id in stale_to_restore {
+                if let Some(managed) = self.managed.get(&window_id)
+                    && let Err(error) = self
+                        .client
+                        .rename_window(&managed.target, &managed.base_name)
+                {
+                    self.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                    return Err(error);
+                }
+                self.managed.remove(&window_id);
+            }
+            for window in windows {
+                if active_window_ids.contains(&window.window_id) {
+                    continue;
+                }
+                let cleaned_name = cleanup_dashboard_window_name(&window);
+                if cleaned_name != window.window_name
+                    && let Err(error) = self
+                        .client
+                        .rename_window(&window_target(&window), &cleaned_name)
+                {
+                    self.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                    return Err(error);
+                }
+            }
+        }
+        self.retry_at = None;
+        Ok(())
+    }
+
+    fn restore(&mut self) -> AppResult<()> {
+        let mut first_error = None;
+        for managed in self.managed.drain().map(|(_, managed)| managed) {
+            if let Err(error) = self
+                .client
+                .rename_window(&managed.target, &managed.base_name)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn retry_pending(&self) -> bool {
+        self.retry_at.is_some()
+    }
+}
+
+impl WindowTitleIo for WindowTitleSynchronizer {
+    fn apply(
+        &mut self,
+        desired: HashMap<String, TitlePaneState>,
+        topology_complete: bool,
+    ) -> AppResult<()> {
+        self.publish(desired.into_values());
+        self.synchronize(topology_complete)
+    }
+
+    fn retry_pending(&self) -> bool {
+        self.retry_pending()
+    }
+
+    fn restore(&mut self) -> AppResult<()> {
+        self.restore()
+    }
+}
+
+impl WindowTitleWorker {
+    fn new(client: TmuxClient) -> Self {
+        Self::start_with(WindowTitleSynchronizer::new(client))
+    }
+
+    fn start_with(mut io: impl WindowTitleIo) -> Self {
+        let request = Arc::new(Mutex::new(TitleSyncRequest::default()));
+        let worker_request = Arc::clone(&request);
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let (error_tx, error_rx) = mpsc::sync_channel(1);
+        let (restore_tx, restore_rx) = mpsc::channel::<mpsc::SyncSender<AppResult<()>>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                if let Ok(reply) = restore_rx.try_recv() {
+                    let _ = reply.send(io.restore());
+                    worker_stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let woke = match wake_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if !woke && !io.retry_pending() {
+                    continue;
+                }
+                let request = {
+                    let mut request = worker_request
+                        .lock()
+                        .expect("window title request lock poisoned");
+                    let snapshot = request.clone();
+                    request.topology_complete = false;
+                    snapshot
+                };
+                if let Err(error) = io.apply(request.desired, request.topology_complete) {
+                    let _ = error_tx.try_send(error);
+                }
+            }
+        });
+        Self {
+            request,
+            wake_tx,
+            error_rx,
+            restore_tx,
+            stop,
+        }
+    }
+
+    fn publish(&self, panes: impl IntoIterator<Item = TitlePaneState>, topology_complete: bool) {
+        let mut request = self
+            .request
+            .lock()
+            .expect("window title request lock poisoned");
+        request.desired = panes
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id.clone(), pane))
+            .collect();
+        request.topology_complete |= topology_complete;
+        drop(request);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    fn drain_error(&self) -> Option<AppError> {
+        let mut latest = None;
+        while let Ok(error) = self.error_rx.try_recv() {
+            latest = Some(error);
+        }
+        latest
+    }
+
+    fn restore(&self) -> AppResult<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.restore_tx
+            .send(reply_tx)
+            .map_err(|_| AppError::new("window title synchronizer stopped before restoration"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| AppError::new("window title synchronizer stopped during restoration"))?
+    }
+}
+
+impl Drop for WindowTitleWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn prune_missing_stale_managed_windows(
+    managed: &mut HashMap<String, ManagedWindowName>,
+    active_window_ids: &HashSet<String>,
+    existing_window_ids: &HashSet<String>,
+) -> Vec<String> {
+    let stale = managed
+        .keys()
+        .filter(|window_id| !active_window_ids.contains(*window_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut existing_stale = Vec::new();
+    for window_id in stale {
+        if existing_window_ids.contains(&window_id) {
+            existing_stale.push(window_id);
+        } else {
+            managed.remove(&window_id);
+        }
+    }
+    existing_stale
+}
+
+fn grouped_title_states(
+    states: &HashMap<String, TitlePaneState>,
+) -> BTreeMap<(String, String), Vec<&TitlePaneState>> {
+    let mut windows = BTreeMap::<(String, String), Vec<&TitlePaneState>>::new();
+    for pane in states.values() {
+        windows
+            .entry((pane.pane.session_name.clone(), pane.pane.window_id.clone()))
+            .or_default()
+            .push(pane);
+    }
+    for panes in windows.values_mut() {
+        panes.sort_by_key(|pane| pane.pane.pane_index);
+    }
+    windows
+}
+
+impl RuntimeSnapshotCache {
+    fn new() -> Self {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        Self {
+            shared: Arc::new(Mutex::new(RuntimeCacheState::default())),
+            wake_rx,
+            wake_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            started: false,
+        }
+    }
+
+    fn start(&mut self, client: RuntimeClient) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        let shared = Arc::clone(&self.shared);
+        let wake = self.wake_tx.clone();
+        let stop = Arc::clone(&self.stop);
+        let poll_client = client.clone();
+        let poll_shared = Arc::clone(&shared);
+        let poll_wake = wake.clone();
+        let poll_stop = Arc::clone(&stop);
+        thread::spawn(move || runtime_cache_worker(client, shared, wake, stop));
+        thread::spawn(move || {
+            runtime_poll_fallback_worker(poll_client, poll_shared, poll_wake, poll_stop)
+        });
+    }
+
+    fn snapshots(&self) -> Vec<RuntimePaneSnapshot> {
+        self.shared
+            .lock()
+            .expect("runtime dashboard cache lock poisoned")
+            .snapshots
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn drain_wake(&self) -> bool {
+        let mut changed = false;
+        while self.wake_rx.try_recv().is_ok() {
+            changed = true;
+        }
+        changed
+    }
+
+    fn wait_for_initial(&self, timeout: Duration) {
+        let _ = self.wake_rx.recv_timeout(timeout);
+    }
+}
+
+fn runtime_poll_fallback_worker(
+    client: RuntimeClient,
+    shared: Arc<Mutex<RuntimeCacheState>>,
+    wake: mpsc::SyncSender<()>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        if poll_runtime_cache_once(&client, &shared).unwrap_or(false) {
+            let _ = wake.try_send(());
+        }
+        let sleep_until = Instant::now() + DETACHED_RUNTIME_POLL_INTERVAL;
+        while !stop.load(Ordering::Relaxed) && Instant::now() < sleep_until {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn poll_runtime_cache_once(
+    client: &RuntimeClient,
+    shared: &Mutex<RuntimeCacheState>,
+) -> AppResult<bool> {
+    if shared
+        .lock()
+        .expect("runtime dashboard cache lock poisoned")
+        .subscription_boundary_supported
+    {
+        return Ok(false);
+    }
+    let snapshots = client.list_panes(None, None)?;
+    Ok(replace_runtime_poll_cache(shared, snapshots))
+}
+
+impl Drop for RuntimeSnapshotCache {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn runtime_cache_worker(
+    client: RuntimeClient,
+    shared: Arc<Mutex<RuntimeCacheState>>,
+    wake: mpsc::SyncSender<()>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut backoff = ReconnectBackoff::default();
+    while !stop.load(Ordering::Relaxed) {
+        set_runtime_subscription_capability(&shared, false);
+        let (stable_connection, should_retry) = match bootstrap_runtime_subscription(&client) {
+            Ok((mut subscription, snapshots, boundary_revision)) => {
+                replace_runtime_cache(&shared, snapshots);
+                set_runtime_subscription_capability(&shared, true);
+                let _ = wake.try_send(());
+                let stable = consume_runtime_subscription(
+                    &mut subscription,
+                    boundary_revision,
+                    &shared,
+                    &wake,
+                    &stop,
+                );
+                set_runtime_subscription_capability(&shared, false);
+                (stable, !stop.load(Ordering::Relaxed))
+            }
+            Err(_) => (false, true),
+        };
+        if !should_retry || stop.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(backoff.failure_delay(stable_connection));
+    }
+}
+
+fn replace_runtime_cache(shared: &Mutex<RuntimeCacheState>, snapshots: Vec<RuntimePaneSnapshot>) {
+    let mut cache = shared
+        .lock()
+        .expect("runtime dashboard cache lock poisoned");
+    cache.snapshots = snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.pane.pane_id.clone(), snapshot))
+        .collect();
+    cache.generation = cache.generation.saturating_add(1);
+}
+
+fn replace_runtime_poll_cache(
+    shared: &Mutex<RuntimeCacheState>,
+    snapshots: Vec<RuntimePaneSnapshot>,
+) -> bool {
+    let mut cache = shared
+        .lock()
+        .expect("runtime dashboard cache lock poisoned");
+    if cache.subscription_boundary_supported {
+        return false;
+    }
+    cache.snapshots = snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.pane.pane_id.clone(), snapshot))
+        .collect();
+    cache.generation = cache.generation.saturating_add(1);
+    true
+}
+
+fn set_runtime_subscription_capability(
+    shared: &Mutex<RuntimeCacheState>,
+    boundary_supported: bool,
+) {
+    shared
+        .lock()
+        .expect("runtime dashboard cache lock poisoned")
+        .subscription_boundary_supported = boundary_supported;
+}
+
+fn bootstrap_runtime_subscription(
+    client: &RuntimeClient,
+) -> AppResult<(RuntimeSubscription, Vec<RuntimePaneSnapshot>, u64)> {
+    let mut subscription = client.subscribe()?;
+    let snapshots = subscription.bootstrap()?.into_values().collect::<Vec<_>>();
+    let boundary_revision = snapshots
+        .iter()
+        .map(|snapshot| snapshot.revision)
+        .max()
+        .unwrap_or_default();
+    Ok((subscription, snapshots, boundary_revision))
+}
+
+fn consume_runtime_subscription(
+    subscription: &mut RuntimeSubscription,
+    mut last_revision: u64,
+    shared: &Arc<Mutex<RuntimeCacheState>>,
+    wake: &mpsc::SyncSender<()>,
+    stop: &AtomicBool,
+) -> bool {
+    let connected_at = Instant::now();
+    let mut live_event_seen = false;
+    while !stop.load(Ordering::Relaxed) {
+        let event = match subscription.recv() {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(_) => {
+                return subscription_connection_is_stable(live_event_seen, connected_at.elapsed());
+            }
+        };
+        live_event_seen = true;
+        if !advance_runtime_revision(&mut last_revision, event.revision) {
+            continue;
+        }
+        if apply_runtime_event(shared, event) {
+            let _ = wake.try_send(());
+        }
+    }
+    subscription_connection_is_stable(live_event_seen, connected_at.elapsed())
+}
+
+fn subscription_connection_is_stable(live_event_seen: bool, connected_for: Duration) -> bool {
+    live_event_seen || connected_for >= RUNTIME_STABLE_CONNECTION
+}
+
+fn advance_runtime_revision(last_revision: &mut u64, event_revision: u64) -> bool {
+    if event_revision <= *last_revision {
+        return false;
+    }
+    *last_revision = event_revision;
+    true
+}
+
+fn apply_runtime_event(shared: &Mutex<RuntimeCacheState>, event: RuntimeEvent) -> bool {
+    let mut cache = shared
+        .lock()
+        .expect("runtime dashboard cache lock poisoned");
+    let changed = if event.kind == "pane-removed" {
+        event
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| cache.snapshots.remove(pane_id))
+            .is_some()
+    } else if let Some(snapshot) = event.snapshot {
+        cache
+            .snapshots
+            .insert(snapshot.pane.pane_id.clone(), snapshot);
+        true
+    } else {
+        false
+    };
+    if changed {
+        cache.generation = cache.generation.saturating_add(1);
+    }
+    changed
+}
+
+impl DetachedFallbackWorker {
+    fn start(
+        client: TmuxClient,
+        runtime_cache: Arc<Mutex<RuntimeCacheState>>,
+        state_dir: PathBuf,
+        history_lines: usize,
+    ) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match request_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) => {
+                        let result = detached_fallback_title_pass(
+                            &client,
+                            &runtime_cache,
+                            &state_dir,
+                            history_lines,
+                        );
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        Self {
+            request_tx,
+            result_rx,
+            stop,
+        }
+    }
+
+    fn request(&self) -> bool {
+        enqueue_detached_fallback(&self.request_tx)
+    }
+
+    fn try_result(&self) -> Option<AppResult<HashMap<String, TitlePaneState>>> {
+        self.result_rx.try_recv().ok()
+    }
+}
+
+fn enqueue_detached_fallback(request_tx: &mpsc::SyncSender<()>) -> bool {
+    request_tx.try_send(()).is_ok()
+}
+
+impl Drop for DetachedFallbackWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn detached_fallback_title_pass(
+    client: &TmuxClient,
+    runtime_cache: &Mutex<RuntimeCacheState>,
+    state_dir: &Path,
+    history_lines: usize,
+) -> AppResult<HashMap<String, TitlePaneState>> {
+    let runtime_ids = runtime_cache
+        .lock()
+        .expect("runtime dashboard cache lock poisoned")
+        .snapshots
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let panes = client
+        .list_panes_strict()?
+        .into_iter()
+        .filter(|pane| {
+            !runtime_ids.contains(&pane.pane_id) && is_dashboard_fallback_candidate(pane)
+        })
+        .collect::<Vec<_>>();
+    let process_tree = fallback_process_tree_with(&panes, ProcessTreeSnapshot::scan);
+    let empty_resolver = EmptyChildResolver;
+    let resolver: &dyn ChildResolver = process_tree
+        .as_ref()
+        .map(|tree| tree as &dyn ChildResolver)
+        .unwrap_or(&empty_resolver);
+    let mut next = HashMap::new();
+
+    for pane in panes {
+        let frame = client.capture_pane_ansi(&pane.pane_id, history_lines)?;
+        let frame = prepare_frame_for_classification(&frame);
+        let classification = Classifier.classify(&pane.pane_id, &focused_dashboard_frame(&frame));
+        let opencode_state = resolve_opencode_session_for_pane(&pane).map(|session| session.state);
+        let agy_session = if is_agy_pane(&pane) {
+            resolve_agy_session_for_pane(&pane, &frame, resolver)?
+        } else {
+            None
+        };
+        if !is_dashboard_visible_non_runtime_pane_with(
+            &pane,
+            &frame,
+            &classification.signals,
+            agy_session.as_ref(),
+            resolver,
+        )? {
+            continue;
+        }
+        let state = opencode_state.unwrap_or(classification.state);
+        let source = pane_source_for_non_runtime_pane_with(
+            &pane,
+            &frame,
+            &classification.signals,
+            agy_session,
+            resolver,
+        )?;
+        let workspace =
+            crate::storage::resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
+        let codex_session_id = if matches!(source, PaneSource::Codex) {
+            resolve_codex_session_id_for_pane(&pane)?
+        } else {
+            None
+        };
+        let session_key = match &source {
+            PaneSource::Claude => None,
+            PaneSource::Codex => codex_session_id.as_deref(),
+            PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
+            PaneSource::Pi { session_id } => Some(session_id.as_str()),
+            PaneSource::Agy { session_id } => session_id.as_deref(),
+        };
+        sync_tmux_runtime_state(
+            state_dir,
+            &workspace.id,
+            &pane,
+            state.as_str(),
+            is_waiting_state(state),
+            is_cooking_state(state),
+            session_key,
+        )?;
+        next.insert(
+            pane.pane_id.clone(),
+            TitlePaneState {
+                pane,
+                state,
+                has_questions: classification.has_questions,
+                yolo_enabled: false,
+            },
+        );
+    }
+
+    Ok(next)
+}
+
+fn fallback_process_tree_with(
+    panes: &[TmuxPane],
+    scanner: impl FnOnce() -> ProcessTreeSnapshot,
+) -> Option<ProcessTreeSnapshot> {
+    panes
+        .iter()
+        .any(|pane| {
+            pane.current_command.eq_ignore_ascii_case("pi")
+                || pane.current_command.eq_ignore_ascii_case("agy")
+        })
+        .then(scanner)
 }
 
 impl DashboardApp {
@@ -277,6 +1208,14 @@ impl DashboardApp {
         preferred_pane_id: Option<String>,
     ) -> AppResult<Self> {
         let restored_selection = load_saved_selection(&state_dir)?;
+        let title_synchronizer = WindowTitleWorker::new(client.clone());
+        let runtime_cache = RuntimeSnapshotCache::new();
+        let detached_fallback = DetachedFallbackWorker::start(
+            client.clone(),
+            Arc::clone(&runtime_cache.shared),
+            state_dir.clone(),
+            history_lines,
+        );
         Ok(Self {
             client,
             host_client,
@@ -293,7 +1232,10 @@ impl DashboardApp {
             previous_agy_model: HashMap::new(),
             cpu_samples: HashMap::new(),
             yes_counts: HashMap::new(),
-            window_names: HashMap::new(),
+            title_synchronizer,
+            fallback_title_states: HashMap::new(),
+            runtime_cache,
+            detached_fallback,
             message: String::new(),
             last_refresh: Instant::now() - Duration::from_millis(poll_ms),
             restored_selection,
@@ -307,10 +1249,10 @@ impl DashboardApp {
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
         let mut next_frames = HashMap::new();
-        let process_age_snapshots = process_snapshots_with_cmdlines();
-        let process_tree = ProcessTreeSnapshot::from_process_snapshots(&process_age_snapshots);
+        let process_tree = ProcessTreeSnapshot::scan();
+        let mut fallback_title_states = HashMap::new();
 
-        for snapshot in self.runtime.list_panes(None, None)? {
+        for snapshot in self.runtime_cache.snapshots() {
             let pane = snapshot.pane.clone();
             seen_pane_ids.insert(pane.pane_id.clone());
             self.first_seen.entry(pane.pane_id.clone()).or_insert(now);
@@ -357,35 +1299,18 @@ impl DashboardApp {
                 .entry(pane.current_path.clone())
                 .or_insert_with(|| git_branch_for_path(&pane.current_path))
                 .clone();
-            let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
+            let age = process_tree.pane_age(&pane).unwrap_or_else(|| {
                 self.first_seen
                     .get(&pane.pane_id)
                     .map(Instant::elapsed)
                     .unwrap_or_default()
             });
             next_frames.insert(pane.pane_id.clone(), snapshot.raw_source.clone());
-            let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
-            let codex_session_id = if matches!(source, PaneSource::Codex) {
-                resolve_codex_session_id_for_pane(&pane)?
-            } else {
-                None
-            };
-            let session_key = match &source {
-                PaneSource::Claude => snapshot.claude_session_id.as_deref(),
-                PaneSource::Codex => codex_session_id.as_deref(),
-                PaneSource::OpenCode { session_id, .. } => session_id.as_deref(),
-                PaneSource::Pi { session_id } => Some(session_id.as_str()),
-                PaneSource::Agy { session_id } => session_id.as_deref(),
-            };
-            let runtime_durations = sync_tmux_runtime_state(
-                &self.state_dir,
-                &workspace.id,
-                &pane,
-                state.as_str(),
-                is_waiting_state(state),
-                is_cooking_state(state),
-                session_key,
-            )?;
+            let resource_usage =
+                self.resource_usage_for_pane(&process_tree, &pane.pane_id, pane.pane_pid, now);
+            let cook_duration =
+                Duration::from_millis(snapshot.cook_duration_ms.unwrap_or_default());
+            let wait_duration = snapshot.wait_duration_ms.map(Duration::from_millis);
             let yes_count = self
                 .yes_counts
                 .get(&yes_count_key(
@@ -411,8 +1336,12 @@ impl DashboardApp {
                 yolo_effective: snapshot.actual_yolo_enabled,
                 yolo_stop_reason: snapshot.last_stop_reason.clone(),
                 age,
-                cook_duration: runtime_durations.cook_duration.unwrap_or_default(),
-                wait_duration: runtime_durations.wait_duration,
+                cook_duration,
+                wait_duration,
+                runtime_duration_sample_at_unix_ms: Some(snapshot.updated_at_unix_ms),
+                runtime_cook_active: snapshot.cook_duration_ms.is_some()
+                    && is_cooking_state(snapshot.classification.state),
+                runtime_wait_active: is_waiting_state(snapshot.classification.state),
                 yes_count,
                 claude_session_id: snapshot.claude_session_id.clone(),
                 focused_source: snapshot.focused_source.clone(),
@@ -421,7 +1350,7 @@ impl DashboardApp {
             });
         }
 
-        for pane in self.client.list_panes()? {
+        for pane in self.client.list_panes_strict()? {
             if seen_pane_ids.contains(&pane.pane_id) || !is_dashboard_fallback_candidate(&pane) {
                 continue;
             }
@@ -475,14 +1404,15 @@ impl DashboardApp {
                 .entry(pane.current_path.clone())
                 .or_insert_with(|| git_branch_for_path(&pane.current_path))
                 .clone();
-            let age = pane_process_age(&pane, &process_age_snapshots).unwrap_or_else(|| {
+            let age = process_tree.pane_age(&pane).unwrap_or_else(|| {
                 self.first_seen
                     .get(&pane.pane_id)
                     .map(Instant::elapsed)
                     .unwrap_or_default()
             });
             next_frames.insert(pane.pane_id.clone(), frame.clone());
-            let resource_usage = self.resource_usage_for_pane(&pane.pane_id, pane.pane_pid, now);
+            let resource_usage =
+                self.resource_usage_for_pane(&process_tree, &pane.pane_id, pane.pane_pid, now);
             let codex_session_id = if matches!(source, PaneSource::Codex) {
                 resolve_codex_session_id_for_pane(&pane)?
             } else {
@@ -495,16 +1425,26 @@ impl DashboardApp {
                 PaneSource::Pi { session_id } => Some(session_id.as_str()),
                 PaneSource::Agy { session_id } => session_id.as_deref(),
             };
+            let duration_state = opencode_state.unwrap_or(classification.state);
             let runtime_durations = sync_tmux_runtime_state(
                 &self.state_dir,
                 &workspace.id,
                 &pane,
-                state.as_str(),
-                is_waiting_state(state),
-                is_cooking_state(state),
+                duration_state.as_str(),
+                is_waiting_state(duration_state),
+                is_cooking_state(duration_state),
                 session_key,
             )?;
             let agy_model = self.resolve_agy_model_sticky(&pane, &frame);
+            fallback_title_states.insert(
+                pane.pane_id.clone(),
+                TitlePaneState {
+                    pane: pane.clone(),
+                    state: duration_state,
+                    has_questions: classification.has_questions,
+                    yolo_enabled: false,
+                },
+            );
 
             panes.push(PaneEntry {
                 pane,
@@ -523,6 +1463,9 @@ impl DashboardApp {
                 age,
                 cook_duration: runtime_durations.cook_duration.unwrap_or_default(),
                 wait_duration: runtime_durations.wait_duration,
+                runtime_duration_sample_at_unix_ms: None,
+                runtime_cook_active: false,
+                runtime_wait_active: false,
                 yes_count: 0,
                 claude_session_id: None,
                 focused_source: focused_dashboard_frame(&frame),
@@ -538,6 +1481,7 @@ impl DashboardApp {
         self.previous_frames = next_frames;
         self.previous_agy_model
             .retain(|pane_id, _| seen_pane_ids.contains(pane_id));
+        self.fallback_title_states = fallback_title_states;
 
         let first_window_by_workspace = panes.iter().fold(
             HashMap::<String, u32>::new(),
@@ -574,7 +1518,7 @@ impl DashboardApp {
 
         self.panes = panes;
         self.rebuild_rows();
-        self.apply_window_name_prefixes()?;
+        self.synchronize_titles(true)?;
         self.last_refresh = Instant::now();
         Ok(())
     }
@@ -610,46 +1554,43 @@ impl DashboardApp {
             return;
         }
 
-        if let Some(pane_id) = self.preferred_pane_id.take() {
-            if let Some(index) = self
+        if let Some(pane_id) = self.preferred_pane_id.take()
+            && let Some(index) = self
                 .rows
                 .iter()
                 .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == &pane_id))
-            {
-                self.selection = index;
-                self.selected_pane_id = Some(pane_id);
-                return;
-            }
+        {
+            self.selection = index;
+            self.selected_pane_id = Some(pane_id);
+            return;
         }
 
-        if let Some(pane_id) = previous {
-            if let Some(index) = self
+        if let Some(pane_id) = previous
+            && let Some(index) = self
                 .rows
                 .iter()
                 .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == &pane_id))
-            {
-                self.selection = index;
-                self.selected_pane_id = Some(pane_id);
-                return;
-            }
+        {
+            self.selection = index;
+            self.selected_pane_id = Some(pane_id);
+            return;
         }
 
-        if let Some(pane_id) = self.restored_selection.pane_id.as_ref() {
-            if let Some(index) = self
+        if let Some(pane_id) = self.restored_selection.pane_id.as_ref()
+            && let Some(index) = self
                 .rows
                 .iter()
                 .position(|row| matches!(row, RowItem::Pane { pane_id: row_pane_id } if row_pane_id == pane_id))
-            {
-                self.set_selection(index);
-                return;
-            }
+        {
+            self.set_selection(index);
+            return;
         }
 
-        if let Some(index) = self.restored_selection.row_index {
-            if let Some(index) = self.nearest_selectable_row(index) {
-                self.set_selection(index);
-                return;
-            }
+        if let Some(index) = self.restored_selection.row_index
+            && let Some(index) = self.nearest_selectable_row(index)
+        {
+            self.set_selection(index);
+            return;
         }
 
         self.selection = self
@@ -707,103 +1648,50 @@ impl DashboardApp {
             .unwrap_or(false)
     }
 
-    fn apply_window_name_prefixes(&mut self) -> AppResult<()> {
-        let mut windows = BTreeMap::<(String, String), Vec<&PaneEntry>>::new();
-        for pane in &self.panes {
-            windows
-                .entry((pane.pane.session_name.clone(), pane.pane.window_id.clone()))
-                .or_default()
-                .push(pane);
-        }
-
-        let active_window_ids = windows
-            .keys()
-            .map(|(_, window_id)| window_id.clone())
-            .collect::<HashSet<_>>();
-
-        for ((session_name, window_id), mut panes) in windows {
-            panes.sort_by_key(|pane| pane.pane.pane_index);
-            let first = panes[0];
-            let prefix = panes
-                .iter()
-                .map(|pane| pane_window_prefix(pane.state, pane.has_questions, pane.yolo_enabled))
-                .collect::<String>();
-            let managed = self
-                .window_names
-                .entry(window_id.clone())
-                .or_insert_with(|| ManagedWindowName {
-                    target: format!("{session_name}:{}", first.pane.window_index),
-                    base_name: derive_base_window_name(&first.pane.window_name, &prefix),
-                    applied_name: None,
-                });
-            managed.base_name = current_base_window_name(
-                &first.pane.window_name,
-                managed.applied_name.as_deref(),
-                &managed.base_name,
-                &prefix,
-            );
-            let target_name = format!("{prefix} {}", managed.base_name);
-            if managed.applied_name.as_deref() != Some(target_name.as_str()) {
-                self.client.rename_window(&managed.target, &target_name)?;
-                managed.applied_name = Some(target_name);
-            }
-        }
-
-        let stale = self
-            .window_names
-            .keys()
-            .filter(|window_id| !active_window_ids.contains(*window_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        for window_id in stale {
-            if let Some(managed) = self.window_names.remove(&window_id) {
-                self.client
-                    .rename_window(&managed.target, &managed.base_name)?;
-            }
-        }
-
-        self.cleanup_stale_window_name_prefixes(&active_window_ids)?;
-
-        Ok(())
-    }
-
-    fn cleanup_stale_window_name_prefixes(
-        &self,
-        active_window_ids: &HashSet<String>,
-    ) -> AppResult<()> {
-        for window in self.client.list_windows()? {
-            if active_window_ids.contains(&window.window_id) {
-                continue;
-            }
-            let cleaned_name = cleanup_dashboard_window_name(&window);
-            if cleaned_name != window.window_name {
-                self.client
-                    .rename_window(&window_target(&window), &cleaned_name)?;
-            }
-        }
-        Ok(())
-    }
-
     fn restore_window_names(&mut self) -> AppResult<()> {
-        let mut windows = BTreeMap::new();
-        for pane in &self.panes {
-            windows.insert(
-                pane.pane.window_id.clone(),
-                (pane.pane.session_name.clone(), pane.pane.window_index),
-            );
+        self.title_synchronizer.restore()
+    }
+
+    fn drain_title_error(&mut self) {
+        if let Some(error) = self.title_synchronizer.drain_error() {
+            self.message = format!("window title update pending: {error}");
         }
-        for (window_id, managed) in self.window_names.drain() {
-            if let Some((session_name, window_index)) = windows.get(&window_id) {
-                self.client.rename_window(
-                    &format!("{session_name}:{window_index}"),
-                    &managed.base_name,
-                )?;
-            } else {
-                self.client
-                    .rename_window(&managed.target, &managed.base_name)?;
-            }
-        }
+    }
+
+    fn synchronize_titles(&mut self, topology_complete: bool) -> AppResult<()> {
+        let runtime_snapshots = self.runtime_cache.snapshots();
+        let runtime_ids = runtime_snapshots
+            .iter()
+            .map(|snapshot| snapshot.pane.pane_id.clone())
+            .collect::<HashSet<_>>();
+        let mut states = runtime_snapshots
+            .into_iter()
+            .map(|snapshot| TitlePaneState {
+                pane: snapshot.pane,
+                state: snapshot.classification.state,
+                has_questions: snapshot.classification.has_questions,
+                yolo_enabled: snapshot.desired_yolo_enabled,
+            })
+            .collect::<Vec<_>>();
+        states.extend(
+            self.fallback_title_states
+                .values()
+                .filter(|state| !runtime_ids.contains(&state.pane.pane_id))
+                .cloned(),
+        );
+        self.title_synchronizer.publish(states, topology_complete);
         Ok(())
+    }
+
+    fn clear_detached_resource_state(&mut self) {
+        self.cpu_samples.clear();
+    }
+
+    fn finish_reattach_attempt(&mut self, succeeded: bool) -> bool {
+        if !succeeded {
+            self.clear_detached_resource_state();
+        }
+        succeeded
     }
 
     fn selected_pane(&self) -> Option<&PaneEntry> {
@@ -896,6 +1784,7 @@ impl DashboardApp {
 
     fn resource_usage_for_pane(
         &mut self,
+        process_tree: &ProcessTreeSnapshot,
         pane_id: &str,
         pid: Option<u32>,
         now: Instant,
@@ -904,7 +1793,7 @@ impl DashboardApp {
             self.cpu_samples.remove(pane_id);
             return ResourceUsage::default();
         };
-        let Some(total) = process_tree_usage(pid) else {
+        let Some(total) = process_tree.usage(pid) else {
             self.cpu_samples.remove(pane_id);
             return ResourceUsage::default();
         };
@@ -912,11 +1801,14 @@ impl DashboardApp {
         let sample = CpuSample {
             at: now,
             total_ticks: total.cpu_ticks,
+            process_start_ticks: total.process_start_ticks,
         };
         let cpu_percent = self
             .cpu_samples
             .insert(pane_id.to_string(), sample)
-            .and_then(|previous| cpu_percent_between(previous, sample));
+            .and_then(|previous| {
+                cpu_percent_between(previous, sample, process_tree.ticks_per_second?)
+            });
 
         ResourceUsage {
             cpu_percent,
@@ -998,6 +1890,30 @@ impl DashboardApp {
 impl PaneEntry {
     fn supports_yolo(&self) -> bool {
         matches!(self.source, PaneSource::Claude | PaneSource::Codex)
+    }
+
+    fn displayed_cook_duration(&self) -> Duration {
+        self.runtime_duration_sample_at_unix_ms
+            .and_then(|sampled_at| {
+                runtime_snapshot_duration(
+                    Some(self.cook_duration.as_millis().min(u64::MAX as u128) as u64),
+                    sampled_at,
+                    self.runtime_cook_active,
+                )
+            })
+            .unwrap_or(self.cook_duration)
+    }
+
+    fn displayed_wait_duration(&self) -> Option<Duration> {
+        match self.runtime_duration_sample_at_unix_ms {
+            Some(sampled_at) => runtime_snapshot_duration(
+                self.wait_duration
+                    .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                sampled_at,
+                self.runtime_wait_active,
+            ),
+            None => self.wait_duration,
+        }
     }
 }
 
@@ -1085,13 +2001,88 @@ fn run_dashboard_loop(
     persistent: bool,
 ) -> AppResult<Option<TmuxPane>> {
     app.refresh()?;
+    let persistent_child = std::env::var_os("BOTCTL_DASHBOARD_PERSISTENT_CHILD").is_some();
+    let mut visibility = if persistent_child {
+        DashboardVisibility::Unknown
+    } else {
+        DashboardVisibility::Visible
+    };
+    let mut last_visibility_probe = Instant::now() - VISIBILITY_PROBE_INTERVAL;
+    let mut last_detached_fallback = Instant::now() - DETACHED_FALLBACK_INTERVAL;
+    let mut draw_needed = true;
+    let mut last_clock_second = unix_time_ms() / 1000;
+
     loop {
-        app.apply_requested_pane_selection()?;
-        terminal.draw(|frame| render_dashboard(frame, app))?;
+        app.drain_title_error();
+        let runtime_changed = app.runtime_cache.drain_wake();
+        if runtime_changed {
+            app.synchronize_titles(false)?;
+        }
+
+        if persistent_child && last_visibility_probe.elapsed() >= VISIBILITY_PROBE_INTERVAL {
+            last_visibility_probe = Instant::now();
+            let probed = visibility_from_attached_count(
+                app.host_client
+                    .session_attached_count(PERSISTENT_DASHBOARD_SESSION)
+                    .map_err(|_| ()),
+            );
+            match (visibility, probed) {
+                (
+                    DashboardVisibility::Visible | DashboardVisibility::Unknown,
+                    DashboardVisibility::Detached,
+                ) => {
+                    app.persist_selection()?;
+                    app.clear_detached_resource_state();
+                    visibility = DashboardVisibility::Detached;
+                    draw_needed = false;
+                }
+                (DashboardVisibility::Detached, DashboardVisibility::Visible) => {
+                    let refreshed = app.refresh().is_ok();
+                    if app.finish_reattach_attempt(refreshed) {
+                        visibility = DashboardVisibility::Visible;
+                        draw_needed = true;
+                    }
+                }
+                (_, next) => visibility = next,
+            }
+        }
+
+        while let Some(result) = app.detached_fallback.try_result() {
+            if visibility == DashboardVisibility::Detached
+                && let Ok(states) = result
+            {
+                app.fallback_title_states = states;
+                app.synchronize_titles(true)?;
+            }
+        }
+
+        let effects = dashboard_loop_effects(
+            visibility,
+            draw_needed,
+            app.last_refresh.elapsed() >= Duration::from_millis(app.poll_ms),
+            last_detached_fallback.elapsed() >= DETACHED_FALLBACK_INTERVAL,
+        );
+        if visibility == DashboardVisibility::Detached {
+            if effects.detached_fallback && app.detached_fallback.request() {
+                last_detached_fallback = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        if visibility == DashboardVisibility::Unknown {
+            visibility = DashboardVisibility::Visible;
+        }
+        if effects.draw {
+            app.apply_requested_pane_selection()?;
+            terminal.draw(|frame| render_dashboard(frame, app))?;
+            draw_needed = false;
+        }
 
         let timeout = Duration::from_millis(100);
         if event::poll(timeout)? {
             app.apply_requested_pane_selection()?;
+            draw_needed = true;
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -1161,9 +2152,22 @@ fn run_dashboard_loop(
             }
         }
 
-        if app.last_refresh.elapsed() >= Duration::from_millis(app.poll_ms) {
+        if effects.full_refresh {
             app.refresh()?;
+            draw_needed = true;
         }
+        let clock_second = unix_time_ms() / 1000;
+        if clock_second != last_clock_second {
+            last_clock_second = clock_second;
+            draw_needed = true;
+        }
+    }
+}
+
+fn visibility_from_attached_count(attached_count: Result<u32, ()>) -> DashboardVisibility {
+    match attached_count {
+        Ok(0) => DashboardVisibility::Detached,
+        Ok(_) | Err(()) => DashboardVisibility::Visible,
     }
 }
 
@@ -1580,14 +2584,14 @@ fn render_pane_list(
                 render_cell(
                     frame,
                     rect_at_y(rects.cook, y),
-                    &format_duration_compact(pane.cook_duration),
+                    &format_duration_compact(pane.displayed_cook_duration()),
                     row_style,
                 );
                 render_cell(
                     frame,
                     rect_at_y(rects.wait, y),
                     &pane
-                        .wait_duration
+                        .displayed_wait_duration()
                         .map(format_duration_compact)
                         .unwrap_or_default(),
                     row_style,
@@ -1723,7 +2727,9 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
             .panes
             .iter()
             .map(|pane| {
-                UnicodeWidthStr::width(format_duration_compact(pane.cook_duration).as_str())
+                UnicodeWidthStr::width(
+                    format_duration_compact(pane.displayed_cook_duration()).as_str(),
+                )
             })
             .max()
             .unwrap_or(4)
@@ -1732,7 +2738,7 @@ fn pane_list_columns(app: &DashboardApp) -> PaneListColumns {
             .panes
             .iter()
             .map(|pane| {
-                pane.wait_duration
+                pane.displayed_wait_duration()
                     .map(format_duration_compact)
                     .unwrap_or_default()
                     .len()
@@ -2331,6 +3337,28 @@ fn is_waiting_state(state: SessionState) -> bool {
     )
 }
 
+fn runtime_snapshot_duration(
+    base_ms: Option<u64>,
+    updated_at_unix_ms: i64,
+    active: bool,
+) -> Option<Duration> {
+    let base_ms = base_ms?;
+    let elapsed_ms = if active {
+        unix_time_ms().saturating_sub(updated_at_unix_ms).max(0) as u64
+    } else {
+        0
+    };
+    Some(Duration::from_millis(base_ms.saturating_add(elapsed_ms)))
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 fn is_attention_state(state: SessionState) -> bool {
     // All three agy permission shapes warrant operator attention: only the
     // command-permission shape may auto-approve, and even then the operator
@@ -2558,89 +3586,17 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn pane_process_age(pane: &TmuxPane, snapshots: &[ProcessSnapshot]) -> Option<Duration> {
-    let root_pid = pane.pane_pid?;
-    let snapshot = select_agent_process(root_pid, &pane.current_command, snapshots)?;
-    process_age_from_start_ticks(snapshot.start_ticks)
-}
-
-fn process_age_from_start_ticks(start_ticks: u64) -> Option<Duration> {
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks_per_second <= 0 {
-        return None;
-    }
-    let uptime = fs::read_to_string("/proc/uptime").ok()?;
-    let uptime_secs = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
-    let start_secs = start_ticks as f64 / ticks_per_second as f64;
-    if uptime_secs < start_secs {
-        return None;
-    }
-    Some(Duration::from_secs_f64(uptime_secs - start_secs))
-}
-
+#[cfg(any(test, rust_analyzer))]
 fn select_agent_process<'a>(
     root_pid: u32,
     current_command: &str,
     snapshots: &'a [ProcessSnapshot],
 ) -> Option<&'a ProcessSnapshot> {
-    let root = snapshots.iter().find(|snapshot| snapshot.pid == root_pid)?;
-    let descendants = process_descendants(root_pid, snapshots);
-    let foreground_pgrp = (root.tpgid > 0).then_some(root.tpgid);
-
-    foreground_pgrp
-        .and_then(|pgrp| {
-            oldest_matching_process(descendants.iter().copied().filter(|snapshot| {
-                snapshot.pgrp == pgrp && process_matches_command(snapshot, current_command)
-            }))
-        })
-        .or_else(|| {
-            oldest_matching_process(
-                descendants
-                    .iter()
-                    .copied()
-                    .filter(|snapshot| process_matches_command(snapshot, current_command)),
-            )
-        })
-        .or_else(|| {
-            foreground_pgrp.and_then(|pgrp| {
-                oldest_matching_process(
-                    descendants
-                        .iter()
-                        .copied()
-                        .filter(|snapshot| snapshot.pgrp == pgrp),
-                )
-            })
-        })
-        .or(Some(root))
-}
-
-fn process_descendants<'a>(
-    root_pid: u32,
-    snapshots: &'a [ProcessSnapshot],
-) -> Vec<&'a ProcessSnapshot> {
-    let mut children_by_parent = HashMap::<u32, Vec<&ProcessSnapshot>>::new();
-    for snapshot in snapshots {
-        children_by_parent
-            .entry(snapshot.ppid)
-            .or_default()
-            .push(snapshot);
-    }
-    let snapshots_by_pid = snapshots
+    let tree = ProcessTreeSnapshot::from_process_snapshots(snapshots);
+    let selected_pid = tree.select_agent_process(root_pid, current_command)?.pid;
+    snapshots
         .iter()
-        .map(|snapshot| (snapshot.pid, snapshot))
-        .collect::<HashMap<_, _>>();
-
-    let mut descendants = Vec::new();
-    let mut stack = vec![root_pid];
-    while let Some(pid) = stack.pop() {
-        if let Some(snapshot) = snapshots_by_pid.get(&pid) {
-            descendants.push(*snapshot);
-        }
-        if let Some(children) = children_by_parent.get(&pid) {
-            stack.extend(children.iter().map(|snapshot| snapshot.pid));
-        }
-    }
-    descendants
+        .find(|snapshot| snapshot.pid == selected_pid)
 }
 
 fn oldest_matching_process<'a, I>(snapshots: I) -> Option<&'a ProcessSnapshot>
@@ -2666,7 +3622,14 @@ fn command_basename(command: &str) -> &str {
     command.rsplit('/').next().unwrap_or(command)
 }
 
-fn cpu_percent_between(previous: CpuSample, current: CpuSample) -> Option<f64> {
+fn cpu_percent_between(
+    previous: CpuSample,
+    current: CpuSample,
+    ticks_per_second: u64,
+) -> Option<f64> {
+    if ticks_per_second == 0 || previous.process_start_ticks != current.process_start_ticks {
+        return None;
+    }
     let elapsed = current
         .at
         .checked_duration_since(previous.at)?
@@ -2675,52 +3638,9 @@ fn cpu_percent_between(previous: CpuSample, current: CpuSample) -> Option<f64> {
         return None;
     }
 
-    let ticks_per_second = ticks_per_second()? as f64;
+    let ticks_per_second = ticks_per_second as f64;
     let cpu_seconds = (current.total_ticks - previous.total_ticks) as f64 / ticks_per_second;
     Some((cpu_seconds / elapsed) * 100.0)
-}
-
-fn process_tree_usage(root_pid: u32) -> Option<ProcessTreeUsage> {
-    let snapshots = process_snapshots();
-    if snapshots.is_empty() {
-        return None;
-    }
-    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
-    let mut snapshots_by_pid = HashMap::<u32, ProcessSnapshot>::new();
-    for snapshot in snapshots {
-        children_by_parent
-            .entry(snapshot.ppid)
-            .or_default()
-            .push(snapshot.pid);
-        snapshots_by_pid.insert(snapshot.pid, snapshot);
-    }
-
-    if !snapshots_by_pid.contains_key(&root_pid) {
-        return None;
-    }
-
-    let page_size = page_size()?;
-    let mut stack = vec![root_pid];
-    let mut cpu_ticks = 0u64;
-    let mut rss_pages = 0u64;
-    while let Some(pid) = stack.pop() {
-        if let Some(snapshot) = snapshots_by_pid.get(&pid) {
-            cpu_ticks = cpu_ticks.saturating_add(snapshot.cpu_ticks);
-            rss_pages = rss_pages.saturating_add(snapshot.rss_pages);
-        }
-        if let Some(children) = children_by_parent.get(&pid) {
-            stack.extend(children.iter().copied());
-        }
-    }
-
-    Some(ProcessTreeUsage {
-        cpu_ticks,
-        memory_bytes: rss_pages.saturating_mul(page_size),
-    })
-}
-
-fn process_snapshots() -> Vec<ProcessSnapshot> {
-    process_snapshots_with_options(false)
 }
 
 fn process_snapshots_with_cmdlines() -> Vec<ProcessSnapshot> {
@@ -2791,6 +3711,15 @@ fn process_cmdline_basenames(pid: u32) -> Vec<String> {
 fn ticks_per_second() -> Option<u64> {
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     (ticks_per_second > 0).then_some(ticks_per_second as u64)
+}
+
+fn process_uptime_secs() -> Option<f64> {
+    fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
 }
 
 fn page_size() -> Option<u64> {
@@ -2943,37 +3872,73 @@ fn navigate_to_pane(client: &TmuxClient, pane: &TmuxPane) -> AppResult<()> {
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Mutex, mpsc};
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DetailBodyKind, ICON_GAP,
-        PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry, PaneSource,
-        ProcessSnapshot, ResourceUsage, SavedSelection, abbreviate_home_path, agent_emoji,
-        agent_marker, cleanup_dashboard_window_name, context_lines_above_input,
-        current_base_window_name, dashboard_body_sections, dashboard_display_state,
-        dashboard_selection_path, derive_base_window_name, detail_body_kind, detail_current_path,
-        detail_workspace_label, details_panel_height, footer_column_widths, footer_help_line,
-        footer_lines, format_age, format_cpu_gauge, format_duration_compact, format_memory_bar,
-        format_memory_gauge, is_attention_state, is_codex_candidate_pane, is_codex_screen,
-        is_cooking_state, is_opencode_candidate_pane, is_waiting_state, load_saved_selection,
-        pad_display_right, pane_list_columns, pane_list_content_area,
-        pane_source_for_non_runtime_pane_with, pane_window_prefix, parse_process_stat, recap_lines,
-        rect_contains, render_workspace_header_line, repo_root_from_repo_key, save_selection,
-        select_agent_process, select_tail_lines_for_rows, should_return_navigation,
+        DASHBOARD_LEFT_PANE_MAX_WIDTH, DashboardApp, DashboardVisibility, DetailBodyKind, ICON_GAP,
+        ManagedWindowName, PERSISTENT_DASHBOARD_SESSION, PERSISTENT_DASHBOARD_SOCKET, PaneEntry,
+        PaneSource, ProcessSnapshot, ProcessTreeSnapshot, ReconnectBackoff, ResourceUsage,
+        RuntimeCacheState, RuntimeSnapshotCache, SavedSelection, TitlePaneState, WindowTitleIo,
+        WindowTitleWorker, abbreviate_home_path, advance_runtime_revision, agent_emoji,
+        agent_marker, apply_runtime_event, cleanup_dashboard_window_name,
+        context_lines_above_input, current_base_window_name, dashboard_body_sections,
+        dashboard_display_state, dashboard_loop_effects, dashboard_selection_path,
+        derive_base_window_name, detail_body_kind, detail_current_path, detail_workspace_label,
+        details_panel_height, enqueue_detached_fallback, fallback_process_tree_with,
+        footer_column_widths, footer_help_line, footer_lines, format_age, format_cpu_gauge,
+        format_duration_compact, format_memory_bar, format_memory_gauge, grouped_title_states,
+        is_attention_state, is_codex_candidate_pane, is_codex_screen, is_cooking_state,
+        is_opencode_candidate_pane, is_waiting_state, load_saved_selection, pad_display_right,
+        pane_list_columns, pane_list_content_area, pane_source_for_non_runtime_pane_with,
+        pane_window_prefix, parse_process_stat, poll_runtime_cache_once,
+        prune_missing_stale_managed_windows, recap_lines, rect_contains,
+        render_workspace_header_line, replace_runtime_cache, replace_runtime_poll_cache,
+        repo_root_from_repo_key, runtime_snapshot_duration, save_selection, select_agent_process,
+        select_tail_lines_for_rows, set_runtime_subscription_capability, should_return_navigation,
         split_workspace_header, state_emoji, state_marker, strip_dashboard_emoji_prefixes,
-        tmux_object_id_order, window_target, workspace_group_key, workspace_group_label,
-        yes_count_key, yolo_column_contains,
+        subscription_connection_is_stable, tmux_object_id_order, visibility_from_attached_count,
+        window_target, workspace_group_key, workspace_group_label, yes_count_key,
+        yolo_column_contains,
     };
-    use crate::classifier::{SIGNAL_CODEX_KEYWORDS, SessionState};
-    use crate::runtime::RuntimeClient;
+    use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
+    use crate::runtime::{RuntimeClient, RuntimeEvent, RuntimePaneSnapshot};
     use crate::storage::WorkspaceRecord;
     use crate::tmux::{TmuxClient, TmuxPane, TmuxWindow};
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
+
+    struct BlockingWindowTitleIo {
+        entered: mpsc::SyncSender<()>,
+        release: Option<mpsc::Receiver<()>>,
+    }
+
+    impl WindowTitleIo for BlockingWindowTitleIo {
+        fn apply(
+            &mut self,
+            _desired: HashMap<String, TitlePaneState>,
+            _topology_complete: bool,
+        ) -> crate::app::AppResult<()> {
+            let _ = self.entered.try_send(());
+            if let Some(release) = self.release.take() {
+                let _ = release.recv();
+            }
+            Ok(())
+        }
+
+        fn retry_pending(&self) -> bool {
+            false
+        }
+
+        fn restore(&mut self) -> crate::app::AppResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn formats_short_age() {
@@ -3050,6 +4015,234 @@ mod tests {
             format_duration_compact(Duration::from_secs(2 * 86400 + 3 * 3600)),
             "2d3h"
         );
+    }
+
+    #[test]
+    fn runtime_duration_advances_only_while_authoritative_state_is_active() {
+        let now = super::unix_time_ms();
+        let active = runtime_snapshot_duration(Some(2_000), now - 1_000, true)
+            .expect("active duration should exist");
+        assert!(active >= Duration::from_millis(3_000));
+        assert!(active < Duration::from_millis(3_250));
+        assert_eq!(
+            runtime_snapshot_duration(Some(2_000), now - 10_000, false),
+            Some(Duration::from_millis(2_000))
+        );
+        assert_eq!(runtime_snapshot_duration(None, now, true), None);
+    }
+
+    #[test]
+    fn visibility_probe_fails_open_and_zero_detaches() {
+        assert_eq!(
+            visibility_from_attached_count(Err(())),
+            DashboardVisibility::Visible
+        );
+        assert_eq!(
+            visibility_from_attached_count(Ok(1)),
+            DashboardVisibility::Visible
+        );
+        assert_eq!(
+            visibility_from_attached_count(Ok(0)),
+            DashboardVisibility::Detached
+        );
+    }
+
+    #[test]
+    fn detached_loop_suppresses_draw_and_full_enrichment() {
+        let effects = dashboard_loop_effects(DashboardVisibility::Detached, true, true, true);
+        assert!(!effects.draw);
+        assert!(!effects.full_refresh);
+        assert!(effects.detached_fallback);
+    }
+
+    #[test]
+    fn runtime_cache_replacement_removes_stale_panes_and_events_upsert_or_remove() {
+        let cache = Mutex::new(RuntimeCacheState::default());
+        replace_runtime_cache(
+            &cache,
+            vec![
+                sample_runtime_snapshot("%1", 1),
+                sample_runtime_snapshot("%2", 2),
+            ],
+        );
+        replace_runtime_cache(&cache, vec![sample_runtime_snapshot("%1", 3)]);
+        {
+            let cache = cache.lock().unwrap();
+            assert_eq!(cache.snapshots.len(), 1);
+            assert!(!cache.snapshots.contains_key("%2"));
+        }
+
+        assert!(apply_runtime_event(
+            &cache,
+            RuntimeEvent {
+                revision: 4,
+                timestamp_unix_ms: 0,
+                kind: String::from("pane-snapshot-updated"),
+                pane_id: Some(String::from("%2")),
+                workspace_id: None,
+                summary: String::new(),
+                snapshot: Some(sample_runtime_snapshot("%2", 4)),
+            },
+        ));
+        assert!(apply_runtime_event(
+            &cache,
+            RuntimeEvent {
+                revision: 5,
+                timestamp_unix_ms: 0,
+                kind: String::from("pane-removed"),
+                pane_id: Some(String::from("%1")),
+                workspace_id: None,
+                summary: String::new(),
+                snapshot: None,
+            },
+        ));
+        let cache = cache.lock().unwrap();
+        assert!(!cache.snapshots.contains_key("%1"));
+        assert!(cache.snapshots.contains_key("%2"));
+    }
+
+    #[test]
+    fn runtime_cache_ignores_duplicate_and_older_revisions() {
+        let mut revision = 10;
+        assert!(!advance_runtime_revision(&mut revision, 9));
+        assert!(!advance_runtime_revision(&mut revision, 10));
+        assert!(advance_runtime_revision(&mut revision, 11));
+        assert_eq!(revision, 11);
+    }
+
+    #[test]
+    fn boundary_capable_runtime_cache_never_uses_polling_fallback() {
+        let cache = RuntimeSnapshotCache::new();
+        replace_runtime_cache(&cache.shared, vec![sample_runtime_snapshot("%1", 1)]);
+        set_runtime_subscription_capability(&cache.shared, true);
+        let missing_runtime = RuntimeClient::with_socket_path(
+            unique_temp_dir("dashboard-missing-runtime").join("runtime.sock"),
+        );
+
+        assert!(!poll_runtime_cache_once(&missing_runtime, &cache.shared).unwrap());
+        assert_eq!(cache.snapshots()[0].pane.pane_id, "%1");
+    }
+
+    #[test]
+    fn failed_legacy_runtime_poll_retains_last_good_cache() {
+        let cache = RuntimeSnapshotCache::new();
+        replace_runtime_cache(&cache.shared, vec![sample_runtime_snapshot("%1", 1)]);
+        let missing_runtime = RuntimeClient::with_socket_path(
+            unique_temp_dir("dashboard-missing-legacy-runtime").join("runtime.sock"),
+        );
+
+        assert!(poll_runtime_cache_once(&missing_runtime, &cache.shared).is_err());
+        assert_eq!(cache.snapshots()[0].pane.pane_id, "%1");
+    }
+
+    #[test]
+    fn subscription_capability_tracks_each_connection_and_runtime_transition() {
+        let cache = Mutex::new(RuntimeCacheState::default());
+        replace_runtime_cache(&cache, vec![sample_runtime_snapshot("%1", 1)]);
+        set_runtime_subscription_capability(&cache, true);
+
+        set_runtime_subscription_capability(&cache, false);
+        assert_eq!(cache.lock().unwrap().snapshots.len(), 1);
+        assert!(replace_runtime_poll_cache(
+            &cache,
+            vec![sample_runtime_snapshot("%2", 2)]
+        ));
+        assert!(cache.lock().unwrap().snapshots.contains_key("%2"));
+
+        replace_runtime_cache(&cache, vec![sample_runtime_snapshot("%3", 3)]);
+        set_runtime_subscription_capability(&cache, true);
+        assert!(!replace_runtime_poll_cache(
+            &cache,
+            vec![sample_runtime_snapshot("%4", 4)]
+        ));
+        let cache = cache.lock().unwrap();
+        assert!(cache.snapshots.contains_key("%3"));
+        assert!(!cache.snapshots.contains_key("%4"));
+    }
+
+    #[test]
+    fn delayed_bootstrap_uses_normal_backoff_without_losing_last_good_cache() {
+        let cache = Mutex::new(RuntimeCacheState::default());
+        replace_runtime_cache(&cache, vec![sample_runtime_snapshot("%1", 1)]);
+        set_runtime_subscription_capability(&cache, false);
+        let mut backoff = ReconnectBackoff::default();
+
+        assert_eq!(backoff.failure_delay(false), Duration::from_millis(250));
+        assert!(cache.lock().unwrap().snapshots.contains_key("%1"));
+
+        replace_runtime_cache(&cache, vec![sample_runtime_snapshot("%2", 2)]);
+        set_runtime_subscription_capability(&cache, true);
+        let cache = cache.lock().unwrap();
+        assert!(cache.subscription_boundary_supported);
+        assert!(cache.snapshots.contains_key("%2"));
+    }
+
+    #[test]
+    fn immediate_post_bootstrap_disconnects_back_off_until_connection_is_stable() {
+        let mut backoff = ReconnectBackoff::default();
+        let delays = (0..6)
+            .map(|_| backoff.failure_delay(false))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ]
+        );
+        assert_eq!(backoff.failure_delay(true), Duration::from_millis(250));
+        assert_eq!(backoff.failure_delay(false), Duration::from_millis(500));
+        assert!(!subscription_connection_is_stable(
+            false,
+            Duration::from_secs(1)
+        ));
+        assert!(subscription_connection_is_stable(
+            true,
+            Duration::from_millis(1)
+        ));
+        assert!(subscription_connection_is_stable(
+            false,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn detached_fallback_request_is_non_blocking_while_work_is_pending() {
+        let (request_tx, _request_rx) = mpsc::sync_channel(1);
+        assert!(enqueue_detached_fallback(&request_tx));
+        assert!(!enqueue_detached_fallback(&request_tx));
+        assert_eq!(
+            visibility_from_attached_count(Ok(1)),
+            DashboardVisibility::Visible
+        );
+    }
+
+    #[test]
+    fn blocked_detached_title_io_does_not_block_visibility_result_handling() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = WindowTitleWorker::start_with(BlockingWindowTitleIo {
+            entered: entered_tx,
+            release: Some(release_rx),
+        });
+        worker.publish(Vec::new(), true);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("title worker should enter blocking I/O");
+
+        // This is the exact operation used to apply a detached fallback result.
+        // It only replaces coalesced desired state and cannot wait for title I/O.
+        worker.publish(Vec::new(), true);
+        assert_eq!(
+            visibility_from_attached_count(Ok(1)),
+            DashboardVisibility::Visible
+        );
+
+        release_tx.send(()).unwrap();
     }
 
     #[test]
@@ -3559,6 +4752,148 @@ mod tests {
     }
 
     #[test]
+    fn process_tree_aggregates_descendant_cpu_and_memory_from_one_index() {
+        let mut snapshots = vec![
+            test_process_snapshot(10, 1, 10, 10, "bash", 100, &[]),
+            test_process_snapshot(20, 10, 20, 20, "claude", 200, &[]),
+            test_process_snapshot(30, 20, 30, 30, "worker", 300, &[]),
+        ];
+        snapshots[0].cpu_ticks = 3;
+        snapshots[0].rss_pages = 5;
+        snapshots[1].cpu_ticks = 7;
+        snapshots[1].rss_pages = 11;
+        snapshots[2].cpu_ticks = 13;
+        snapshots[2].rss_pages = 17;
+        let tree = ProcessTreeSnapshot::from_process_snapshots_with_system(
+            &snapshots,
+            Some(10.0),
+            Some(100),
+            Some(4096),
+        );
+
+        let usage = tree.usage(10).expect("root should resolve");
+        assert_eq!(usage.cpu_ticks, 23);
+        assert_eq!(usage.memory_bytes, 33 * 4096);
+        assert!(tree.usage(999).is_none());
+    }
+
+    #[test]
+    fn process_tree_supplies_age_and_multiple_panes_from_one_scan() {
+        let calls = std::cell::Cell::new(0);
+        let snapshots = vec![
+            test_process_snapshot(10, 1, 10, 20, "bash", 100, &[]),
+            test_process_snapshot(20, 10, 20, 20, "claude", 250, &[]),
+        ];
+        let tree = ProcessTreeSnapshot::scan_with(|| {
+            calls.set(calls.get() + 1);
+            snapshots.clone()
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert!(tree.usage(10).is_some());
+        assert!(tree.usage(20).is_some());
+        let mut pane = sample_tmux_pane("claude", "demo");
+        pane.pane_pid = Some(10);
+        assert!(tree.pane_age(&pane).is_some());
+    }
+
+    #[test]
+    fn detached_fallback_scans_proc_only_for_pi_or_antigravity_candidates() {
+        let calls = std::cell::Cell::new(0);
+        let no_process_candidates = vec![
+            sample_tmux_pane("opencode", "OC | demo"),
+            sample_tmux_pane("codex", "Codex"),
+        ];
+        assert!(
+            fallback_process_tree_with(&no_process_candidates, || {
+                calls.set(calls.get() + 1);
+                ProcessTreeSnapshot::from_process_snapshots(&[])
+            })
+            .is_none()
+        );
+        assert_eq!(calls.get(), 0);
+
+        let process_candidates = vec![sample_tmux_pane("pi", "Pi")];
+        assert!(
+            fallback_process_tree_with(&process_candidates, || {
+                calls.set(calls.get() + 1);
+                ProcessTreeSnapshot::from_process_snapshots(&[])
+            })
+            .is_some()
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn detach_clears_cpu_baselines_and_first_reattach_sample_is_unavailable() {
+        let mut app = make_test_app("dashboard-detach-cpu");
+        app.cpu_samples.insert(
+            String::from("%1"),
+            super::CpuSample {
+                at: std::time::Instant::now(),
+                total_ticks: 10,
+                process_start_ticks: 100,
+            },
+        );
+        app.clear_detached_resource_state();
+        assert!(app.cpu_samples.is_empty());
+
+        let mut snapshots = vec![test_process_snapshot(10, 1, 10, 10, "claude", 100, &[])];
+        snapshots[0].cpu_ticks = 20;
+        let tree = ProcessTreeSnapshot::from_process_snapshots_with_system(
+            &snapshots,
+            Some(10.0),
+            Some(100),
+            Some(4096),
+        );
+        let usage = app.resource_usage_for_pane(&tree, "%1", Some(10), std::time::Instant::now());
+        assert_eq!(usage.cpu_percent, None);
+        assert_eq!(usage.memory_bytes, Some(0));
+    }
+
+    #[test]
+    fn failed_reattach_attempt_clears_partially_repopulated_cpu_baselines() {
+        let mut app = make_test_app("dashboard-failed-reattach-cpu");
+        let mut snapshots = vec![test_process_snapshot(10, 1, 10, 10, "claude", 100, &[])];
+        snapshots[0].cpu_ticks = 20;
+        let tree = ProcessTreeSnapshot::from_process_snapshots_with_system(
+            &snapshots,
+            Some(10.0),
+            Some(100),
+            Some(4096),
+        );
+
+        app.resource_usage_for_pane(&tree, "%1", Some(10), std::time::Instant::now());
+        assert!(!app.cpu_samples.is_empty());
+        assert!(!app.finish_reattach_attempt(false));
+        assert!(app.cpu_samples.is_empty());
+
+        let usage = app.resource_usage_for_pane(
+            &tree,
+            "%1",
+            Some(10),
+            std::time::Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(usage.cpu_percent, None);
+    }
+
+    #[test]
+    fn cpu_sample_restarts_when_the_root_process_identity_changes() {
+        let previous = super::CpuSample {
+            at: std::time::Instant::now(),
+            total_ticks: 10,
+            process_start_ticks: 100,
+        };
+        let current = super::CpuSample {
+            at: previous.at + Duration::from_secs(1),
+            total_ticks: 1_000,
+            process_start_ticks: 200,
+        };
+
+        assert_eq!(super::cpu_percent_between(previous, current, 100), None);
+    }
+
+    #[test]
     fn agent_process_selection_prefers_foreground_matching_child() {
         let snapshots = vec![
             test_process_snapshot(10, 1, 10, 20, "bash", 100, &[]),
@@ -3795,6 +5130,76 @@ mod tests {
     }
 
     #[test]
+    fn title_states_group_and_order_multi_pane_prefixes_by_pane_index() {
+        let mut second = sample_tmux_pane("claude", "demo");
+        second.pane_id = String::from("%2");
+        second.pane_index = 1;
+        let mut first = second.clone();
+        first.pane_id = String::from("%1");
+        first.pane_index = 0;
+        let states = [
+            TitlePaneState {
+                pane: second,
+                state: SessionState::BusyResponding,
+                has_questions: false,
+                yolo_enabled: false,
+            },
+            TitlePaneState {
+                pane: first,
+                state: SessionState::ChatReady,
+                has_questions: false,
+                yolo_enabled: true,
+            },
+        ]
+        .into_iter()
+        .map(|state| (state.pane.pane_id.clone(), state))
+        .collect();
+
+        let grouped = grouped_title_states(&states);
+        let panes = grouped.values().next().expect("window should be grouped");
+        assert_eq!(panes[0].pane.pane_id, "%1");
+        assert_eq!(panes[1].pane.pane_id, "%2");
+        let prefix = panes
+            .iter()
+            .map(|pane| pane_window_prefix(pane.state, pane.has_questions, pane.yolo_enabled))
+            .collect::<String>();
+        assert_eq!(prefix, "💤ʸ⚙️");
+    }
+
+    #[test]
+    fn complete_topology_drops_missing_managed_windows_without_retry_work() {
+        let mut managed = HashMap::from([
+            (
+                String::from("@missing"),
+                ManagedWindowName {
+                    target: String::from("demo:1"),
+                    base_name: String::from("missing"),
+                    applied_name: Some(String::from("💤 missing")),
+                },
+            ),
+            (
+                String::from("@existing"),
+                ManagedWindowName {
+                    target: String::from("demo:2"),
+                    base_name: String::from("existing"),
+                    applied_name: Some(String::from("💤 existing")),
+                },
+            ),
+        ]);
+        let active = HashSet::new();
+        let existing = HashSet::from([String::from("@existing")]);
+
+        let restore = prune_missing_stale_managed_windows(&mut managed, &active, &existing);
+        assert_eq!(restore, vec![String::from("@existing")]);
+        assert!(!managed.contains_key("@missing"));
+        assert!(managed.contains_key("@existing"));
+
+        managed.remove("@existing");
+        assert!(prune_missing_stale_managed_windows(&mut managed, &active, &existing).is_empty());
+        assert!(managed.is_empty());
+    }
+
+    #[test]
     fn current_base_window_name_preserves_live_rename() {
         assert_eq!(
             current_base_window_name(
@@ -4000,6 +5405,9 @@ mod tests {
             age: Duration::from_secs(1),
             cook_duration: Duration::from_secs(0),
             wait_duration: None,
+            runtime_duration_sample_at_unix_ms: None,
+            runtime_cook_active: false,
+            runtime_wait_active: false,
             yes_count: 0,
             claude_session_id: None,
             focused_source: focused_source.to_string(),
@@ -4065,6 +5473,37 @@ mod tests {
             start_ticks,
             cpu_ticks: 0,
             rss_pages: 0,
+        }
+    }
+
+    fn sample_runtime_snapshot(pane_id: &str, revision: u64) -> RuntimePaneSnapshot {
+        RuntimePaneSnapshot {
+            pane: TmuxPane {
+                pane_id: pane_id.to_string(),
+                ..sample_tmux_pane("claude", "demo")
+            },
+            classification: Classification {
+                source: String::from("test"),
+                state: SessionState::ChatReady,
+                has_questions: false,
+                recap_present: false,
+                recap_excerpt: None,
+                signals: Vec::new(),
+            },
+            focused_source: String::new(),
+            raw_source: String::new(),
+            live_excerpt: String::new(),
+            wait_duration_ms: Some(0),
+            cook_duration_ms: Some(0),
+            claude_session_id: None,
+            workspace_id: String::from("workspace-1"),
+            workspace_root: String::from("/tmp/demo"),
+            desired_yolo_enabled: false,
+            actual_yolo_enabled: false,
+            last_stop_reason: None,
+            last_action: None,
+            revision,
+            updated_at_unix_ms: 0,
         }
     }
 

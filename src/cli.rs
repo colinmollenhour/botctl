@@ -736,7 +736,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             &[
                 "--foreground (run in this process instead of a managed tmux session)",
-                "--reconcile-ms N (default: 1000)",
+                "--reconcile-ms N (default: 1000; maximum dirty-pane delay and, above 10000, full-state safety interval)",
                 "--history-lines N (default: 200)",
                 "--state-dir PATH",
                 "stop (subcommand: request the runtime to stop)",

@@ -1,5 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,7 +30,7 @@ use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
 use crate::screen_model::ScreenModel;
 use crate::storage::{
-    WorkspaceRecord, list_babysit_registration_pane_ids, resolve_workspace,
+    TmuxRuntimeDurations, WorkspaceRecord, list_babysit_registration_pane_ids, resolve_workspace,
     resolve_workspace_for_path, sync_tmux_claude_session_id, sync_tmux_runtime_state,
 };
 use crate::tmux::{ControlModeReceive, TmuxClient, TmuxPane};
@@ -41,6 +43,12 @@ const SUBSCRIPTION_READ_TIMEOUT_MS: u64 = 200;
 const RUNTIME_TIMEOUT_EXIT_CODE: i32 = 408;
 const STREAM_DEBOUNCE_MS: u64 = 200;
 const MAX_LIVE_EXCERPT_LINES: usize = 20;
+const SCHEDULER_TICK_MS: u64 = 50;
+const TOPOLOGY_SCAN_INTERVAL_MS: u64 = 15_000;
+const MIN_FULL_SAFETY_INTERVAL_MS: u64 = 10_000;
+const SUBSCRIBER_CAPACITY: usize = 128;
+const SUBSCRIPTION_WRITE_TIMEOUT_MS: u64 = 1_000;
+const DIAGNOSTIC_THROTTLE_MS: u64 = 30_000;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeServerConfig {
@@ -66,6 +74,8 @@ pub struct RuntimePaneSnapshot {
     pub raw_source: String,
     pub live_excerpt: String,
     pub wait_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub cook_duration_ms: Option<u64>,
     pub claude_session_id: Option<String>,
     pub workspace_id: String,
     pub workspace_root: String,
@@ -299,6 +309,24 @@ pub struct RuntimeSubscription {
 }
 
 impl RuntimeSubscription {
+    /// Receive the complete subscription backlog through the explicit `Ok`
+    /// boundary. A timeout is returned as an error so callers can detect an
+    /// older runtime that does not provide atomic bootstrap completion.
+    pub fn bootstrap(&mut self) -> AppResult<BTreeMap<String, RuntimePaneSnapshot>> {
+        let mut panes = BTreeMap::new();
+        loop {
+            match read_response(&mut self.reader)? {
+                RuntimeResponse::Event { event } => {
+                    if let Some(snapshot) = event.snapshot {
+                        panes.insert(snapshot.pane.pane_id.clone(), snapshot);
+                    }
+                }
+                RuntimeResponse::Ok => return Ok(panes),
+                other => return Err(unexpected_response("subscription bootstrap", &other)),
+            }
+        }
+    }
+
     pub fn recv(&mut self) -> AppResult<Option<RuntimeEvent>> {
         let response = match read_response(&mut self.reader) {
             Ok(response) => response,
@@ -408,7 +436,7 @@ struct RuntimeShared {
     tmux_socket_path: Option<String>,
     next_revision: u64,
     panes: BTreeMap<String, TrackedPane>,
-    subscribers: Vec<mpsc::Sender<RuntimeEvent>>,
+    subscribers: Vec<mpsc::SyncSender<RuntimeEvent>>,
     in_flight_actions: HashSet<String>,
 }
 
@@ -437,9 +465,101 @@ impl RuntimeShared {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneIdentityProjection {
+    pane_id: String,
+    pane_tty: String,
+    pane_pid: Option<u32>,
+    session_id: String,
+    window_id: String,
+    current_command: String,
+}
+
+impl From<&TmuxPane> for PaneIdentityProjection {
+    fn from(pane: &TmuxPane) -> Self {
+        Self {
+            pane_id: pane.pane_id.clone(),
+            pane_tty: pane.pane_tty.clone(),
+            pane_pid: pane.pane_pid,
+            session_id: pane.session_id.clone(),
+            window_id: pane.window_id.clone(),
+            current_command: pane.current_command.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopologyPaneProjection {
+    identity: PaneIdentityProjection,
+    session_name: String,
+    window_index: u16,
+    pane_index: u16,
+    current_path: String,
+}
+
+impl From<&TmuxPane> for TopologyPaneProjection {
+    fn from(pane: &TmuxPane) -> Self {
+        // Window/pane titles, focus, and cursor position are volatile and do
+        // not require a fresh classification. Identity, placement, and cwd do.
+        Self {
+            identity: PaneIdentityProjection::from(pane),
+            session_name: pane.session_name.clone(),
+            window_index: pane.window_index,
+            pane_index: pane.pane_index,
+            current_path: pane.current_path.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotPaneProjection {
+    topology: TopologyPaneProjection,
+}
+
+impl From<&TmuxPane> for SnapshotPaneProjection {
+    fn from(pane: &TmuxPane) -> Self {
+        // Publication follows the same stable topology contract. The full
+        // pane still updates internally for safety checks on every reconcile.
+        Self {
+            topology: TopologyPaneProjection::from(pane),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotSignature {
-    pane: TmuxPane,
+    pane: SnapshotPaneProjection,
     classification: Classification,
+    workspace_id: String,
+    workspace_root: String,
+    provider_session_id: Option<String>,
+    desired_yolo_enabled: bool,
+    actual_yolo_enabled: bool,
+    last_stop_reason: Option<String>,
+    last_action: Option<String>,
+    focused_source: String,
+    live_excerpt: String,
+    raw_source_hash: u64,
+}
+
+impl SnapshotSignature {
+    fn from_snapshot(snapshot: &RuntimePaneSnapshot, provider_session_id: Option<String>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        snapshot.raw_source.hash(&mut hasher);
+        Self {
+            pane: SnapshotPaneProjection::from(&snapshot.pane),
+            classification: snapshot.classification.clone(),
+            workspace_id: snapshot.workspace_id.clone(),
+            workspace_root: snapshot.workspace_root.clone(),
+            provider_session_id,
+            desired_yolo_enabled: snapshot.desired_yolo_enabled,
+            actual_yolo_enabled: snapshot.actual_yolo_enabled,
+            last_stop_reason: snapshot.last_stop_reason.clone(),
+            last_action: snapshot.last_action.clone(),
+            focused_source: snapshot.focused_source.clone(),
+            live_excerpt: snapshot.live_excerpt.clone(),
+            raw_source_hash: hasher.finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -450,8 +570,12 @@ struct TrackedPane {
     signature: SnapshotSignature,
     screen_model: Option<ScreenModel>,
     screen_model_seeded: bool,
-    dirty: bool,
+    stream_generation: u64,
+    reconciled_generation: u64,
+    dirty_since: Option<Instant>,
     last_stream_activity: Option<Instant>,
+    retry_at: Option<Instant>,
+    retry_attempt: u8,
     /// `Some(raw_source)` immediately after a successful YOLO approve.
     /// `maybe_run_yolo_action` skips the next call if the current snapshot's
     /// `raw_source` still matches this — that means the agy UI has not yet
@@ -463,14 +587,137 @@ struct TrackedPane {
 
 #[derive(Debug)]
 enum ObserverMessage {
-    ControlLine(String),
-    ControlClosed(String),
+    Opened(String),
+    Line { session_name: String, line: String },
+    Closed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlLineEffect {
     None,
     Reconcile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileReason {
+    Topology,
+    Dirty,
+    Safety,
+    Retry,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingReconcile {
+    reason: ReconcileReason,
+    retry_attempt: u8,
+    retry_at: Option<Instant>,
+}
+
+impl PendingReconcile {
+    fn new(reason: ReconcileReason) -> Self {
+        Self {
+            reason,
+            retry_attempt: 0,
+            retry_at: None,
+        }
+    }
+
+    fn is_due(self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|retry_at| retry_at <= now)
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.retry_at = Some(now + retry_delay(self.retry_attempt));
+        self.retry_attempt = self.retry_attempt.saturating_add(1);
+        self.reason = ReconcileReason::Retry;
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeScheduler {
+    topology_requested: bool,
+    last_topology_scan: Option<Instant>,
+    topology_retry_at: Option<Instant>,
+    topology_retry_attempt: u8,
+    last_full_safety_pass: Instant,
+    full_safety_interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchedulerDecision {
+    topology_scan: bool,
+    full_safety_pass: bool,
+}
+
+impl RuntimeScheduler {
+    fn new(now: Instant, reconcile_ms: u64) -> Self {
+        Self {
+            topology_requested: true,
+            last_topology_scan: None,
+            topology_retry_at: None,
+            topology_retry_attempt: 0,
+            last_full_safety_pass: now,
+            full_safety_interval: Duration::from_millis(
+                reconcile_ms.max(MIN_FULL_SAFETY_INTERVAL_MS),
+            ),
+        }
+    }
+
+    fn request_topology_scan(&mut self) {
+        self.topology_requested = true;
+    }
+
+    fn take_due(&mut self, now: Instant) -> SchedulerDecision {
+        let retry_due = self
+            .topology_retry_at
+            .is_none_or(|retry_at| retry_at <= now);
+        let topology_scan = retry_due
+            && (self.topology_requested
+                || self.last_topology_scan.is_none_or(|last| {
+                    now.duration_since(last) >= Duration::from_millis(TOPOLOGY_SCAN_INTERVAL_MS)
+                }));
+        if topology_scan {
+            self.topology_requested = false;
+            self.last_topology_scan = Some(now);
+        }
+        let full_safety_pass =
+            now.duration_since(self.last_full_safety_pass) >= self.full_safety_interval;
+        if full_safety_pass {
+            self.last_full_safety_pass = now;
+        }
+        SchedulerDecision {
+            topology_scan,
+            full_safety_pass,
+        }
+    }
+
+    fn finish_topology_scan(&mut self, now: Instant, succeeded: bool) {
+        if succeeded {
+            self.topology_retry_at = None;
+            self.topology_retry_attempt = 0;
+        } else {
+            self.topology_requested = true;
+            self.topology_retry_at = Some(now + retry_delay(self.topology_retry_attempt));
+            self.topology_retry_attempt = self.topology_retry_attempt.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiagnosticThrottle {
+    last_emitted: BTreeMap<String, Instant>,
+}
+
+impl DiagnosticThrottle {
+    fn should_emit(&mut self, key: &str, now: Instant) -> bool {
+        if self.last_emitted.get(key).is_some_and(|last| {
+            now.duration_since(*last) < Duration::from_millis(DIAGNOSTIC_THROTTLE_MS)
+        }) {
+            return false;
+        }
+        self.last_emitted.insert(key.to_string(), now);
+        true
+    }
 }
 
 fn handle_client(
@@ -558,7 +805,8 @@ fn handle_client(
 }
 
 fn handle_subscribe(mut stream: UnixStream, shared: &Arc<Mutex<RuntimeShared>>) -> AppResult<()> {
-    let (tx, rx) = mpsc::channel();
+    stream.set_write_timeout(Some(Duration::from_millis(SUBSCRIPTION_WRITE_TIMEOUT_MS)))?;
+    let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CAPACITY);
     let backlog = {
         let mut shared = shared.lock().unwrap();
         shared.subscribers.push(tx);
@@ -584,6 +832,7 @@ fn handle_subscribe(mut stream: UnixStream, shared: &Arc<Mutex<RuntimeShared>>) 
     for event in backlog {
         write_message(&mut stream, &RuntimeResponse::Event { event })?;
     }
+    write_message(&mut stream, &RuntimeResponse::Ok)?;
 
     loop {
         match rx.recv() {
@@ -629,7 +878,8 @@ fn handle_set_yolo(
         } else {
             let _ = disable_yolo_record(state_dir, &pane.pane_id)?;
         }
-        update_yolo_runtime_state(shared, &pane.pane_id, enabled, None);
+        let snapshot =
+            update_yolo_runtime_state(shared, &pane.pane_id, Some(enabled), enabled, None);
         updated.push(pane.pane_id.clone());
         let summary = if enabled {
             "yolo-enabled"
@@ -642,7 +892,7 @@ fn handle_set_yolo(
             Some(workspace.id),
             summary,
             summary.to_string(),
-            None,
+            snapshot,
         );
         return Ok(updated);
     }
@@ -715,7 +965,22 @@ fn handle_set_yolo(
                 .collect::<AppResult<Vec<_>>>()?
         };
         for pane_id in &pane_ids {
-            update_yolo_runtime_state(shared, pane_id, enabled, None);
+            let snapshot = update_yolo_runtime_state(shared, pane_id, Some(enabled), enabled, None);
+            if let Some(snapshot) = snapshot {
+                let kind = if enabled {
+                    "yolo-enabled"
+                } else {
+                    "yolo-disabled"
+                };
+                emit_shared_event(
+                    shared,
+                    Some(pane_id.clone()),
+                    Some(snapshot.workspace_id.clone()),
+                    kind,
+                    kind.to_string(),
+                    Some(snapshot),
+                );
+            }
         }
         updated.extend(pane_ids);
     }
@@ -1021,66 +1286,143 @@ fn spawn_observer(
     thread::spawn(move || {
         let client = runtime_tmux_client();
         let (tx, rx) = mpsc::channel();
+        let mut scheduler = RuntimeScheduler::new(Instant::now(), config.reconcile_ms);
+        let mut known_candidates = BTreeMap::<String, TmuxPane>::new();
+        let mut pending = BTreeMap::<String, PendingReconcile>::new();
         let mut observed_sessions = BTreeSet::new();
-        let mut last_reconcile = Instant::now() - Duration::from_millis(config.reconcile_ms);
+        let mut observer_retries = BTreeMap::<String, (u8, Instant)>::new();
+        let mut diagnostics = DiagnosticThrottle::default();
 
         while !stop.load(Ordering::SeqCst) {
-            let mut force_reconcile = false;
-            if let Ok(panes) = client.list_panes() {
-                for session_name in panes
-                    .into_iter()
-                    .filter(is_runtime_discovery_candidate)
-                    .map(|pane| pane.session_name)
-                    .collect::<BTreeSet<_>>()
-                {
-                    if observed_sessions.insert(session_name.clone()) {
-                        let tx = tx.clone();
-                        let client = client.clone();
-                        let stop = Arc::clone(&stop);
-                        thread::spawn(move || {
-                            observe_session_lines(client, &session_name, tx, stop)
-                        });
-                    }
-                }
-            }
-
             while let Ok(message) = rx.try_recv() {
                 match message {
-                    ObserverMessage::ControlLine(line) => {
+                    ObserverMessage::Opened(session_name) => {
+                        observer_retries.remove(&session_name);
+                    }
+                    ObserverMessage::Line { session_name, line } => {
+                        observer_retries.remove(&session_name);
                         if handle_control_line_shared(&shared, &line)
                             == ControlLineEffect::Reconcile
                         {
-                            force_reconcile = true;
+                            scheduler.request_topology_scan();
                         }
                     }
-                    ObserverMessage::ControlClosed(session_name) => {
+                    ObserverMessage::Closed(session_name) => {
                         observed_sessions.remove(&session_name);
-                        force_reconcile = true;
+                        let attempt = observer_retries
+                            .get(&session_name)
+                            .map(|(attempt, _)| *attempt)
+                            .unwrap_or(0);
+                        observer_retries.insert(
+                            session_name,
+                            (
+                                attempt.saturating_add(1),
+                                Instant::now() + retry_delay(attempt),
+                            ),
+                        );
+                        scheduler.request_topology_scan();
                     }
                 }
             }
 
-            if emit_dirty_stream_events(&shared, Duration::from_millis(STREAM_DEBOUNCE_MS)) {
-                last_reconcile = Instant::now();
-            }
-
-            if force_reconcile
-                || last_reconcile.elapsed() >= Duration::from_millis(config.reconcile_ms)
-            {
-                if let Err(error) = reconcile_all(&client, &config, &shared) {
-                    emit_shared_event(
-                        &shared,
-                        None,
-                        None,
-                        "runtime-error",
-                        error.to_string(),
-                        None,
-                    );
+            let now = Instant::now();
+            let decision = scheduler.take_due(now);
+            if decision.topology_scan {
+                match topology_scan(&client, &config, &shared, &mut known_candidates) {
+                    Ok(changed_panes) => {
+                        scheduler.finish_topology_scan(now, true);
+                        let tracked = tracked_pane_ids(&shared)
+                            .into_iter()
+                            .collect::<BTreeSet<_>>();
+                        pending.retain(|pane_id, _| {
+                            known_candidates.contains_key(pane_id) || tracked.contains(pane_id)
+                        });
+                        for pane_id in changed_panes {
+                            pending.entry(pane_id).or_insert_with(|| {
+                                PendingReconcile::new(ReconcileReason::Topology)
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        scheduler.finish_topology_scan(now, false);
+                        if diagnostics.should_emit("topology-scan", now) {
+                            emit_shared_event(
+                                &shared,
+                                None,
+                                None,
+                                "runtime-error",
+                                format!("topology scan failed: {error}"),
+                                None,
+                            );
+                        }
+                    }
                 }
-                last_reconcile = Instant::now();
             }
 
-            thread::sleep(Duration::from_millis(50));
+            let candidate_sessions = known_candidates
+                .values()
+                .map(|pane| pane.session_name.clone())
+                .collect::<BTreeSet<_>>();
+            for session_name in candidate_sessions {
+                let retry_due = observer_retries
+                    .get(&session_name)
+                    .is_none_or(|(_, retry_at)| *retry_at <= now);
+                if !observed_sessions.contains(&session_name) && retry_due {
+                    observed_sessions.insert(session_name.clone());
+                    let tx = tx.clone();
+                    let client = client.clone();
+                    let stop = Arc::clone(&stop);
+                    thread::spawn(move || observe_session_lines(client, &session_name, tx, stop));
+                }
+            }
+
+            if decision.full_safety_pass {
+                queue_full_state_safety_pass(&shared, &mut pending);
+            }
+            for pane_id in dirty_panes_due(&shared, now, config.reconcile_ms) {
+                pending
+                    .entry(pane_id)
+                    .or_insert_with(|| PendingReconcile::new(ReconcileReason::Dirty));
+            }
+
+            let due = pending
+                .iter()
+                .filter(|(_, work)| work.is_due(now))
+                .map(|(pane_id, work)| (pane_id.clone(), work.reason))
+                .collect::<Vec<_>>();
+            for (pane_id, reason) in due {
+                let generation = pane_stream_generation(&shared, &pane_id);
+                match reconcile_pane(&client, &config, &shared, &pane_id, reason, generation) {
+                    Ok(ReconcileOutcome::Complete) => {
+                        pending.remove(&pane_id);
+                    }
+                    Ok(ReconcileOutcome::TopologyRequired) => {
+                        mark_reconcile_failure(&shared, &pane_id, now);
+                        if let Some(work) = pending.get_mut(&pane_id) {
+                            work.failed(now);
+                        }
+                        scheduler.request_topology_scan();
+                    }
+                    Err(error) => {
+                        mark_reconcile_failure(&shared, &pane_id, now);
+                        if let Some(work) = pending.get_mut(&pane_id) {
+                            work.failed(now);
+                        }
+                        if diagnostics.should_emit(&format!("reconcile:{pane_id}"), now) {
+                            emit_shared_event(
+                                &shared,
+                                Some(pane_id),
+                                None,
+                                "runtime-error",
+                                format!("pane reconcile failed: {error}"),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(SCHEDULER_TICK_MS));
         }
     })
 }
@@ -1092,14 +1434,26 @@ fn observe_session_lines(
     stop: Arc<AtomicBool>,
 ) {
     let Ok(mut control) = client.control_mode_session(session_name) else {
-        let _ = tx.send(ObserverMessage::ControlClosed(session_name.to_string()));
+        let _ = tx.send(ObserverMessage::Closed(session_name.to_string()));
         return;
     };
+    if tx
+        .send(ObserverMessage::Opened(session_name.to_string()))
+        .is_err()
+    {
+        return;
+    }
 
     while !stop.load(Ordering::SeqCst) {
         match control.recv_timeout(Duration::from_millis(CONTROL_POLL_MS)) {
             Ok(ControlModeReceive::Line(line)) => {
-                if tx.send(ObserverMessage::ControlLine(line)).is_err() {
+                if tx
+                    .send(ObserverMessage::Line {
+                        session_name: session_name.to_string(),
+                        line,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1108,7 +1462,7 @@ fn observe_session_lines(
         }
     }
 
-    let _ = tx.send(ObserverMessage::ControlClosed(session_name.to_string()));
+    let _ = tx.send(ObserverMessage::Closed(session_name.to_string()));
 }
 
 fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) -> ControlLineEffect {
@@ -1119,6 +1473,7 @@ fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) ->
             pane_id, payload, ..
         }) => {
             if let Some(tracked) = shared.panes.get_mut(&pane_id) {
+                let now = Instant::now();
                 let decoded = decode_tmux_escaped(&payload);
                 let model = tracked
                     .screen_model
@@ -1126,8 +1481,9 @@ fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) ->
                 model.ingest(&decoded);
                 tracked.snapshot.live_excerpt =
                     trim_visible_block(&model.render(), MAX_LIVE_EXCERPT_LINES);
-                tracked.dirty = true;
-                tracked.last_stream_activity = Some(Instant::now());
+                tracked.stream_generation = tracked.stream_generation.wrapping_add(1);
+                tracked.dirty_since.get_or_insert(now);
+                tracked.last_stream_activity = Some(now);
             }
             ControlLineEffect::None
         }
@@ -1142,283 +1498,422 @@ fn handle_control_line_shared(shared: &Arc<Mutex<RuntimeShared>>, line: &str) ->
     }
 }
 
-fn emit_dirty_stream_events(shared: &Arc<Mutex<RuntimeShared>>, debounce: Duration) -> bool {
-    let now = Instant::now();
-    let events = {
-        let mut shared = shared.lock().unwrap();
-        let pane_ids = shared
-            .panes
-            .iter()
-            .filter(|(_, tracked)| {
-                tracked.dirty
-                    && tracked
-                        .last_stream_activity
-                        .is_some_and(|last_activity| now.duration_since(last_activity) >= debounce)
-            })
-            .map(|(pane_id, _)| pane_id.clone())
-            .collect::<Vec<_>>();
-
-        pane_ids
-            .into_iter()
-            .filter_map(|pane_id| {
-                let revision = next_revision(&mut shared);
-                let tracked = shared.panes.get_mut(&pane_id)?;
-                tracked.dirty = false;
-                tracked.snapshot.revision = revision;
-                tracked.snapshot.updated_at_unix_ms = now_unix_ms();
-                Some(RuntimeEvent {
-                    revision,
-                    timestamp_unix_ms: tracked.snapshot.updated_at_unix_ms,
-                    kind: String::from("pane-snapshot-updated"),
-                    pane_id: Some(pane_id),
-                    workspace_id: Some(tracked.snapshot.workspace_id.clone()),
-                    summary: String::from("stream-output"),
-                    snapshot: Some(tracked.snapshot.clone()),
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-
-    if events.is_empty() {
-        return false;
-    }
-
-    let mut shared = shared.lock().unwrap();
-    for event in events {
-        shared
-            .subscribers
-            .retain(|sender| sender.send(event.clone()).is_ok());
-    }
-    true
-}
-
-fn reconcile_all(
+fn topology_scan(
     client: &TmuxClient,
     config: &RuntimeServerConfig,
     shared: &Arc<Mutex<RuntimeShared>>,
-) -> AppResult<()> {
-    let mut current_panes = Vec::new();
-    for pane in client
-        .list_panes()?
+    known_candidates: &mut BTreeMap<String, TmuxPane>,
+) -> AppResult<Vec<String>> {
+    let current = client
+        .list_panes_strict()?
         .into_iter()
         .filter(is_runtime_discovery_candidate)
-    {
-        let inspected = if pane.current_command.eq_ignore_ascii_case("node") {
-            let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
-            if !is_verified_runtime_discovery_candidate(&pane, &inspected.classification) {
-                continue;
-            }
-            Some(inspected)
-        } else {
-            None
-        };
-        current_panes.push((pane, inspected));
-    }
-    let current_ids = current_panes
-        .iter()
-        .map(|(pane, _)| pane.pane_id.clone())
+        .map(|pane| (pane.pane_id.clone(), pane))
+        .collect::<BTreeMap<_, _>>();
+    let tracked_ids = tracked_pane_ids(shared)
+        .into_iter()
         .collect::<BTreeSet<_>>();
-
-    let removed = {
-        let shared = shared.lock().unwrap();
-        shared
-            .panes
-            .keys()
-            .filter(|pane_id| !current_ids.contains(*pane_id))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let (changed, removed) = topology_delta(known_candidates, &current, &tracked_ids);
 
     for pane_id in removed {
-        let snapshot = {
-            let mut shared = shared.lock().unwrap();
-            shared
-                .panes
-                .remove(&pane_id)
-                .map(|tracked| tracked.snapshot)
-        };
-        if let Some(snapshot) = snapshot {
-            if snapshot.desired_yolo_enabled {
-                let _ = disable_yolo_record(&config.state_dir, &pane_id);
-                emit_shared_event(
-                    shared,
-                    Some(pane_id.clone()),
-                    Some(snapshot.workspace_id.clone()),
-                    "yolo-monitoring-stopped",
-                    String::from("missing-pane"),
-                    None,
-                );
-            }
-            emit_shared_event(
-                shared,
-                Some(pane_id),
-                Some(snapshot.workspace_id),
-                "pane-removed",
-                String::from("pane removed"),
-                None,
-            );
-        }
+        remove_tracked_pane(config, shared, &pane_id, "missing-pane");
+    }
+    *known_candidates = current;
+    Ok(changed)
+}
+
+fn topology_delta(
+    previous: &BTreeMap<String, TmuxPane>,
+    current: &BTreeMap<String, TmuxPane>,
+    tracked_ids: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let changed = current
+        .iter()
+        .filter(|(pane_id, pane)| {
+            previous.get(*pane_id).is_none_or(|previous| {
+                TopologyPaneProjection::from(previous) != TopologyPaneProjection::from(*pane)
+            }) || !tracked_ids.contains(*pane_id)
+        })
+        .map(|(pane_id, _)| pane_id.clone())
+        .collect();
+    let removed = tracked_ids
+        .iter()
+        .filter(|pane_id| !current.contains_key(*pane_id))
+        .cloned()
+        .collect();
+    (changed, removed)
+}
+
+fn tracked_pane_ids(shared: &Arc<Mutex<RuntimeShared>>) -> Vec<String> {
+    shared.lock().unwrap().panes.keys().cloned().collect()
+}
+
+fn queue_full_state_safety_pass(
+    shared: &Arc<Mutex<RuntimeShared>>,
+    pending: &mut BTreeMap<String, PendingReconcile>,
+) {
+    for pane_id in tracked_pane_ids(shared) {
+        pending
+            .entry(pane_id)
+            .or_insert_with(|| PendingReconcile::new(ReconcileReason::Safety));
+    }
+}
+
+fn pane_stream_generation(shared: &Arc<Mutex<RuntimeShared>>, pane_id: &str) -> u64 {
+    shared
+        .lock()
+        .unwrap()
+        .panes
+        .get(pane_id)
+        .map(|tracked| tracked.stream_generation)
+        .unwrap_or(0)
+}
+
+fn dirty_panes_due(
+    shared: &Arc<Mutex<RuntimeShared>>,
+    now: Instant,
+    reconcile_ms: u64,
+) -> Vec<String> {
+    let debounce = Duration::from_millis(STREAM_DEBOUNCE_MS);
+    let deadline = Duration::from_millis(reconcile_ms);
+    shared
+        .lock()
+        .unwrap()
+        .panes
+        .iter()
+        .filter(|(_, tracked)| dirty_reconcile_due(tracked, now, debounce, deadline))
+        .map(|(pane_id, _)| pane_id.clone())
+        .collect()
+}
+
+fn dirty_reconcile_due(
+    tracked: &TrackedPane,
+    now: Instant,
+    debounce: Duration,
+    deadline: Duration,
+) -> bool {
+    tracked.stream_generation > tracked.reconciled_generation
+        && tracked.retry_at.is_none_or(|retry_at| retry_at <= now)
+        && (tracked
+            .last_stream_activity
+            .is_some_and(|activity| now.duration_since(activity) >= debounce)
+            || tracked
+                .dirty_since
+                .is_some_and(|dirty_since| now.duration_since(dirty_since) >= deadline))
+}
+
+fn mark_reconcile_failure(shared: &Arc<Mutex<RuntimeShared>>, pane_id: &str, now: Instant) {
+    let mut shared = shared.lock().unwrap();
+    if let Some(tracked) = shared.panes.get_mut(pane_id) {
+        tracked.retry_at = Some(now + retry_delay(tracked.retry_attempt));
+        tracked.retry_attempt = tracked.retry_attempt.saturating_add(1);
+    }
+}
+
+fn retry_delay(attempt: u8) -> Duration {
+    Duration::from_millis(match attempt {
+        0 => 250,
+        1 => 500,
+        2 => 1_000,
+        3 => 2_000,
+        _ => 5_000,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileOutcome {
+    Complete,
+    TopologyRequired,
+}
+
+fn reconcile_pane(
+    client: &TmuxClient,
+    config: &RuntimeServerConfig,
+    shared: &Arc<Mutex<RuntimeShared>>,
+    pane_id: &str,
+    _reason: ReconcileReason,
+    generation: u64,
+) -> AppResult<ReconcileOutcome> {
+    let Some(pane) = client.pane_by_id_exact(pane_id)? else {
+        return Ok(ReconcileOutcome::TopologyRequired);
+    };
+    if !is_runtime_discovery_candidate(&pane) {
+        return Ok(ReconcileOutcome::TopologyRequired);
     }
 
-    for (pane, inspected) in current_panes {
-        let workspace =
-            resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
-        let inspected = match inspected {
-            Some(inspected) => inspected,
-            None => inspect_pane(client, &pane.pane_id, config.history_lines)?,
-        };
-        let claude_session_id =
-            sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
-        let codex_session_id = if is_yolo_candidate_pane(&pane) {
-            resolve_codex_session_id_for_pane(&pane)?
-        } else {
-            None
-        };
-        let runtime_durations = sync_tmux_runtime_state(
-            &config.state_dir,
-            &workspace.id,
-            &pane,
-            inspected.classification.state.as_str(),
-            is_waiting_state(inspected.classification.state),
-            inspected.classification.state == SessionState::BusyResponding,
-            claude_session_id.as_deref().or(codex_session_id.as_deref()),
-        )?;
-        let desired_yolo_enabled = matches!(read_yolo_record(&config.state_dir, &pane.pane_id)?, Some(record) if record.enabled);
-
-        let live_excerpt = {
-            let shared = shared.lock().unwrap();
-            shared
-                .panes
-                .get(&pane.pane_id)
+    let identity_changed = shared
+        .lock()
+        .unwrap()
+        .panes
+        .get(pane_id)
+        .is_some_and(|tracked| !same_pane_identity(&tracked.pane, &pane));
+    let inspected = inspect_pane(client, &pane.pane_id, config.history_lines)?;
+    if !is_verified_runtime_discovery_candidate(&pane, &inspected.classification) {
+        remove_tracked_pane(config, shared, pane_id, "candidate-not-verified");
+        return Ok(ReconcileOutcome::Complete);
+    }
+    let workspace = resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))?;
+    let claude_session_id = sync_tmux_claude_session_id(&config.state_dir, &workspace.id, &pane)?;
+    let codex_session_id = if is_yolo_candidate_pane(&pane) {
+        resolve_codex_session_id_for_pane(&pane)?
+    } else {
+        None
+    };
+    let provider_session_id = claude_session_id
+        .as_deref()
+        .or(codex_session_id.as_deref())
+        .map(str::to_string);
+    let runtime_durations = sync_tmux_runtime_state(
+        &config.state_dir,
+        &workspace.id,
+        &pane,
+        inspected.classification.state.as_str(),
+        is_waiting_state(inspected.classification.state),
+        inspected.classification.state == SessionState::BusyResponding,
+        provider_session_id.as_deref(),
+    )?;
+    let desired_yolo_enabled = matches!(
+        read_yolo_record(&config.state_dir, &pane.pane_id)?,
+        Some(record) if record.enabled
+    );
+    let (previous_stop_reason, previous_last_action, previous_revision, live_excerpt) = {
+        let shared = shared.lock().unwrap();
+        let previous = shared.panes.get(&pane.pane_id);
+        (
+            previous
+                .filter(|_| !identity_changed)
+                .and_then(|tracked| tracked.snapshot.last_stop_reason.clone()),
+            previous
+                .filter(|_| !identity_changed)
+                .and_then(|tracked| tracked.snapshot.last_action.clone()),
+            previous
+                .map(|tracked| tracked.snapshot.revision)
+                .unwrap_or(0),
+            previous
+                .filter(|_| !identity_changed)
                 .map(|tracked| tracked.snapshot.live_excerpt.clone())
                 .filter(|excerpt| !excerpt.is_empty())
                 .unwrap_or_else(|| {
                     trim_visible_block(&inspected.focused_source, MAX_LIVE_EXCERPT_LINES)
-                })
-        };
-
-        let updated_at_unix_ms = now_unix_ms();
-        let event_snapshot;
-        let mut discovered = false;
-        let mut state_changed = None;
-        {
-            let mut shared = shared.lock().unwrap();
-            let previous_stop_reason = shared
-                .panes
-                .get(&pane.pane_id)
-                .and_then(|tracked| tracked.snapshot.last_stop_reason.clone());
-            let actual_yolo_enabled = desired_yolo_enabled && previous_stop_reason.is_none();
-            let revision = next_revision(&mut shared);
-            let snapshot = RuntimePaneSnapshot {
-                pane: pane.clone(),
-                classification: inspected.classification.clone(),
-                focused_source: inspected.focused_source.clone(),
-                raw_source: inspected.raw_source.clone(),
-                live_excerpt,
-                wait_duration_ms: runtime_durations
-                    .wait_duration
-                    .map(|duration| duration.as_millis() as u64),
-                claude_session_id,
-                workspace_id: workspace.id.clone(),
-                workspace_root: workspace.workspace_root.clone(),
-                desired_yolo_enabled,
-                actual_yolo_enabled,
-                last_stop_reason: previous_stop_reason,
-                last_action: shared
-                    .panes
-                    .get(&pane.pane_id)
-                    .and_then(|tracked| tracked.snapshot.last_action.clone()),
-                revision,
-                updated_at_unix_ms,
-            };
-            let signature = SnapshotSignature {
-                pane: pane.clone(),
-                classification: inspected.classification.clone(),
-            };
-            let entry = shared.panes.entry(pane.pane_id.clone());
-            match entry {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    discovered = true;
-                    event_snapshot = Some(snapshot.clone());
-                    entry.insert(TrackedPane {
-                        pane: pane.clone(),
-                        workspace,
-                        snapshot,
-                        signature,
-                        screen_model: None,
-                        screen_model_seeded: false,
-                        dirty: false,
-                        last_stream_activity: None,
-                        post_approve_guard_raw_source: None,
-                    });
+                }),
+        )
+    };
+    let actual_yolo_enabled = desired_yolo_enabled && previous_stop_reason.is_none();
+    let mut snapshot = RuntimePaneSnapshot {
+        pane: pane.clone(),
+        classification: inspected.classification.clone(),
+        focused_source: inspected.focused_source.clone(),
+        raw_source: inspected.raw_source.clone(),
+        live_excerpt,
+        wait_duration_ms: runtime_durations
+            .wait_duration
+            .map(|duration| duration.as_millis() as u64),
+        cook_duration_ms: runtime_durations
+            .cook_duration
+            .map(|duration| duration.as_millis() as u64),
+        claude_session_id,
+        workspace_id: workspace.id.clone(),
+        workspace_root: workspace.workspace_root.clone(),
+        desired_yolo_enabled,
+        actual_yolo_enabled,
+        last_stop_reason: previous_stop_reason,
+        last_action: previous_last_action,
+        revision: previous_revision,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    let mut discovered = false;
+    let mut state_changed = None;
+    let publish_snapshot;
+    let generation_stable;
+    {
+        let mut shared = shared.lock().unwrap();
+        generation_stable = shared
+            .panes
+            .get(&pane.pane_id)
+            .is_none_or(|tracked| tracked.stream_generation == generation);
+        if !generation_stable {
+            snapshot.live_excerpt = shared.panes[&pane.pane_id].snapshot.live_excerpt.clone();
+        }
+        let signature = SnapshotSignature::from_snapshot(&snapshot, provider_session_id);
+        let previous_signature = shared
+            .panes
+            .get(&pane.pane_id)
+            .map(|tracked| tracked.signature.clone());
+        let changed = previous_signature.as_ref() != Some(&signature);
+        if changed {
+            snapshot.revision = next_revision(&mut shared);
+        }
+        match shared.panes.entry(pane.pane_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                discovered = true;
+                let mut model = ScreenModel::new(config.history_lines.max(MAX_LIVE_EXCERPT_LINES));
+                let screen_model_seeded = !inspected.focused_source.is_empty();
+                if screen_model_seeded {
+                    model.seed(&inspected.focused_source);
                 }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let tracked = entry.get_mut();
-                    if tracked.snapshot.classification.state != inspected.classification.state {
-                        state_changed = Some(inspected.classification.state);
-                    }
-                    // Clear the post-approve guard once the frame has changed
-                    // — the agy UI has redrawn, so it is safe to evaluate the
-                    // next prompt on its own merits.
-                    if let Some(prev_raw) = tracked.post_approve_guard_raw_source.as_deref() {
-                        if prev_raw != inspected.raw_source.as_str() {
-                            tracked.post_approve_guard_raw_source = None;
-                        }
-                    }
-                    tracked.pane = pane.clone();
-                    tracked.workspace = workspace;
-                    tracked.signature = signature;
-                    tracked.snapshot = snapshot.clone();
-                    if !tracked.screen_model_seeded && !inspected.focused_source.is_empty() {
-                        let mut model =
-                            ScreenModel::new(config.history_lines.max(MAX_LIVE_EXCERPT_LINES));
-                        model.seed(&inspected.focused_source);
-                        tracked.screen_model = Some(model);
-                        tracked.screen_model_seeded = true;
-                    }
-                    event_snapshot = Some(snapshot);
+                entry.insert(TrackedPane {
+                    pane: pane.clone(),
+                    workspace,
+                    snapshot: snapshot.clone(),
+                    signature,
+                    screen_model: screen_model_seeded.then_some(model),
+                    screen_model_seeded,
+                    stream_generation: generation,
+                    reconciled_generation: generation,
+                    dirty_since: None,
+                    last_stream_activity: None,
+                    retry_at: None,
+                    retry_attempt: 0,
+                    post_approve_guard_raw_source: None,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let tracked = entry.get_mut();
+                if tracked.snapshot.classification.state != inspected.classification.state {
+                    state_changed = Some(inspected.classification.state);
+                }
+                if identity_changed
+                    || tracked
+                        .post_approve_guard_raw_source
+                        .as_deref()
+                        .is_some_and(|raw| raw != inspected.raw_source.as_str())
+                {
+                    tracked.post_approve_guard_raw_source = None;
+                }
+                tracked.pane = pane.clone();
+                tracked.workspace = workspace;
+                tracked.signature = signature;
+                tracked.snapshot = snapshot.clone();
+                complete_reconcile_generation(tracked, generation);
+                tracked.retry_at = None;
+                tracked.retry_attempt = 0;
+                if identity_changed {
+                    tracked.screen_model = None;
+                    tracked.screen_model_seeded = false;
+                }
+                if !tracked.screen_model_seeded && !inspected.focused_source.is_empty() {
+                    let mut model =
+                        ScreenModel::new(config.history_lines.max(MAX_LIVE_EXCERPT_LINES));
+                    model.seed(&inspected.focused_source);
+                    tracked.screen_model = Some(model);
+                    tracked.screen_model_seeded = true;
                 }
             }
         }
+        publish_snapshot = changed.then_some(snapshot.clone());
+    }
 
-        if let Some(snapshot) = event_snapshot.clone() {
-            if discovered {
-                emit_shared_event(
-                    shared,
-                    Some(snapshot.pane.pane_id.clone()),
-                    Some(snapshot.workspace_id.clone()),
-                    "pane-discovered",
-                    format!("pane discovered {}", snapshot.pane.pane_id),
-                    Some(snapshot.clone()),
-                );
-            }
+    if discovered {
+        emit_shared_event(
+            shared,
+            Some(snapshot.pane.pane_id.clone()),
+            Some(snapshot.workspace_id.clone()),
+            "pane-discovered",
+            format!("pane discovered {}", snapshot.pane.pane_id),
+            Some(snapshot.clone()),
+        );
+    }
+    if let Some(published) = publish_snapshot {
+        emit_shared_event(
+            shared,
+            Some(published.pane.pane_id.clone()),
+            Some(published.workspace_id.clone()),
+            "pane-snapshot-updated",
+            format!(
+                "{} {}",
+                published.pane.pane_id,
+                published.classification.state.as_str()
+            ),
+            Some(published.clone()),
+        );
+        if let Some(state) = state_changed {
             emit_shared_event(
                 shared,
-                Some(snapshot.pane.pane_id.clone()),
-                Some(snapshot.workspace_id.clone()),
-                "pane-snapshot-updated",
-                format!(
-                    "{} {}",
-                    snapshot.pane.pane_id,
-                    snapshot.classification.state.as_str()
-                ),
-                Some(snapshot.clone()),
+                Some(published.pane.pane_id.clone()),
+                Some(published.workspace_id.clone()),
+                "pane-state-changed",
+                format!("{} {}", published.pane.pane_id, state.as_str()),
+                Some(published),
             );
-            if let Some(state) = state_changed {
-                emit_shared_event(
-                    shared,
-                    Some(snapshot.pane.pane_id.clone()),
-                    Some(snapshot.workspace_id.clone()),
-                    "pane-state-changed",
-                    format!("{} {}", snapshot.pane.pane_id, state.as_str()),
-                    Some(snapshot.clone()),
-                );
-            }
-            maybe_run_yolo_action(client, config, shared, &snapshot)?;
         }
     }
 
+    // Internal persistence and guard maintenance still run when an unchanged
+    // consumer snapshot does not need publication. Automatic action requires
+    // a generation-stable capture; raced output remains dirty for a retry.
+    let generation_stable =
+        generation_stable && pane_stream_generation(shared, &snapshot.pane.pane_id) == generation;
+    run_automatic_action_if_generation_stable(generation_stable, || {
+        maybe_run_yolo_action(client, config, shared, &snapshot)
+    })?;
+    Ok(ReconcileOutcome::Complete)
+}
+
+fn same_pane_identity(expected: &TmuxPane, current: &TmuxPane) -> bool {
+    PaneIdentityProjection::from(expected) == PaneIdentityProjection::from(current)
+}
+
+fn run_automatic_action_if_generation_stable(
+    generation_stable: bool,
+    action: impl FnOnce() -> AppResult<()>,
+) -> AppResult<()> {
+    if generation_stable {
+        action()?;
+    }
     Ok(())
+}
+
+fn reconcile_clears_dirty(stream_generation: u64, captured_generation: u64) -> bool {
+    stream_generation == captured_generation
+}
+
+fn complete_reconcile_generation(tracked: &mut TrackedPane, captured_generation: u64) {
+    tracked.reconciled_generation = tracked.reconciled_generation.max(captured_generation);
+    if reconcile_clears_dirty(tracked.stream_generation, captured_generation) {
+        tracked.dirty_since = None;
+        tracked.last_stream_activity = None;
+    } else {
+        // A newer output event raced with capture. Keep it dirty, but start
+        // its hard deadline at that newer activity instead of immediately
+        // recapturing on every scheduler tick.
+        tracked.dirty_since = tracked.last_stream_activity;
+    }
+}
+
+fn remove_tracked_pane(
+    config: &RuntimeServerConfig,
+    shared: &Arc<Mutex<RuntimeShared>>,
+    pane_id: &str,
+    reason: &str,
+) {
+    let snapshot = shared
+        .lock()
+        .unwrap()
+        .panes
+        .remove(pane_id)
+        .map(|tracked| tracked.snapshot);
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if snapshot.desired_yolo_enabled {
+        let _ = disable_yolo_record(&config.state_dir, pane_id);
+        emit_shared_event(
+            shared,
+            Some(pane_id.to_string()),
+            Some(snapshot.workspace_id.clone()),
+            "yolo-monitoring-stopped",
+            reason.to_string(),
+            None,
+        );
+    }
+    emit_shared_event(
+        shared,
+        Some(pane_id.to_string()),
+        Some(snapshot.workspace_id),
+        "pane-removed",
+        reason.to_string(),
+        None,
+    );
 }
 
 fn maybe_run_yolo_action(
@@ -1437,18 +1932,14 @@ fn maybe_run_yolo_action(
     // Post-approve guard: if the previous reconcile pass already approved this
     // exact frame (same `raw_source`), skip — the agy UI has not yet redrawn
     // and re-firing `Enter` would land on whatever the post-approve frame is
-    // showing. The guard is cleared by `reconcile_all` once `raw_source`
+    // showing. The guard is cleared by `reconcile_pane` once `raw_source`
     // changes.
     {
         let locked = shared.lock().unwrap();
-        if let Some(tracked) = locked.panes.get(&snapshot.pane.pane_id) {
-            if tracked
-                .post_approve_guard_raw_source
-                .as_deref()
-                .is_some_and(|prev| prev == snapshot.raw_source.as_str())
-            {
-                return Ok(());
-            }
+        if let Some(tracked) = locked.panes.get(&snapshot.pane.pane_id)
+            && post_approve_guard_matches(tracked, &snapshot.raw_source)
+        {
+            return Ok(());
         }
     }
 
@@ -1457,9 +1948,10 @@ fn maybe_run_yolo_action(
     };
     if !record.matches_pane(&snapshot.pane) {
         let _ = disable_yolo_record(&config.state_dir, &snapshot.pane.pane_id)?;
-        update_yolo_runtime_state(
+        let stopped_snapshot = update_yolo_runtime_state(
             shared,
             &snapshot.pane.pane_id,
+            Some(false),
             false,
             Some("identity-changed"),
         );
@@ -1469,7 +1961,7 @@ fn maybe_run_yolo_action(
             Some(snapshot.workspace_id.clone()),
             "yolo-monitoring-stopped",
             String::from("identity-changed"),
-            Some(snapshot.clone()),
+            stopped_snapshot.or_else(|| Some(snapshot.clone())),
         );
         return Ok(());
     }
@@ -1518,54 +2010,116 @@ fn maybe_run_yolo_action(
         &snapshot.classification,
     ) {
         Ok(executed) => {
-            let after = inspect_pane(client, &snapshot.pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
-            let mut next_snapshot = snapshot.clone();
-            next_snapshot.classification = after.classification.clone();
-            next_snapshot.focused_source = after.focused_source.clone();
-            next_snapshot.raw_source = after.raw_source.clone();
-            next_snapshot.last_action = Some(executed);
-            // Write the refreshed snapshot back into `shared.panes` and arm the
-            // post-approve guard with the pre-approve `raw_source`. The next
-            // reconcile pass will skip re-firing if `raw_source` is still
-            // unchanged (UI has not redrawn yet) and clear the guard once it
-            // diverges. The `ActionGuard` released on `Drop` here only covers
-            // concurrent calls within the same reconcile.
+            // Arm the guard before the post-action capture so a capture
+            // failure cannot make the same prompt eligible a second time.
             {
                 let mut locked = shared.lock().unwrap();
                 if let Some(tracked) = locked.panes.get_mut(&snapshot.pane.pane_id) {
-                    tracked.snapshot.classification = after.classification.clone();
-                    tracked.snapshot.focused_source = after.focused_source.clone();
-                    tracked.snapshot.raw_source = after.raw_source.clone();
-                    tracked.snapshot.last_action = next_snapshot.last_action.clone();
-                    tracked.signature = SnapshotSignature {
-                        pane: tracked.pane.clone(),
-                        classification: after.classification,
-                    };
                     tracked.post_approve_guard_raw_source = Some(snapshot.raw_source.clone());
                 }
             }
+            let after = inspect_pane(client, &snapshot.pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+            let provider_session_id = shared
+                .lock()
+                .unwrap()
+                .panes
+                .get(&snapshot.pane.pane_id)
+                .and_then(|tracked| tracked.signature.provider_session_id.clone());
+            let runtime_durations = sync_tmux_runtime_state(
+                &config.state_dir,
+                &snapshot.workspace_id,
+                &snapshot.pane,
+                after.classification.state.as_str(),
+                is_waiting_state(after.classification.state),
+                after.classification.state == SessionState::BusyResponding,
+                provider_session_id.as_deref(),
+            )?;
+            let next_snapshot = commit_post_yolo_snapshot(
+                shared,
+                &snapshot.pane.pane_id,
+                &after,
+                executed,
+                runtime_durations,
+                now_unix_ms(),
+            )?;
             emit_shared_event(
                 shared,
-                Some(snapshot.pane.pane_id.clone()),
-                Some(snapshot.workspace_id.clone()),
+                Some(next_snapshot.pane.pane_id.clone()),
+                Some(next_snapshot.workspace_id.clone()),
                 "action-executed",
-                action_summary.clone(),
+                action_summary,
                 Some(next_snapshot),
             );
         }
         Err(error) => {
-            update_yolo_runtime_state(shared, &snapshot.pane.pane_id, false, Some("action-failed"));
+            let failed_snapshot = update_yolo_runtime_state(
+                shared,
+                &snapshot.pane.pane_id,
+                None,
+                false,
+                Some("action-failed"),
+            );
             emit_shared_event(
                 shared,
                 Some(snapshot.pane.pane_id.clone()),
                 Some(snapshot.workspace_id.clone()),
                 "action-failed",
                 error.to_string(),
-                Some(snapshot.clone()),
+                failed_snapshot.or_else(|| Some(snapshot.clone())),
             );
         }
     }
     Ok(())
+}
+
+fn commit_post_yolo_snapshot(
+    shared: &Arc<Mutex<RuntimeShared>>,
+    pane_id: &str,
+    inspected: &InspectedPane,
+    last_action: String,
+    runtime_durations: TmuxRuntimeDurations,
+    updated_at_unix_ms: i64,
+) -> AppResult<RuntimePaneSnapshot> {
+    let mut shared = shared.lock().unwrap();
+    if !shared.panes.contains_key(pane_id) {
+        return Err(AppError::with_exit_code(
+            format!("pane not found: {pane_id}"),
+            404,
+        ));
+    }
+    let revision = next_revision(&mut shared);
+    let tracked = shared.panes.get_mut(pane_id).expect("pane checked above");
+    tracked.snapshot.classification = inspected.classification.clone();
+    tracked.snapshot.focused_source = inspected.focused_source.clone();
+    tracked.snapshot.raw_source = inspected.raw_source.clone();
+    tracked.snapshot.live_excerpt =
+        trim_visible_block(&inspected.focused_source, MAX_LIVE_EXCERPT_LINES);
+    tracked.snapshot.wait_duration_ms = runtime_durations
+        .wait_duration
+        .map(|duration| duration.as_millis() as u64);
+    tracked.snapshot.cook_duration_ms = runtime_durations
+        .cook_duration
+        .map(|duration| duration.as_millis() as u64);
+    tracked.snapshot.last_action = Some(last_action);
+    tracked.snapshot.revision = revision;
+    tracked.snapshot.updated_at_unix_ms = updated_at_unix_ms;
+    if !inspected.focused_source.is_empty() {
+        let model = tracked
+            .screen_model
+            .get_or_insert_with(|| ScreenModel::new(MAX_LIVE_EXCERPT_LINES));
+        model.seed(&inspected.focused_source);
+        tracked.screen_model_seeded = true;
+    }
+    let provider_session_id = tracked.signature.provider_session_id.clone();
+    tracked.signature = SnapshotSignature::from_snapshot(&tracked.snapshot, provider_session_id);
+    Ok(tracked.snapshot.clone())
+}
+
+fn post_approve_guard_matches(tracked: &TrackedPane, raw_source: &str) -> bool {
+    tracked
+        .post_approve_guard_raw_source
+        .as_deref()
+        .is_some_and(|previous| previous == raw_source)
 }
 
 fn yolo_workflow(snapshot: &RuntimePaneSnapshot) -> Option<GuardedWorkflow> {
@@ -1609,14 +2163,26 @@ fn is_yolo_candidate_pane(pane: &TmuxPane) -> bool {
 fn update_yolo_runtime_state(
     shared: &Arc<Mutex<RuntimeShared>>,
     pane_id: &str,
+    desired_yolo_enabled: Option<bool>,
     actual_yolo_enabled: bool,
     stop_reason: Option<&str>,
-) {
+) -> Option<RuntimePaneSnapshot> {
     let mut shared = shared.lock().unwrap();
-    if let Some(tracked) = shared.panes.get_mut(pane_id) {
-        tracked.snapshot.actual_yolo_enabled = actual_yolo_enabled;
-        tracked.snapshot.last_stop_reason = stop_reason.map(str::to_string);
+    if !shared.panes.contains_key(pane_id) {
+        return None;
     }
+    let revision = next_revision(&mut shared);
+    let tracked = shared.panes.get_mut(pane_id).expect("pane checked above");
+    if let Some(desired) = desired_yolo_enabled {
+        tracked.snapshot.desired_yolo_enabled = desired;
+    }
+    tracked.snapshot.actual_yolo_enabled = actual_yolo_enabled;
+    tracked.snapshot.last_stop_reason = stop_reason.map(str::to_string);
+    tracked.snapshot.revision = revision;
+    tracked.snapshot.updated_at_unix_ms = now_unix_ms();
+    let provider_session_id = tracked.signature.provider_session_id.clone();
+    tracked.signature = SnapshotSignature::from_snapshot(&tracked.snapshot, provider_session_id);
+    Some(tracked.snapshot.clone())
 }
 
 fn filtered_snapshots(
@@ -1691,10 +2257,8 @@ fn refresh_action_snapshot(
     tracked.snapshot.last_action = last_action;
     tracked.snapshot.revision = revision;
     tracked.snapshot.updated_at_unix_ms = now_unix_ms();
-    tracked.signature = SnapshotSignature {
-        pane: tracked.pane.clone(),
-        classification: inspected.classification,
-    };
+    let provider_session_id = tracked.signature.provider_session_id.clone();
+    tracked.signature = SnapshotSignature::from_snapshot(&tracked.snapshot, provider_session_id);
     Ok(tracked.snapshot.clone())
 }
 
@@ -1702,9 +2266,11 @@ fn validate_action_target(
     client: &TmuxClient,
     snapshot: &RuntimePaneSnapshot,
 ) -> AppResult<TmuxPane> {
-    let current = client.pane_by_id(&snapshot.pane.pane_id)?.ok_or_else(|| {
-        AppError::with_exit_code(format!("pane not found: {}", snapshot.pane.pane_id), 404)
-    })?;
+    let current = client
+        .pane_by_id_exact(&snapshot.pane.pane_id)?
+        .ok_or_else(|| {
+            AppError::with_exit_code(format!("pane not found: {}", snapshot.pane.pane_id), 404)
+        })?;
     let current_record = YoloRecord {
         instance_id: String::new(),
         workspace_id: snapshot.workspace_id.clone(),
@@ -1777,7 +2343,7 @@ fn emit_shared_event(
         };
         shared
             .subscribers
-            .retain(|sender| sender.send(event.clone()).is_ok());
+            .retain(|sender| sender.try_send(event.clone()).is_ok());
         event
     };
     let _ = event;
@@ -1861,6 +2427,8 @@ fn notification_requires_reconcile(message: &str) -> bool {
     [
         "%window-add",
         "%window-close",
+        "%window-renamed",
+        "%session-renamed",
         "%session-changed",
         "%pane-add",
         "%pane-close",
@@ -1876,6 +2444,7 @@ fn is_waiting_state(state: SessionState) -> bool {
             | SessionState::PromptEditing
             | SessionState::PermissionDialog
             | SessionState::FolderTrustPrompt
+            | SessionState::AgyCommandPermissionPrompt
     )
 }
 
@@ -1963,6 +2532,7 @@ pub fn build_instance_detail_json(
             "actual_yolo_enabled": snapshot.actual_yolo_enabled,
             "last_stop_reason": snapshot.last_stop_reason,
             "wait_duration_ms": snapshot.wait_duration_ms,
+            "cook_duration_ms": snapshot.cook_duration_ms,
             "claude_session_id": snapshot.claude_session_id,
             "revision": snapshot.revision,
             "updated_at_unix_ms": snapshot.updated_at_unix_ms,
@@ -1973,12 +2543,29 @@ pub fn build_instance_detail_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeEvent, RuntimeResponse, is_runtime_discovery_candidate,
-        is_verified_runtime_discovery_candidate, is_yolo_candidate_pane, runtime_socket_path,
+        ActionGuard, ControlLineEffect, PendingReconcile, ReconcileReason, RuntimeEvent,
+        RuntimePaneSnapshot, RuntimeResponse, RuntimeScheduler, RuntimeShared, RuntimeSubscription,
+        SnapshotSignature, TrackedPane, commit_post_yolo_snapshot, complete_reconcile_generation,
+        dirty_reconcile_due, emit_shared_event, handle_control_line_shared, handle_subscribe,
+        is_runtime_discovery_candidate, is_verified_runtime_discovery_candidate, is_waiting_state,
+        is_yolo_candidate_pane, notification_requires_reconcile, post_approve_guard_matches,
+        queue_full_state_safety_pass, reconcile_clears_dirty, retry_delay,
+        run_automatic_action_if_generation_stable, runtime_socket_path, same_pane_identity,
+        topology_delta, update_yolo_runtime_state, write_message, yolo_workflow,
     };
+    use crate::app::InspectedPane;
+    use crate::automation::GuardedWorkflow;
     use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
+    use crate::storage::{TmuxRuntimeDurations, WorkspaceRecord};
     use crate::tmux::TmuxPane;
-    use std::path::Path;
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::BufReader;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn sample_pane(current_command: &str) -> TmuxPane {
         TmuxPane {
@@ -1997,6 +2584,64 @@ mod tests {
             pane_active: true,
             cursor_x: Some(0),
             cursor_y: Some(0),
+        }
+    }
+
+    fn sample_classification(state: SessionState) -> Classification {
+        Classification {
+            source: String::from("test"),
+            state,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: Vec::new(),
+        }
+    }
+
+    fn sample_snapshot() -> RuntimePaneSnapshot {
+        RuntimePaneSnapshot {
+            pane: sample_pane("claude"),
+            classification: sample_classification(SessionState::ChatReady),
+            focused_source: String::from("ready"),
+            raw_source: String::from("raw ready"),
+            live_excerpt: String::from("ready"),
+            wait_duration_ms: Some(10),
+            cook_duration_ms: Some(20),
+            claude_session_id: Some(String::from("session")),
+            workspace_id: String::from("workspace"),
+            workspace_root: String::from("/tmp/demo"),
+            desired_yolo_enabled: false,
+            actual_yolo_enabled: false,
+            last_stop_reason: None,
+            last_action: None,
+            revision: 1,
+            updated_at_unix_ms: 100,
+        }
+    }
+
+    fn tracked_pane(now: Instant) -> TrackedPane {
+        let snapshot = sample_snapshot();
+        TrackedPane {
+            pane: snapshot.pane.clone(),
+            workspace: WorkspaceRecord {
+                id: snapshot.workspace_id.clone(),
+                workspace_root: snapshot.workspace_root.clone(),
+                repo_key: None,
+            },
+            signature: SnapshotSignature::from_snapshot(
+                &snapshot,
+                snapshot.claude_session_id.clone(),
+            ),
+            snapshot,
+            screen_model: None,
+            screen_model_seeded: false,
+            stream_generation: 1,
+            reconciled_generation: 0,
+            dirty_since: Some(now),
+            last_stream_activity: Some(now),
+            retry_at: None,
+            retry_attempt: 0,
+            post_approve_guard_raw_source: None,
         }
     }
 
@@ -2089,5 +2734,579 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn scheduler_scans_immediately_but_not_on_ordinary_ticks() {
+        let start = Instant::now();
+        let mut scheduler = RuntimeScheduler::new(start, 1_000);
+
+        assert!(scheduler.take_due(start).topology_scan);
+        let ordinary = scheduler.take_due(start + Duration::from_millis(50));
+        assert!(!ordinary.topology_scan);
+        assert!(!ordinary.full_safety_pass);
+
+        let safety = scheduler.take_due(start + Duration::from_secs(10));
+        assert!(!safety.topology_scan);
+        assert!(safety.full_safety_pass);
+        let topology = scheduler.take_due(start + Duration::from_secs(15));
+        assert!(topology.topology_scan);
+        assert!(!topology.full_safety_pass);
+    }
+
+    #[test]
+    fn scheduler_coalesces_notifications_and_honors_long_reconcile_interval() {
+        let start = Instant::now();
+        let mut scheduler = RuntimeScheduler::new(start, 20_000);
+        scheduler.take_due(start);
+        scheduler.request_topology_scan();
+        scheduler.request_topology_scan();
+
+        assert!(
+            scheduler
+                .take_due(start + Duration::from_millis(50))
+                .topology_scan
+        );
+        assert!(
+            !scheduler
+                .take_due(start + Duration::from_millis(100))
+                .topology_scan
+        );
+        assert!(
+            !scheduler
+                .take_due(start + Duration::from_secs(10))
+                .full_safety_pass
+        );
+        assert!(
+            scheduler
+                .take_due(start + Duration::from_secs(20))
+                .full_safety_pass
+        );
+    }
+
+    #[test]
+    fn scheduler_retries_failed_topology_with_bounded_backoff() {
+        let start = Instant::now();
+        let mut scheduler = RuntimeScheduler::new(start, 1_000);
+        assert!(scheduler.take_due(start).topology_scan);
+        scheduler.finish_topology_scan(start, false);
+
+        assert!(
+            !scheduler
+                .take_due(start + Duration::from_millis(249))
+                .topology_scan
+        );
+        assert!(
+            scheduler
+                .take_due(start + Duration::from_millis(250))
+                .topology_scan
+        );
+        scheduler.finish_topology_scan(start + Duration::from_millis(250), false);
+        assert!(
+            !scheduler
+                .take_due(start + Duration::from_millis(749))
+                .topology_scan
+        );
+        assert!(
+            scheduler
+                .take_due(start + Duration::from_millis(750))
+                .topology_scan
+        );
+    }
+
+    #[test]
+    fn topology_delta_detects_add_change_and_complete_removal() {
+        let old = sample_pane("claude");
+        let mut volatile_only = old.clone();
+        volatile_only.window_name = String::from("renamed");
+        volatile_only.pane_title = String::from("terminal title");
+        volatile_only.pane_active = false;
+        volatile_only.cursor_x = Some(12);
+        volatile_only.cursor_y = Some(8);
+        let mut added = sample_pane("codex");
+        added.pane_id = String::from("%2");
+        let previous = BTreeMap::from([(old.pane_id.clone(), old.clone())]);
+        let current = BTreeMap::from([
+            (volatile_only.pane_id.clone(), volatile_only.clone()),
+            (added.pane_id.clone(), added),
+        ]);
+        let tracked = BTreeSet::from([String::from("%1"), String::from("%3")]);
+
+        let (changed, removed) = topology_delta(&previous, &current, &tracked);
+        assert_eq!(changed, [String::from("%2")]);
+        assert_eq!(removed, [String::from("%3")]);
+
+        let mut relevant = volatile_only;
+        relevant.current_path = String::from("/tmp/replacement-worktree");
+        let current = BTreeMap::from([(relevant.pane_id.clone(), relevant)]);
+        let (changed, _) = topology_delta(&previous, &current, &tracked);
+        assert_eq!(changed, [String::from("%1")]);
+
+        let mut replacement = old;
+        replacement.pane_pid = Some(9999);
+        let current = BTreeMap::from([(replacement.pane_id.clone(), replacement)]);
+        let (changed, _) = topology_delta(&previous, &current, &tracked);
+        assert_eq!(changed, [String::from("%1")]);
+    }
+
+    #[test]
+    fn full_state_safety_pass_only_queues_tracked_panes() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
+            "/tmp/runtime-test.sock",
+        ))));
+        shared
+            .lock()
+            .unwrap()
+            .panes
+            .insert(String::from("%1"), tracked_pane(Instant::now()));
+        let mut pending = BTreeMap::new();
+
+        queue_full_state_safety_pass(&shared, &mut pending);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending["%1"].reason, ReconcileReason::Safety);
+    }
+
+    #[test]
+    fn dirty_reconcile_uses_quiet_debounce_or_hard_deadline() {
+        let start = Instant::now();
+        let mut tracked = tracked_pane(start);
+        tracked.last_stream_activity = Some(start + Duration::from_millis(900));
+
+        assert!(!dirty_reconcile_due(
+            &tracked,
+            start + Duration::from_millis(999),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        ));
+        assert!(dirty_reconcile_due(
+            &tracked,
+            start + Duration::from_secs(1),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        ));
+
+        tracked.dirty_since = Some(start + Duration::from_millis(950));
+        tracked.last_stream_activity = Some(start);
+        assert!(dirty_reconcile_due(
+            &tracked,
+            start + Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn dirty_reconcile_retains_generation_and_respects_retry() {
+        let start = Instant::now();
+        let mut tracked = tracked_pane(start);
+        tracked.retry_at = Some(start + Duration::from_millis(250));
+        assert!(!dirty_reconcile_due(
+            &tracked,
+            start + Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        ));
+        assert!(dirty_reconcile_due(
+            &tracked,
+            start + Duration::from_millis(250),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        ));
+        assert!(reconcile_clears_dirty(7, 7));
+        assert!(!reconcile_clears_dirty(8, 7));
+
+        tracked.stream_generation = 2;
+        tracked.last_stream_activity = Some(start + Duration::from_millis(100));
+        complete_reconcile_generation(&mut tracked, 1);
+        assert_eq!(tracked.reconciled_generation, 1);
+        assert_eq!(
+            tracked.dirty_since,
+            Some(start + Duration::from_millis(100))
+        );
+        assert!(!dirty_reconcile_due(
+            &tracked,
+            start + Duration::from_millis(150),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn raced_generation_blocks_automatic_action_until_stable_capture() {
+        let start = Instant::now();
+        let mut tracked = tracked_pane(start);
+        let key_sends = Cell::new(0);
+        let mut permission_snapshot = sample_snapshot();
+        permission_snapshot.classification = sample_classification(SessionState::PermissionDialog);
+        permission_snapshot.desired_yolo_enabled = true;
+        assert_eq!(
+            yolo_workflow(&permission_snapshot),
+            Some(GuardedWorkflow::ApprovePermission)
+        );
+
+        tracked.stream_generation = 2;
+        tracked.last_stream_activity = Some(start + Duration::from_millis(100));
+        complete_reconcile_generation(&mut tracked, 1);
+        run_automatic_action_if_generation_stable(tracked.stream_generation == 1, || {
+            key_sends.set(key_sends.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(key_sends.get(), 0);
+        assert!(tracked.stream_generation > tracked.reconciled_generation);
+        assert!(tracked.dirty_since.is_some());
+
+        complete_reconcile_generation(&mut tracked, 2);
+        run_automatic_action_if_generation_stable(tracked.stream_generation == 2, || {
+            key_sends.set(key_sends.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(key_sends.get(), 1);
+        assert_eq!(tracked.stream_generation, tracked.reconciled_generation);
+        assert!(tracked.dirty_since.is_none());
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded() {
+        assert_eq!(retry_delay(0), Duration::from_millis(250));
+        assert_eq!(retry_delay(1), Duration::from_millis(500));
+        assert_eq!(retry_delay(2), Duration::from_secs(1));
+        assert_eq!(retry_delay(3), Duration::from_secs(2));
+        assert_eq!(retry_delay(4), Duration::from_secs(5));
+        assert_eq!(retry_delay(u8::MAX), Duration::from_secs(5));
+
+        let start = Instant::now();
+        let mut pending = PendingReconcile::new(ReconcileReason::Dirty);
+        pending.failed(start);
+        assert!(!pending.is_due(start + Duration::from_millis(249)));
+        assert!(pending.is_due(start + Duration::from_millis(250)));
+        assert_eq!(pending.reason, ReconcileReason::Retry);
+    }
+
+    #[test]
+    fn stream_output_only_marks_dirty_and_never_publishes_stale_snapshot() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
+            "/tmp/runtime-test.sock",
+        ))));
+        let now = Instant::now();
+        shared
+            .lock()
+            .unwrap()
+            .panes
+            .insert(String::from("%1"), tracked_pane(now));
+        let (tx, rx) = mpsc::sync_channel(2);
+        shared.lock().unwrap().subscribers.push(tx);
+
+        assert_eq!(
+            handle_control_line_shared(&shared, "%output %1 new-output"),
+            ControlLineEffect::None
+        );
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.panes["%1"].stream_generation, 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn snapshot_signature_covers_consumer_content_but_not_timing() {
+        let snapshot = sample_snapshot();
+        let signature = SnapshotSignature::from_snapshot(&snapshot, Some(String::from("provider")));
+        let mut timing_only = snapshot.clone();
+        timing_only.revision += 1;
+        timing_only.updated_at_unix_ms += 1;
+        timing_only.wait_duration_ms = Some(999);
+        timing_only.cook_duration_ms = Some(999);
+        assert_eq!(
+            signature,
+            SnapshotSignature::from_snapshot(&timing_only, Some(String::from("provider")))
+        );
+
+        let mut changed = snapshot.clone();
+        changed.classification.has_questions = true;
+        assert_ne!(
+            signature,
+            SnapshotSignature::from_snapshot(&changed, Some(String::from("provider")))
+        );
+        let mut changed = snapshot.clone();
+        changed.raw_source.push_str(" changed");
+        assert_ne!(
+            signature,
+            SnapshotSignature::from_snapshot(&changed, Some(String::from("provider")))
+        );
+        let mut changed = snapshot;
+        changed.last_action = Some(String::from("approve"));
+        assert_ne!(
+            signature,
+            SnapshotSignature::from_snapshot(&changed, Some(String::from("provider")))
+        );
+    }
+
+    #[test]
+    fn snapshot_signature_ignores_volatile_tmux_metadata_but_tracks_path_and_identity() {
+        let snapshot = sample_snapshot();
+        let signature = SnapshotSignature::from_snapshot(&snapshot, None);
+        let mut volatile_only = snapshot.clone();
+        volatile_only.pane.window_name = String::from("botctl title prefix");
+        volatile_only.pane.pane_title = String::from("shell title");
+        volatile_only.pane.pane_active = false;
+        volatile_only.pane.cursor_x = Some(20);
+        volatile_only.pane.cursor_y = Some(10);
+        assert_eq!(
+            signature,
+            SnapshotSignature::from_snapshot(&volatile_only, None)
+        );
+
+        let mut changed_path = snapshot.clone();
+        changed_path.pane.current_path = String::from("/tmp/other");
+        assert_ne!(
+            signature,
+            SnapshotSignature::from_snapshot(&changed_path, None)
+        );
+        let mut replacement = snapshot;
+        replacement.pane.pane_pid = Some(9999);
+        assert_ne!(
+            signature,
+            SnapshotSignature::from_snapshot(&replacement, None)
+        );
+    }
+
+    #[test]
+    fn snapshot_decodes_without_additive_cook_duration() {
+        let mut encoded = serde_json::to_value(sample_snapshot()).unwrap();
+        encoded.as_object_mut().unwrap().remove("cook_duration_ms");
+
+        let decoded: RuntimePaneSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.cook_duration_ms, None);
+    }
+
+    #[test]
+    fn runtime_wait_policy_matches_shared_provider_policy() {
+        assert!(is_waiting_state(SessionState::ChatReady));
+        assert!(is_waiting_state(SessionState::PromptEditing));
+        assert!(is_waiting_state(SessionState::PermissionDialog));
+        assert!(is_waiting_state(SessionState::FolderTrustPrompt));
+        assert!(is_waiting_state(SessionState::AgyCommandPermissionPrompt));
+        assert!(!is_waiting_state(SessionState::BusyResponding));
+        assert!(!is_waiting_state(SessionState::AgyFolderTrustPrompt));
+        assert!(!is_waiting_state(SessionState::AgySettingsPersistPrompt));
+    }
+
+    #[test]
+    fn topology_notifications_include_renames() {
+        assert!(notification_requires_reconcile("%window-add @1"));
+        assert!(notification_requires_reconcile("%window-renamed @1 name"));
+        assert!(notification_requires_reconcile("%session-renamed $1 name"));
+        assert!(!notification_requires_reconcile("%output %1 text"));
+    }
+
+    #[test]
+    fn full_subscriber_is_dropped_without_blocking_runtime() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(&PathBuf::from(
+            "/tmp/runtime-test.sock",
+        ))));
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.try_send(RuntimeEvent {
+            revision: 1,
+            timestamp_unix_ms: 1,
+            kind: String::from("filled"),
+            pane_id: None,
+            workspace_id: None,
+            summary: String::new(),
+            snapshot: None,
+        })
+        .unwrap();
+        shared.lock().unwrap().subscribers.push(tx);
+
+        emit_shared_event(&shared, None, None, "next", String::new(), None);
+        assert!(shared.lock().unwrap().subscribers.is_empty());
+    }
+
+    #[test]
+    fn subscription_bootstrap_ends_at_ok_boundary_with_complete_backlog() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
+            "/tmp/runtime-test.sock",
+        ))));
+        shared
+            .lock()
+            .unwrap()
+            .panes
+            .insert(String::from("%1"), tracked_pane(Instant::now()));
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_shared = Arc::clone(&shared);
+        let server_thread = thread::spawn(move || handle_subscribe(server, &server_shared));
+        let mut subscription = RuntimeSubscription {
+            reader: BufReader::new(client),
+        };
+
+        let backlog = subscription.bootstrap().unwrap();
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(backlog["%1"].pane.pane_id, "%1");
+
+        drop(subscription);
+        emit_shared_event(
+            &shared,
+            None,
+            None,
+            "wake-closed-subscriber",
+            String::new(),
+            None,
+        );
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn existing_subscription_receive_treats_bootstrap_marker_as_no_event() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        write_message(&mut server, &RuntimeResponse::Ok).unwrap();
+        let mut subscription = RuntimeSubscription {
+            reader: BufReader::new(client),
+        };
+
+        assert!(subscription.recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn action_and_post_approve_guards_reject_duplicate_work() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
+            "/tmp/runtime-test.sock",
+        ))));
+        let first = ActionGuard::acquire(&shared, "%1").unwrap();
+        assert!(ActionGuard::acquire(&shared, "%1").is_err());
+        drop(first);
+        assert!(ActionGuard::acquire(&shared, "%1").is_ok());
+
+        let mut tracked = tracked_pane(Instant::now());
+        tracked.post_approve_guard_raw_source = Some(String::from("same-frame"));
+        assert!(post_approve_guard_matches(&tracked, "same-frame"));
+        assert!(!post_approve_guard_matches(&tracked, "changed-frame"));
+    }
+
+    #[test]
+    fn stable_identity_excludes_mutable_topology_but_detects_process_replacement() {
+        let original = sample_pane("claude");
+        let mut renamed = original.clone();
+        renamed.window_name = String::from("manual rename");
+        renamed.current_path = String::from("/tmp/other");
+        assert!(same_pane_identity(&original, &renamed));
+
+        let mut replacement = original.clone();
+        replacement.pane_pid = Some(9999);
+        assert!(!same_pane_identity(&original, &replacement));
+    }
+
+    #[test]
+    fn yolo_policy_update_is_immediately_reflected_in_snapshot_signature() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
+            "/tmp/runtime-test.sock",
+        ))));
+        shared
+            .lock()
+            .unwrap()
+            .panes
+            .insert(String::from("%1"), tracked_pane(Instant::now()));
+
+        let snapshot = update_yolo_runtime_state(&shared, "%1", Some(true), true, None).unwrap();
+        assert!(snapshot.desired_yolo_enabled);
+        assert!(snapshot.actual_yolo_enabled);
+        let shared = shared.lock().unwrap();
+        assert_eq!(
+            shared.panes["%1"].signature,
+            SnapshotSignature::from_snapshot(
+                &snapshot,
+                shared.panes["%1"].signature.provider_session_id.clone(),
+            )
+        );
+    }
+
+    #[test]
+    fn post_yolo_commit_atomically_updates_busy_and_ready_durations() {
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
+            "/tmp/runtime-test.sock",
+        ))));
+        let mut tracked = tracked_pane(Instant::now());
+        tracked.snapshot.classification = sample_classification(SessionState::PermissionDialog);
+        tracked.signature = SnapshotSignature::from_snapshot(
+            &tracked.snapshot,
+            tracked.signature.provider_session_id.clone(),
+        );
+        {
+            let mut locked = shared.lock().unwrap();
+            locked.next_revision = 10;
+            locked.panes.insert(String::from("%1"), tracked);
+        }
+
+        let busy = InspectedPane {
+            classification: sample_classification(SessionState::BusyResponding),
+            focused_source: String::from("Working..."),
+            raw_source: String::from("Working... esc to cancel"),
+        };
+        let busy_snapshot = commit_post_yolo_snapshot(
+            &shared,
+            "%1",
+            &busy,
+            String::from("approve-permission"),
+            TmuxRuntimeDurations {
+                wait_duration: None,
+                cook_duration: Some(Duration::from_millis(75)),
+            },
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(
+            busy_snapshot.classification.state,
+            SessionState::BusyResponding
+        );
+        assert_eq!(busy_snapshot.wait_duration_ms, None);
+        assert_eq!(busy_snapshot.cook_duration_ms, Some(75));
+        assert_eq!(busy_snapshot.updated_at_unix_ms, 2_000);
+        assert_eq!(busy_snapshot.revision, 11);
+
+        let ready = InspectedPane {
+            classification: sample_classification(SessionState::ChatReady),
+            focused_source: String::from("> "),
+            raw_source: String::from("> "),
+        };
+        let ready_snapshot = commit_post_yolo_snapshot(
+            &shared,
+            "%1",
+            &ready,
+            String::from("approve-permission"),
+            TmuxRuntimeDurations {
+                wait_duration: Some(Duration::from_millis(5)),
+                cook_duration: Some(Duration::from_millis(80)),
+            },
+            3_000,
+        )
+        .unwrap();
+        assert_eq!(ready_snapshot.classification.state, SessionState::ChatReady);
+        assert_eq!(ready_snapshot.wait_duration_ms, Some(5));
+        assert_eq!(ready_snapshot.cook_duration_ms, Some(80));
+        assert_eq!(ready_snapshot.updated_at_unix_ms, 3_000);
+        assert_eq!(ready_snapshot.revision, 12);
+        let locked = shared.lock().unwrap();
+        assert_eq!(
+            locked.panes["%1"].snapshot.classification,
+            ready_snapshot.classification
+        );
+        assert_eq!(
+            locked.panes["%1"].snapshot.wait_duration_ms,
+            ready_snapshot.wait_duration_ms
+        );
+        assert_eq!(
+            locked.panes["%1"].snapshot.cook_duration_ms,
+            ready_snapshot.cook_duration_ms
+        );
+        assert_eq!(
+            locked.panes["%1"].snapshot.updated_at_unix_ms,
+            ready_snapshot.updated_at_unix_ms
+        );
+        assert_eq!(
+            locked.panes["%1"].signature,
+            SnapshotSignature::from_snapshot(
+                &ready_snapshot,
+                locked.panes["%1"].signature.provider_session_id.clone(),
+            )
+        );
     }
 }
