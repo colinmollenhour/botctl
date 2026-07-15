@@ -3877,6 +3877,23 @@ fn is_focus_prompt_line(line: &&str) -> bool {
         || trimmed.starts_with("› 3.")
         || (trimmed.starts_with("› ")
             && !starts_with_numbered_focus_option(trimmed.trim_start_matches('›').trim()))
+        // Grok Build TUI prompt rows are boxed as `│ ❯` or `│ ❯ Build anything`.
+        // Do not treat boxed numbered options (`│ ❯ 1.` / `│ ❯ 2.`) as the
+        // live prompt anchor — that would crop away the real footer/context.
+        || is_grok_focus_prompt_line(trimmed)
+}
+
+fn is_grok_focus_prompt_line(trimmed: &str) -> bool {
+    // Accept Grok's boxed prompt row (`│ ❯` / `│ ❯ Build anything`) but not
+    // boxed numbered option rows (`│ ❯ 1.` / `│ ❯ 2.`).
+    let Some(after_box) = trimmed.strip_prefix('│').map(str::trim_start) else {
+        return false;
+    };
+    if !after_box.starts_with('❯') {
+        return false;
+    }
+    let after_arrow = after_box.trim_start_matches('❯').trim_start();
+    !starts_with_numbered_focus_option(after_arrow)
 }
 
 fn starts_with_numbered_focus_option(line: &str) -> bool {
@@ -4303,6 +4320,10 @@ fn pane_provider_label(pane: &TmuxPane) -> &'static str {
         "Claude"
     } else if is_pane_command_opencode(pane) {
         "OpenCode"
+    } else if is_pane_command_pi(pane) {
+        "Pi"
+    } else if is_pane_command_grok(pane) {
+        "Grok"
     } else if pane.window_name.starts_with("botctl-mcp-codex-") {
         "Codex"
     } else if pane.window_name.starts_with("botctl-mcp-agy-") {
@@ -4318,6 +4339,14 @@ fn pane_provider_label(pane: &TmuxPane) -> &'static str {
 
 fn is_pane_command_agy(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("agy")
+}
+
+fn is_pane_command_pi(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("pi")
+}
+
+fn is_pane_command_grok(pane: &TmuxPane) -> bool {
+    pane.current_command.eq_ignore_ascii_case("grok")
 }
 
 fn is_classified_codex(classification: &Classification, pane: &TmuxPane) -> bool {
@@ -4345,11 +4374,23 @@ fn is_classified_agy(classification: &Classification, pane: &TmuxPane) -> bool {
             .any(|signal| signal == crate::classifier::SIGNAL_AGY_KEYWORDS)
 }
 
+fn is_classified_grok(classification: &Classification, pane: &TmuxPane) -> bool {
+    is_pane_command_grok(pane)
+        || classification
+            .signals
+            .iter()
+            .any(|signal| signal == crate::classifier::SIGNAL_GROK_KEYWORDS)
+}
+
 fn classification_provider_label(classification: &Classification, pane: &TmuxPane) -> &'static str {
     if is_pane_command_claude(pane) {
         "Claude"
     } else if is_pane_command_opencode(pane) {
         "OpenCode"
+    } else if is_pane_command_pi(pane) {
+        "Pi"
+    } else if is_classified_grok(classification, pane) {
+        "Grok"
     } else if is_classified_codex(classification, pane) {
         "Codex"
     } else if is_classified_agy(classification, pane) {

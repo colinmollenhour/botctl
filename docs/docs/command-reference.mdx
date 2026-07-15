@@ -200,7 +200,7 @@ Notes:
 - maps running OpenCode file/glob tools that target absolute paths outside the session directory to `PermissionDialog` when that pending permission is visible in SQLite
 - ignores OpenCode panes when the title is missing, the database is unreadable, or the cwd/title match is missing or ambiguous
 - scans Antigravity panes when the pane command is `agy` and the secondary signal passes (the state directory at `~/.gemini/antigravity-cli` or `ANTIGRAVITY_STATE_DIR` exists, or the captured frame contains an Antigravity fingerprint); shows the `⚛` glyph, classified state, and cook time
-- Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode, Pi, and Antigravity support is visibility-only, and broader guarded automation remains Claude-only
+- Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode, Pi, Grok, and Antigravity support is visibility-only (plus `last-message` where applicable), and broader guarded automation remains Claude-only
 - shows current classified state, age, wait time, branch, workspace grouping, pane PID, process-tree average CPU, memory, and observed active `Cook` time persisted across dashboard restarts
 - consumes authoritative cook/wait duration bases from the runtime for runtime-backed panes and advances them locally while the runtime classification remains cooking/waiting; only fallback panes synchronize duration state from the dashboard
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
@@ -374,7 +374,7 @@ botctl capture --pane 0:2.3 --history-lines 80
 
 ### `last-message`
 
-Purpose: dump the latest assistant message for one Claude Code, Codex CLI, OpenCode, Pi, or Antigravity pane as raw Markdown. Claude/Codex/OpenCode/Pi read persisted provider transcripts; Antigravity scrapes the pane's tmux scrollback.
+Purpose: dump the latest assistant message for one Claude Code, Codex CLI, OpenCode, Pi, Grok, or Antigravity pane as raw Markdown. Claude/Codex/OpenCode/Pi/Grok read persisted provider transcripts (Grok from `~/.grok/sessions/.../updates.jsonl`); Antigravity scrapes the pane's tmux scrollback.
 
 Syntax:
 ```bash
