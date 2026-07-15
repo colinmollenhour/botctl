@@ -7,12 +7,12 @@ slug: /
 
 `botctl` helps you keep Claude Code, Codex CLI, OpenCode, Pi, Grok, and Antigravity sessions visible and controlled inside `tmux`.
 
-Claude Code panes get the full guarded automation path. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status. Antigravity (`agy`) panes are discovered passively for dashboard visibility, state classification, and pane-scrape last-message extraction.
+Claude Code panes get the full guarded automation path. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively for dashboard visibility, recent-message context, state classification, and tmux window status. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status. Grok panes are discovered passively from `~/.grok` (or `GROK_HOME`) for dashboard visibility, screen classification, and transcript-backed `last-message` from `updates.jsonl`. Antigravity (`agy`) panes are discovered passively for dashboard visibility, state classification, and pane-scrape last-message extraction.
 
 Use `botctl` when you want to:
 
 - start one local `runtime` that owns observation and automation
-- open a live `dashboard` and see what Claude Code, screen-detected Codex CLI, resolvable OpenCode panes, Pi panes, and Antigravity panes are doing
+- open a live `dashboard` and see what Claude Code, screen-detected Codex CLI, resolvable OpenCode panes, Pi panes, Grok panes, and Antigravity panes are doing
 - turn on `yolo` for guarded Claude and Codex permission approval
 - run `serve` for a runtime-backed foreground event stream or localhost HTTP API
 - export the latest persisted assistant reply with `last-message`
@@ -36,6 +36,7 @@ Use `botctl` when you want to:
 | Codex CLI | yes, from screen capture | yes, from screen capture | command permission approval only | no | yes |
 | OpenCode | yes, after safe title plus cwd resolution | limited passive state from SQLite | no | no | yes |
 | Pi | yes, from JSONL session matching | limited passive state from JSONL | no | no | yes |
+| Grok | yes, from process-name plus `~/.grok` session matching | passive state from frame capture | no | no | yes, from `updates.jsonl` |
 | Antigravity | yes, from process-name plus state-dir detection | passive state from frame capture | no | no | yes, via pane-scrape when rule boundaries are visible |
 
 ## Main commands

@@ -2,7 +2,7 @@
 
 `botctl` is a Rust CLI for keeping Claude Code, Codex CLI, OpenCode, Pi, Grok, and Antigravity sessions visible and controlled inside `tmux`.
 
-Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively from their SQLite database. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status. Antigravity (`agy`) panes are discovered passively for dashboard visibility, state classification, and pane-scrape last-message extraction.
+Claude Code panes support guarded automation. Codex CLI panes are classified from captured terminal screens and can use YOLO for command permission approval. OpenCode panes are discovered passively from their SQLite database. Pi panes are discovered passively from `~/.pi/agent/sessions` for dashboard visibility, recent-message context, state classification, and tmux window status. Grok panes are discovered passively from `~/.grok` (or `GROK_HOME`) for dashboard visibility, screen classification, and transcript-backed `last-message` from `updates.jsonl`. Antigravity (`agy`) panes are discovered passively for dashboard visibility, state classification, and pane-scrape last-message extraction.
 
 For end-to-end operator flows, see [workflows](./workflows.mdx). For command details, see [command reference](./command-reference.mdx).
 
@@ -28,6 +28,7 @@ If you just want to get value quickly, install it, open `dashboard`, then try `y
 - `claude` on `PATH` for Claude Code automation
 - `codex` panes for Codex CLI screen classification and command permission approval
 - `opencode` panes with `OC | <session title>` pane titles for passive OpenCode dashboard visibility
+- `grok` panes for passive Grok Build TUI dashboard visibility; session storage defaults to `~/.grok` and can be overridden with `GROK_HOME`
 - `agy` on `PATH` (optional) for Antigravity dashboard visibility; the state directory defaults to `~/.gemini/antigravity-cli` and can be overridden with `ANTIGRAVITY_STATE_DIR`
 - `botctl` installed
 

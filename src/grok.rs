@@ -230,10 +230,9 @@ pub fn classify_grok_state(frame: &str) -> Option<SessionState> {
 fn is_grok_busy_status_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     // Background tool still active while the prompt chrome is otherwise idle.
-    if lower.contains("command still running")
-        || lower.contains("commands still running")
-        || lower.contains("task started:")
-    {
+    // Do not key on historical "Task started:" scrollback alone — that can
+    // remain visible after the task finishes and would false-busy the pane.
+    if lower.contains("command still running") || lower.contains("commands still running") {
         return true;
     }
 
@@ -420,8 +419,12 @@ fn latest_session_for_cwd(
         {
             continue;
         }
-        let modified = fs::metadata(&summary_path)
+        // Prefer updates.jsonl mtime: Grok keeps appending conversation
+        // updates while summary.json can lag and leave cwd-fallback stuck on
+        // a stale session.
+        let modified = fs::metadata(path.join("updates.jsonl"))
             .and_then(|meta| meta.modified())
+            .or_else(|_| fs::metadata(&summary_path).and_then(|meta| meta.modified()))
             .or_else(|_| fs::metadata(&path).and_then(|meta| meta.modified()))
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let candidate = ResolvedSession {
@@ -572,15 +575,18 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     if len > max_bytes {
         file.seek(SeekFrom::Start(len - max_bytes))?;
     }
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
+    // Read as bytes first so a seek that lands mid-UTF-8 sequence does not
+    // fail the whole last-message extract via read_to_string.
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
     // If we started mid-line, drop the partial first line.
-    if len > max_bytes
-        && let Some(idx) = buf.find('\n')
-    {
-        buf = buf[idx + 1..].to_string();
+    if len > max_bytes {
+        let Some(idx) = buf.iter().position(|byte| *byte == b'\n') else {
+            return Ok(String::new());
+        };
+        buf.drain(..=idx);
     }
-    Ok(buf)
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn latest_assistant_text_has_question(text: &str) -> bool {
@@ -649,9 +655,43 @@ pub fn encode_grok_cwd(path: &str) -> String {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::proc_fd::ChildResolver;
+
+    /// Serialize tests that mutate process-global `GROK_HOME`.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct GrokHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl GrokHomeGuard {
+        fn install(home: &Path) -> Self {
+            let previous = std::env::var_os("GROK_HOME");
+            // SAFETY: callers hold env_lock for the lifetime of this guard.
+            unsafe {
+                std::env::set_var("GROK_HOME", home);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for GrokHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold env_lock for the lifetime of this guard.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("GROK_HOME", value),
+                    None => std::env::remove_var("GROK_HOME"),
+                }
+            }
+        }
+    }
 
     struct MapResolver {
         children: std::collections::HashMap<u32, Vec<u32>>,
@@ -730,6 +770,19 @@ mod tests {
     }
 
     #[test]
+    fn historical_task_started_alone_is_not_busy() {
+        let frame = concat!(
+            "     ◆ Task started: finished work\n",
+            "     Worked for 42s.\n",
+            "  ╭──────────────────────────────────────────────╮\n",
+            "  │ ❯ Build anything                             │\n",
+            "  ╰──────────────────────────── Grok 4.5 (high) · always-approve ─╯\n",
+            "  ←:collapse  │  Ctrl+.:shortcuts\n",
+        );
+        assert_eq!(classify_grok_state(frame), Some(SessionState::ChatReady));
+    }
+
+    #[test]
     fn reconstructs_assistant_text_from_updates() {
         let dir = unique_temp_dir("grok-updates");
         let path = dir.join("updates.jsonl");
@@ -785,12 +838,8 @@ mod tests {
         children.insert(100, vec![200]);
         let resolver = MapResolver { children };
 
-        // Temporarily point GROK_HOME at the temp dir.
-        let previous = std::env::var_os("GROK_HOME");
-        // SAFETY: test-only env mutation, single-threaded unit test.
-        unsafe {
-            std::env::set_var("GROK_HOME", &home);
-        }
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _home_guard = GrokHomeGuard::install(&home);
 
         let pane = TmuxPane {
             pane_id: String::from("%1"),
@@ -822,11 +871,6 @@ mod tests {
         assert_eq!(session.id, session_id);
         assert_eq!(session.title.as_deref(), Some("Demo"));
         assert_eq!(session.state, SessionState::ChatReady);
-
-        match previous {
-            Some(value) => unsafe { std::env::set_var("GROK_HOME", value) },
-            None => unsafe { std::env::remove_var("GROK_HOME") },
-        }
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

@@ -3816,8 +3816,23 @@ fn is_focus_prompt_line(line: &&str) -> bool {
         || trimmed.starts_with("› 3.")
         || (trimmed.starts_with("› ")
             && !starts_with_numbered_focus_option(trimmed.trim_start_matches('›').trim()))
-        // Grok Build TUI prompt rows: `│ ❯` or `│ ❯ Build anything`
-        || (trimmed.contains('│') && trimmed.contains('❯') && !trimmed.contains("❯ 1."))
+        // Grok Build TUI prompt rows are boxed as `│ ❯` or `│ ❯ Build anything`.
+        // Do not treat boxed numbered options (`│ ❯ 1.` / `│ ❯ 2.`) as the
+        // live prompt anchor — that would crop away the real footer/context.
+        || is_grok_focus_prompt_line(trimmed)
+}
+
+fn is_grok_focus_prompt_line(trimmed: &str) -> bool {
+    // Accept Grok's boxed prompt row (`│ ❯` / `│ ❯ Build anything`) but not
+    // boxed numbered option rows (`│ ❯ 1.` / `│ ❯ 2.`).
+    let Some(after_box) = trimmed.strip_prefix('│').map(str::trim_start) else {
+        return false;
+    };
+    if !after_box.starts_with('❯') {
+        return false;
+    }
+    let after_arrow = after_box.trim_start_matches('❯').trim_start();
+    !starts_with_numbered_focus_option(after_arrow)
 }
 
 fn starts_with_numbered_focus_option(line: &str) -> bool {

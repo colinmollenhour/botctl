@@ -1,2 +1,4 @@
+# Idle Grok chrome: model footer `Grok 4.5 (high) · always-approve` and
+# shortcut bar without a spinner/[stop]/command-still-running status line.
 state=ChatReady
 recap_present=false
