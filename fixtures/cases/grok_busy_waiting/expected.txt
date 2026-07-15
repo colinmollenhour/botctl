@@ -1,0 +1,4 @@
+# Spinner status line with tool activity and [stop] while waiting on tools —
+# BusyResponding, not ChatReady (prompt box can still be visible while busy).
+state=BusyResponding
+recap_present=false

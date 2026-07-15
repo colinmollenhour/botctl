@@ -11,6 +11,7 @@ This document describes the internal agent roles that the system will eventually
 - `src/app.rs`: CLI orchestration, live diagnostics, and high-level workflow execution
 - `src/fixtures.rs`: fixture recording and loading
 - `src/prompt.rs`: pending-prompt handoff and external-editor helper path
+- `src/grok.rs`: Grok Build TUI passive discovery, session resolution, and last-message extraction
 
 ## Session Manager
 
@@ -58,6 +59,20 @@ Passively discovered via tmux pane title (`OC | <session title>`) and cwd match 
 ### Pi
 
 Passively discovered by matching `pi` tmux commands to JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`). Dashboard/status visibility and `last-message` from JSONL session files. No YOLO, prompt submission, or keybinding automation.
+
+### Grok
+
+Passively discovered when the tmux pane command is `grok`. Conversation identity is resolved by matching the pane process tree against `~/.grok/active_sessions.json` (or `GROK_HOME/active_sessions.json`) first, then walking open file descriptors for `…/sessions/…/<uuid>/events.jsonl`, then falling back to the newest session directory under `~/.grok/sessions/<urlencode(cwd)>/` with a matching `summary.json` cwd.
+
+`last-message` rebuilds the latest assistant turn from `updates.jsonl` by concatenating `sessionUpdate: agent_message_chunk` text pieces (the authoritative ACP session log). `chat_history.jsonl` is not used as the sole source because tool-heavy turns often have empty assistant content there.
+
+State classification is screen-first: Braille spinner status lines with `[stop]` / `Waiting for response` / token counters map to `BusyResponding`; the `Grok … · always-approve` prompt footer (or `Ctrl+.:shortcuts` chrome) without a busy status line maps to `ChatReady`. Internal `permission_prompt` events under always-approve are not treated as user-facing dialogs. Cook time uses the standard `BusyResponding` derivation.
+
+No YOLO, prompt submission, Claude-style keybinding automation, or managed MCP spawn for Grok.
+
+The dashboard glyph is `✦` (U+2726 BLACK FOUR POINTED STAR, single-width). The provider label is `Grok`. The compact pane-source marker character is `G`.
+
+Output filename: `MESSAGE_<session-id>.md` (no provider prefix, same convention as Claude/Codex/OpenCode/Pi).
 
 ### Antigravity (`agy`)
 

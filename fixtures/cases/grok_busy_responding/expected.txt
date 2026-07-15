@@ -1,0 +1,4 @@
+# Live status line uses a Braille spinner plus [stop]/token counter —
+# that is the BusyResponding fingerprint for the Grok Build TUI.
+state=BusyResponding
+recap_present=false

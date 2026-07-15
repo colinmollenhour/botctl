@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::agy;
 use crate::app::{AppError, AppResult};
+use crate::grok;
 use crate::opencode;
 use crate::pi;
 use crate::proc_fd::transcript_from_process_fds;
@@ -40,6 +41,10 @@ pub fn load_last_agent_message(
         return load_pi_last_message(pane);
     }
 
+    if pane.current_command.eq_ignore_ascii_case("grok") {
+        return load_grok_last_message(pane);
+    }
+
     if pane.current_command.eq_ignore_ascii_case("agy") {
         return load_agy_last_message(pane, tmux, history_lines);
     }
@@ -52,7 +57,7 @@ pub fn load_last_agent_message(
     }
 
     Err(AppError::new(format!(
-        "last-message supports Claude, Codex, OpenCode, Pi, and Antigravity panes; pane {} is running {}",
+        "last-message supports Claude, Codex, OpenCode, Pi, Grok, and Antigravity panes; pane {} is running {}",
         pane.pane_id, pane.current_command
     )))
 }
@@ -162,6 +167,23 @@ fn load_pi_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
     })?;
     Ok(LastAgentMessage {
         provider: "Pi",
+        session_id: message.session_id,
+        text: message.text,
+    })
+}
+
+fn load_grok_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
+    use crate::proc_fd::LiveProc;
+    let message = grok::latest_assistant_message_for_pane(pane, &LiveProc)?.ok_or_else(|| {
+        AppError::new(
+            "no Grok session/message resolved for pane; expected an entry in \
+             ~/.grok/active_sessions.json (or GROK_HOME) matching the pane process tree, \
+             an open events.jsonl under ~/.grok/sessions, or a cwd session directory with \
+             non-empty agent_message_chunk text in updates.jsonl",
+        )
+    })?;
+    Ok(LastAgentMessage {
+        provider: "Grok",
         session_id: message.session_id,
         text: message.text,
     })
