@@ -70,6 +70,7 @@ pub struct InstanceRuntimeState {
 pub struct TmuxRuntimeDurations {
     pub wait_duration: Option<Duration>,
     pub cook_duration: Option<Duration>,
+    pub sampled_at_unix_ms: i64,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -720,6 +721,7 @@ pub fn sync_tmux_runtime_state(
     Ok(TmuxRuntimeDurations {
         wait_duration,
         cook_duration,
+        sampled_at_unix_ms: now_ms,
     })
 }
 
@@ -1702,7 +1704,7 @@ mod tests {
             .expect("workspace should resolve");
 
         let pane = sample_pane();
-        let first = sync_tmux_runtime_state(
+        let first_sample = sync_tmux_runtime_state(
             &state_dir,
             &workspace.id,
             &pane,
@@ -1711,11 +1713,13 @@ mod tests {
             false,
             None,
         )
-        .expect("first sync should succeed")
-        .wait_duration
-        .expect("first sync should return duration");
+        .expect("first sync should succeed");
+        let first_sampled_at = first_sample.sampled_at_unix_ms;
+        let first = first_sample
+            .wait_duration
+            .expect("first sync should return duration");
         std::thread::sleep(Duration::from_millis(20));
-        let second = sync_tmux_runtime_state(
+        let second_sample = sync_tmux_runtime_state(
             &state_dir,
             &workspace.id,
             &pane,
@@ -1724,9 +1728,11 @@ mod tests {
             false,
             None,
         )
-        .expect("second sync should succeed")
-        .wait_duration
-        .expect("second sync should return duration");
+        .expect("second sync should succeed");
+        let second_sampled_at = second_sample.sampled_at_unix_ms;
+        let second = second_sample
+            .wait_duration
+            .expect("second sync should return duration");
         let cleared = sync_tmux_runtime_state(
             &state_dir,
             &workspace.id,
@@ -1740,6 +1746,7 @@ mod tests {
         .wait_duration;
 
         assert!(second >= first);
+        assert!(second_sampled_at >= first_sampled_at);
         assert!(cleared.is_none());
 
         let _ = fs::remove_dir_all(&state_dir);

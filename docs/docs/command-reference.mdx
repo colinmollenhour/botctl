@@ -54,6 +54,7 @@ Notes:
 - disables tmux `status` in botctl-created hidden sessions so user statusline commands do not run there
 - `stop` shuts down the current runtime
 - `--foreground` runs the runtime in the current process instead of the hidden tmux session
+- `--reconcile-ms N` (default: `1000`) is the maximum delay before a dirty pane receives a fresh targeted reconcile; values above 10 seconds also set the full-state safety interval
 - `dashboard`, `yolo`, and `serve` connect to this process instead of running independent long-lived control loops; in managed mode they auto-start it when needed
 - one runtime should own one local state root and tmux socket at a time
 
@@ -201,8 +202,9 @@ Notes:
 - scans Antigravity panes when the pane command is `agy` and the secondary signal passes (the state directory at `~/.gemini/antigravity-cli` or `ANTIGRAVITY_STATE_DIR` exists, or the captured frame contains an Antigravity fingerprint); shows the `⚛` glyph, classified state, and cook time
 - Codex YOLO can approve command permission dialogs by sending `y` for `Yes, proceed`; OpenCode, Pi, and Antigravity support is visibility-only, and broader guarded automation remains Claude-only
 - shows current classified state, age, wait time, branch, workspace grouping, pane PID, process-tree average CPU, memory, and observed active `Cook` time persisted across dashboard restarts
+- consumes authoritative cook/wait duration bases from the runtime for runtime-backed panes and advances them locally while the runtime classification remains cooking/waiting; only fallback panes synchronize duration state from the dashboard
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
-- queries the central runtime for shared pane state and yolo policy
+- subscribes to the central runtime for shared pane state and yolo policy; reconnect bootstrap replaces the complete runtime-pane cache while transient disconnects retain the last good view
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 - auto-starts a managed runtime unless `--unmanaged` is set
 
@@ -483,6 +485,9 @@ Persistent mode behavior:
 - when launched from tmux, captures the outer tmux socket first so the dashboard continues inspecting the outer tmux server instead of its own dedicated dashboard session
 - if you launch it from `tmux display-popup`, tmux controls popup size and closing the popup only detaches from the persistent dashboard
 - inside persistent mode, pressing `q` detaches the client instead of terminating the dashboard process
+- while no client is attached, pauses ratatui drawing, git enrichment, process resource aggregation, CPU sampling, and full row rebuilding
+- while detached, keeps runtime-backed tmux window prefixes current from runtime subscription events and refreshes fallback-only provider titles on a three-second cadence
+- after reattachment, completes a successful full refresh before drawing a new frame; the first CPU sample is unavailable because detached CPU baselines are discarded
 
 Examples:
 ```bash
