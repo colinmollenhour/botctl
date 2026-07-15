@@ -3129,7 +3129,8 @@ fn recovery_summary_lines(recovery: &RuntimeRecoveryOffer) -> Vec<String> {
             abbreviate_home_path(&recovery.workspace_root)
         ),
         format!(
-            "Provider: Claude recovery | Lifecycle: {}",
+            "Provider: {} recovery | Lifecycle: {}",
+            recovery_provider_label(&recovery.provider),
             recovery.lifecycle.as_str()
         ),
         format!(
@@ -3156,7 +3157,11 @@ fn recovery_summary_lines(recovery: &RuntimeRecoveryOffer) -> Vec<String> {
             original.server.start_time
         ),
         format!("Original cwd: {}", original.cwd),
-        format!("Claude UUID: {}", recovery.provider_session_id),
+        format!(
+            "{} UUID: {}",
+            recovery_provider_label(&recovery.provider),
+            recovery.provider_session_id
+        ),
         format!("Target: {target}"),
         format!(
             "Times (unix ms): crashed={} staged={} resolved={} dismissed={}",
@@ -3204,7 +3209,9 @@ fn recovery_instruction(recovery: &RuntimeRecoveryOffer) -> &'static str {
         RecoveryLifecycle::Uncertain => {
             "A prior staging attempt ended without confirmation; inspect the target. Botctl will not paste again."
         }
-        RecoveryLifecycle::Resolved => "The same Claude UUID was observed in the target pane.",
+        RecoveryLifecycle::Resolved => {
+            "The same provider session UUID was observed in the target pane."
+        }
         RecoveryLifecycle::Dismissed => "This recovery was dismissed.",
     }
 }
@@ -3218,6 +3225,14 @@ fn recovery_match_state_label(state: RecoveryMatchState) -> &'static str {
         RecoveryMatchState::Incompatible => "incompatible",
         RecoveryMatchState::NotStageable => "not stageable",
         RecoveryMatchState::InvalidMetadata => "invalid metadata",
+    }
+}
+
+fn recovery_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "Claude",
+        "grok" => "Grok",
+        _ => "Provider",
     }
 }
 

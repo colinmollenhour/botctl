@@ -14,7 +14,7 @@ use crate::recovery::{
 use crate::tmux::{TmuxInventory, TmuxPane, TmuxServerIdentity};
 use crate::workspace::resolve_workspace_locator;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -84,17 +84,22 @@ pub struct ClaudeObservationRecord {
     pub workspace_id: String,
     pub status: String,
     pub original: RecoveryOriginalIdentity,
+    pub provider: String,
     pub provider_session_id: String,
     pub first_observed_at_unix_ms: i64,
     pub last_observed_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone)]
-pub struct VerifiedClaudeRecoveryEvidence {
+pub struct VerifiedProviderRecoveryEvidence {
     pub workspace_id: String,
     pub pane: TmuxPane,
-    pub claude_session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
 }
+
+/// Back-compat alias used by older call sites and tests.
+pub type VerifiedClaudeRecoveryEvidence = VerifiedProviderRecoveryEvidence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryInventoryUpdate {
@@ -210,6 +215,7 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
             2 => migrate_to_v3(&tx)?,
             3 => migrate_to_v4(&tx)?,
             4 => migrate_to_v5(&tx)?,
+            5 => migrate_to_v6(&tx)?,
             other => {
                 return Err(AppError::new(format!(
                     "no state.db migration path from version {} to {}",
@@ -238,6 +244,7 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
         3 => ensure_v3_tables(connection),
         4 => ensure_v4_tables(connection),
         5 => ensure_v5_tables(connection),
+        6 => ensure_v6_tables(connection),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -285,6 +292,8 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
             && index_exists(connection, "session_recoveries_status")?
             && index_sql(connection, "session_recoveries_claimed_target")?
                 .is_some_and(|sql| sql.contains("'uncertain'"))),
+        6 => Ok(schema_layout_matches_version(connection, 5)?
+            && provider_check_allows_grok(connection)?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -729,6 +738,128 @@ fn ensure_v5_tables(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn migrate_to_v6(connection: &Connection) -> AppResult<()> {
+    ensure_v5_tables(connection)?;
+    ensure_v6_tables(connection)
+}
+
+fn ensure_v6_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v5_tables(connection)?;
+    if provider_check_allows_grok(connection)? {
+        return Ok(());
+    }
+    // Rebuild recovery tables so CHECK allows claude and grok.
+    connection.execute_batch(
+        "
+        CREATE TABLE runtime_claude_observations_v6 (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runtime_runs(id) ON DELETE CASCADE,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN ('observed', 'retired', 'crashed')),
+            tmux_socket_path TEXT NOT NULL,
+            tmux_server_pid INTEGER NOT NULL,
+            tmux_server_started_at_unix INTEGER NOT NULL,
+            original_tmux_pane_id TEXT NOT NULL,
+            original_pane_tty TEXT NOT NULL,
+            original_pane_pid INTEGER,
+            original_tmux_session_id TEXT NOT NULL,
+            original_session_name TEXT NOT NULL,
+            original_tmux_window_id TEXT NOT NULL,
+            original_window_index INTEGER NOT NULL,
+            original_window_name TEXT NOT NULL,
+            original_pane_index INTEGER NOT NULL,
+            original_cwd TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK (provider IN ('claude', 'grok')),
+            provider_session_id TEXT NOT NULL,
+            first_observed_at_unix_ms INTEGER NOT NULL,
+            last_observed_at_unix_ms INTEGER NOT NULL
+        );
+        INSERT INTO runtime_claude_observations_v6
+            SELECT * FROM runtime_claude_observations;
+
+        CREATE TABLE session_recoveries_v6 (
+            id TEXT PRIMARY KEY,
+            source_observation_id TEXT NOT NULL UNIQUE
+                REFERENCES runtime_claude_observations_v6(id) ON DELETE RESTRICT,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN (
+                'crashed', 'staging', 'staged', 'uncertain', 'resolved', 'dismissed'
+            )),
+            provider TEXT NOT NULL CHECK (provider IN ('claude', 'grok')),
+            provider_session_id TEXT NOT NULL,
+            original_tmux_socket_path TEXT NOT NULL,
+            original_tmux_server_pid INTEGER NOT NULL,
+            original_tmux_server_started_at_unix INTEGER NOT NULL,
+            original_tmux_pane_id TEXT NOT NULL,
+            original_pane_tty TEXT NOT NULL,
+            original_pane_pid INTEGER,
+            original_tmux_session_id TEXT NOT NULL,
+            original_session_name TEXT NOT NULL,
+            original_tmux_window_id TEXT NOT NULL,
+            original_window_index INTEGER NOT NULL,
+            original_window_name TEXT NOT NULL,
+            original_pane_index INTEGER NOT NULL,
+            original_cwd TEXT NOT NULL,
+            crashed_at_unix_ms INTEGER NOT NULL,
+            staging_run_id TEXT REFERENCES runtime_runs(id) ON DELETE RESTRICT,
+            staging_token TEXT,
+            staging_started_at_unix_ms INTEGER,
+            target_tmux_socket_path TEXT,
+            target_tmux_server_pid INTEGER,
+            target_tmux_server_started_at_unix INTEGER,
+            target_tmux_pane_id TEXT,
+            target_tmux_session_id TEXT,
+            target_tmux_window_id TEXT,
+            target_session_name TEXT,
+            target_window_index INTEGER,
+            target_window_name TEXT,
+            target_pane_index INTEGER,
+            target_cwd TEXT,
+            staged_command TEXT,
+            staged_at_unix_ms INTEGER,
+            resolved_at_unix_ms INTEGER,
+            dismissed_at_unix_ms INTEGER
+        );
+        INSERT INTO session_recoveries_v6
+            SELECT * FROM session_recoveries;
+
+        DROP TABLE session_recoveries;
+        DROP TABLE runtime_claude_observations;
+        ALTER TABLE runtime_claude_observations_v6 RENAME TO runtime_claude_observations;
+        ALTER TABLE session_recoveries_v6 RENAME TO session_recoveries;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS runtime_claude_observations_live_object
+         ON runtime_claude_observations (
+             run_id, tmux_socket_path, tmux_server_pid,
+             tmux_server_started_at_unix, original_tmux_pane_id
+         ) WHERE status = 'observed';
+        CREATE INDEX IF NOT EXISTS runtime_claude_observations_run_status
+         ON runtime_claude_observations (run_id, status);
+        CREATE INDEX IF NOT EXISTS session_recoveries_status
+         ON session_recoveries (status, crashed_at_unix_ms);
+        CREATE UNIQUE INDEX IF NOT EXISTS session_recoveries_claimed_target
+         ON session_recoveries (
+             target_tmux_socket_path, target_tmux_server_pid,
+             target_tmux_server_started_at_unix, target_tmux_pane_id
+         ) WHERE status IN ('staging', 'staged', 'uncertain');
+        ",
+    )?;
+    Ok(())
+}
+
+fn provider_check_allows_grok(connection: &Connection) -> AppResult<bool> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_recoveries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql
+        .as_deref()
+        .is_some_and(|ddl| ddl.contains("'grok'") || ddl.contains("\"grok\"")))
+}
+
 const V5_REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
     (
         "runtime_runs",
@@ -1121,7 +1252,27 @@ pub fn checkpoint_claude_observation(
     pane: &TmuxPane,
     claude_session_id: &str,
 ) -> AppResult<String> {
-    build_recovery_command("claude", &pane.current_path, claude_session_id)?;
+    checkpoint_provider_observation(
+        state_dir,
+        run_id,
+        workspace_id,
+        server,
+        pane,
+        "claude",
+        claude_session_id,
+    )
+}
+
+pub fn checkpoint_provider_observation(
+    state_dir: &Path,
+    run_id: &str,
+    workspace_id: &str,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<String> {
+    build_recovery_command(provider, &pane.current_path, provider_session_id)?;
     let mut connection = open_bootstrapped_state_db(state_dir)?;
     let tx = connection.transaction()?;
     let id = checkpoint_claude_observation_with_connection(
@@ -1130,7 +1281,8 @@ pub fn checkpoint_claude_observation(
         workspace_id,
         server,
         pane,
-        claude_session_id,
+        provider,
+        provider_session_id,
     )?;
     tx.commit()?;
     Ok(id)
@@ -1142,9 +1294,10 @@ fn checkpoint_claude_observation_with_connection(
     workspace_id: &str,
     server: &TmuxServerIdentity,
     pane: &TmuxPane,
-    claude_session_id: &str,
+    provider: &str,
+    provider_session_id: &str,
 ) -> AppResult<String> {
-    build_recovery_command("claude", &pane.current_path, claude_session_id)?;
+    build_recovery_command(provider, &pane.current_path, provider_session_id)?;
     let run_is_active = connection
         .query_row(
             "SELECT 1 FROM runtime_runs WHERE id = ?1 AND outcome = 'active'",
@@ -1160,7 +1313,7 @@ fn checkpoint_claude_observation_with_connection(
     }
     let existing = connection
         .query_row(
-            "SELECT id, provider_session_id FROM runtime_claude_observations \
+            "SELECT id, provider, provider_session_id FROM runtime_claude_observations \
              WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
                AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
                AND status = 'observed'",
@@ -1171,12 +1324,18 @@ fn checkpoint_claude_observation_with_connection(
                 server.start_time,
                 pane.pane_id
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
     let now = current_unix_ms()?;
-    if let Some((id, existing_session_id)) = existing {
-        if existing_session_id == claude_session_id {
+    if let Some((id, existing_provider, existing_session_id)) = existing {
+        if existing_provider == provider && existing_session_id == provider_session_id {
             connection.execute(
                 "UPDATE runtime_claude_observations SET \
                     workspace_id = ?2, original_pane_tty = ?3, original_pane_pid = ?4, \
@@ -1218,7 +1377,7 @@ fn checkpoint_claude_observation_with_connection(
             first_observed_at_unix_ms, last_observed_at_unix_ms
          ) VALUES (
             ?1, ?2, ?3, 'observed', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16, 'claude', ?17, ?18, ?18
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19
          )",
         params![
             id,
@@ -1237,7 +1396,8 @@ fn checkpoint_claude_observation_with_connection(
             pane.window_name,
             pane.pane_index,
             pane.current_path,
-            claude_session_id,
+            provider,
+            provider_session_id,
             now
         ],
     )?;
@@ -1344,13 +1504,13 @@ pub fn apply_recovery_inventory_evidence(
     state_dir: &Path,
     current_run_id: &str,
     inventory: &TmuxInventory,
-    verified_claude: &[VerifiedClaudeRecoveryEvidence],
+    verified: &[VerifiedProviderRecoveryEvidence],
 ) -> AppResult<RecoveryInventoryUpdate> {
-    for evidence in verified_claude {
+    for evidence in verified {
         build_recovery_command(
-            "claude",
+            &evidence.provider,
             &evidence.pane.current_path,
-            &evidence.claude_session_id,
+            &evidence.provider_session_id,
         )?;
     }
     let mut connection = open_bootstrapped_state_db(state_dir)?;
@@ -1411,41 +1571,61 @@ pub fn apply_recovery_inventory_evidence(
     }
 
     let mut retired = 0;
-    for pane in inventory
-        .panes
-        .iter()
-        .filter(|pane| !pane.current_command.eq_ignore_ascii_case("claude"))
-    {
-        retired += tx.execute(
-            "UPDATE runtime_claude_observations SET status = 'retired' \
-             WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
-               AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
-               AND status = 'observed'",
-            params![
-                current_run_id,
-                inventory.server.socket_path,
-                inventory.server.pid,
-                inventory.server.start_time,
-                pane.pane_id
-            ],
-        )?;
+    for pane in &inventory.panes {
+        match crate::recovery::provider_for_pane_command(&pane.current_command) {
+            Some(provider) => {
+                // Still a recoverable provider process: retire only mismatched
+                // provider observations for this live object.
+                retired += tx.execute(
+                    "UPDATE runtime_claude_observations SET status = 'retired' \
+                     WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
+                       AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
+                       AND status = 'observed' AND provider <> ?6",
+                    params![
+                        current_run_id,
+                        inventory.server.socket_path,
+                        inventory.server.pid,
+                        inventory.server.start_time,
+                        pane.pane_id,
+                        provider
+                    ],
+                )?;
+            }
+            None => {
+                retired += tx.execute(
+                    "UPDATE runtime_claude_observations SET status = 'retired' \
+                     WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
+                       AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
+                       AND status = 'observed'",
+                    params![
+                        current_run_id,
+                        inventory.server.socket_path,
+                        inventory.server.pid,
+                        inventory.server.start_time,
+                        pane.pane_id
+                    ],
+                )?;
+            }
+        }
     }
 
     let mut resolved = 0;
-    for evidence in verified_claude {
+    for evidence in verified {
         checkpoint_claude_observation_with_connection(
             &tx,
             current_run_id,
             &evidence.workspace_id,
             &inventory.server,
             &evidence.pane,
-            &evidence.claude_session_id,
+            &evidence.provider,
+            &evidence.provider_session_id,
         )?;
-        resolved += resolve_recovery_for_live_claude_session_with_connection(
+        resolved += resolve_recovery_for_live_provider_session_with_connection(
             &tx,
             &inventory.server,
             &evidence.pane,
-            &evidence.claude_session_id,
+            &evidence.provider,
+            &evidence.provider_session_id,
         )?;
     }
     tx.commit()?;
@@ -1453,7 +1633,7 @@ pub fn apply_recovery_inventory_evidence(
         abandoned_crashed,
         current_crashed: missing.len(),
         retired,
-        checkpointed: verified_claude.len(),
+        checkpointed: verified.len(),
         resolved,
     })
 }
@@ -1637,32 +1817,45 @@ pub fn resolve_recovery_for_live_claude_session(
     pane: &TmuxPane,
     claude_session_id: &str,
 ) -> AppResult<usize> {
+    resolve_recovery_for_live_provider_session(state_dir, server, pane, "claude", claude_session_id)
+}
+
+pub fn resolve_recovery_for_live_provider_session(
+    state_dir: &Path,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<usize> {
     let connection = open_bootstrapped_state_db(state_dir)?;
-    resolve_recovery_for_live_claude_session_with_connection(
+    resolve_recovery_for_live_provider_session_with_connection(
         &connection,
         server,
         pane,
-        claude_session_id,
+        provider,
+        provider_session_id,
     )
 }
 
-fn resolve_recovery_for_live_claude_session_with_connection(
+fn resolve_recovery_for_live_provider_session_with_connection(
     connection: &Connection,
     server: &TmuxServerIdentity,
     pane: &TmuxPane,
-    claude_session_id: &str,
+    provider: &str,
+    provider_session_id: &str,
 ) -> AppResult<usize> {
     Ok(connection.execute(
-        "UPDATE session_recoveries SET status = 'resolved', resolved_at_unix_ms = ?13 \
-          WHERE status IN ('staged', 'uncertain') AND provider = 'claude' \
-            AND provider_session_id = ?1 AND target_tmux_socket_path = ?2 \
-            AND target_tmux_server_pid = ?3 AND target_tmux_server_started_at_unix = ?4 \
-            AND target_tmux_pane_id = ?5 AND target_tmux_session_id = ?6 \
-            AND target_tmux_window_id = ?7 AND target_session_name = ?8 \
-            AND target_window_index = ?9 AND target_window_name = ?10 \
-            AND target_pane_index = ?11 AND target_cwd = ?12",
+        "UPDATE session_recoveries SET status = 'resolved', resolved_at_unix_ms = ?14 \
+          WHERE status IN ('staged', 'uncertain') AND provider = ?1 \
+            AND provider_session_id = ?2 AND target_tmux_socket_path = ?3 \
+            AND target_tmux_server_pid = ?4 AND target_tmux_server_started_at_unix = ?5 \
+            AND target_tmux_pane_id = ?6 AND target_tmux_session_id = ?7 \
+            AND target_tmux_window_id = ?8 AND target_session_name = ?9 \
+            AND target_window_index = ?10 AND target_window_name = ?11 \
+            AND target_pane_index = ?12 AND target_cwd = ?13",
         params![
-            claude_session_id,
+            provider,
+            provider_session_id,
             server.socket_path,
             server.pid,
             server.start_time,
@@ -1730,12 +1923,13 @@ fn crash_observation_with_connection(
             original_pane_tty, original_pane_pid, original_tmux_session_id,
             original_session_name, original_tmux_window_id, original_window_index,
             original_window_name, original_pane_index, original_cwd, crashed_at_unix_ms
-         ) VALUES (?1, ?2, ?3, 'crashed', 'claude', ?4, ?5, ?6, ?7, ?8, ?9,
-            ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+         ) VALUES (?1, ?2, ?3, 'crashed', ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             new_uuid(),
             observation.id,
             observation.workspace_id,
+            observation.provider,
             observation.provider_session_id,
             observation.original.server.socket_path,
             observation.original.server.pid,
@@ -1784,7 +1978,7 @@ fn list_observations_with_connection<P: rusqlite::Params>(
             observations.original_tmux_session_id, observations.original_session_name,
             observations.original_tmux_window_id, observations.original_window_index,
             observations.original_window_name, observations.original_pane_index,
-            observations.original_cwd, observations.provider_session_id,
+            observations.original_cwd, observations.provider, observations.provider_session_id,
             observations.first_observed_at_unix_ms, observations.last_observed_at_unix_ms
          FROM runtime_claude_observations observations {suffix}"
     );
@@ -1816,9 +2010,10 @@ fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaudeObserva
             pane_index: row.get(15)?,
             cwd: row.get(16)?,
         },
-        provider_session_id: row.get(17)?,
-        first_observed_at_unix_ms: row.get(18)?,
-        last_observed_at_unix_ms: row.get(19)?,
+        provider: row.get(17)?,
+        provider_session_id: row.get(18)?,
+        first_observed_at_unix_ms: row.get(19)?,
+        last_observed_at_unix_ms: row.get(20)?,
     })
 }
 
@@ -3755,10 +3950,11 @@ mod tests {
             &state_dir,
             &current_run,
             &inventory,
-            &[super::VerifiedClaudeRecoveryEvidence {
+            &[super::VerifiedProviderRecoveryEvidence {
                 workspace_id: workspace.id.clone(),
                 pane: replacement,
-                claude_session_id: B.to_string(),
+                provider: "claude".to_string(),
+                provider_session_id: B.to_string(),
             }],
         )
         .unwrap();
@@ -3923,10 +4119,11 @@ mod tests {
                 server: new_server,
                 panes: vec![pane.clone()],
             },
-            &[super::VerifiedClaudeRecoveryEvidence {
+            &[super::VerifiedProviderRecoveryEvidence {
                 workspace_id: workspace.id,
                 pane,
-                claude_session_id: B.to_string(),
+                provider: "claude".to_string(),
+                provider_session_id: B.to_string(),
             }],
         )
         .unwrap();

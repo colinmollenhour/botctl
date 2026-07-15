@@ -46,7 +46,7 @@ Responsible for deciding what action is allowed in the current state. Example po
 
 ### Claude Code
 
-Full guarded automation path: pane launch, classification, prompt submission, YOLO permission approval, and `last-message` from `~/.claude/projects` transcripts.
+Full guarded automation path: pane launch, classification, prompt submission, YOLO permission approval, and `last-message` from `~/.claude/projects` transcripts. Crash recovery journals verified live Claude session UUIDs and can stage `cd <cwd> && claude --resume <uuid>` after external tmux recreation (paste only; never Enter).
 
 ### Codex CLI
 
@@ -69,6 +69,8 @@ Passively discovered when the tmux pane command is `grok`. Conversation identity
 State classification is screen-first: Braille spinner status lines with `[stop]` / `Waiting for response` / token counters map to `BusyResponding`; the `Grok … · always-approve` prompt footer (or `Ctrl+.:shortcuts` chrome) without a busy status line maps to `ChatReady`. Internal `permission_prompt` events under always-approve are not treated as user-facing dialogs. Cook time uses the standard `BusyResponding` derivation.
 
 No YOLO, prompt submission, Claude-style keybinding automation, or managed MCP spawn for Grok.
+
+Crash recovery journals verified live Grok session UUIDs (via `active_sessions.json` / FD / cwd session resolution) and can stage `cd <cwd> && grok --resume <uuid>` after external tmux recreation (paste only; never Enter). Matching and staging rules match Claude recovery.
 
 The dashboard glyph is `✦` (U+2726 BLACK FOUR POINTED STAR, single-width). The provider label is `Grok`. The compact pane-source marker character is `G`.
 

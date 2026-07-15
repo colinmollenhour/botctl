@@ -56,7 +56,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - dump the latest persisted assistant message from Claude, Codex, OpenCode, Pi, Grok, or Antigravity to `MESSAGE_<conversation-id>.md` or a path passed with `--out`
 - run `serve` as a runtime-backed foreground facade for one tmux session
 - run `dashboard` as a runtime-backed popup-sized TUI grouped by workspace with per-pane YOLO controls for Claude and Codex
-- offer a Claude-only recovery command after an external tool recreates a missing tmux shell pane and exact matching identifies one unambiguous target; botctl stages the command but never presses Enter
+- offer Claude and Grok recovery commands after an external tool recreates a missing tmux shell pane and exact matching identifies one unambiguous target; botctl stages the command but never presses Enter
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files

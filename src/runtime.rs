@@ -35,7 +35,7 @@ use crate::recovery::{
 };
 use crate::screen_model::ScreenModel;
 use crate::storage::{
-    TmuxRuntimeDurations, VerifiedClaudeRecoveryEvidence, WorkspaceRecord,
+    TmuxRuntimeDurations, VerifiedProviderRecoveryEvidence, WorkspaceRecord,
     apply_recovery_inventory_evidence, begin_runtime_run, claim_recovery_for_staging,
     dismiss_recovery, finish_runtime_run_clean, list_babysit_registration_pane_ids,
     list_nonterminal_recoveries, load_recovery, mark_recovery_staged, mark_recovery_uncertain,
@@ -2263,33 +2263,36 @@ fn topology_scan(
 
     if let Some(inventory) = inventory {
         let run_id = shared.lock().unwrap().run_id.clone();
-        let mut verified_claude = Vec::new();
-        for pane in inventory
-            .panes
-            .iter()
-            .filter(|pane| pane.current_command.eq_ignore_ascii_case("claude"))
-        {
-            if let Ok(Some(session_id)) = resolve_live_claude_session_id(pane)
-                && Uuid::parse_str(&session_id).is_ok()
+        let mut verified = Vec::new();
+        let resolver = crate::proc_fd::LiveProc;
+        for pane in &inventory.panes {
+            let Some(provider) = crate::recovery::provider_for_pane_command(&pane.current_command)
+            else {
+                continue;
+            };
+            let session_id = match provider {
+                "claude" => resolve_live_claude_session_id(pane).ok().flatten(),
+                "grok" => crate::grok::resolve_live_grok_session_id(pane, &resolver)
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            let Some(session_id) = session_id.filter(|id| Uuid::parse_str(id).is_ok()) else {
+                continue;
+            };
+            if let Ok(workspace) =
+                resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))
             {
-                if let Ok(workspace) =
-                    resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))
-                {
-                    verified_claude.push(VerifiedClaudeRecoveryEvidence {
-                        workspace_id: workspace.id.clone(),
-                        pane: pane.clone(),
-                        claude_session_id: session_id,
-                    });
-                }
+                verified.push(VerifiedProviderRecoveryEvidence {
+                    workspace_id: workspace.id.clone(),
+                    pane: pane.clone(),
+                    provider: provider.to_string(),
+                    provider_session_id: session_id,
+                });
             }
         }
         // Best-effort: recovery evidence should not fail topology scans.
-        let _ = apply_recovery_inventory_evidence(
-            &config.state_dir,
-            &run_id,
-            &inventory,
-            &verified_claude,
-        );
+        let _ = apply_recovery_inventory_evidence(&config.state_dir, &run_id, &inventory, &verified);
     }
 
     *known_candidates = current;

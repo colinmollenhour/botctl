@@ -155,25 +155,44 @@ pub fn build_recovery_command(
     original_cwd: &str,
     provider_session_id: &str,
 ) -> AppResult<String> {
-    if provider != "claude" {
-        return Err(AppError::new(
-            "recovery is supported only for provider claude",
-        ));
-    }
     if original_cwd.is_empty() || !Path::new(original_cwd).is_absolute() {
         return Err(AppError::new(
             "recovery cwd must be a non-empty absolute path",
         ));
     }
     validate_command_value("recovery cwd", original_cwd)?;
-    validate_command_value("Claude session id", provider_session_id)?;
+    validate_command_value("provider session id", provider_session_id)?;
     Uuid::parse_str(provider_session_id)
-        .map_err(|_| AppError::new("Claude recovery session id must be a valid UUID"))?;
+        .map_err(|_| AppError::new("recovery session id must be a valid UUID"))?;
+    let binary = match provider {
+        "claude" => "claude",
+        "grok" => "grok",
+        _ => {
+            return Err(AppError::new(format!(
+                "recovery is supported only for providers claude and grok (got {provider})"
+            )));
+        }
+    };
     Ok(format!(
-        "cd {} && claude --resume {}",
+        "cd {} && {binary} --resume {}",
         posix_single_quote(original_cwd),
         posix_single_quote(provider_session_id)
     ))
+}
+
+/// Providers that support crash recovery checkpointing and staged resume.
+pub fn is_recoverable_provider(provider: &str) -> bool {
+    matches!(provider, "claude" | "grok")
+}
+
+pub fn provider_for_pane_command(current_command: &str) -> Option<&'static str> {
+    if current_command.eq_ignore_ascii_case("claude") {
+        Some("claude")
+    } else if current_command.eq_ignore_ascii_case("grok") {
+        Some("grok")
+    } else {
+        None
+    }
 }
 
 fn validate_command_value(label: &str, value: &str) -> AppResult<()> {
@@ -469,6 +488,11 @@ mod tests {
             "cd '/tmp/Colin'\"'\"'s work' && claude --resume '4d8dc7f8-a842-438a-b2c2-4d39ad509a53'"
         );
         assert!(!command.ends_with(['\n', '\r']));
+        let grok = build_recovery_command("grok", "/tmp/demo", SESSION_ID).unwrap();
+        assert_eq!(
+            grok,
+            "cd '/tmp/demo' && grok --resume '4d8dc7f8-a842-438a-b2c2-4d39ad509a53'"
+        );
     }
 
     #[test]
@@ -477,6 +501,7 @@ mod tests {
         assert!(build_recovery_command("claude", "relative", SESSION_ID).is_err());
         assert!(build_recovery_command("claude", "/tmp/x", "not-a-uuid").is_err());
         assert!(build_recovery_command("claude", "/tmp/x\nrm -rf /", SESSION_ID).is_err());
+        assert!(build_recovery_command("opencode", "/tmp/x", SESSION_ID).is_err());
     }
 
     #[test]

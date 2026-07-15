@@ -208,7 +208,7 @@ Notes:
 - fetches recovery offers independently from live classifier panes and leaves their PID, CPU, memory, cook, wait, YOLO, and classifier columns blank
 - recovery requires an external tool to recreate the tmux server, sessions, windows, and shell panes first; botctl does not restore tmux objects or layouts
 - matches only the exact original object on the same server or one exact logical pane by socket path, session name, window index/name, pane index, and cwd; cwd-only, fuzzy, ambiguous, incompatible-shell, and globally conflicting matches remain disabled
-- recovery rows are Claude-only and preview the exact `cd <cwd> && claude --resume <uuid>` command, original identity, lifecycle, target, or precise disabled reason
+- recovery rows are Claude and Grok only and preview the exact `cd <cwd> && claude --resume <uuid>` or `cd <cwd> && grok --resume <uuid>` command, original identity, lifecycle, target, or precise disabled reason
 - lowercase `r` refreshes; uppercase `R` stages one selected ready `Crashed` recovery; uppercase `D` dismisses a selected `Crashed`, `Staged`, or `Uncertain` recovery; a current `Staging` recovery cannot be dismissed
 - `Enter` only navigates to a live pane or uniquely matched recovery target; it never stages or submits a command
 - staging pastes the exact preview without a newline or Enter; botctl does not clear shell input, and the operator must inspect the pane and press Enter manually
