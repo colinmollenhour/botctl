@@ -447,12 +447,13 @@ fn is_agy_folder_trust_prompt(lines: &[&str]) -> bool {
     // Ordered BEFORE settings-persist's `[y/n]` fallback so tail-truncated
     // folder-trust frames are not misclassified as settings-persist.
     if mentions_workspace_folder_or_project
-        && let Some(last_non_blank) = lines.iter().rev().find(|line| !line.is_empty()) {
-            let lower = last_non_blank.to_ascii_lowercase();
-            if lower.ends_with("[y/n]") || lower.ends_with("(y/n)") {
-                return true;
-            }
+        && let Some(last_non_blank) = lines.iter().rev().find(|line| !line.is_empty())
+    {
+        let lower = last_non_blank.to_ascii_lowercase();
+        if lower.ends_with("[y/n]") || lower.ends_with("(y/n)") {
+            return true;
         }
+    }
     false
 }
 

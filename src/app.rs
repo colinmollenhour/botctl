@@ -675,15 +675,16 @@ fn stop_runtime_process(state_dir: &Path) -> AppResult<()> {
     }
 
     if let Some(metadata) = load_runtime_manager_metadata(state_dir)?
-        && let Some(session_name) = metadata.session_name {
-            let tmux_client = match metadata.tmux_socket_path {
-                Some(socket_path) => TmuxClient::with_socket_path(socket_path),
-                None => TmuxClient::default(),
-            };
-            if tmux_client.has_session(&session_name)? {
-                tmux_client.kill_session(&session_name)?;
-            }
+        && let Some(session_name) = metadata.session_name
+    {
+        let tmux_client = match metadata.tmux_socket_path {
+            Some(socket_path) => TmuxClient::with_socket_path(socket_path),
+            None => TmuxClient::default(),
+        };
+        if tmux_client.has_session(&session_name)? {
+            tmux_client.kill_session(&session_name)?;
         }
+    }
     remove_runtime_manager_metadata(state_dir)?;
     Ok(())
 }
@@ -1839,9 +1840,9 @@ fn keep_going_body_start(lines: &[&str], token_idx: usize, prompt_anchor: Option
         && let Some(prompt_idx) = lines[..token_idx]
             .iter()
             .rposition(|line| line.contains(anchor))
-        {
-            return prompt_idx + 1;
-        }
+    {
+        return prompt_idx + 1;
+    }
 
     lines[..token_idx]
         .iter()
@@ -3141,9 +3142,10 @@ fn is_plausible_permission_prompt_title(title: &str) -> bool {
 fn parse_permission_prompt_title(title: &str) -> (String, Option<String>) {
     if let Some((label, suffix)) = title.rsplit_once(" (")
         && let Some(mode) = suffix.strip_suffix(')')
-            && matches!(mode, "sandboxed" | "unsandboxed") {
-                return (label.to_string(), Some(mode.to_string()));
-            }
+        && matches!(mode, "sandboxed" | "unsandboxed")
+    {
+        return (label.to_string(), Some(mode.to_string()));
+    }
     (title.to_string(), None)
 }
 

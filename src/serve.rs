@@ -205,10 +205,11 @@ where
                 &mut tracked,
                 ServeSnapshotReason::StreamActivity,
                 &mut emit,
-            )? {
-                emit(ServeEvent::Stopped { reason })?;
-                return Ok(());
-            }
+            )?
+        {
+            emit(ServeEvent::Stopped { reason })?;
+            return Ok(());
+        }
 
         if last_periodic.elapsed() >= periodic_interval {
             if let Some(reason) = reconcile_panes(
@@ -294,9 +295,10 @@ fn note_stream_output(
     payload: &str,
 ) {
     if let Some(target_pane) = &request.target_pane
-        && target_pane != pane_id {
-            return;
-        }
+        && target_pane != pane_id
+    {
+        return;
+    }
 
     let entry = tracked.entry(pane_id.to_string()).or_default();
     let decoded = decode_tmux_escaped(payload);

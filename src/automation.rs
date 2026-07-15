@@ -530,9 +530,11 @@ fn parse_chord(chord: &str) -> Result<String, String> {
     }
 
     if let Some(rest) = normalized.strip_prefix('f')
-        && !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
-            return Ok(format!("F{rest}"));
-        }
+        && !rest.is_empty()
+        && rest.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Ok(format!("F{rest}"));
+    }
 
     if normalized.len() == 1 {
         return Ok(normalized);

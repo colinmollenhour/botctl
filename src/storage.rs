@@ -836,10 +836,11 @@ pub fn resolve_workspace(
 ) -> AppResult<WorkspaceRecord> {
     let connection = open_bootstrapped_state_db(state_dir)?;
     if let Some(selector) = selector.filter(|value| !value.trim().is_empty())
-        && Uuid::parse_str(selector).is_ok() {
-            return load_workspace_by_id(&connection, selector)?
-                .ok_or_else(|| AppError::new(format!("unknown workspace id: {selector}")));
-        }
+        && Uuid::parse_str(selector).is_ok()
+    {
+        return load_workspace_by_id(&connection, selector)?
+            .ok_or_else(|| AppError::new(format!("unknown workspace id: {selector}")));
+    }
 
     let requested_path = match selector {
         Some(raw) => {
