@@ -150,6 +150,87 @@ pub struct RuntimeRecoveryOffer {
     pub dismissed_at_unix_ms: Option<i64>,
 }
 
+/// How a provider's CLI addresses a saved session on resume.
+struct RecoverableProvider {
+    provider: &'static str,
+    /// `<binary> <resume_args..> '<session-id>'` — quoted id appended last.
+    binary: &'static str,
+    resume_prefix: &'static str,
+    id_kind: SessionIdKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIdKind {
+    Uuid,
+    /// OpenCode `ses_<base62>` identifiers.
+    OpenCodeSession,
+}
+
+pub const RECOVERABLE_PROVIDERS: &[&str] = &["claude", "grok", "opencode", "agy", "pi", "codex"];
+
+const PROVIDER_TABLE: &[RecoverableProvider] = &[
+    RecoverableProvider {
+        provider: "claude",
+        binary: "claude",
+        resume_prefix: "--resume",
+        id_kind: SessionIdKind::Uuid,
+    },
+    RecoverableProvider {
+        provider: "grok",
+        binary: "grok",
+        resume_prefix: "--resume",
+        id_kind: SessionIdKind::Uuid,
+    },
+    RecoverableProvider {
+        provider: "opencode",
+        binary: "opencode",
+        resume_prefix: "--session",
+        id_kind: SessionIdKind::OpenCodeSession,
+    },
+    RecoverableProvider {
+        provider: "agy",
+        binary: "agy",
+        resume_prefix: "--conversation",
+        id_kind: SessionIdKind::Uuid,
+    },
+    RecoverableProvider {
+        provider: "pi",
+        binary: "pi",
+        resume_prefix: "--session",
+        id_kind: SessionIdKind::Uuid,
+    },
+    RecoverableProvider {
+        provider: "codex",
+        binary: "codex",
+        resume_prefix: "resume",
+        id_kind: SessionIdKind::Uuid,
+    },
+];
+
+fn provider_entry(provider: &str) -> Option<&'static RecoverableProvider> {
+    PROVIDER_TABLE
+        .iter()
+        .find(|entry| entry.provider == provider)
+}
+
+/// Validate a session id against the provider's format. Every staged resume
+/// command embeds this value in a shell line, so anything outside the known
+/// alphabet is rejected outright.
+pub fn is_valid_provider_session_id(provider: &str, session_id: &str) -> bool {
+    let Some(entry) = provider_entry(provider) else {
+        return false;
+    };
+    match entry.id_kind {
+        SessionIdKind::Uuid => Uuid::parse_str(session_id).is_ok(),
+        SessionIdKind::OpenCodeSession => {
+            session_id.len() > 4
+                && session_id.len() <= 128
+                && session_id.starts_with("ses_")
+                && session_id[4..].chars().all(|c| c.is_ascii_alphanumeric())
+        }
+    }
+}
+
 pub fn build_recovery_command(
     provider: &str,
     original_cwd: &str,
@@ -162,37 +243,36 @@ pub fn build_recovery_command(
     }
     validate_command_value("recovery cwd", original_cwd)?;
     validate_command_value("provider session id", provider_session_id)?;
-    Uuid::parse_str(provider_session_id)
-        .map_err(|_| AppError::new("recovery session id must be a valid UUID"))?;
-    let binary = match provider {
-        "claude" => "claude",
-        "grok" => "grok",
-        _ => {
-            return Err(AppError::new(format!(
-                "recovery is supported only for providers claude and grok (got {provider})"
-            )));
-        }
+    let Some(entry) = provider_entry(provider) else {
+        return Err(AppError::new(format!(
+            "recovery is supported only for providers {} (got {provider})",
+            RECOVERABLE_PROVIDERS.join(", ")
+        )));
     };
+    if !is_valid_provider_session_id(provider, provider_session_id) {
+        return Err(AppError::new(format!(
+            "recovery session id is not a valid {provider} session identifier"
+        )));
+    }
     Ok(format!(
-        "cd {} && {binary} --resume {}",
+        "cd {} && {} {} {}",
         posix_single_quote(original_cwd),
+        entry.binary,
+        entry.resume_prefix,
         posix_single_quote(provider_session_id)
     ))
 }
 
 /// Providers that support crash recovery checkpointing and staged resume.
 pub fn is_recoverable_provider(provider: &str) -> bool {
-    matches!(provider, "claude" | "grok")
+    provider_entry(provider).is_some()
 }
 
 pub fn provider_for_pane_command(current_command: &str) -> Option<&'static str> {
-    if current_command.eq_ignore_ascii_case("claude") {
-        Some("claude")
-    } else if current_command.eq_ignore_ascii_case("grok") {
-        Some("grok")
-    } else {
-        None
-    }
+    PROVIDER_TABLE
+        .iter()
+        .map(|entry| entry.provider)
+        .find(|provider| current_command.eq_ignore_ascii_case(provider))
 }
 
 fn validate_command_value(label: &str, value: &str) -> AppResult<()> {
@@ -496,12 +576,44 @@ mod tests {
     }
 
     #[test]
+    fn command_covers_every_recoverable_provider() {
+        let commands = [
+            ("claude", SESSION_ID, "claude --resume"),
+            ("grok", SESSION_ID, "grok --resume"),
+            ("agy", SESSION_ID, "agy --conversation"),
+            ("pi", SESSION_ID, "pi --session"),
+            ("codex", SESSION_ID, "codex resume"),
+            (
+                "opencode",
+                "ses_0965e3dcbffeKBENMf0BDST6Cj",
+                "opencode --session",
+            ),
+        ];
+        for (provider, session_id, expected_prefix) in commands {
+            assert!(is_recoverable_provider(provider));
+            assert_eq!(provider_for_pane_command(provider), Some(provider));
+            let command = build_recovery_command(provider, "/tmp/demo", session_id).unwrap();
+            assert_eq!(
+                command,
+                format!("cd '/tmp/demo' && {expected_prefix} '{session_id}'")
+            );
+        }
+    }
+
+    #[test]
     fn command_rejects_invalid_metadata() {
-        assert!(build_recovery_command("codex", "/tmp/x", SESSION_ID).is_err());
+        assert!(build_recovery_command("gemini", "/tmp/x", SESSION_ID).is_err());
         assert!(build_recovery_command("claude", "relative", SESSION_ID).is_err());
         assert!(build_recovery_command("claude", "/tmp/x", "not-a-uuid").is_err());
         assert!(build_recovery_command("claude", "/tmp/x\nrm -rf /", SESSION_ID).is_err());
+        // UUID providers reject OpenCode-style ids and vice versa.
+        assert!(
+            build_recovery_command("codex", "/tmp/x", "ses_0965e3dcbffeKBENMf0BDST6Cj").is_err()
+        );
         assert!(build_recovery_command("opencode", "/tmp/x", SESSION_ID).is_err());
+        // OpenCode ids allow only `ses_` + ASCII alphanumerics.
+        assert!(build_recovery_command("opencode", "/tmp/x", "ses_").is_err());
+        assert!(build_recovery_command("opencode", "/tmp/x", "ses_abc'; rm -rf /'").is_err());
     }
 
     #[test]

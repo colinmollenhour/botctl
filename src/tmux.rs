@@ -1412,14 +1412,7 @@ mod tests {
         // A prefix that ends mid-scalar (2 of ⚙'s 3 bytes) must fail cleanly
         // rather than emit garbage fields.
         let mut encoded = String::from("2:%1");
-        for field in [
-            "/dev/pts/1",
-            "123",
-            "$1",
-            "demo",
-            "@2",
-            "3",
-        ] {
+        for field in ["/dev/pts/1", "123", "$1", "demo", "@2", "3"] {
             encoded.push_str(&format!("{}:{field}", field.len()));
         }
         encoded.push_str("2:⚙ bloodraven");

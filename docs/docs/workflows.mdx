@@ -118,15 +118,15 @@ MESSAGE_91399d1d-79e5-48a2-b355-c8b751fe9333.md
 
 Use `--out -` to stream the raw Markdown body to stdout for piping. Claude reads `~/.claude/projects`, Codex reads `~/.codex/sessions`, OpenCode reads the latest assistant text parts from its SQLite storage after resolving the pane title and cwd, Pi reads the latest assistant text blocks from JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`), and Antigravity uses pane-scrape extraction (requires three horizontal-rule lines to be visible in the pane scrollback: one above the last assistant turn, plus the two that bracket the live input box). The export contains assistant-visible text, not tool calls or transcript metadata.
 
-## Recover a missing Claude or Grok session
+## Recover a missing agent session
 
 Use this only after another tool recreates the tmux server, sessions, windows, and shell panes. Botctl does not recreate tmux objects, restore layouts or scrollback, launch the provider automatically, clear shell input, or press Enter.
 
-Recovery offers are Claude and Grok only. Botctl must previously have checkpointed a verified Claude or Grok pane with a valid provider session UUID. A `Crashed` row means a later successful stable all-pane inventory did not contain that original pane object. It is conservative evidence of absence, not an inference that a human or crash closed the pane. An inventory failure, malformed server identity, or unstable server identity creates no recovery record.
+Recovery offers cover Claude, Grok, OpenCode, Antigravity, Pi, and Codex panes. Botctl must previously have checkpointed a verified provider pane with a valid provider session id. A `Crashed` row means a later successful stable all-pane inventory did not contain that original pane object. It is conservative evidence of absence, not an inference that a human or crash closed the pane. An inventory failure, malformed server identity, or unstable server identity creates no recovery record.
 
 1. Use your external tmux restoration tool to recreate the shell pane at its original coordinates and cwd.
 2. Open `botctl dashboard` and select the recovery row under its original workspace.
-3. Review the original identity, provider session UUID, exact resume command (`cd <cwd> && claude --resume <uuid>` or `cd <cwd> && grok --resume <uuid>`), target, and lifecycle in the details panel.
+3. Review the original identity, provider session id, exact resume command (for example `cd <cwd> && claude --resume <uuid>`, `cd <cwd> && opencode --session <id>`, or `cd <cwd> && codex resume <uuid>`), target, and lifecycle in the details panel.
 4. If the row is ready, press uppercase `R` once to stage that exact command in the matched shell pane without Enter.
 5. Press `Enter` on the recovery row only to navigate to the matched target. This navigation never stages or submits the command.
 6. Inspect the pane and its editing buffer. Press Enter yourself only when the displayed command and target are correct.

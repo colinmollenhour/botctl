@@ -155,9 +155,8 @@ pub fn latest_assistant_message_for_pane(
     if resolved.id.is_empty() {
         return Ok(None);
     }
-    let Some(text) =
-        latest_assistant_text_from_updates(&resolved.path.join("updates.jsonl"))?
-            .filter(|text| !text.trim().is_empty())
+    let Some(text) = latest_assistant_text_from_updates(&resolved.path.join("updates.jsonl"))?
+        .filter(|text| !text.trim().is_empty())
     else {
         return Ok(None);
     };
@@ -223,7 +222,10 @@ pub fn classify_grok_state(frame: &str) -> Option<SessionState> {
         .copied()
         .collect::<Vec<_>>();
 
-    if tail_window.iter().any(|line| is_grok_busy_status_line(line)) {
+    if tail_window
+        .iter()
+        .any(|line| is_grok_busy_status_line(line))
+    {
         return Some(SessionState::BusyResponding);
     }
 
@@ -298,19 +300,20 @@ fn resolve_grok_session_identity(
     let sessions_root = home.join(GROK_SESSIONS_DIR);
 
     if let Some(pid) = pane.pane_pid.filter(|&p| p != 0) {
-        if let Some(resolved) =
-            resolve_from_active_sessions(&home, &sessions_root, pid, resolver)?
+        if let Some(resolved) = resolve_from_active_sessions(&home, &sessions_root, pid, resolver)?
         {
             return Ok(Some(resolved));
         }
 
-        if let Some(path) = transcript_from_process_tree_fds_with_resolver(pid, resolver, |target| {
-            target.starts_with(&sessions_root)
-                && target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name == "events.jsonl")
-        })? && let Some(resolved) = resolved_from_events_path(&path)
+        if let Some(path) =
+            transcript_from_process_tree_fds_with_resolver(pid, resolver, |target| {
+                target.starts_with(&sessions_root)
+                    && target
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name == "events.jsonl")
+            })?
+            && let Some(resolved) = resolved_from_events_path(&path)
         {
             return Ok(Some(resolved));
         }
@@ -749,7 +752,9 @@ mod tests {
             Some(SessionState::BusyResponding)
         );
 
-        assert!(!frame_has_grok_fingerprint("just claude output\n? for shortcuts\n"));
+        assert!(!frame_has_grok_fingerprint(
+            "just claude output\n? for shortcuts\n"
+        ));
     }
 
     #[test]

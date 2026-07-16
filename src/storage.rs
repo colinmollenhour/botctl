@@ -14,7 +14,7 @@ use crate::recovery::{
 use crate::tmux::{TmuxInventory, TmuxPane, TmuxServerIdentity};
 use crate::workspace::resolve_workspace_locator;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -216,6 +216,7 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
             3 => migrate_to_v4(&tx)?,
             4 => migrate_to_v5(&tx)?,
             5 => migrate_to_v6(&tx)?,
+            6 => migrate_to_v7(&tx)?,
             other => {
                 return Err(AppError::new(format!(
                     "no state.db migration path from version {} to {}",
@@ -245,6 +246,7 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
         4 => ensure_v4_tables(connection),
         5 => ensure_v5_tables(connection),
         6 => ensure_v6_tables(connection),
+        7 => ensure_v7_tables(connection),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -293,7 +295,9 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
             && index_sql(connection, "session_recoveries_claimed_target")?
                 .is_some_and(|sql| sql.contains("'uncertain'"))),
         6 => Ok(schema_layout_matches_version(connection, 5)?
-            && provider_check_allows_grok(connection)?),
+            && provider_check_allows(connection, "grok")?),
+        7 => Ok(schema_layout_matches_version(connection, 6)?
+            && recovery_provider_check_is_current(connection)?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -745,13 +749,40 @@ fn migrate_to_v6(connection: &Connection) -> AppResult<()> {
 
 fn ensure_v6_tables(connection: &Connection) -> AppResult<()> {
     ensure_v5_tables(connection)?;
-    if provider_check_allows_grok(connection)? {
+    if provider_check_allows(connection, "grok")? {
         return Ok(());
     }
-    // Rebuild recovery tables so CHECK allows claude and grok.
-    connection.execute_batch(
+    rebuild_recovery_provider_tables(connection, "v6", &["claude", "grok"])
+}
+
+fn migrate_to_v7(connection: &Connection) -> AppResult<()> {
+    ensure_v6_tables(connection)?;
+    ensure_v7_tables(connection)
+}
+
+fn ensure_v7_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v6_tables(connection)?;
+    if recovery_provider_check_is_current(connection)? {
+        return Ok(());
+    }
+    rebuild_recovery_provider_tables(connection, "v7", crate::recovery::RECOVERABLE_PROVIDERS)
+}
+
+/// Rebuild the observation/recovery tables so their provider CHECK
+/// constraints allow exactly `providers`, preserving all rows and indexes.
+fn rebuild_recovery_provider_tables(
+    connection: &Connection,
+    temp_suffix: &str,
+    providers: &[&str],
+) -> AppResult<()> {
+    let provider_list = providers
+        .iter()
+        .map(|provider| format!("'{provider}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    connection.execute_batch(&format!(
         "
-        CREATE TABLE runtime_claude_observations_v6 (
+        CREATE TABLE runtime_claude_observations_{temp_suffix} (
             id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL REFERENCES runtime_runs(id) ON DELETE CASCADE,
             workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
@@ -769,23 +800,23 @@ fn ensure_v6_tables(connection: &Connection) -> AppResult<()> {
             original_window_name TEXT NOT NULL,
             original_pane_index INTEGER NOT NULL,
             original_cwd TEXT NOT NULL,
-            provider TEXT NOT NULL CHECK (provider IN ('claude', 'grok')),
+            provider TEXT NOT NULL CHECK (provider IN ({provider_list})),
             provider_session_id TEXT NOT NULL,
             first_observed_at_unix_ms INTEGER NOT NULL,
             last_observed_at_unix_ms INTEGER NOT NULL
         );
-        INSERT INTO runtime_claude_observations_v6
+        INSERT INTO runtime_claude_observations_{temp_suffix}
             SELECT * FROM runtime_claude_observations;
 
-        CREATE TABLE session_recoveries_v6 (
+        CREATE TABLE session_recoveries_{temp_suffix} (
             id TEXT PRIMARY KEY,
             source_observation_id TEXT NOT NULL UNIQUE
-                REFERENCES runtime_claude_observations_v6(id) ON DELETE RESTRICT,
+                REFERENCES runtime_claude_observations_{temp_suffix}(id) ON DELETE RESTRICT,
             workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
             status TEXT NOT NULL CHECK (status IN (
                 'crashed', 'staging', 'staged', 'uncertain', 'resolved', 'dismissed'
             )),
-            provider TEXT NOT NULL CHECK (provider IN ('claude', 'grok')),
+            provider TEXT NOT NULL CHECK (provider IN ({provider_list})),
             provider_session_id TEXT NOT NULL,
             original_tmux_socket_path TEXT NOT NULL,
             original_tmux_server_pid INTEGER NOT NULL,
@@ -820,13 +851,13 @@ fn ensure_v6_tables(connection: &Connection) -> AppResult<()> {
             resolved_at_unix_ms INTEGER,
             dismissed_at_unix_ms INTEGER
         );
-        INSERT INTO session_recoveries_v6
+        INSERT INTO session_recoveries_{temp_suffix}
             SELECT * FROM session_recoveries;
 
         DROP TABLE session_recoveries;
         DROP TABLE runtime_claude_observations;
-        ALTER TABLE runtime_claude_observations_v6 RENAME TO runtime_claude_observations;
-        ALTER TABLE session_recoveries_v6 RENAME TO session_recoveries;
+        ALTER TABLE runtime_claude_observations_{temp_suffix} RENAME TO runtime_claude_observations;
+        ALTER TABLE session_recoveries_{temp_suffix} RENAME TO session_recoveries;
 
         CREATE UNIQUE INDEX IF NOT EXISTS runtime_claude_observations_live_object
          ON runtime_claude_observations (
@@ -843,11 +874,11 @@ fn ensure_v6_tables(connection: &Connection) -> AppResult<()> {
              target_tmux_server_started_at_unix, target_tmux_pane_id
          ) WHERE status IN ('staging', 'staged', 'uncertain');
         ",
-    )?;
+    ))?;
     Ok(())
 }
 
-fn provider_check_allows_grok(connection: &Connection) -> AppResult<bool> {
+fn provider_check_allows(connection: &Connection, provider: &str) -> AppResult<bool> {
     let sql: Option<String> = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_recoveries'",
@@ -855,9 +886,18 @@ fn provider_check_allows_grok(connection: &Connection) -> AppResult<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(sql
-        .as_deref()
-        .is_some_and(|ddl| ddl.contains("'grok'") || ddl.contains("\"grok\"")))
+    Ok(sql.as_deref().is_some_and(|ddl| {
+        ddl.contains(&format!("'{provider}'")) || ddl.contains(&format!("\"{provider}\""))
+    }))
+}
+
+fn recovery_provider_check_is_current(connection: &Connection) -> AppResult<bool> {
+    for provider in crate::recovery::RECOVERABLE_PROVIDERS {
+        if !provider_check_allows(connection, provider)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 const V5_REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
@@ -3983,6 +4023,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!((recoveries, live_a, live_b), (1, 0, 1));
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn recovery_supports_every_provider_end_to_end() {
+        let providers = [
+            ("claude", "4d8dc7f8-a842-438a-b2c2-4d39ad509a53"),
+            ("grok", "f18b9e1b-f638-4f38-ab94-b1fc3053dacf"),
+            ("opencode", "ses_0965e3dcbffeKBENMf0BDST6Cj"),
+            ("agy", "10cebaa2-4dd8-42a2-a101-7eb0a6c5f45d"),
+            ("pi", "019e488e-c32a-7ee9-9d2c-6478c4d554e3"),
+            ("codex", "019d6a4e-bafb-7322-9cf1-4ba83efbd5ed"),
+        ];
+        let state_dir = unique_temp_dir("storage-all-providers");
+        let workspace_root = unique_temp_dir("storage-all-providers-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let server = crate::tmux::TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut evidence = Vec::new();
+        for (index, (provider, session_id)) in providers.iter().enumerate() {
+            let mut pane = sample_pane();
+            pane.pane_id = format!("%{}", index + 10);
+            pane.current_command = provider.to_string();
+            pane.current_path = workspace_root.display().to_string();
+            evidence.push(super::VerifiedProviderRecoveryEvidence {
+                workspace_id: workspace.id.clone(),
+                pane,
+                provider: provider.to_string(),
+                provider_session_id: session_id.to_string(),
+            });
+        }
+        let run = super::begin_runtime_run(&state_dir).unwrap();
+        let inventory = crate::tmux::TmuxInventory {
+            server: server.clone(),
+            panes: evidence.iter().map(|item| item.pane.clone()).collect(),
+        };
+        let observed =
+            super::apply_recovery_inventory_evidence(&state_dir, &run, &inventory, &evidence)
+                .unwrap();
+        assert_eq!(observed.checkpointed, providers.len());
+
+        // The tmux server dies: a fresh run sees none of the panes.
+        let next_run = super::begin_runtime_run(&state_dir).unwrap();
+        let crashed = super::apply_recovery_inventory_evidence(
+            &state_dir,
+            &next_run,
+            &crate::tmux::TmuxInventory {
+                server: server.clone(),
+                panes: Vec::new(),
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(crashed.abandoned_crashed, providers.len());
+
+        let recoveries = super::list_nonterminal_recoveries(&state_dir).unwrap();
+        assert_eq!(recoveries.len(), providers.len());
+        for (provider, session_id) in providers {
+            let record = recoveries
+                .iter()
+                .find(|record| record.provider == provider)
+                .unwrap_or_else(|| panic!("missing recovery for provider {provider}"));
+            assert_eq!(
+                record.lifecycle,
+                crate::recovery::RecoveryLifecycle::Crashed
+            );
+            assert_eq!(record.provider_session_id, session_id);
+            crate::recovery::build_recovery_command(
+                &record.provider,
+                &record.original.cwd,
+                &record.provider_session_id,
+            )
+            .unwrap_or_else(|error| {
+                panic!("command should build for provider {provider}: {error}")
+            });
+        }
         let _ = fs::remove_dir_all(state_dir);
         let _ = fs::remove_dir_all(workspace_root);
     }

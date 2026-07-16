@@ -40,6 +40,17 @@ pub fn is_pi_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("pi")
 }
 
+/// Resolve the live Pi session id for a pane without loading message context.
+pub fn resolve_live_pi_session_id(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<String>> {
+    if !is_pi_pane(pane) {
+        return Ok(None);
+    }
+    Ok(resolve_pi_transcript_for_pane(pane, resolver)?.map(|(session_id, _, _)| session_id))
+}
+
 pub fn resolve_pi_session_for_pane(
     pane: &TmuxPane,
     resolver: &dyn ChildResolver,

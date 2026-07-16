@@ -79,6 +79,25 @@ pub fn is_agy_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("agy")
 }
 
+/// Resolve the live agy conversation UUID for a pane without needing a screen
+/// frame. Used by recovery evidence, where only the identity matters: the fd
+/// walk only matches `.pb` files under the Antigravity conversations dir, and
+/// the history fallback matches the pane's workspace.
+pub fn resolve_live_agy_session_id(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<String>> {
+    if !is_agy_pane(pane) || !state_dir_exists() {
+        return Ok(None);
+    }
+    if let Some(pid) = pane.pane_pid.filter(|&p| p != 0)
+        && let Some(uuid) = conversation_id_from_process_tree_fds(pid, resolver)?
+    {
+        return Ok(Some(uuid));
+    }
+    conversation_id_from_history_jsonl(&pane.current_path)
+}
+
 pub fn resolve_agy_session_for_pane(
     pane: &TmuxPane,
     frame: &str,

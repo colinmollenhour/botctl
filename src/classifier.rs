@@ -449,9 +449,9 @@ impl Classifier {
         // Agy/Grok don't currently support reliable screen-only question
         // detection; the operator-question path is Claude/Codex specific (it
         // keys on chat input markers and recap excerpts those TUIs do not share).
-        let is_provider_owned_state = signals.iter().any(|s| {
-            s == SIGNAL_AGY_KEYWORDS || s == SIGNAL_GROK_KEYWORDS
-        });
+        let is_provider_owned_state = signals
+            .iter()
+            .any(|s| s == SIGNAL_AGY_KEYWORDS || s == SIGNAL_GROK_KEYWORDS);
         let has_questions = !is_provider_owned_state
             && matches!(
                 state,

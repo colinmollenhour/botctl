@@ -70,7 +70,7 @@ State classification is screen-first: Braille spinner status lines with `[stop]`
 
 No YOLO, prompt submission, Claude-style keybinding automation, or managed MCP spawn for Grok.
 
-Crash recovery journals verified live Grok session UUIDs (via `active_sessions.json` / FD / cwd session resolution) and can stage `cd <cwd> && grok --resume <uuid>` after external tmux recreation (paste only; never Enter). Matching and staging rules match Claude recovery.
+Crash recovery journals verified live provider session ids for Claude, Grok, OpenCode, Antigravity (agy), Pi, and Codex panes (via provider-specific FD walks, session stores, or cwd session resolution) and can stage the provider's resume command (`claude --resume`, `grok --resume`, `opencode --session`, `agy --conversation`, `pi --session`, `codex resume`) after external tmux recreation (paste only; never Enter). Matching and staging rules are identical for every provider.
 
 The dashboard glyph is `✦` (U+2726 BLACK FOUR POINTED STAR, single-width). The provider label is `Grok`. The compact pane-source marker character is `G`.
 

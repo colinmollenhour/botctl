@@ -56,11 +56,8 @@ const FOOTER_LINE2: &[(&str, &str)] = &[
     ("N", "all off"),
 ];
 
-const FOOTER_LINE3: &[(&str, &str)] = &[
-    ("R", "stage, no Enter"),
-    ("r", "refresh"),
-    ("D", "dismiss"),
-];
+const FOOTER_LINE3: &[(&str, &str)] =
+    &[("R", "stage, no Enter"), ("r", "refresh"), ("D", "dismiss")];
 const FOOTER_LINE2_PERSISTENT_END: &[(&str, &str)] = &[("q", "detach"), ("X", "kill server")];
 const FOOTER_INDENT: &str = "  ";
 const FOOTER_COLUMN_GAP: &str = "    ";
@@ -411,7 +408,6 @@ fn recovery_can_dismiss(recovery: &RuntimeRecoveryOffer) -> bool {
         RecoveryLifecycle::Crashed | RecoveryLifecycle::Staged | RecoveryLifecycle::Uncertain
     )
 }
-
 
 struct ManagedWindowName {
     target: String,
@@ -3109,7 +3105,6 @@ fn split_workspace_header(label: &str) -> Option<(&str, &str)> {
     Some((name, path.strip_suffix(')')?))
 }
 
-
 fn recovery_summary_lines(recovery: &RuntimeRecoveryOffer) -> Vec<String> {
     let original = &recovery.original;
     let target = recovery.target.as_ref().map_or_else(
@@ -3232,6 +3227,10 @@ fn recovery_provider_label(provider: &str) -> &'static str {
     match provider {
         "claude" => "Claude",
         "grok" => "Grok",
+        "opencode" => "OpenCode",
+        "agy" => "Antigravity",
+        "pi" => "Pi",
+        "codex" => "Codex",
         _ => "Provider",
     }
 }

@@ -271,11 +271,21 @@ enum RuntimeRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RuntimeResponse {
     Ok,
-    Status { status: RuntimeStatus },
-    Panes { panes: Vec<RuntimePaneSnapshot> },
-    Pane { pane: Option<RuntimePaneSnapshot> },
-    YoloUpdated { updated: Vec<String> },
-    Action { result: RuntimeActionResult },
+    Status {
+        status: RuntimeStatus,
+    },
+    Panes {
+        panes: Vec<RuntimePaneSnapshot>,
+    },
+    Pane {
+        pane: Option<RuntimePaneSnapshot>,
+    },
+    YoloUpdated {
+        updated: Vec<String>,
+    },
+    Action {
+        result: RuntimeActionResult,
+    },
     Recoveries {
         recoveries: Vec<RuntimeRecoveryOffer>,
     },
@@ -285,8 +295,13 @@ enum RuntimeResponse {
     RecoveryDismissed {
         recovery_id: String,
     },
-    Error { message: String, exit_code: i32 },
-    Event { event: RuntimeEvent },
+    Error {
+        message: String,
+        exit_code: i32,
+    },
+    Event {
+        event: RuntimeEvent,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2228,7 +2243,6 @@ fn inventory_contains_exact_target(inventory: &TmuxInventory, target: &RecoveryT
     inventory.server == target.server && inventory.panes.iter().any(|pane| pane == &target.pane)
 }
 
-
 fn topology_scan(
     client: &TmuxClient,
     config: &RuntimeServerConfig,
@@ -2275,9 +2289,21 @@ fn topology_scan(
                 "grok" => crate::grok::resolve_live_grok_session_id(pane, &resolver)
                     .ok()
                     .flatten(),
+                "opencode" => crate::opencode::resolve_live_opencode_session_id(pane),
+                "agy" => crate::agy::resolve_live_agy_session_id(pane, &resolver)
+                    .ok()
+                    .flatten(),
+                "pi" => crate::pi::resolve_live_pi_session_id(pane, &resolver)
+                    .ok()
+                    .flatten(),
+                "codex" => crate::last_message::resolve_codex_session_id_for_pane(pane)
+                    .ok()
+                    .flatten(),
                 _ => None,
             };
-            let Some(session_id) = session_id.filter(|id| Uuid::parse_str(id).is_ok()) else {
+            let Some(session_id) =
+                session_id.filter(|id| crate::recovery::is_valid_provider_session_id(provider, id))
+            else {
                 continue;
             };
             if let Ok(workspace) =
@@ -2292,7 +2318,8 @@ fn topology_scan(
             }
         }
         // Best-effort: recovery evidence should not fail topology scans.
-        let _ = apply_recovery_inventory_evidence(&config.state_dir, &run_id, &inventory, &verified);
+        let _ =
+            apply_recovery_inventory_evidence(&config.state_dir, &run_id, &inventory, &verified);
     }
 
     *known_candidates = current;
@@ -3714,7 +3741,10 @@ mod tests {
 
     #[test]
     fn full_state_safety_pass_only_queues_tracked_panes() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         shared
             .lock()
             .unwrap()
@@ -3848,7 +3878,10 @@ mod tests {
 
     #[test]
     fn stream_output_only_marks_dirty_and_never_publishes_stale_snapshot() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         let now = Instant::now();
         shared
             .lock()
@@ -4021,7 +4054,10 @@ mod tests {
 
     #[test]
     fn full_subscriber_is_dropped_without_blocking_runtime() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         let (tx, _rx) = mpsc::sync_channel(1);
         tx.try_send(RuntimeEvent {
             revision: 1,
@@ -4041,7 +4077,10 @@ mod tests {
 
     #[test]
     fn subscription_bootstrap_ends_at_ok_boundary_with_complete_backlog() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         shared
             .lock()
             .unwrap()
@@ -4083,7 +4122,10 @@ mod tests {
 
     #[test]
     fn action_and_post_approve_guards_reject_duplicate_work() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         let first = ActionGuard::acquire(&shared, "%1").unwrap();
         assert!(ActionGuard::acquire(&shared, "%1").is_err());
         drop(first);
@@ -4110,7 +4152,10 @@ mod tests {
 
     #[test]
     fn yolo_policy_update_is_immediately_reflected_in_snapshot_signature() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         shared
             .lock()
             .unwrap()
@@ -4133,7 +4178,10 @@ mod tests {
 
     #[test]
     fn post_yolo_commit_atomically_updates_busy_and_ready_durations() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(
+            Path::new("/tmp/runtime-test.sock"),
+            String::from("test-run"),
+        )));
         let mut tracked = tracked_pane(Instant::now());
         tracked.snapshot.classification = sample_classification(SessionState::PermissionDialog);
         tracked.signature = SnapshotSignature::from_snapshot(

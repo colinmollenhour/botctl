@@ -39,6 +39,15 @@ pub fn resolve_opencode_session_for_pane(pane: &TmuxPane) -> Option<OpenCodeSess
     resolve_opencode_session(default_opencode_db_path(), &pane.current_path, title)
 }
 
+/// Resolve the live OpenCode session id for a pane without loading message
+/// context. Returns `None` when the pane is not OpenCode or no session row
+/// matches the pane's directory and title.
+pub fn resolve_live_opencode_session_id(pane: &TmuxPane) -> Option<String> {
+    resolve_opencode_session_for_pane(pane)
+        .map(|session| session.id)
+        .filter(|id| !id.is_empty())
+}
+
 pub fn latest_assistant_message_for_pane(
     pane: &TmuxPane,
 ) -> crate::app::AppResult<Option<OpenCodeLastMessage>> {
