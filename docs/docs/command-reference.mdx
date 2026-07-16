@@ -213,6 +213,7 @@ Notes:
 - `Enter` only navigates to a live pane or uniquely matched recovery target; it never stages or submits a command
 - staging pastes the exact preview without a newline or Enter; botctl does not clear shell input, and the operator must inspect the pane and press Enter manually
 - `Staged` and `Uncertain` records are not pasted again automatically
+- `Crashed` rows persist until the same provider session id is observed live again (`Resolved`), the operator dismisses them, or they age out three days after the crash; tmux inventory failures list them unmatched and disabled instead of hiding them
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 - auto-starts a managed runtime unless `--unmanaged` is set
 

@@ -1279,7 +1279,12 @@ impl DashboardApp {
 
     fn refresh(&mut self) -> AppResult<()> {
         let now = Instant::now();
-        let recoveries = self.runtime.list_recoveries().unwrap_or_default();
+        // A failed runtime request must not blank out recovery rows; keep the
+        // last good list so crashed sessions never silently disappear.
+        let recoveries = self
+            .runtime
+            .list_recoveries()
+            .unwrap_or_else(|_| self.recoveries.clone());
         let mut panes = Vec::new();
         let mut seen_pane_ids = HashSet::new();
         let mut branch_by_path = HashMap::new();
@@ -3204,9 +3209,7 @@ fn recovery_instruction(recovery: &RuntimeRecoveryOffer) -> &'static str {
         RecoveryLifecycle::Uncertain => {
             "A prior staging attempt ended without confirmation; inspect the target. Botctl will not paste again."
         }
-        RecoveryLifecycle::Resolved => {
-            "The same provider session UUID was observed in the target pane."
-        }
+        RecoveryLifecycle::Resolved => "The same provider session id was observed live again.",
         RecoveryLifecycle::Dismissed => "This recovery was dismissed.",
     }
 }

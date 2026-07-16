@@ -135,6 +135,8 @@ Matching is deliberately exact. Botctl accepts the exact original pane object on
 
 Lowercase `r` only refreshes. Uppercase `D` dismisses a selected `Crashed`, `Staged`, or `Uncertain` row; a currently owned `Staging` row cannot be dismissed. A `Staged` row means the command was pasted without Enter. An `Uncertain` row means a prior staging owner ended without a durable paste result, so inspect the target carefully. Botctl never automatically pastes `Staged` or `Uncertain` records again.
 
+A `Crashed` row is retained until one of exactly three things happens: the same provider session id is observed live again (the row becomes `Resolved`, whether the resume was staged by botctl or typed manually), you dismiss it with `D`, or it ages out three days after the crash. Inventory failures disable matching but never remove rows from the list.
+
 ## Blocker recovery flow
 
 Use the direct pane-targeted actions only when the classified state matches the flow.

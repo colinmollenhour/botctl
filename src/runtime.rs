@@ -1962,8 +1962,16 @@ fn mark_stream_activity(tracked: &mut TrackedPane) {
 }
 
 fn recovery_offers(state_dir: &Path, client: &TmuxClient) -> AppResult<Vec<RuntimeRecoveryOffer>> {
-    let inventory = client.inventory()?;
-    recovery_offers_for_inventory(state_dir, &inventory)
+    // An inventory failure must never hide recoveries: crashed rows disappear
+    // only via resolve, dismiss, or the crashed TTL. Without a stable
+    // inventory the rows stay listed, unmatched and disabled.
+    match client.inventory() {
+        Ok(inventory) => recovery_offers_for_inventory(state_dir, &inventory),
+        Err(error) => Ok(crate::recovery::offers_without_inventory(
+            &list_nonterminal_recoveries(state_dir)?,
+            &error.to_string(),
+        )),
+    }
 }
 
 fn recovery_offers_for_inventory(

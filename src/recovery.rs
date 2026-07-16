@@ -168,6 +168,11 @@ enum SessionIdKind {
 
 pub const RECOVERABLE_PROVIDERS: &[&str] = &["claude", "grok", "opencode", "agy", "pi", "codex"];
 
+/// How long a `Crashed` recovery stays offered. Crashed rows disappear only
+/// when their session is detected live again (resolved), the user dismisses
+/// them, or they age past this window.
+pub const CRASHED_RECOVERY_TTL_MS: i64 = 3 * 24 * 60 * 60 * 1000;
+
 const PROVIDER_TABLE: &[RecoverableProvider] = &[
     RecoverableProvider {
         provider: "claude",
@@ -443,6 +448,30 @@ pub fn match_recoveries(
         matches.insert(recovery.id.clone(), result);
     }
     matches
+}
+
+/// Build offers when no stable tmux inventory is available. Every recovery
+/// stays visible (nothing silently disappears on an inventory failure); rows
+/// are unmatched and disabled until an inventory succeeds.
+pub fn offers_without_inventory(
+    recoveries: &[RecoveryRecord],
+    reason: &str,
+) -> Vec<RuntimeRecoveryOffer> {
+    recoveries
+        .iter()
+        .map(|record| {
+            offer_from_record(
+                record,
+                RecoveryMatch {
+                    state: RecoveryMatchState::Unmatched,
+                    target: None,
+                    disabled_reason: Some(format!(
+                        "tmux pane inventory is unavailable; matching is disabled: {reason}"
+                    )),
+                },
+            )
+        })
+        .collect()
 }
 
 pub fn offer_from_record(record: &RecoveryRecord, matched: RecoveryMatch) -> RuntimeRecoveryOffer {
@@ -733,6 +762,21 @@ mod tests {
         let matched = match_recoveries(&[first, second], &inventory);
         assert_eq!(matched["one"].state, RecoveryMatchState::Conflict);
         assert_eq!(matched["two"].state, RecoveryMatchState::Conflict);
+    }
+
+    #[test]
+    fn offers_without_inventory_keep_every_recovery_visible_and_disabled() {
+        let records = [recovery("one"), recovery("two")];
+        let offers = offers_without_inventory(&records, "boom");
+        assert_eq!(offers.len(), 2);
+        for offer in &offers {
+            assert_eq!(offer.match_state, RecoveryMatchState::Unmatched);
+            assert!(offer.target.is_none());
+            let reason = offer.disabled_reason.as_deref().unwrap();
+            assert!(reason.contains("inventory is unavailable"));
+            assert!(reason.contains("boom"));
+            assert!(!offer.command.is_empty());
+        }
     }
 
     #[test]

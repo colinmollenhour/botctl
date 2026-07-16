@@ -1667,6 +1667,11 @@ pub fn apply_recovery_inventory_evidence(
             &evidence.provider,
             &evidence.provider_session_id,
         )?;
+        resolved += resolve_crashed_recovery_for_live_session_with_connection(
+            &tx,
+            &evidence.provider,
+            &evidence.provider_session_id,
+        )?;
     }
     tx.commit()?;
     Ok(RecoveryInventoryUpdate {
@@ -1680,11 +1685,13 @@ pub fn apply_recovery_inventory_evidence(
 
 pub fn list_nonterminal_recoveries(state_dir: &Path) -> AppResult<Vec<RecoveryRecord>> {
     let connection = open_bootstrapped_state_db(state_dir)?;
+    let crashed_cutoff = current_unix_ms()? - crate::recovery::CRASHED_RECOVERY_TTL_MS;
     list_recoveries_with_connection(
         &connection,
         "WHERE recoveries.status IN ('crashed', 'staging', 'staged', 'uncertain') \
+         AND NOT (recoveries.status = 'crashed' AND recoveries.crashed_at_unix_ms < ?1) \
          ORDER BY recoveries.crashed_at_unix_ms, recoveries.id",
-        [],
+        params![crashed_cutoff],
     )
 }
 
@@ -1909,6 +1916,22 @@ fn resolve_recovery_for_live_provider_session_with_connection(
             pane.current_path,
             current_unix_ms()?
         ],
+    )?)
+}
+
+/// A `Crashed` recovery is "detected as recovered" when its exact provider
+/// session id is verified live in any pane — the user resumed it themselves
+/// (staged resumes go through the stricter target-pane match above). Session
+/// ids are unique per provider, so no pane-coordinate check is needed.
+fn resolve_crashed_recovery_for_live_session_with_connection(
+    connection: &Connection,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<usize> {
+    Ok(connection.execute(
+        "UPDATE session_recoveries SET status = 'resolved', resolved_at_unix_ms = ?3 \
+          WHERE status = 'crashed' AND provider = ?1 AND provider_session_id = ?2",
+        params![provider, provider_session_id, current_unix_ms()?],
     )?)
 }
 
@@ -4106,6 +4129,104 @@ mod tests {
         }
         let _ = fs::remove_dir_all(state_dir);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn crashed_recoveries_expire_only_after_ttl_and_rows_are_preserved() {
+        let fixture = recovery_fixture("crashed-ttl", 1);
+        let recovery_id = fixture.recoveries[0].id.clone();
+        let connection = open_state_db(&fixture.state_dir).unwrap();
+        let now = super::current_unix_ms().unwrap();
+
+        // Just inside the window: still offered.
+        connection
+            .execute(
+                "UPDATE session_recoveries SET crashed_at_unix_ms = ?1 WHERE id = ?2",
+                params![
+                    now - crate::recovery::CRASHED_RECOVERY_TTL_MS + 60_000,
+                    recovery_id
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            super::list_nonterminal_recoveries(&fixture.state_dir)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Past the window: no longer offered, but the row is preserved.
+        connection
+            .execute(
+                "UPDATE session_recoveries SET crashed_at_unix_ms = ?1 WHERE id = ?2",
+                params![
+                    now - crate::recovery::CRASHED_RECOVERY_TTL_MS - 60_000,
+                    recovery_id
+                ],
+            )
+            .unwrap();
+        assert!(
+            super::list_nonterminal_recoveries(&fixture.state_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM session_recoveries WHERE id = ?1",
+                params![recovery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "crashed");
+        let _ = fs::remove_dir_all(fixture.state_dir);
+        let _ = fs::remove_dir_all(fixture.workspace_root);
+    }
+
+    #[test]
+    fn crashed_recovery_resolves_when_session_id_is_seen_live_anywhere() {
+        let fixture = recovery_fixture("crashed-live-resolve", 1);
+        let workspace =
+            resolve_workspace_for_path(&fixture.state_dir, &fixture.workspace_root).unwrap();
+        // The crashed session id reappears live in a completely different pane.
+        let mut pane = sample_pane();
+        pane.pane_id = "%99".to_string();
+        pane.session_id = "$9".to_string();
+        pane.window_id = "@9".to_string();
+        pane.window_index = 9;
+        pane.current_path = fixture.workspace_root.display().to_string();
+        let result = super::apply_recovery_inventory_evidence(
+            &fixture.state_dir,
+            &fixture.run,
+            &crate::tmux::TmuxInventory {
+                server: fixture.target.server.clone(),
+                panes: vec![pane.clone()],
+            },
+            &[super::VerifiedProviderRecoveryEvidence {
+                workspace_id: workspace.id,
+                pane,
+                provider: "claude".to_string(),
+                provider_session_id: "4d8dc7f8-a842-438a-b2c2-4d39ad509a53".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.resolved, 1);
+        assert!(
+            super::list_nonterminal_recoveries(&fixture.state_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let connection = open_state_db(&fixture.state_dir).unwrap();
+        let (status, resolved_at): (String, Option<i64>) = connection
+            .query_row(
+                "SELECT status, resolved_at_unix_ms FROM session_recoveries WHERE id = ?1",
+                params![fixture.recoveries[0].id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "resolved");
+        assert!(resolved_at.is_some());
+        let _ = fs::remove_dir_all(fixture.state_dir);
+        let _ = fs::remove_dir_all(fixture.workspace_root);
     }
 
     #[test]
