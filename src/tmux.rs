@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::app::{AppError, AppResult};
 
@@ -61,6 +62,19 @@ pub struct TmuxPane {
     pub cursor_y: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxServerIdentity {
+    pub socket_path: String,
+    pub pid: u32,
+    pub start_time: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxInventory {
+    pub server: TmuxServerIdentity,
+    pub panes: Vec<TmuxPane>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxWindow {
     pub session_name: String,
@@ -69,10 +83,16 @@ pub struct TmuxWindow {
     pub window_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxCommandPlan {
     pub program: String,
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteTextPlan {
+    pub set_buffer: TmuxCommandPlan,
+    pub paste_buffer: TmuxCommandPlan,
 }
 
 impl TmuxCommandPlan {
@@ -278,6 +298,32 @@ impl TmuxClient {
         parse_pane_listing_strict(&output)
     }
 
+    /// Full server identity plus length-prefixed pane inventory for recovery.
+    /// Rejects partial reads when server identity changes mid-collection.
+    pub fn inventory(&self) -> AppResult<TmuxInventory> {
+        let before = self.read_server_identity()?;
+        let output = self.run_output(vec![
+            String::from("list-panes"),
+            String::from("-a"),
+            String::from("-F"),
+            pane_list_format(),
+        ])?;
+        let panes = parse_inventory_panes(&output)?;
+        let after = self.read_server_identity()?;
+        stable_inventory(before, panes, after)
+    }
+
+    fn read_server_identity(&self) -> AppResult<TmuxServerIdentity> {
+        let output = self.run_output(vec![
+            String::from("display-message"),
+            String::from("-p"),
+            String::from(
+                "#{n:socket_path}:#{socket_path}#{n:pid}:#{pid}#{n:start_time}:#{start_time}",
+            ),
+        ])?;
+        parse_server_identity(&output)
+    }
+
     pub fn list_windows(&self) -> AppResult<Vec<TmuxWindow>> {
         let output = self.run_output(vec![
             String::from("list-windows"),
@@ -459,24 +505,38 @@ impl TmuxClient {
     }
 
     pub fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()> {
-        let buffer_name = format!("botctl-prompt-{}", std::process::id());
-        self.run_status(vec![
-            String::from("set-buffer"),
-            String::from("-b"),
-            buffer_name.clone(),
-            String::from("--"),
-            text.to_string(),
-        ])
-        .map_err(|_| AppError::new("tmux set-buffer failed while staging prompt text"))?;
-        self.run_status(vec![
-            String::from("paste-buffer"),
-            String::from("-d"),
-            String::from("-p"),
-            String::from("-b"),
-            buffer_name,
-            String::from("-t"),
-            pane_id.to_string(),
-        ])
+        let plan = self.plan_paste_text(pane_id, text);
+        self.run_command_plan_status(&plan.set_buffer)
+            .map_err(|_| AppError::new("tmux set-buffer failed while staging prompt text"))?;
+        self.run_command_plan_status(&plan.paste_buffer)
+    }
+
+    pub fn plan_paste_text(&self, pane_id: &str, text: &str) -> PasteTextPlan {
+        let buffer_name = format!("botctl-paste-{}", Uuid::now_v7());
+        PasteTextPlan {
+            set_buffer: TmuxCommandPlan {
+                program: self.program.clone(),
+                args: self.with_socket_args(vec![
+                    String::from("set-buffer"),
+                    String::from("-b"),
+                    buffer_name.clone(),
+                    String::from("--"),
+                    text.to_string(),
+                ]),
+            },
+            paste_buffer: TmuxCommandPlan {
+                program: self.program.clone(),
+                args: self.with_socket_args(vec![
+                    String::from("paste-buffer"),
+                    String::from("-d"),
+                    String::from("-p"),
+                    String::from("-b"),
+                    buffer_name,
+                    String::from("-t"),
+                    pane_id.to_string(),
+                ]),
+            },
+        }
     }
 
     pub fn select_window(&self, target: &str) -> AppResult<()> {
@@ -613,6 +673,19 @@ impl TmuxClient {
                 "tmux command failed: {} {}",
                 self.program,
                 args.join(" ")
+            )))
+        }
+    }
+
+    fn run_command_plan_status(&self, plan: &TmuxCommandPlan) -> AppResult<()> {
+        let status = Command::new(&plan.program).args(&plan.args).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(AppError::new(format!(
+                "tmux command failed: {} {}",
+                plan.program,
+                plan.args.join(" ")
             )))
         }
     }
@@ -775,6 +848,181 @@ fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     })
 }
 
+fn pane_from_fields(parts: &[String]) -> Option<TmuxPane> {
+    if parts.len() != 15 {
+        return None;
+    }
+    Some(TmuxPane {
+        pane_id: parts[0].clone(),
+        pane_tty: parts[1].clone(),
+        pane_pid: parts[2].parse::<u32>().ok(),
+        session_id: parts[3].clone(),
+        session_name: parts[4].clone(),
+        window_id: parts[5].clone(),
+        window_index: parts[6].parse::<u16>().ok()?,
+        window_name: parts[7].clone(),
+        pane_index: parts[8].parse::<u16>().ok()?,
+        current_command: parts[9].clone(),
+        current_path: parts[10].clone(),
+        pane_title: parts[11].clone(),
+        pane_active: match parts[12].as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        },
+        cursor_x: parse_cursor(&parts[13]),
+        cursor_y: parse_cursor(&parts[14]),
+    })
+}
+
+fn pane_list_format() -> String {
+    [
+        "pane_id",
+        "pane_tty",
+        "pane_pid",
+        "session_id",
+        "session_name",
+        "window_id",
+        "window_index",
+        "window_name",
+        "pane_index",
+        "pane_current_command",
+        "pane_current_path",
+        "pane_title",
+        "pane_active",
+        "cursor_x",
+        "cursor_y",
+    ]
+    .into_iter()
+    .map(|field| format!("#{{n:{field}}}:#{{{field}}}"))
+    .collect()
+}
+
+fn parse_server_identity(output: &str) -> AppResult<TmuxServerIdentity> {
+    let bytes = output.as_bytes();
+    let mut offset = 0;
+    let parts = parse_length_prefixed_fields(bytes, &mut offset, 3)?;
+    if bytes.get(offset) != Some(&b'\n') || offset + 1 != bytes.len() {
+        return Err(AppError::new(
+            "tmux server identity output had a malformed record terminator",
+        ));
+    }
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(AppError::new(
+            "tmux server identity was missing socket_path, pid, or start_time",
+        ));
+    }
+    let pid = parts[1]
+        .parse::<u32>()
+        .map_err(|_| AppError::new("tmux server pid was malformed"))?;
+    let start_time = parts[2]
+        .parse::<i64>()
+        .map_err(|_| AppError::new("tmux server start_time was malformed"))?;
+    if pid == 0 || start_time <= 0 {
+        return Err(AppError::new(
+            "tmux server pid and start_time must be positive",
+        ));
+    }
+    Ok(TmuxServerIdentity {
+        socket_path: parts[0].to_string(),
+        pid,
+        start_time,
+    })
+}
+
+fn parse_inventory_panes(output: &str) -> AppResult<Vec<TmuxPane>> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = output.as_bytes();
+    let mut offset = 0;
+    let mut panes = Vec::new();
+    while offset < bytes.len() {
+        let fields = parse_length_prefixed_fields(bytes, &mut offset, 15)?;
+        if bytes.get(offset) != Some(&b'\n') {
+            return Err(AppError::new(
+                "raw tmux pane inventory record lacked its terminator",
+            ));
+        }
+        offset += 1;
+        panes
+            .push(pane_from_fields(&fields).ok_or_else(|| {
+                AppError::new("malformed typed field in raw tmux pane inventory")
+            })?);
+    }
+    Ok(panes)
+}
+
+fn parse_length_prefixed_fields(
+    bytes: &[u8],
+    offset: &mut usize,
+    count: usize,
+) -> AppResult<Vec<String>> {
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length_start = *offset;
+        while *offset < bytes.len() && bytes[*offset].is_ascii_digit() {
+            *offset += 1;
+        }
+        if *offset == length_start || bytes.get(*offset) != Some(&b':') {
+            return Err(AppError::new(
+                "malformed length prefix in tmux structured output",
+            ));
+        }
+        // tmux `#{n:field}` is a Unicode scalar (character) count, not a byte
+        // count — multi-byte UTF-8 (emoji, accents) must advance by chars.
+        let char_len = std::str::from_utf8(&bytes[length_start..*offset])
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| AppError::new("invalid field length in tmux structured output"))?;
+        *offset += 1;
+        let rest = std::str::from_utf8(&bytes[*offset..])
+            .map_err(|_| AppError::new("tmux structured output field was not valid UTF-8"))?;
+        let mut chars = rest.char_indices();
+        let mut end_in_rest = 0;
+        for _ in 0..char_len {
+            let Some((idx, ch)) = chars.next() else {
+                return Err(AppError::new("truncated field in tmux structured output"));
+            };
+            end_in_rest = idx + ch.len_utf8();
+        }
+        if char_len == 0 {
+            end_in_rest = 0;
+        }
+        let value = &rest[..end_in_rest];
+        fields.push(value.to_string());
+        *offset += end_in_rest;
+    }
+    Ok(fields)
+}
+
+#[cfg(any(test, rust_analyzer))]
+fn encode_pane_record_for_test(fields: &[&str]) -> String {
+    let mut output = fields
+        .iter()
+        // Match tmux `#{n:...}` character counts, not UTF-8 byte lengths.
+        .map(|field| format!("{}:{field}", field.chars().count()))
+        .collect::<String>();
+    output.push('\n');
+    output
+}
+
+fn stable_inventory(
+    before: TmuxServerIdentity,
+    panes: Vec<TmuxPane>,
+    after: TmuxServerIdentity,
+) -> AppResult<TmuxInventory> {
+    if before != after {
+        return Err(AppError::new(
+            "tmux server identity changed while collecting pane inventory",
+        ));
+    }
+    Ok(TmuxInventory {
+        server: before,
+        panes,
+    })
+}
+
 fn list_panes_args(target: Option<&str>) -> Vec<String> {
     let mut args = vec![String::from("list-panes")];
     if let Some(target) = target {
@@ -917,10 +1165,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        StartSessionRequest, StartWindowRequest, TmuxClient, TmuxCommandPlan, list_panes_args,
-        parse_created_pane_window, parse_explicit_pane_target_line, parse_pane_line,
-        parse_pane_listing_strict, parse_session_attached_count, parse_window_line,
-        select_explicit_pane_target, session_attached_count_args,
+        StartSessionRequest, StartWindowRequest, TmuxClient, TmuxCommandPlan,
+        encode_pane_record_for_test, list_panes_args, parse_created_pane_window,
+        parse_explicit_pane_target_line, parse_inventory_panes, parse_pane_line,
+        parse_pane_listing_strict, parse_server_identity, parse_session_attached_count,
+        parse_window_line, select_explicit_pane_target, session_attached_count_args,
+        stable_inventory,
     };
 
     #[test]
@@ -1072,6 +1322,179 @@ mod tests {
         assert!(parse_pane_listing_strict(invalid_pid).is_err());
         let invalid_active = "%1\t/dev/pts/1\t123\t$1\tdemo\t@2\t3\tclaude\t1\tclaude\t/tmp/demo\tClaude\tyes\t12\t4\n";
         assert!(parse_pane_listing_strict(invalid_active).is_err());
+    }
+
+    #[test]
+    fn parses_stable_server_identity_fields() {
+        let encoded = encode_pane_record_for_test(&["/tmp/tmux-1000/default", "123", "1710000000"]);
+        let identity = parse_server_identity(&encoded).expect("identity should parse");
+        assert_eq!(identity.socket_path, "/tmp/tmux-1000/default");
+        assert_eq!(identity.pid, 123);
+        assert_eq!(identity.start_time, 1_710_000_000);
+        assert!(parse_server_identity("").is_err());
+        assert!(
+            parse_server_identity(&encode_pane_record_for_test(&["/tmp/socket", "", "1"])).is_err()
+        );
+        assert!(
+            parse_server_identity(&encode_pane_record_for_test(&["/tmp/socket", "nope", "1"]))
+                .is_err()
+        );
+        assert!(
+            parse_server_identity(&encode_pane_record_for_test(&["/tmp/socket", "1", "0"]))
+                .is_err()
+        );
+        let unusual = parse_server_identity(&encode_pane_record_for_test(&[
+            "/tmp/socket\tline\nnext",
+            "12",
+            "34",
+        ]))
+        .unwrap();
+        assert_eq!(unusual.socket_path, "/tmp/socket\tline\nnext");
+    }
+
+    #[test]
+    fn raw_inventory_rejects_any_malformed_pane() {
+        assert!(parse_inventory_panes("malformed").is_err());
+        assert!(parse_inventory_panes("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pane_inventory_round_trips_delimiters_and_newlines() {
+        let encoded = encode_pane_record_for_test(&[
+            "%1",
+            "/dev/pts/1",
+            "123",
+            "$1",
+            "session\tname",
+            "@2",
+            "3",
+            "window\nname",
+            "1",
+            "bash",
+            "/tmp/tab\tline\nnext",
+            "title\twith\nlines",
+            "1",
+            "12",
+            "4",
+        ]);
+        let panes = parse_inventory_panes(&encoded).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].session_name, "session\tname");
+        assert_eq!(panes[0].window_name, "window\nname");
+        assert_eq!(panes[0].current_path, "/tmp/tab\tline\nnext");
+        assert_eq!(panes[0].pane_title, "title\twith\nlines");
+    }
+
+    #[test]
+    fn pane_inventory_advances_by_unicode_characters_not_bytes() {
+        // "⚙" is one Unicode scalar (3 UTF-8 bytes); tmux prefixes use char count.
+        let encoded = encode_pane_record_for_test(&[
+            "%1",
+            "/dev/pts/1",
+            "123",
+            "$1",
+            "demo",
+            "@2",
+            "3",
+            "⚙ bloodraven",
+            "1",
+            "claude",
+            "/tmp/demo",
+            "title 🚀",
+            "1",
+            "12",
+            "4",
+        ]);
+        let panes = parse_inventory_panes(&encoded).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window_name, "⚙ bloodraven");
+        assert_eq!(panes[0].pane_title, "title 🚀");
+        assert_eq!(panes[0].pane_id, "%1");
+    }
+
+    #[test]
+    fn pane_inventory_preserves_other_rows_around_encoded_delimiters() {
+        let first = encode_pane_record_for_test(&[
+            "%1",
+            "/dev/pts/1",
+            "1",
+            "$1",
+            "one",
+            "@1",
+            "0",
+            "one",
+            "0",
+            "bash",
+            "/tmp/a\tb",
+            "a\nb",
+            "1",
+            "",
+            "",
+        ]);
+        let second = encode_pane_record_for_test(&[
+            "%2",
+            "/dev/pts/2",
+            "2",
+            "$2",
+            "two",
+            "@2",
+            "1",
+            "two",
+            "0",
+            "zsh",
+            "/tmp/two",
+            "two",
+            "0",
+            "",
+            "",
+        ]);
+        let panes = parse_inventory_panes(&(first + &second)).unwrap();
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| pane.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["%1", "%2"]
+        );
+    }
+
+    #[test]
+    fn raw_inventory_rejects_changed_server_identity() {
+        let before = parse_server_identity(&encode_pane_record_for_test(&[
+            "/tmp/tmux/default",
+            "123",
+            "456",
+        ]))
+        .unwrap();
+        let mut after = before.clone();
+        after.pid += 1;
+        assert!(stable_inventory(before, Vec::new(), after).is_err());
+    }
+
+    #[test]
+    fn paste_plan_targets_only_explicit_pane_without_enter() {
+        let plan = TmuxClient::with_socket_path("/tmp/tmux/default")
+            .plan_paste_text("%7", "literal command");
+        assert!(
+            plan.set_buffer
+                .args
+                .iter()
+                .any(|arg| arg == "literal command")
+        );
+        assert_eq!(
+            plan.paste_buffer.args.last().map(String::as_str),
+            Some("%7")
+        );
+        let rendered = format!(
+            "{} {}",
+            plan.set_buffer.render(),
+            plan.paste_buffer.render()
+        );
+        assert!(rendered.contains("set-buffer"));
+        assert!(rendered.contains("paste-buffer -d -p"));
+        assert!(!rendered.contains("send-keys"));
+        assert!(!rendered.contains("Enter"));
+        assert!(!rendered.contains(['\n', '\r']));
     }
 
     #[test]

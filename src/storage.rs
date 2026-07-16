@@ -7,10 +7,14 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::app::{AppError, AppResult};
-use crate::tmux::TmuxPane;
+use crate::recovery::{
+    RecoveryLifecycle, RecoveryOriginalIdentity, RecoveryRecord, RecoveryTarget,
+    build_recovery_command,
+};
+use crate::tmux::{TmuxInventory, TmuxPane, TmuxServerIdentity};
 use crate::workspace::resolve_workspace_locator;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 const SCHEMA_VERSION_ROW_ID: i64 = 1;
 const STATE_DB_FILENAME: &str = "state.db";
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -71,6 +75,39 @@ pub struct TmuxRuntimeDurations {
     pub wait_duration: Option<Duration>,
     pub cook_duration: Option<Duration>,
     pub sampled_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeObservationRecord {
+    pub id: String,
+    pub run_id: String,
+    pub workspace_id: String,
+    pub status: String,
+    pub original: RecoveryOriginalIdentity,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub first_observed_at_unix_ms: i64,
+    pub last_observed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedProviderRecoveryEvidence {
+    pub workspace_id: String,
+    pub pane: TmuxPane,
+    pub provider: String,
+    pub provider_session_id: String,
+}
+
+/// Back-compat alias used by older call sites and tests.
+pub type VerifiedClaudeRecoveryEvidence = VerifiedProviderRecoveryEvidence;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryInventoryUpdate {
+    pub abandoned_crashed: usize,
+    pub current_crashed: usize,
+    pub retired: usize,
+    pub checkpointed: usize,
+    pub resolved: usize,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -177,6 +214,8 @@ pub fn migrate_state_db(connection: &mut Connection) -> AppResult<()> {
             1 => migrate_to_v2(&tx)?,
             2 => migrate_to_v3(&tx)?,
             3 => migrate_to_v4(&tx)?,
+            4 => migrate_to_v5(&tx)?,
+            5 => migrate_to_v6(&tx)?,
             other => {
                 return Err(AppError::new(format!(
                     "no state.db migration path from version {} to {}",
@@ -204,6 +243,8 @@ fn ensure_schema_layout_for_version(connection: &Connection, version: i64) -> Ap
         2 => ensure_v2_tables(connection),
         3 => ensure_v3_tables(connection),
         4 => ensure_v4_tables(connection),
+        5 => ensure_v5_tables(connection),
+        6 => ensure_v6_tables(connection),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -241,6 +282,18 @@ fn schema_layout_matches_version(connection: &Connection, version: i64) -> AppRe
                 "cook_segment_started_at_unix_ms",
             )?
             && table_has_column(connection, "instance_runtime_state", "cook_session_key")?),
+        5 => Ok(schema_layout_matches_version(connection, 4)?
+            && table_exists(connection, "runtime_runs")?
+            && table_exists(connection, "runtime_claude_observations")?
+            && table_exists(connection, "session_recoveries")?
+            && v5_required_columns_present(connection)?
+            && index_exists(connection, "runtime_claude_observations_live_object")?
+            && index_exists(connection, "runtime_claude_observations_run_status")?
+            && index_exists(connection, "session_recoveries_status")?
+            && index_sql(connection, "session_recoveries_claimed_target")?
+                .is_some_and(|sql| sql.contains("'uncertain'"))),
+        6 => Ok(schema_layout_matches_version(connection, 5)?
+            && provider_check_allows_grok(connection)?),
         other => Err(AppError::new(format!(
             "no state.db migration path from version {} to {}",
             other, CURRENT_SCHEMA_VERSION
@@ -257,6 +310,28 @@ fn table_exists(connection: &Connection, table_name: &str) -> AppResult<bool> {
         )
         .optional()?
         .is_some())
+}
+
+fn index_exists(connection: &Connection, index_name: &str) -> AppResult<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![index_name],
+            |_row| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn index_sql(connection: &Connection, index_name: &str) -> AppResult<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![index_name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 fn migrate_to_v1(connection: &Connection) -> AppResult<()> {
@@ -551,6 +626,340 @@ fn ensure_v4_tables(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn migrate_to_v5(connection: &Connection) -> AppResult<()> {
+    ensure_v4_tables(connection)?;
+    ensure_v5_tables(connection)
+}
+
+fn ensure_v5_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v4_tables(connection)?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS runtime_runs (
+            id TEXT PRIMARY KEY,
+            started_at_unix_ms INTEGER NOT NULL,
+            ended_at_unix_ms INTEGER,
+            outcome TEXT NOT NULL CHECK (outcome IN ('active', 'clean', 'reconciled'))
+        );
+        CREATE TABLE IF NOT EXISTS runtime_claude_observations (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runtime_runs(id) ON DELETE CASCADE,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN ('observed', 'retired', 'crashed')),
+            tmux_socket_path TEXT NOT NULL,
+            tmux_server_pid INTEGER NOT NULL,
+            tmux_server_started_at_unix INTEGER NOT NULL,
+            original_tmux_pane_id TEXT NOT NULL,
+            original_pane_tty TEXT NOT NULL,
+            original_pane_pid INTEGER,
+            original_tmux_session_id TEXT NOT NULL,
+            original_session_name TEXT NOT NULL,
+            original_tmux_window_id TEXT NOT NULL,
+            original_window_index INTEGER NOT NULL,
+            original_window_name TEXT NOT NULL,
+            original_pane_index INTEGER NOT NULL,
+            original_cwd TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK (provider = 'claude'),
+            provider_session_id TEXT NOT NULL,
+            first_observed_at_unix_ms INTEGER NOT NULL,
+            last_observed_at_unix_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_recoveries (
+            id TEXT PRIMARY KEY,
+            source_observation_id TEXT NOT NULL UNIQUE
+                REFERENCES runtime_claude_observations(id) ON DELETE RESTRICT,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN (
+                'crashed', 'staging', 'staged', 'uncertain', 'resolved', 'dismissed'
+            )),
+            provider TEXT NOT NULL CHECK (provider = 'claude'),
+            provider_session_id TEXT NOT NULL,
+            original_tmux_socket_path TEXT NOT NULL,
+            original_tmux_server_pid INTEGER NOT NULL,
+            original_tmux_server_started_at_unix INTEGER NOT NULL,
+            original_tmux_pane_id TEXT NOT NULL,
+            original_pane_tty TEXT NOT NULL,
+            original_pane_pid INTEGER,
+            original_tmux_session_id TEXT NOT NULL,
+            original_session_name TEXT NOT NULL,
+            original_tmux_window_id TEXT NOT NULL,
+            original_window_index INTEGER NOT NULL,
+            original_window_name TEXT NOT NULL,
+            original_pane_index INTEGER NOT NULL,
+            original_cwd TEXT NOT NULL,
+            crashed_at_unix_ms INTEGER NOT NULL,
+            staging_run_id TEXT REFERENCES runtime_runs(id) ON DELETE RESTRICT,
+            staging_token TEXT,
+            staging_started_at_unix_ms INTEGER,
+            target_tmux_socket_path TEXT,
+            target_tmux_server_pid INTEGER,
+            target_tmux_server_started_at_unix INTEGER,
+            target_tmux_pane_id TEXT,
+            target_tmux_session_id TEXT,
+            target_tmux_window_id TEXT,
+            target_session_name TEXT,
+            target_window_index INTEGER,
+            target_window_name TEXT,
+            target_pane_index INTEGER,
+            target_cwd TEXT,
+            staged_command TEXT,
+            staged_at_unix_ms INTEGER,
+            resolved_at_unix_ms INTEGER,
+            dismissed_at_unix_ms INTEGER
+        );
+        ",
+    )?;
+    ensure_v5_required_columns(connection)?;
+    connection.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS runtime_claude_observations_live_object
+         ON runtime_claude_observations (
+             run_id, tmux_socket_path, tmux_server_pid,
+             tmux_server_started_at_unix, original_tmux_pane_id
+         ) WHERE status = 'observed';
+         CREATE INDEX IF NOT EXISTS runtime_claude_observations_run_status
+         ON runtime_claude_observations (run_id, status);
+         CREATE INDEX IF NOT EXISTS session_recoveries_status
+         ON session_recoveries (status, crashed_at_unix_ms);",
+    )?;
+    let claimed_target_sql = index_sql(connection, "session_recoveries_claimed_target")?;
+    if claimed_target_sql
+        .as_deref()
+        .is_some_and(|sql| !sql.contains("'uncertain'"))
+    {
+        connection.execute("DROP INDEX session_recoveries_claimed_target", [])?;
+    }
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS session_recoveries_claimed_target
+         ON session_recoveries (
+             target_tmux_socket_path, target_tmux_server_pid,
+             target_tmux_server_started_at_unix, target_tmux_pane_id
+         ) WHERE status IN ('staging', 'staged', 'uncertain')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_to_v6(connection: &Connection) -> AppResult<()> {
+    ensure_v5_tables(connection)?;
+    ensure_v6_tables(connection)
+}
+
+fn ensure_v6_tables(connection: &Connection) -> AppResult<()> {
+    ensure_v5_tables(connection)?;
+    if provider_check_allows_grok(connection)? {
+        return Ok(());
+    }
+    // Rebuild recovery tables so CHECK allows claude and grok.
+    connection.execute_batch(
+        "
+        CREATE TABLE runtime_claude_observations_v6 (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runtime_runs(id) ON DELETE CASCADE,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN ('observed', 'retired', 'crashed')),
+            tmux_socket_path TEXT NOT NULL,
+            tmux_server_pid INTEGER NOT NULL,
+            tmux_server_started_at_unix INTEGER NOT NULL,
+            original_tmux_pane_id TEXT NOT NULL,
+            original_pane_tty TEXT NOT NULL,
+            original_pane_pid INTEGER,
+            original_tmux_session_id TEXT NOT NULL,
+            original_session_name TEXT NOT NULL,
+            original_tmux_window_id TEXT NOT NULL,
+            original_window_index INTEGER NOT NULL,
+            original_window_name TEXT NOT NULL,
+            original_pane_index INTEGER NOT NULL,
+            original_cwd TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK (provider IN ('claude', 'grok')),
+            provider_session_id TEXT NOT NULL,
+            first_observed_at_unix_ms INTEGER NOT NULL,
+            last_observed_at_unix_ms INTEGER NOT NULL
+        );
+        INSERT INTO runtime_claude_observations_v6
+            SELECT * FROM runtime_claude_observations;
+
+        CREATE TABLE session_recoveries_v6 (
+            id TEXT PRIMARY KEY,
+            source_observation_id TEXT NOT NULL UNIQUE
+                REFERENCES runtime_claude_observations_v6(id) ON DELETE RESTRICT,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN (
+                'crashed', 'staging', 'staged', 'uncertain', 'resolved', 'dismissed'
+            )),
+            provider TEXT NOT NULL CHECK (provider IN ('claude', 'grok')),
+            provider_session_id TEXT NOT NULL,
+            original_tmux_socket_path TEXT NOT NULL,
+            original_tmux_server_pid INTEGER NOT NULL,
+            original_tmux_server_started_at_unix INTEGER NOT NULL,
+            original_tmux_pane_id TEXT NOT NULL,
+            original_pane_tty TEXT NOT NULL,
+            original_pane_pid INTEGER,
+            original_tmux_session_id TEXT NOT NULL,
+            original_session_name TEXT NOT NULL,
+            original_tmux_window_id TEXT NOT NULL,
+            original_window_index INTEGER NOT NULL,
+            original_window_name TEXT NOT NULL,
+            original_pane_index INTEGER NOT NULL,
+            original_cwd TEXT NOT NULL,
+            crashed_at_unix_ms INTEGER NOT NULL,
+            staging_run_id TEXT REFERENCES runtime_runs(id) ON DELETE RESTRICT,
+            staging_token TEXT,
+            staging_started_at_unix_ms INTEGER,
+            target_tmux_socket_path TEXT,
+            target_tmux_server_pid INTEGER,
+            target_tmux_server_started_at_unix INTEGER,
+            target_tmux_pane_id TEXT,
+            target_tmux_session_id TEXT,
+            target_tmux_window_id TEXT,
+            target_session_name TEXT,
+            target_window_index INTEGER,
+            target_window_name TEXT,
+            target_pane_index INTEGER,
+            target_cwd TEXT,
+            staged_command TEXT,
+            staged_at_unix_ms INTEGER,
+            resolved_at_unix_ms INTEGER,
+            dismissed_at_unix_ms INTEGER
+        );
+        INSERT INTO session_recoveries_v6
+            SELECT * FROM session_recoveries;
+
+        DROP TABLE session_recoveries;
+        DROP TABLE runtime_claude_observations;
+        ALTER TABLE runtime_claude_observations_v6 RENAME TO runtime_claude_observations;
+        ALTER TABLE session_recoveries_v6 RENAME TO session_recoveries;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS runtime_claude_observations_live_object
+         ON runtime_claude_observations (
+             run_id, tmux_socket_path, tmux_server_pid,
+             tmux_server_started_at_unix, original_tmux_pane_id
+         ) WHERE status = 'observed';
+        CREATE INDEX IF NOT EXISTS runtime_claude_observations_run_status
+         ON runtime_claude_observations (run_id, status);
+        CREATE INDEX IF NOT EXISTS session_recoveries_status
+         ON session_recoveries (status, crashed_at_unix_ms);
+        CREATE UNIQUE INDEX IF NOT EXISTS session_recoveries_claimed_target
+         ON session_recoveries (
+             target_tmux_socket_path, target_tmux_server_pid,
+             target_tmux_server_started_at_unix, target_tmux_pane_id
+         ) WHERE status IN ('staging', 'staged', 'uncertain');
+        ",
+    )?;
+    Ok(())
+}
+
+fn provider_check_allows_grok(connection: &Connection) -> AppResult<bool> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_recoveries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql
+        .as_deref()
+        .is_some_and(|ddl| ddl.contains("'grok'") || ddl.contains("\"grok\"")))
+}
+
+const V5_REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "runtime_runs",
+        &["id", "started_at_unix_ms", "ended_at_unix_ms", "outcome"],
+    ),
+    (
+        "runtime_claude_observations",
+        &[
+            "id",
+            "run_id",
+            "workspace_id",
+            "status",
+            "tmux_socket_path",
+            "tmux_server_pid",
+            "tmux_server_started_at_unix",
+            "original_tmux_pane_id",
+            "original_pane_tty",
+            "original_pane_pid",
+            "original_tmux_session_id",
+            "original_session_name",
+            "original_tmux_window_id",
+            "original_window_index",
+            "original_window_name",
+            "original_pane_index",
+            "original_cwd",
+            "provider",
+            "provider_session_id",
+            "first_observed_at_unix_ms",
+            "last_observed_at_unix_ms",
+        ],
+    ),
+    (
+        "session_recoveries",
+        &[
+            "id",
+            "source_observation_id",
+            "workspace_id",
+            "status",
+            "provider",
+            "provider_session_id",
+            "original_tmux_socket_path",
+            "original_tmux_server_pid",
+            "original_tmux_server_started_at_unix",
+            "original_tmux_pane_id",
+            "original_pane_tty",
+            "original_pane_pid",
+            "original_tmux_session_id",
+            "original_session_name",
+            "original_tmux_window_id",
+            "original_window_index",
+            "original_window_name",
+            "original_pane_index",
+            "original_cwd",
+            "crashed_at_unix_ms",
+            "staging_run_id",
+            "staging_token",
+            "staging_started_at_unix_ms",
+            "target_tmux_socket_path",
+            "target_tmux_server_pid",
+            "target_tmux_server_started_at_unix",
+            "target_tmux_pane_id",
+            "target_tmux_session_id",
+            "target_tmux_window_id",
+            "target_session_name",
+            "target_window_index",
+            "target_window_name",
+            "target_pane_index",
+            "target_cwd",
+            "staged_command",
+            "staged_at_unix_ms",
+            "resolved_at_unix_ms",
+            "dismissed_at_unix_ms",
+        ],
+    ),
+];
+
+fn v5_required_columns_present(connection: &Connection) -> AppResult<bool> {
+    for (table, columns) in V5_REQUIRED_COLUMNS {
+        for column in *columns {
+            if !table_has_column(connection, table, column)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn ensure_v5_required_columns(connection: &Connection) -> AppResult<()> {
+    for (table, columns) in V5_REQUIRED_COLUMNS {
+        for column in *columns {
+            if !table_has_column(connection, table, column)? {
+                return Err(AppError::new(format!(
+                    "state.db schema v5 layout is malformed: table {table} is missing required column {column}; restore the schema from backup or recreate the state database"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Persist a full runtime-state upsert in one SQL statement.
 ///
 /// All three callers (wait, cook, claude-session) write to the same row, so
@@ -731,20 +1140,55 @@ pub fn sync_tmux_claude_session_id(
     workspace_id: &str,
     pane: &TmuxPane,
 ) -> AppResult<Option<String>> {
+    sync_tmux_claude_session_id_with(
+        state_dir,
+        workspace_id,
+        pane,
+        true,
+        resolve_live_claude_session_id,
+    )
+}
+
+pub fn sync_tmux_claude_session_id_fresh(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+) -> AppResult<Option<String>> {
+    sync_tmux_claude_session_id_with(
+        state_dir,
+        workspace_id,
+        pane,
+        false,
+        resolve_live_claude_session_id,
+    )
+}
+
+fn sync_tmux_claude_session_id_with<F>(
+    state_dir: &Path,
+    workspace_id: &str,
+    pane: &TmuxPane,
+    allow_cache: bool,
+    resolve: F,
+) -> AppResult<Option<String>>
+where
+    F: FnOnce(&TmuxPane) -> AppResult<Option<String>>,
+{
     let connection = open_bootstrapped_state_db(state_dir)?;
     let instance = find_or_create_tmux_instance_with_connection(&connection, workspace_id, pane)?;
     let existing = load_instance_runtime_state_with_connection(&connection, &instance.id)?;
     let now_ms = current_unix_ms()?;
 
-    if let Some(existing) = existing.as_ref().filter(|row| {
-        row.claude_session_checked_at_unix_ms
-            .map(|checked_at| now_ms.saturating_sub(checked_at) < CLAUDE_SESSION_REVALIDATE_MS)
-            .unwrap_or(false)
-    }) {
+    if allow_cache
+        && let Some(existing) = existing.as_ref().filter(|row| {
+            row.claude_session_checked_at_unix_ms
+                .map(|checked_at| now_ms.saturating_sub(checked_at) < CLAUDE_SESSION_REVALIDATE_MS)
+                .unwrap_or(false)
+        })
+    {
         return Ok(existing.claude_session_id.clone());
     }
 
-    let claude_session_id = resolve_claude_session_id_for_pane(pane)?;
+    let claude_session_id = resolve(pane)?;
     upsert_instance_runtime_state(
         &connection,
         &instance.id,
@@ -766,6 +1210,917 @@ pub fn sync_tmux_claude_session_id(
             .and_then(|row| row.cook_session_key.as_deref()),
     )?;
     Ok(claude_session_id)
+}
+
+pub fn begin_runtime_run(state_dir: &Path) -> AppResult<String> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let id = new_uuid();
+    connection.execute(
+        "INSERT INTO runtime_runs (id, started_at_unix_ms, outcome) VALUES (?1, ?2, 'active')",
+        params![id, current_unix_ms()?],
+    )?;
+    Ok(id)
+}
+
+pub fn finish_runtime_run_clean(state_dir: &Path, run_id: &str) -> AppResult<()> {
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE runtime_claude_observations SET status = 'retired' \
+         WHERE run_id = ?1 AND status = 'observed'",
+        params![run_id],
+    )?;
+    let changed = tx.execute(
+        "UPDATE runtime_runs SET outcome = 'clean', ended_at_unix_ms = ?2 \
+         WHERE id = ?1 AND outcome = 'active'",
+        params![run_id, current_unix_ms()?],
+    )?;
+    if changed != 1 {
+        return Err(AppError::new(format!(
+            "runtime run is not active and cannot be finalized clean: {run_id}"
+        )));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn checkpoint_claude_observation(
+    state_dir: &Path,
+    run_id: &str,
+    workspace_id: &str,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    claude_session_id: &str,
+) -> AppResult<String> {
+    checkpoint_provider_observation(
+        state_dir,
+        run_id,
+        workspace_id,
+        server,
+        pane,
+        "claude",
+        claude_session_id,
+    )
+}
+
+pub fn checkpoint_provider_observation(
+    state_dir: &Path,
+    run_id: &str,
+    workspace_id: &str,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<String> {
+    build_recovery_command(provider, &pane.current_path, provider_session_id)?;
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+    let id = checkpoint_claude_observation_with_connection(
+        &tx,
+        run_id,
+        workspace_id,
+        server,
+        pane,
+        provider,
+        provider_session_id,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+fn checkpoint_claude_observation_with_connection(
+    connection: &Connection,
+    run_id: &str,
+    workspace_id: &str,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<String> {
+    build_recovery_command(provider, &pane.current_path, provider_session_id)?;
+    let run_is_active = connection
+        .query_row(
+            "SELECT 1 FROM runtime_runs WHERE id = ?1 AND outcome = 'active'",
+            params![run_id],
+            |_row| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !run_is_active {
+        return Err(AppError::new(format!(
+            "runtime run is not active and cannot accept checkpoints: {run_id}"
+        )));
+    }
+    let existing = connection
+        .query_row(
+            "SELECT id, provider, provider_session_id FROM runtime_claude_observations \
+             WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
+               AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
+               AND status = 'observed'",
+            params![
+                run_id,
+                server.socket_path,
+                server.pid,
+                server.start_time,
+                pane.pane_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let now = current_unix_ms()?;
+    if let Some((id, existing_provider, existing_session_id)) = existing {
+        if existing_provider == provider && existing_session_id == provider_session_id {
+            connection.execute(
+                "UPDATE runtime_claude_observations SET \
+                    workspace_id = ?2, original_pane_tty = ?3, original_pane_pid = ?4, \
+                    original_tmux_session_id = ?5, original_session_name = ?6, \
+                    original_tmux_window_id = ?7, original_window_index = ?8, \
+                    original_window_name = ?9, original_pane_index = ?10, original_cwd = ?11, \
+                    last_observed_at_unix_ms = ?12 WHERE id = ?1",
+                params![
+                    id,
+                    workspace_id,
+                    pane.pane_tty,
+                    pane.pane_pid,
+                    pane.session_id,
+                    pane.session_name,
+                    pane.window_id,
+                    pane.window_index,
+                    pane.window_name,
+                    pane.pane_index,
+                    pane.current_path,
+                    now
+                ],
+            )?;
+            return Ok(id);
+        }
+        connection.execute(
+            "UPDATE runtime_claude_observations SET status = 'retired' WHERE id = ?1",
+            params![id],
+        )?;
+    }
+
+    let id = new_uuid();
+    connection.execute(
+        "INSERT INTO runtime_claude_observations (
+            id, run_id, workspace_id, status, tmux_socket_path, tmux_server_pid,
+            tmux_server_started_at_unix, original_tmux_pane_id, original_pane_tty,
+            original_pane_pid, original_tmux_session_id, original_session_name,
+            original_tmux_window_id, original_window_index, original_window_name,
+            original_pane_index, original_cwd, provider, provider_session_id,
+            first_observed_at_unix_ms, last_observed_at_unix_ms
+         ) VALUES (
+            ?1, ?2, ?3, 'observed', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19
+         )",
+        params![
+            id,
+            run_id,
+            workspace_id,
+            server.socket_path,
+            server.pid,
+            server.start_time,
+            pane.pane_id,
+            pane.pane_tty,
+            pane.pane_pid,
+            pane.session_id,
+            pane.session_name,
+            pane.window_id,
+            pane.window_index,
+            pane.window_name,
+            pane.pane_index,
+            pane.current_path,
+            provider,
+            provider_session_id,
+            now
+        ],
+    )?;
+    Ok(id)
+}
+
+pub fn retire_current_observation_for_pane(
+    state_dir: &Path,
+    run_id: &str,
+    server: &TmuxServerIdentity,
+    pane_id: &str,
+) -> AppResult<bool> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(connection.execute(
+        "UPDATE runtime_claude_observations SET status = 'retired' \
+         WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
+           AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
+           AND status = 'observed'",
+        params![
+            run_id,
+            server.socket_path,
+            server.pid,
+            server.start_time,
+            pane_id
+        ],
+    )? > 0)
+}
+
+pub fn record_missing_current_observations(
+    state_dir: &Path,
+    run_id: &str,
+    inventory: &TmuxInventory,
+) -> AppResult<usize> {
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+    let observations = list_observations_with_connection(
+        &tx,
+        "WHERE observations.run_id = ?1 AND observations.status = 'observed'",
+        params![run_id],
+    )?;
+    let missing = observations
+        .into_iter()
+        .filter(|observation| !observation_exists(observation, inventory))
+        .collect::<Vec<_>>();
+    for observation in &missing {
+        crash_observation_with_connection(&tx, observation)?;
+    }
+    tx.commit()?;
+    Ok(missing.len())
+}
+
+pub fn reconcile_abandoned_observations(
+    state_dir: &Path,
+    current_run_id: &str,
+    inventory: &TmuxInventory,
+) -> AppResult<usize> {
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+    let run_ids = {
+        let mut statement = tx.prepare(
+            "SELECT id FROM runtime_runs WHERE outcome = 'active' AND id <> ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![current_run_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let observations = list_observations_with_connection(
+        &tx,
+        "JOIN runtime_runs runs ON runs.id = observations.run_id \
+         WHERE runs.outcome = 'active' AND runs.id <> ?1 AND observations.status = 'observed'",
+        params![current_run_id],
+    )?;
+    let mut crashed = 0;
+    for observation in observations {
+        if observation_exists(&observation, inventory) {
+            tx.execute(
+                "UPDATE runtime_claude_observations SET status = 'retired' WHERE id = ?1",
+                params![observation.id],
+            )?;
+        } else {
+            crash_observation_with_connection(&tx, &observation)?;
+            crashed += 1;
+        }
+    }
+    for old_run_id in run_ids {
+        let outstanding: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM runtime_claude_observations \
+             WHERE run_id = ?1 AND status = 'observed'",
+            params![old_run_id],
+            |row| row.get(0),
+        )?;
+        if outstanding == 0 {
+            tx.execute(
+                "UPDATE runtime_runs SET outcome = 'reconciled', ended_at_unix_ms = ?2 \
+                 WHERE id = ?1 AND outcome = 'active'",
+                params![old_run_id, current_unix_ms()?],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(crashed)
+}
+
+pub fn apply_recovery_inventory_evidence(
+    state_dir: &Path,
+    current_run_id: &str,
+    inventory: &TmuxInventory,
+    verified: &[VerifiedProviderRecoveryEvidence],
+) -> AppResult<RecoveryInventoryUpdate> {
+    for evidence in verified {
+        build_recovery_command(
+            &evidence.provider,
+            &evidence.pane.current_path,
+            &evidence.provider_session_id,
+        )?;
+    }
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+
+    let old_run_ids = {
+        let mut statement = tx.prepare(
+            "SELECT id FROM runtime_runs WHERE outcome = 'active' AND id <> ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![current_run_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let abandoned = list_observations_with_connection(
+        &tx,
+        "JOIN runtime_runs runs ON runs.id = observations.run_id \
+         WHERE runs.outcome = 'active' AND runs.id <> ?1 AND observations.status = 'observed'",
+        params![current_run_id],
+    )?;
+    let mut abandoned_crashed = 0;
+    for observation in abandoned {
+        if observation_exists(&observation, inventory) {
+            tx.execute(
+                "UPDATE runtime_claude_observations SET status = 'retired' WHERE id = ?1",
+                params![observation.id],
+            )?;
+        } else {
+            crash_observation_with_connection(&tx, &observation)?;
+            abandoned_crashed += 1;
+        }
+    }
+    for old_run_id in old_run_ids {
+        let outstanding: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM runtime_claude_observations \
+             WHERE run_id = ?1 AND status = 'observed'",
+            params![old_run_id],
+            |row| row.get(0),
+        )?;
+        if outstanding == 0 {
+            tx.execute(
+                "UPDATE runtime_runs SET outcome = 'reconciled', ended_at_unix_ms = ?2 \
+                 WHERE id = ?1 AND outcome = 'active'",
+                params![old_run_id, current_unix_ms()?],
+            )?;
+        }
+    }
+
+    let current = list_observations_with_connection(
+        &tx,
+        "WHERE observations.run_id = ?1 AND observations.status = 'observed'",
+        params![current_run_id],
+    )?;
+    let missing = current
+        .into_iter()
+        .filter(|observation| !observation_exists(observation, inventory))
+        .collect::<Vec<_>>();
+    for observation in &missing {
+        crash_observation_with_connection(&tx, observation)?;
+    }
+
+    let mut retired = 0;
+    for pane in &inventory.panes {
+        match crate::recovery::provider_for_pane_command(&pane.current_command) {
+            Some(provider) => {
+                // Still a recoverable provider process: retire only mismatched
+                // provider observations for this live object.
+                retired += tx.execute(
+                    "UPDATE runtime_claude_observations SET status = 'retired' \
+                     WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
+                       AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
+                       AND status = 'observed' AND provider <> ?6",
+                    params![
+                        current_run_id,
+                        inventory.server.socket_path,
+                        inventory.server.pid,
+                        inventory.server.start_time,
+                        pane.pane_id,
+                        provider
+                    ],
+                )?;
+            }
+            None => {
+                retired += tx.execute(
+                    "UPDATE runtime_claude_observations SET status = 'retired' \
+                     WHERE run_id = ?1 AND tmux_socket_path = ?2 AND tmux_server_pid = ?3 \
+                       AND tmux_server_started_at_unix = ?4 AND original_tmux_pane_id = ?5 \
+                       AND status = 'observed'",
+                    params![
+                        current_run_id,
+                        inventory.server.socket_path,
+                        inventory.server.pid,
+                        inventory.server.start_time,
+                        pane.pane_id
+                    ],
+                )?;
+            }
+        }
+    }
+
+    let mut resolved = 0;
+    for evidence in verified {
+        checkpoint_claude_observation_with_connection(
+            &tx,
+            current_run_id,
+            &evidence.workspace_id,
+            &inventory.server,
+            &evidence.pane,
+            &evidence.provider,
+            &evidence.provider_session_id,
+        )?;
+        resolved += resolve_recovery_for_live_provider_session_with_connection(
+            &tx,
+            &inventory.server,
+            &evidence.pane,
+            &evidence.provider,
+            &evidence.provider_session_id,
+        )?;
+    }
+    tx.commit()?;
+    Ok(RecoveryInventoryUpdate {
+        abandoned_crashed,
+        current_crashed: missing.len(),
+        retired,
+        checkpointed: verified.len(),
+        resolved,
+    })
+}
+
+pub fn list_nonterminal_recoveries(state_dir: &Path) -> AppResult<Vec<RecoveryRecord>> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    list_recoveries_with_connection(
+        &connection,
+        "WHERE recoveries.status IN ('crashed', 'staging', 'staged', 'uncertain') \
+         ORDER BY recoveries.crashed_at_unix_ms, recoveries.id",
+        [],
+    )
+}
+
+pub fn load_recovery(state_dir: &Path, recovery_id: &str) -> AppResult<Option<RecoveryRecord>> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(list_recoveries_with_connection(
+        &connection,
+        "WHERE recoveries.id = ?1",
+        params![recovery_id],
+    )?
+    .into_iter()
+    .next())
+}
+
+pub fn claim_recovery_for_staging(
+    state_dir: &Path,
+    recovery_id: &str,
+    run_id: &str,
+    token: &str,
+    target: &RecoveryTarget,
+    command: &str,
+) -> AppResult<()> {
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+    let run_is_active = tx
+        .query_row(
+            "SELECT 1 FROM runtime_runs WHERE id = ?1 AND outcome = 'active'",
+            params![run_id],
+            |_row| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !run_is_active {
+        return Err(AppError::with_exit_code(
+            "recovery staging owner runtime is no longer active",
+            409,
+        ));
+    }
+    let record =
+        list_recoveries_with_connection(&tx, "WHERE recoveries.id = ?1", params![recovery_id])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                AppError::with_exit_code(format!("recovery not found: {recovery_id}"), 404)
+            })?;
+    let expected = build_recovery_command(
+        &record.provider,
+        &record.original.cwd,
+        &record.provider_session_id,
+    )?;
+    if command != expected {
+        return Err(AppError::with_exit_code(
+            "recovery command changed before staging",
+            409,
+        ));
+    }
+    let conflict: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM session_recoveries WHERE id <> ?1 \
+         AND status IN ('staging', 'staged', 'uncertain') \
+         AND target_tmux_socket_path = ?2 AND target_tmux_server_pid = ?3 \
+         AND target_tmux_server_started_at_unix = ?4 AND target_tmux_pane_id = ?5",
+        params![
+            recovery_id,
+            target.server.socket_path,
+            target.server.pid,
+            target.server.start_time,
+            target.pane.pane_id
+        ],
+        |row| row.get(0),
+    )?;
+    if conflict != 0 {
+        return Err(AppError::with_exit_code(
+            "target pane is already claimed by another recovery",
+            409,
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE session_recoveries SET status = 'staging', staging_run_id = ?2,
+            staging_token = ?3, staging_started_at_unix_ms = ?4,
+            target_tmux_socket_path = ?5, target_tmux_server_pid = ?6,
+            target_tmux_server_started_at_unix = ?7, target_tmux_pane_id = ?8,
+            target_tmux_session_id = ?9, target_tmux_window_id = ?10,
+            target_session_name = ?11, target_window_index = ?12,
+            target_window_name = ?13, target_pane_index = ?14, target_cwd = ?15,
+            staged_command = ?16
+         WHERE id = ?1 AND status = 'crashed'",
+        params![
+            recovery_id,
+            run_id,
+            token,
+            current_unix_ms()?,
+            target.server.socket_path,
+            target.server.pid,
+            target.server.start_time,
+            target.pane.pane_id,
+            target.pane.session_id,
+            target.pane.window_id,
+            target.pane.session_name,
+            target.pane.window_index,
+            target.pane.window_name,
+            target.pane.pane_index,
+            target.pane.current_path,
+            command
+        ],
+    )?;
+    if changed != 1 {
+        return Err(AppError::with_exit_code(
+            "recovery is no longer available for staging",
+            409,
+        ));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn release_known_failed_staging_claim(
+    state_dir: &Path,
+    recovery_id: &str,
+    token: &str,
+) -> AppResult<bool> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(connection.execute(
+        "UPDATE session_recoveries SET status = 'crashed', staging_run_id = NULL,
+            staging_token = NULL, staging_started_at_unix_ms = NULL,
+            target_tmux_socket_path = NULL, target_tmux_server_pid = NULL,
+            target_tmux_server_started_at_unix = NULL, target_tmux_pane_id = NULL,
+            target_tmux_session_id = NULL, target_tmux_window_id = NULL,
+            target_session_name = NULL, target_window_index = NULL,
+            target_window_name = NULL, target_pane_index = NULL, target_cwd = NULL,
+            staged_command = NULL
+         WHERE id = ?1 AND status = 'staging' AND staging_token = ?2",
+        params![recovery_id, token],
+    )? == 1)
+}
+
+pub fn mark_recovery_staged(state_dir: &Path, recovery_id: &str, token: &str) -> AppResult<bool> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(connection.execute(
+        "UPDATE session_recoveries SET status = 'staged', staged_at_unix_ms = ?3 \
+         WHERE id = ?1 AND status = 'staging' AND staging_token = ?2",
+        params![recovery_id, token, current_unix_ms()?],
+    )? == 1)
+}
+
+pub fn mark_recovery_uncertain(
+    state_dir: &Path,
+    recovery_id: &str,
+    token: &str,
+) -> AppResult<bool> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(connection.execute(
+        "UPDATE session_recoveries SET status = 'uncertain' \
+         WHERE id = ?1 AND status = 'staging' AND staging_token = ?2",
+        params![recovery_id, token],
+    )? == 1)
+}
+
+pub fn mark_stale_staging_uncertain(state_dir: &Path, current_run_id: &str) -> AppResult<usize> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    Ok(connection.execute(
+        "UPDATE session_recoveries SET status = 'uncertain' \
+         WHERE status = 'staging' AND (staging_run_id IS NULL OR staging_run_id <> ?1)",
+        params![current_run_id],
+    )?)
+}
+
+pub fn resolve_recovery_for_live_claude_session(
+    state_dir: &Path,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    claude_session_id: &str,
+) -> AppResult<usize> {
+    resolve_recovery_for_live_provider_session(state_dir, server, pane, "claude", claude_session_id)
+}
+
+pub fn resolve_recovery_for_live_provider_session(
+    state_dir: &Path,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<usize> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    resolve_recovery_for_live_provider_session_with_connection(
+        &connection,
+        server,
+        pane,
+        provider,
+        provider_session_id,
+    )
+}
+
+fn resolve_recovery_for_live_provider_session_with_connection(
+    connection: &Connection,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+    provider: &str,
+    provider_session_id: &str,
+) -> AppResult<usize> {
+    Ok(connection.execute(
+        "UPDATE session_recoveries SET status = 'resolved', resolved_at_unix_ms = ?14 \
+          WHERE status IN ('staged', 'uncertain') AND provider = ?1 \
+            AND provider_session_id = ?2 AND target_tmux_socket_path = ?3 \
+            AND target_tmux_server_pid = ?4 AND target_tmux_server_started_at_unix = ?5 \
+            AND target_tmux_pane_id = ?6 AND target_tmux_session_id = ?7 \
+            AND target_tmux_window_id = ?8 AND target_session_name = ?9 \
+            AND target_window_index = ?10 AND target_window_name = ?11 \
+            AND target_pane_index = ?12 AND target_cwd = ?13",
+        params![
+            provider,
+            provider_session_id,
+            server.socket_path,
+            server.pid,
+            server.start_time,
+            pane.pane_id,
+            pane.session_id,
+            pane.window_id,
+            pane.session_name,
+            pane.window_index,
+            pane.window_name,
+            pane.pane_index,
+            pane.current_path,
+            current_unix_ms()?
+        ],
+    )?)
+}
+
+pub fn dismiss_recovery(state_dir: &Path, recovery_id: &str) -> AppResult<bool> {
+    let connection = open_bootstrapped_state_db(state_dir)?;
+    let changed = connection.execute(
+        "UPDATE session_recoveries SET status = 'dismissed', dismissed_at_unix_ms = ?2 \
+         WHERE id = ?1 AND status IN ('crashed', 'staged', 'uncertain')",
+        params![recovery_id, current_unix_ms()?],
+    )?;
+    if changed == 1 {
+        return Ok(true);
+    }
+    let status = connection
+        .query_row(
+            "SELECT status FROM session_recoveries WHERE id = ?1",
+            params![recovery_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match status.as_deref() {
+        Some("dismissed") => Ok(false),
+        Some(_) => Err(AppError::with_exit_code(
+            "recovery cannot be dismissed from its current lifecycle",
+            409,
+        )),
+        None => Err(AppError::with_exit_code(
+            format!("recovery not found: {recovery_id}"),
+            404,
+        )),
+    }
+}
+
+fn observation_exists(observation: &ClaudeObservationRecord, inventory: &TmuxInventory) -> bool {
+    observation.original.server == inventory.server
+        && inventory
+            .panes
+            .iter()
+            .any(|pane| pane.pane_id == observation.original.pane_id)
+}
+
+fn crash_observation_with_connection(
+    connection: &Connection,
+    observation: &ClaudeObservationRecord,
+) -> AppResult<()> {
+    let now = current_unix_ms()?;
+    connection.execute(
+        "INSERT OR IGNORE INTO session_recoveries (
+            id, source_observation_id, workspace_id, status, provider, provider_session_id,
+            original_tmux_socket_path, original_tmux_server_pid,
+            original_tmux_server_started_at_unix, original_tmux_pane_id,
+            original_pane_tty, original_pane_pid, original_tmux_session_id,
+            original_session_name, original_tmux_window_id, original_window_index,
+            original_window_name, original_pane_index, original_cwd, crashed_at_unix_ms
+         ) VALUES (?1, ?2, ?3, 'crashed', ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            new_uuid(),
+            observation.id,
+            observation.workspace_id,
+            observation.provider,
+            observation.provider_session_id,
+            observation.original.server.socket_path,
+            observation.original.server.pid,
+            observation.original.server.start_time,
+            observation.original.pane_id,
+            observation.original.pane_tty,
+            observation.original.pane_pid,
+            observation.original.session_id,
+            observation.original.session_name,
+            observation.original.window_id,
+            observation.original.window_index,
+            observation.original.window_name,
+            observation.original.pane_index,
+            observation.original.cwd,
+            now
+        ],
+    )?;
+    let changed = connection.execute(
+        "UPDATE runtime_claude_observations SET status = 'crashed' \
+         WHERE id = ?1 AND status = 'observed'",
+        params![observation.id],
+    )?;
+    if changed == 0 {
+        let status: String = connection.query_row(
+            "SELECT status FROM runtime_claude_observations WHERE id = ?1",
+            params![observation.id],
+            |row| row.get(0),
+        )?;
+        if status != "crashed" {
+            return Err(AppError::new("observation changed while recording crash"));
+        }
+    }
+    Ok(())
+}
+
+fn list_observations_with_connection<P: rusqlite::Params>(
+    connection: &Connection,
+    suffix: &str,
+    query_params: P,
+) -> AppResult<Vec<ClaudeObservationRecord>> {
+    let sql = format!(
+        "SELECT observations.id, observations.run_id, observations.workspace_id,
+            observations.status, observations.tmux_socket_path, observations.tmux_server_pid,
+            observations.tmux_server_started_at_unix, observations.original_tmux_pane_id,
+            observations.original_pane_tty, observations.original_pane_pid,
+            observations.original_tmux_session_id, observations.original_session_name,
+            observations.original_tmux_window_id, observations.original_window_index,
+            observations.original_window_name, observations.original_pane_index,
+            observations.original_cwd, observations.provider, observations.provider_session_id,
+            observations.first_observed_at_unix_ms, observations.last_observed_at_unix_ms
+         FROM runtime_claude_observations observations {suffix}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(query_params, row_to_observation)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaudeObservationRecord> {
+    Ok(ClaudeObservationRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        status: row.get(3)?,
+        original: RecoveryOriginalIdentity {
+            server: TmuxServerIdentity {
+                socket_path: row.get(4)?,
+                pid: row.get(5)?,
+                start_time: row.get(6)?,
+            },
+            pane_id: row.get(7)?,
+            pane_tty: row.get(8)?,
+            pane_pid: row.get(9)?,
+            session_id: row.get(10)?,
+            session_name: row.get(11)?,
+            window_id: row.get(12)?,
+            window_index: row.get(13)?,
+            window_name: row.get(14)?,
+            pane_index: row.get(15)?,
+            cwd: row.get(16)?,
+        },
+        provider: row.get(17)?,
+        provider_session_id: row.get(18)?,
+        first_observed_at_unix_ms: row.get(19)?,
+        last_observed_at_unix_ms: row.get(20)?,
+    })
+}
+
+fn list_recoveries_with_connection<P: rusqlite::Params>(
+    connection: &Connection,
+    suffix: &str,
+    query_params: P,
+) -> AppResult<Vec<RecoveryRecord>> {
+    let sql = format!(
+        "SELECT recoveries.id, recoveries.source_observation_id, recoveries.workspace_id,
+            workspaces.workspace_root, recoveries.status, recoveries.provider,
+            recoveries.provider_session_id, recoveries.original_tmux_socket_path,
+            recoveries.original_tmux_server_pid, recoveries.original_tmux_server_started_at_unix,
+            recoveries.original_tmux_pane_id, recoveries.original_pane_tty,
+            recoveries.original_pane_pid, recoveries.original_tmux_session_id,
+            recoveries.original_session_name, recoveries.original_tmux_window_id,
+            recoveries.original_window_index, recoveries.original_window_name,
+            recoveries.original_pane_index, recoveries.original_cwd, recoveries.crashed_at_unix_ms,
+            recoveries.staging_run_id, recoveries.staging_token,
+            recoveries.staging_started_at_unix_ms, recoveries.target_tmux_socket_path,
+            recoveries.target_tmux_server_pid, recoveries.target_tmux_server_started_at_unix,
+            recoveries.target_tmux_pane_id, recoveries.target_tmux_session_id,
+            recoveries.target_tmux_window_id, recoveries.target_session_name,
+            recoveries.target_window_index, recoveries.target_window_name,
+            recoveries.target_pane_index, recoveries.target_cwd, recoveries.staged_command,
+            recoveries.staged_at_unix_ms, recoveries.resolved_at_unix_ms,
+            recoveries.dismissed_at_unix_ms
+         FROM session_recoveries recoveries
+         JOIN workspaces ON workspaces.id = recoveries.workspace_id {suffix}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(query_params, row_to_recovery)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn row_to_recovery(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecoveryRecord> {
+    let target_socket: Option<String> = row.get(24)?;
+    let target = match target_socket {
+        Some(socket_path) => Some(RecoveryTarget {
+            server: TmuxServerIdentity {
+                socket_path,
+                pid: row.get(25)?,
+                start_time: row.get(26)?,
+            },
+            pane: TmuxPane {
+                pane_id: row.get(27)?,
+                pane_tty: String::new(),
+                pane_pid: None,
+                session_id: row.get(28)?,
+                session_name: row.get(30)?,
+                window_id: row.get(29)?,
+                window_index: row.get(31)?,
+                window_name: row.get(32)?,
+                pane_index: row.get(33)?,
+                current_command: String::new(),
+                current_path: row.get(34)?,
+                pane_title: String::new(),
+                pane_active: false,
+                cursor_x: None,
+                cursor_y: None,
+            },
+        }),
+        None => None,
+    };
+    let status: String = row.get(4)?;
+    let lifecycle = RecoveryLifecycle::parse(&status).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error.to_string())),
+        )
+    })?;
+    Ok(RecoveryRecord {
+        id: row.get(0)?,
+        source_observation_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        workspace_root: row.get(3)?,
+        lifecycle,
+        provider: row.get(5)?,
+        provider_session_id: row.get(6)?,
+        original: RecoveryOriginalIdentity {
+            server: TmuxServerIdentity {
+                socket_path: row.get(7)?,
+                pid: row.get(8)?,
+                start_time: row.get(9)?,
+            },
+            pane_id: row.get(10)?,
+            pane_tty: row.get(11)?,
+            pane_pid: row.get(12)?,
+            session_id: row.get(13)?,
+            session_name: row.get(14)?,
+            window_id: row.get(15)?,
+            window_index: row.get(16)?,
+            window_name: row.get(17)?,
+            pane_index: row.get(18)?,
+            cwd: row.get(19)?,
+        },
+        crashed_at_unix_ms: row.get(20)?,
+        staging_run_id: row.get(21)?,
+        staging_token: row.get(22)?,
+        staging_started_at_unix_ms: row.get(23)?,
+        target,
+        staged_command: row.get(35)?,
+        staged_at_unix_ms: row.get(36)?,
+        resolved_at_unix_ms: row.get(37)?,
+        dismissed_at_unix_ms: row.get(38)?,
+    })
 }
 
 fn table_has_column(
@@ -1275,11 +2630,19 @@ fn load_instance_runtime_state_with_connection(
         .optional()?)
 }
 
-fn resolve_claude_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<String>> {
+/// Resolve the live Claude identity without consulting or updating SQLite.
+pub fn resolve_live_claude_session_id(pane: &TmuxPane) -> AppResult<Option<String>> {
     let Some(projects_root) = claude_projects_root() else {
         return Ok(None);
     };
 
+    resolve_live_claude_session_id_in(&projects_root, pane)
+}
+
+fn resolve_live_claude_session_id_in(
+    projects_root: &Path,
+    pane: &TmuxPane,
+) -> AppResult<Option<String>> {
     for project_dir in candidate_claude_project_dirs(&projects_root, &pane.current_path) {
         if let Some(pid) = pane.pane_pid
             && let Some(session_id) = claude_session_id_from_pid(pid, &project_dir)?
@@ -1496,7 +2859,8 @@ mod tests {
         sync_tmux_claude_session_id, sync_tmux_runtime_state, table_exists, table_has_column,
         tape_artifact_path,
     };
-    use crate::tmux::TmuxPane;
+    use crate::recovery::{RecoveryRecord, RecoveryTarget};
+    use crate::tmux::{TmuxPane, TmuxServerIdentity};
 
     #[test]
     fn state_db_path_uses_state_root_filename() {
@@ -1552,6 +2916,16 @@ mod tests {
         assert!(
             table_has_column(&connection, "instance_runtime_state", "cook_session_key")
                 .expect("cook session key column should exist")
+        );
+        assert!(table_exists(&connection, "runtime_runs").expect("runtime runs should exist"));
+        assert!(
+            table_exists(&connection, "runtime_claude_observations")
+                .expect("observations should exist")
+        );
+        assert!(table_exists(&connection, "session_recoveries").expect("recoveries should exist"));
+        assert!(
+            super::index_exists(&connection, "session_recoveries_claimed_target")
+                .expect("claim index should exist")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -2072,6 +3446,937 @@ mod tests {
     }
 
     #[test]
+    fn migrate_v4_adds_empty_recovery_tables_without_backfill() {
+        let state_dir = unique_temp_dir("storage-migrate-v4-recovery");
+        let mut connection = open_state_db(&state_dir).expect("db should open");
+        super::migrate_to_v4(&connection).expect("v4 should create");
+        ensure_schema_version_table(&connection).expect("version table should create");
+        connection
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (?1, 4)",
+                params![SCHEMA_VERSION_ROW_ID],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces (id, workspace_root) VALUES ('ws', '/tmp/project')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO instances (id, workspace_id, session_name, pane_id, kind, active) \
+                 VALUES ('instance', 'ws', 'work', '%1', 'tmux-pane', 1)",
+                [],
+            )
+            .unwrap();
+
+        migrate_state_db(&mut connection).expect("v5 migration should succeed");
+        let instances: i64 = connection
+            .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+            .unwrap();
+        let observations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_claude_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recoveries: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_recoveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((instances, observations, recoveries), (1, 0, 0));
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn v5_reopen_repairs_missing_recovery_index_idempotently() {
+        let state_dir = unique_temp_dir("storage-v5-index-repair");
+        bootstrap_state_db(&state_dir).unwrap();
+        let connection = open_state_db(&state_dir).unwrap();
+        connection
+            .execute("DROP INDEX session_recoveries_claimed_target", [])
+            .unwrap();
+        drop(connection);
+
+        bootstrap_state_db(&state_dir).expect("first repair should succeed");
+        bootstrap_state_db(&state_dir).expect("second repair should be idempotent");
+        let connection = open_state_db(&state_dir).unwrap();
+        assert!(super::index_exists(&connection, "session_recoveries_claimed_target").unwrap());
+        assert!(
+            super::index_sql(&connection, "session_recoveries_claimed_target")
+                .unwrap()
+                .unwrap()
+                .contains("'uncertain'")
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn v5_reopen_replaces_legacy_claimed_target_predicate() {
+        let state_dir = unique_temp_dir("storage-v5-index-predicate-repair");
+        bootstrap_state_db(&state_dir).unwrap();
+        let connection = open_state_db(&state_dir).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX session_recoveries_claimed_target;
+                 CREATE UNIQUE INDEX session_recoveries_claimed_target
+                 ON session_recoveries (
+                     target_tmux_socket_path, target_tmux_server_pid,
+                     target_tmux_server_started_at_unix, target_tmux_pane_id
+                 ) WHERE status IN ('staging', 'staged');",
+            )
+            .unwrap();
+        drop(connection);
+        bootstrap_state_db(&state_dir).unwrap();
+        let connection = open_state_db(&state_dir).unwrap();
+        assert!(
+            super::index_sql(&connection, "session_recoveries_claimed_target")
+                .unwrap()
+                .unwrap()
+                .contains("'uncertain'")
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn malformed_v5_missing_required_columns_fails_during_bootstrap() {
+        for (table, column, prerequisite) in [
+            ("runtime_claude_observations", "provider_session_id", None),
+            ("session_recoveries", "staging_token", None),
+            ("session_recoveries", "staged_command", None),
+            (
+                "runtime_claude_observations",
+                "tmux_socket_path",
+                Some("DROP INDEX runtime_claude_observations_live_object"),
+            ),
+            (
+                "session_recoveries",
+                "target_tmux_pane_id",
+                Some("DROP INDEX session_recoveries_claimed_target"),
+            ),
+        ] {
+            let state_dir = unique_temp_dir(&format!("storage-v5-missing-{column}"));
+            bootstrap_state_db(&state_dir).unwrap();
+            let connection = open_state_db(&state_dir).unwrap();
+            if let Some(prerequisite) = prerequisite {
+                connection.execute(prerequisite, []).unwrap();
+            }
+            connection
+                .execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])
+                .unwrap();
+            drop(connection);
+            let error = bootstrap_state_db(&state_dir).unwrap_err();
+            assert!(error.to_string().contains("schema v5 layout is malformed"));
+            assert!(error.to_string().contains(column));
+            let second = bootstrap_state_db(&state_dir).unwrap_err();
+            assert!(second.to_string().contains(column));
+            let _ = fs::remove_dir_all(state_dir);
+        }
+    }
+
+    #[test]
+    fn fresh_claude_session_sync_bypasses_pane_id_cache() {
+        const A: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        const B: &str = "f18b9e1b-f638-4f38-ab94-b1fc3053dacf";
+        let state_dir = unique_temp_dir("storage-fresh-claude-id");
+        let workspace_root = unique_temp_dir("storage-fresh-claude-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        let first =
+            super::sync_tmux_claude_session_id_with(&state_dir, &workspace.id, &pane, true, |_| {
+                Ok(Some(A.to_string()))
+            })
+            .unwrap();
+        let cached =
+            super::sync_tmux_claude_session_id_with(&state_dir, &workspace.id, &pane, true, |_| {
+                panic!("cached lookup should not call resolver")
+            })
+            .unwrap();
+        pane.pane_pid = Some(9999);
+        let fresh = super::sync_tmux_claude_session_id_with(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            false,
+            |_| Ok(Some(B.to_string())),
+        )
+        .unwrap();
+        assert_eq!(first.as_deref(), Some(A));
+        assert_eq!(cached.as_deref(), Some(A));
+        assert_eq!(fresh.as_deref(), Some(B));
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn live_claude_resolution_keeps_multi_pane_identities_separate_without_sqlite() {
+        const A: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        const B: &str = "f18b9e1b-f638-4f38-ab94-b1fc3053dacf";
+        let root = unique_temp_dir("storage-live-claude-identities");
+        let projects_root = root.join("projects");
+        let cwd_a = root.join("workspace-a");
+        let cwd_b = root.join("workspace-b");
+        for (cwd, session_id) in [(&cwd_a, A), (&cwd_b, B)] {
+            let project_dir = projects_root.join(encode_claude_project_path(cwd));
+            fs::create_dir_all(&project_dir).unwrap();
+            fs::write(
+                project_dir.join(format!("{session_id}.jsonl")),
+                format!("{{\"sessionId\":\"{session_id}\"}}\n"),
+            )
+            .unwrap();
+        }
+        let mut pane_a = sample_pane();
+        pane_a.pane_pid = Some(0);
+        pane_a.current_path = cwd_a.display().to_string();
+        let mut pane_b = sample_pane();
+        pane_b.pane_id = "%2".to_string();
+        pane_b.pane_pid = Some(0);
+        pane_b.current_path = cwd_b.display().to_string();
+
+        assert_eq!(
+            super::resolve_live_claude_session_id_in(&projects_root, &pane_a)
+                .unwrap()
+                .as_deref(),
+            Some(A)
+        );
+        assert_eq!(
+            super::resolve_live_claude_session_id_in(&projects_root, &pane_b)
+                .unwrap()
+                .as_deref(),
+            Some(B)
+        );
+        assert!(!root.join("state.db").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_finalization_failure_rolls_back_observation_retirement() {
+        const SESSION: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        let state_dir = unique_temp_dir("storage-clean-rollback");
+        let workspace_root = unique_temp_dir("storage-clean-rollback-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let run = super::begin_runtime_run(&state_dir).unwrap();
+        let server = crate::tmux::TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        super::checkpoint_claude_observation(
+            &state_dir,
+            &run,
+            &workspace.id,
+            &server,
+            &pane,
+            SESSION,
+        )
+        .unwrap();
+        let connection = open_state_db(&state_dir).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_clean BEFORE UPDATE OF outcome ON runtime_runs
+                 WHEN NEW.outcome = 'clean'
+                 BEGIN SELECT RAISE(ABORT, 'induced clean failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(super::finish_runtime_run_clean(&state_dir, &run).is_err());
+        let connection = open_state_db(&state_dir).unwrap();
+        let outcome: String = connection
+            .query_row(
+                "SELECT outcome FROM runtime_runs WHERE id = ?1",
+                params![run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let observation_status: String = connection
+            .query_row(
+                "SELECT status FROM runtime_claude_observations WHERE run_id = ?1",
+                params![run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (outcome.as_str(), observation_status.as_str()),
+            ("active", "observed")
+        );
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn runtime_observation_clean_and_crash_transitions_are_atomic_and_idempotent() {
+        const SESSION: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        let state_dir = unique_temp_dir("storage-recovery-lifecycle");
+        let workspace_root = unique_temp_dir("storage-recovery-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let server = crate::tmux::TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+
+        let clean_run = super::begin_runtime_run(&state_dir).unwrap();
+        super::checkpoint_claude_observation(
+            &state_dir,
+            &clean_run,
+            &workspace.id,
+            &server,
+            &pane,
+            SESSION,
+        )
+        .unwrap();
+        super::finish_runtime_run_clean(&state_dir, &clean_run).unwrap();
+
+        let abandoned = super::begin_runtime_run(&state_dir).unwrap();
+        super::checkpoint_claude_observation(
+            &state_dir,
+            &abandoned,
+            &workspace.id,
+            &server,
+            &pane,
+            SESSION,
+        )
+        .unwrap();
+        let current = super::begin_runtime_run(&state_dir).unwrap();
+        let empty = crate::tmux::TmuxInventory {
+            server: server.clone(),
+            panes: Vec::new(),
+        };
+        assert_eq!(
+            super::reconcile_abandoned_observations(&state_dir, &current, &empty).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::reconcile_abandoned_observations(&state_dir, &current, &empty).unwrap(),
+            0
+        );
+        let recoveries = super::list_nonterminal_recoveries(&state_dir).unwrap();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].provider_session_id, SESSION);
+
+        let connection = open_state_db(&state_dir).unwrap();
+        let clean: (String, i64) = connection
+            .query_row(
+                "SELECT runs.outcome, COUNT(observations.id) FROM runtime_runs runs \
+                 LEFT JOIN runtime_claude_observations observations \
+                   ON observations.run_id = runs.id AND observations.status = 'observed' \
+                 WHERE runs.id = ?1 GROUP BY runs.id",
+                params![clean_run],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(clean, ("clean".to_string(), 0));
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn existing_raw_pane_retires_without_creating_recovery() {
+        const SESSION: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        let state_dir = unique_temp_dir("storage-process-retirement");
+        let workspace_root = unique_temp_dir("storage-process-retirement-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let run = super::begin_runtime_run(&state_dir).unwrap();
+        let server = crate::tmux::TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        super::checkpoint_claude_observation(
+            &state_dir,
+            &run,
+            &workspace.id,
+            &server,
+            &pane,
+            SESSION,
+        )
+        .unwrap();
+        pane.current_command = "bash".to_string();
+        let inventory = crate::tmux::TmuxInventory {
+            server: server.clone(),
+            panes: vec![pane.clone()],
+        };
+        assert_eq!(
+            super::record_missing_current_observations(&state_dir, &run, &inventory).unwrap(),
+            0
+        );
+        assert!(
+            super::retire_current_observation_for_pane(&state_dir, &run, &server, &pane.pane_id)
+                .unwrap()
+        );
+        assert!(
+            super::list_nonterminal_recoveries(&state_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn staging_claims_enforce_target_and_token_cas() {
+        const SESSION: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        let state_dir = unique_temp_dir("storage-recovery-claim");
+        let workspace_root = unique_temp_dir("storage-recovery-claim-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let server = crate::tmux::TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        let old_run = super::begin_runtime_run(&state_dir).unwrap();
+        super::checkpoint_claude_observation(
+            &state_dir,
+            &old_run,
+            &workspace.id,
+            &server,
+            &pane,
+            SESSION,
+        )
+        .unwrap();
+        let run = super::begin_runtime_run(&state_dir).unwrap();
+        super::reconcile_abandoned_observations(
+            &state_dir,
+            &run,
+            &crate::tmux::TmuxInventory {
+                server: server.clone(),
+                panes: Vec::new(),
+            },
+        )
+        .unwrap();
+        let recovery = super::list_nonterminal_recoveries(&state_dir)
+            .unwrap()
+            .remove(0);
+        let mut shell = pane.clone();
+        shell.current_command = "bash".to_string();
+        let target = crate::recovery::RecoveryTarget {
+            server,
+            pane: shell,
+        };
+        let command =
+            crate::recovery::build_recovery_command("claude", &recovery.original.cwd, SESSION)
+                .unwrap();
+        super::claim_recovery_for_staging(
+            &state_dir,
+            &recovery.id,
+            &run,
+            "right-token",
+            &target,
+            &command,
+        )
+        .unwrap();
+        assert!(!super::mark_recovery_staged(&state_dir, &recovery.id, "wrong-token").unwrap());
+        assert!(
+            !super::release_known_failed_staging_claim(&state_dir, &recovery.id, "wrong-token")
+                .unwrap()
+        );
+        assert!(super::mark_recovery_staged(&state_dir, &recovery.id, "right-token").unwrap());
+        assert!(!super::mark_recovery_staged(&state_dir, &recovery.id, "right-token").unwrap());
+
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn inventory_evidence_batch_handles_multiple_lifecycles_atomically() {
+        const A: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        const B: &str = "f18b9e1b-f638-4f38-ab94-b1fc3053dacf";
+        let state_dir = unique_temp_dir("storage-batched-evidence");
+        let workspace_root = unique_temp_dir("storage-batched-evidence-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let server = crate::tmux::TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut missing = sample_pane();
+        missing.current_path = workspace_root.display().to_string();
+        let mut surviving_shell = missing.clone();
+        surviving_shell.pane_id = "%2".to_string();
+        let old_run = super::begin_runtime_run(&state_dir).unwrap();
+        for pane in [&missing, &surviving_shell] {
+            super::checkpoint_claude_observation(
+                &state_dir,
+                &old_run,
+                &workspace.id,
+                &server,
+                pane,
+                A,
+            )
+            .unwrap();
+        }
+        let current_run = super::begin_runtime_run(&state_dir).unwrap();
+        let mut current_shell = missing.clone();
+        current_shell.pane_id = "%3".to_string();
+        let mut replacement = missing.clone();
+        replacement.pane_id = "%4".to_string();
+        for pane in [&current_shell, &replacement] {
+            super::checkpoint_claude_observation(
+                &state_dir,
+                &current_run,
+                &workspace.id,
+                &server,
+                pane,
+                A,
+            )
+            .unwrap();
+        }
+        surviving_shell.current_command = "bash".to_string();
+        current_shell.current_command = "zsh".to_string();
+        let inventory = crate::tmux::TmuxInventory {
+            server: server.clone(),
+            panes: vec![surviving_shell, current_shell, replacement.clone()],
+        };
+        let result = super::apply_recovery_inventory_evidence(
+            &state_dir,
+            &current_run,
+            &inventory,
+            &[super::VerifiedProviderRecoveryEvidence {
+                workspace_id: workspace.id.clone(),
+                pane: replacement,
+                provider: "claude".to_string(),
+                provider_session_id: B.to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.abandoned_crashed, 1);
+        assert_eq!(result.current_crashed, 0);
+        assert_eq!(result.retired, 1);
+        assert_eq!(result.checkpointed, 1);
+        let connection = open_state_db(&state_dir).unwrap();
+        let recoveries: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_recoveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let live_a: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_claude_observations WHERE run_id = ?1 AND status = 'observed' AND provider_session_id = ?2",
+                params![current_run, A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live_b: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_claude_observations WHERE run_id = ?1 AND status = 'observed' AND provider_session_id = ?2",
+                params![current_run, B],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((recoveries, live_a, live_b), (1, 0, 1));
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn independent_claims_have_one_winner_and_uncertain_owns_target() {
+        let fixture = recovery_fixture("concurrent-claims", 2);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for (index, recovery) in fixture.recoveries.iter().cloned().enumerate() {
+            let state_dir = fixture.state_dir.clone();
+            let run = fixture.run.clone();
+            let target = fixture.target.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let command = crate::recovery::build_recovery_command(
+                    "claude",
+                    &recovery.original.cwd,
+                    &recovery.provider_session_id,
+                )
+                .unwrap();
+                barrier.wait();
+                super::claim_recovery_for_staging(
+                    &state_dir,
+                    &recovery.id,
+                    &run,
+                    &format!("token-{index}"),
+                    &target,
+                    &command,
+                )
+                .map(|_| (recovery.id, format!("token-{index}")))
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let (winner_id, winner_token) = results.into_iter().find_map(Result::ok).unwrap();
+        assert!(
+            super::mark_recovery_uncertain(&fixture.state_dir, &winner_id, &winner_token).unwrap()
+        );
+        let loser = fixture
+            .recoveries
+            .iter()
+            .find(|recovery| recovery.id != winner_id)
+            .unwrap();
+        let command = crate::recovery::build_recovery_command(
+            "claude",
+            &loser.original.cwd,
+            &loser.provider_session_id,
+        )
+        .unwrap();
+        assert!(
+            super::claim_recovery_for_staging(
+                &fixture.state_dir,
+                &loser.id,
+                &fixture.run,
+                "loser-retry",
+                &fixture.target,
+                &command,
+            )
+            .is_err()
+        );
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn staging_claim_rejects_clean_runtime_owner() {
+        let fixture = recovery_fixture("clean-owner-claim", 1);
+        super::finish_runtime_run_clean(&fixture.state_dir, &fixture.run).unwrap();
+        let recovery = &fixture.recoveries[0];
+        let command = crate::recovery::build_recovery_command(
+            "claude",
+            &recovery.original.cwd,
+            &recovery.provider_session_id,
+        )
+        .unwrap();
+        let error = super::claim_recovery_for_staging(
+            &fixture.state_dir,
+            &recovery.id,
+            &fixture.run,
+            "token",
+            &fixture.target,
+            &command,
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 409);
+        assert_eq!(
+            super::load_recovery(&fixture.state_dir, &recovery.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            crate::recovery::RecoveryLifecycle::Crashed
+        );
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn replacement_server_reuse_crashes_a_and_checkpoints_fresh_b() {
+        const A: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        const B: &str = "f18b9e1b-f638-4f38-ab94-b1fc3053dacf";
+        let state_dir = unique_temp_dir("storage-server-reuse-fresh-id");
+        let workspace_root = unique_temp_dir("storage-server-reuse-fresh-id-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let old_server = TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 100,
+            start_time: 100,
+        };
+        let new_server = TmuxServerIdentity {
+            socket_path: old_server.socket_path.clone(),
+            pid: 200,
+            start_time: 200,
+        };
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        let run = super::begin_runtime_run(&state_dir).unwrap();
+        super::checkpoint_claude_observation(
+            &state_dir,
+            &run,
+            &workspace.id,
+            &old_server,
+            &pane,
+            A,
+        )
+        .unwrap();
+        let result = super::apply_recovery_inventory_evidence(
+            &state_dir,
+            &run,
+            &crate::tmux::TmuxInventory {
+                server: new_server,
+                panes: vec![pane.clone()],
+            },
+            &[super::VerifiedProviderRecoveryEvidence {
+                workspace_id: workspace.id,
+                pane,
+                provider: "claude".to_string(),
+                provider_session_id: B.to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.current_crashed, 1);
+        let connection = open_state_db(&state_dir).unwrap();
+        let live_a: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_claude_observations WHERE status = 'observed' AND provider_session_id = ?1",
+                params![A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live_b: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_claude_observations WHERE status = 'observed' AND provider_session_id = ?1",
+                params![B],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((live_a, live_b), (0, 1));
+        let _ = fs::remove_dir_all(state_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn stale_uncertain_resolution_and_dismissal_follow_lifecycle_contract() {
+        let fixture = recovery_fixture("lifecycle-contract", 5);
+        let first = &fixture.recoveries[0];
+        let command = crate::recovery::build_recovery_command(
+            "claude",
+            &first.original.cwd,
+            &first.provider_session_id,
+        )
+        .unwrap();
+        super::claim_recovery_for_staging(
+            &fixture.state_dir,
+            &first.id,
+            &fixture.run,
+            "stale-token",
+            &fixture.target,
+            &command,
+        )
+        .unwrap();
+        let next_run = super::begin_runtime_run(&fixture.state_dir).unwrap();
+        assert_eq!(
+            super::mark_stale_staging_uncertain(&fixture.state_dir, &next_run).unwrap(),
+            1
+        );
+        assert!(
+            !super::release_known_failed_staging_claim(
+                &fixture.state_dir,
+                &first.id,
+                "stale-token"
+            )
+            .unwrap()
+        );
+        assert!(
+            super::claim_recovery_for_staging(
+                &fixture.state_dir,
+                &first.id,
+                &next_run,
+                "retry-token",
+                &fixture.target,
+                &command,
+            )
+            .is_err()
+        );
+
+        let mut server_mismatches = Vec::new();
+        let mut wrong_server = fixture.target.server.clone();
+        wrong_server.socket_path.push_str("-wrong");
+        server_mismatches.push(("socket path", wrong_server));
+        let mut wrong_server = fixture.target.server.clone();
+        wrong_server.pid += 1;
+        server_mismatches.push(("server pid", wrong_server));
+        let mut wrong_server = fixture.target.server.clone();
+        wrong_server.start_time += 1;
+        server_mismatches.push(("server start time", wrong_server));
+        for (label, server) in server_mismatches {
+            assert_eq!(
+                super::resolve_recovery_for_live_claude_session(
+                    &fixture.state_dir,
+                    &server,
+                    &fixture.target.pane,
+                    &first.provider_session_id,
+                )
+                .unwrap(),
+                0,
+                "{label} mismatch must not resolve"
+            );
+        }
+
+        let mut pane_mismatches = Vec::new();
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.pane_id.push_str("-wrong");
+        pane_mismatches.push(("pane id", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.session_id.push_str("-wrong");
+        pane_mismatches.push(("session id", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.window_id.push_str("-wrong");
+        pane_mismatches.push(("window id", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.session_name.push_str("-wrong");
+        pane_mismatches.push(("session name", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.window_index += 1;
+        pane_mismatches.push(("window index", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.window_name.push_str("-wrong");
+        pane_mismatches.push(("window name", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.pane_index += 1;
+        pane_mismatches.push(("pane index", wrong_pane));
+        let mut wrong_pane = fixture.target.pane.clone();
+        wrong_pane.current_path.push_str("-wrong");
+        pane_mismatches.push(("cwd", wrong_pane));
+        for (label, pane) in pane_mismatches {
+            assert_eq!(
+                super::resolve_recovery_for_live_claude_session(
+                    &fixture.state_dir,
+                    &fixture.target.server,
+                    &pane,
+                    &first.provider_session_id,
+                )
+                .unwrap(),
+                0,
+                "{label} mismatch must not resolve"
+            );
+        }
+        assert_eq!(
+            super::resolve_recovery_for_live_claude_session(
+                &fixture.state_dir,
+                &fixture.target.server,
+                &fixture.target.pane,
+                "f18b9e1b-f638-4f38-ab94-b1fc3053dacf",
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            super::resolve_recovery_for_live_claude_session(
+                &fixture.state_dir,
+                &fixture.target.server,
+                &fixture.target.pane,
+                &first.provider_session_id,
+            )
+            .unwrap(),
+            1
+        );
+
+        let second = &fixture.recoveries[1];
+        assert!(super::dismiss_recovery(&fixture.state_dir, &second.id).unwrap());
+        assert!(!super::dismiss_recovery(&fixture.state_dir, &second.id).unwrap());
+        let third = &fixture.recoveries[2];
+        let third_command = crate::recovery::build_recovery_command(
+            "claude",
+            &third.original.cwd,
+            &third.provider_session_id,
+        )
+        .unwrap();
+        super::claim_recovery_for_staging(
+            &fixture.state_dir,
+            &third.id,
+            &next_run,
+            "active-token",
+            &RecoveryTarget {
+                server: fixture.target.server.clone(),
+                pane: {
+                    let mut pane = fixture.target.pane.clone();
+                    pane.pane_id = "%other".to_string();
+                    pane
+                },
+            },
+            &third_command,
+        )
+        .unwrap();
+        assert!(super::dismiss_recovery(&fixture.state_dir, &third.id).is_err());
+        assert!(
+            super::mark_recovery_staged(&fixture.state_dir, &third.id, "active-token").unwrap()
+        );
+        assert!(super::dismiss_recovery(&fixture.state_dir, &third.id).unwrap());
+
+        let fourth = &fixture.recoveries[3];
+        let fourth_command = crate::recovery::build_recovery_command(
+            "claude",
+            &fourth.original.cwd,
+            &fourth.provider_session_id,
+        )
+        .unwrap();
+        super::claim_recovery_for_staging(
+            &fixture.state_dir,
+            &fourth.id,
+            &next_run,
+            "uncertain-token",
+            &RecoveryTarget {
+                server: fixture.target.server.clone(),
+                pane: {
+                    let mut pane = fixture.target.pane.clone();
+                    pane.pane_id = "%uncertain".to_string();
+                    pane
+                },
+            },
+            &fourth_command,
+        )
+        .unwrap();
+        assert!(
+            super::mark_recovery_uncertain(&fixture.state_dir, &fourth.id, "uncertain-token")
+                .unwrap()
+        );
+        assert!(super::dismiss_recovery(&fixture.state_dir, &fourth.id).unwrap());
+
+        let fifth = &fixture.recoveries[4];
+        let fifth_command = crate::recovery::build_recovery_command(
+            "claude",
+            &fifth.original.cwd,
+            &fifth.provider_session_id,
+        )
+        .unwrap();
+        let fifth_target = RecoveryTarget {
+            server: fixture.target.server.clone(),
+            pane: {
+                let mut pane = fixture.target.pane.clone();
+                pane.pane_id = "%staged-resolve".to_string();
+                pane
+            },
+        };
+        super::claim_recovery_for_staging(
+            &fixture.state_dir,
+            &fifth.id,
+            &next_run,
+            "staged-token",
+            &fifth_target,
+            &fifth_command,
+        )
+        .unwrap();
+        assert!(
+            super::mark_recovery_staged(&fixture.state_dir, &fifth.id, "staged-token").unwrap()
+        );
+        assert_eq!(
+            super::resolve_recovery_for_live_claude_session(
+                &fixture.state_dir,
+                &fifth_target.server,
+                &fifth_target.pane,
+                &fifth.provider_session_id,
+            )
+            .unwrap(),
+            1
+        );
+        fixture.cleanup();
+    }
+
+    #[test]
     fn encode_claude_project_path_rewrites_slashes() {
         assert_eq!(
             encode_claude_project_path(std::path::Path::new("/home/colin/Projects/botctl")),
@@ -2296,6 +4601,72 @@ mod tests {
             pane_active: true,
             cursor_x: Some(1),
             cursor_y: Some(2),
+        }
+    }
+
+    struct RecoveryFixture {
+        state_dir: PathBuf,
+        workspace_root: PathBuf,
+        run: String,
+        target: RecoveryTarget,
+        recoveries: Vec<RecoveryRecord>,
+    }
+
+    impl RecoveryFixture {
+        fn cleanup(&self) {
+            let _ = fs::remove_dir_all(&self.state_dir);
+            let _ = fs::remove_dir_all(&self.workspace_root);
+        }
+    }
+
+    fn recovery_fixture(label: &str, count: usize) -> RecoveryFixture {
+        const SESSION: &str = "4d8dc7f8-a842-438a-b2c2-4d39ad509a53";
+        let state_dir = unique_temp_dir(&format!("storage-{label}"));
+        let workspace_root = unique_temp_dir(&format!("storage-{label}-workspace"));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = resolve_workspace_for_path(&state_dir, &workspace_root).unwrap();
+        let server = TmuxServerIdentity {
+            socket_path: "/tmp/tmux/default".to_string(),
+            pid: 123,
+            start_time: 456,
+        };
+        let mut pane = sample_pane();
+        pane.current_path = workspace_root.display().to_string();
+        for _ in 0..count {
+            let old_run = super::begin_runtime_run(&state_dir).unwrap();
+            super::checkpoint_claude_observation(
+                &state_dir,
+                &old_run,
+                &workspace.id,
+                &server,
+                &pane,
+                SESSION,
+            )
+            .unwrap();
+        }
+        let run = super::begin_runtime_run(&state_dir).unwrap();
+        super::reconcile_abandoned_observations(
+            &state_dir,
+            &run,
+            &crate::tmux::TmuxInventory {
+                server: server.clone(),
+                panes: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut target_pane = pane;
+        target_pane.current_command = "bash".to_string();
+        let recoveries = super::list_nonterminal_recoveries(&state_dir).unwrap();
+        assert_eq!(recoveries.len(), count);
+        RecoveryFixture {
+            state_dir,
+            workspace_root,
+            run,
+            target: RecoveryTarget {
+                server,
+                pane: target_pane,
+            },
+            recoveries,
         }
     }
 

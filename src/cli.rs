@@ -1010,7 +1010,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
         "dashboard-keys" => {
             return Some(topic_page(
                 "dashboard-keys",
-                "Dashboard keys are shown in the TUI footer. Typical flow: select pane, Enter to navigate, y to toggle yolo where supported, q to quit.",
+                "Dashboard keys are shown in the TUI footer. Select a live pane or Claude recovery with arrows/j/k. Lowercase r refreshes. On a ready crashed recovery, uppercase R stages the exact displayed command without pressing Enter. Uppercase D dismisses a selected crashed, staged, or uncertain recovery. Enter only navigates to a live pane or uniquely matched recovery target; it never stages or submits a recovery command. Inspect a staged command in the target pane and press Enter yourself. Pane-only yolo and unstick actions ignore recovery rows.",
             ));
         }
         "opencode" => {
@@ -3118,6 +3118,21 @@ mod tests {
         assert!(usage.contains("1 runtime failure"));
         assert!(usage.contains("2 usage error or guarded refusal"));
         assert!(usage.contains("130 interrupted"));
+    }
+
+    #[test]
+    fn dashboard_keys_help_separates_recovery_staging_from_navigation() {
+        let usage = super::usage_for(&super::HelpArgs {
+            topic: Some(String::from("dashboard-keys")),
+            color: false,
+        });
+
+        assert!(usage.contains("uppercase R stages"));
+        assert!(usage.contains("without pressing Enter"));
+        assert!(usage.contains("Enter only navigates"));
+        assert!(usage.contains("press Enter yourself"));
+        assert!(usage.contains("Lowercase r refreshes"));
+        assert!(usage.contains("Uppercase D dismisses"));
     }
 
     #[test]

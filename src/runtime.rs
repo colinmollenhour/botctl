@@ -7,7 +7,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::app::{
     ACTION_GUARD_HISTORY_LINES, AppError, AppResult, ContinueOutcome, InspectedPane,
@@ -28,12 +29,23 @@ use crate::automation::{AutomationAction, GuardedWorkflow, KeybindingsInspection
 use crate::classifier::{Classification, SIGNAL_CODEX_KEYWORDS, SessionState};
 use crate::last_message::resolve_codex_session_id_for_pane;
 use crate::observe::{ControlEvent, decode_tmux_escaped, parse_control_line};
+use crate::recovery::{
+    RecoveryLifecycle, RecoveryMatchState, RecoveryTarget, build_recovery_command,
+    match_recoveries, offer_from_record,
+};
 use crate::screen_model::ScreenModel;
 use crate::storage::{
-    TmuxRuntimeDurations, WorkspaceRecord, list_babysit_registration_pane_ids, resolve_workspace,
-    resolve_workspace_for_path, sync_tmux_claude_session_id, sync_tmux_runtime_state,
+    TmuxRuntimeDurations, VerifiedProviderRecoveryEvidence, WorkspaceRecord,
+    apply_recovery_inventory_evidence, begin_runtime_run, claim_recovery_for_staging,
+    dismiss_recovery, finish_runtime_run_clean, list_babysit_registration_pane_ids,
+    list_nonterminal_recoveries, load_recovery, mark_recovery_staged, mark_recovery_uncertain,
+    mark_stale_staging_uncertain, release_known_failed_staging_claim,
+    resolve_live_claude_session_id, resolve_workspace, resolve_workspace_for_path,
+    sync_tmux_claude_session_id, sync_tmux_runtime_state,
 };
-use crate::tmux::{ControlModeReceive, TmuxClient, TmuxPane};
+use crate::tmux::{ControlModeReceive, TmuxClient, TmuxInventory, TmuxPane};
+
+pub use crate::recovery::RuntimeRecoveryOffer;
 use crate::yolo::{YoloRecord, disable_yolo_record, read_yolo_record, write_yolo_record};
 
 const SOCKET_FILENAME: &str = "runtime.sock";
@@ -51,6 +63,83 @@ const OBSERVER_CHANNEL_CAPACITY: usize = 256;
 const OBSERVER_BATCH_SIZE: usize = 256;
 const SUBSCRIPTION_WRITE_TIMEOUT_MS: u64 = 1_000;
 const DIAGNOSTIC_THROTTLE_MS: u64 = 30_000;
+pub const RUNTIME_PROTOCOL_VERSION: u32 = 2;
+pub const RUNTIME_SCHEMA_VERSION: i64 = crate::storage::CURRENT_SCHEMA_VERSION;
+
+struct ShutdownState {
+    result: Option<Result<(), String>>,
+    acknowledged: bool,
+}
+
+#[derive(Clone)]
+struct MutationGate {
+    state: Arc<(Mutex<MutationState>, Condvar)>,
+}
+
+struct MutationState {
+    stopping: bool,
+    active: usize,
+}
+
+struct MutationPermit {
+    gate: MutationGate,
+}
+
+impl MutationGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(MutationState {
+                    stopping: false,
+                    active: 0,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn acquire(&self) -> AppResult<MutationPermit> {
+        let (state, _) = &*self.state;
+        let mut state = state.lock().unwrap();
+        if state.stopping {
+            return Err(AppError::with_exit_code(
+                "runtime shutdown has begun; refusing new mutating request",
+                409,
+            ));
+        }
+        state.active += 1;
+        Ok(MutationPermit { gate: self.clone() })
+    }
+
+    fn begin_stop(&self) -> bool {
+        let (state, _) = &*self.state;
+        let mut state = state.lock().unwrap();
+        if state.stopping {
+            return false;
+        }
+        state.stopping = true;
+        true
+    }
+
+    fn wait_for_drain(&self) {
+        let (state, ready) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while state.active != 0 {
+            state = ready.wait(state).unwrap();
+        }
+    }
+}
+
+impl Drop for MutationPermit {
+    fn drop(&mut self) {
+        let (state, ready) = &*self.gate.state;
+        let mut state = state.lock().unwrap();
+        state.active -= 1;
+        if state.active == 0 {
+            ready.notify_all();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeServerConfig {
@@ -61,11 +150,27 @@ pub struct RuntimeServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    pub protocol_version: u32,
+    pub schema_version: i64,
     pub socket_path: String,
     pub boot_time_unix_ms: i64,
     pub revision: u64,
     pub pane_count: usize,
     pub tmux_socket_path: Option<String>,
+}
+
+impl RuntimeStatus {
+    pub fn is_compatible(&self) -> bool {
+        self.protocol_version == RUNTIME_PROTOCOL_VERSION
+            && self.schema_version == RUNTIME_SCHEMA_VERSION
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeProbe {
+    Compatible(RuntimeStatus),
+    Incompatible(String),
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +256,13 @@ enum RuntimeRequest {
         prompt_text: String,
         submit_delay_ms: u64,
     },
+    ListRecoveries,
+    StageRecovery {
+        recovery_id: String,
+    },
+    DismissRecovery {
+        recovery_id: String,
+    },
     Stop,
     Subscribe,
 }
@@ -164,11 +276,20 @@ enum RuntimeResponse {
     Pane { pane: Option<RuntimePaneSnapshot> },
     YoloUpdated { updated: Vec<String> },
     Action { result: RuntimeActionResult },
+    Recoveries {
+        recoveries: Vec<RuntimeRecoveryOffer>,
+    },
+    RecoveryStaged {
+        recovery: RuntimeRecoveryOffer,
+    },
+    RecoveryDismissed {
+        recovery_id: String,
+    },
     Error { message: String, exit_code: i32 },
     Event { event: RuntimeEvent },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RuntimeClient {
     socket_path: PathBuf,
 }
@@ -189,6 +310,65 @@ impl RuntimeClient {
         match self.request(RuntimeRequest::GetStatus)? {
             RuntimeResponse::Status { status } => Ok(status),
             other => Err(unexpected_response("status", &other)),
+        }
+    }
+
+    pub fn probe(&self) -> AppResult<RuntimeProbe> {
+        let mut stream = match UnixStream::connect(&self.socket_path) {
+            Ok(stream) => stream,
+            Err(_) => return Ok(RuntimeProbe::Unavailable),
+        };
+        write_message(&mut stream, &RuntimeRequest::GetStatus)?;
+        let mut line = String::new();
+        if BufReader::new(stream).read_line(&mut line)? == 0 {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime closed the capability handshake".to_string(),
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(line.trim_end()).map_err(|error| {
+            AppError::new(format!(
+                "failed to decode runtime capability response: {error}"
+            ))
+        })?;
+        let Some(status) = value.get("status") else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime status omitted capability metadata".to_string(),
+            ));
+        };
+        let Some(protocol_version) = status
+            .get("protocol_version")
+            .and_then(|value| value.as_u64())
+        else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime status has no protocol_version; restart the runtime with this botctl version"
+                    .to_string(),
+            ));
+        };
+        let Some(schema_version) = status
+            .get("schema_version")
+            .and_then(|value| value.as_i64())
+        else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime status has no schema_version; restart the runtime with this botctl version"
+                    .to_string(),
+            ));
+        };
+        let response: RuntimeResponse = serde_json::from_value(value).map_err(|error| {
+            AppError::new(format!(
+                "failed to decode runtime capability response: {error}"
+            ))
+        })?;
+        let RuntimeResponse::Status { status } = response else {
+            return Ok(RuntimeProbe::Incompatible(
+                "runtime returned an unexpected capability response".to_string(),
+            ));
+        };
+        if status.is_compatible() {
+            Ok(RuntimeProbe::Compatible(status))
+        } else {
+            Ok(RuntimeProbe::Incompatible(format!(
+                "runtime protocol/schema is {protocol_version}/{schema_version}, but this botctl requires {RUNTIME_PROTOCOL_VERSION}/{RUNTIME_SCHEMA_VERSION}"
+            )))
         }
     }
 
@@ -286,6 +466,31 @@ impl RuntimeClient {
         Ok(RuntimeSubscription {
             reader: BufReader::new(stream),
         })
+    }
+
+    pub fn list_recoveries(&self) -> AppResult<Vec<RuntimeRecoveryOffer>> {
+        match self.request(RuntimeRequest::ListRecoveries)? {
+            RuntimeResponse::Recoveries { recoveries } => Ok(recoveries),
+            other => Err(unexpected_response("recoveries", &other)),
+        }
+    }
+
+    pub fn stage_recovery(&self, recovery_id: &str) -> AppResult<RuntimeRecoveryOffer> {
+        match self.request(RuntimeRequest::StageRecovery {
+            recovery_id: recovery_id.to_string(),
+        })? {
+            RuntimeResponse::RecoveryStaged { recovery } => Ok(recovery),
+            other => Err(unexpected_response("stage_recovery", &other)),
+        }
+    }
+
+    pub fn dismiss_recovery(&self, recovery_id: &str) -> AppResult<()> {
+        match self.request(RuntimeRequest::DismissRecovery {
+            recovery_id: recovery_id.to_string(),
+        })? {
+            RuntimeResponse::RecoveryDismissed { .. } => Ok(()),
+            other => Err(unexpected_response("dismiss_recovery", &other)),
+        }
     }
 
     pub fn stop(&self) -> AppResult<()> {
@@ -390,8 +595,19 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
-    let shared = Arc::new(Mutex::new(RuntimeShared::new(&socket_path)));
+    let run_id = begin_runtime_run(&config.state_dir)?;
+    mark_stale_staging_uncertain(&config.state_dir, &run_id)?;
+    let shared = Arc::new(Mutex::new(RuntimeShared::new(&socket_path, run_id.clone())));
     let stop = Arc::new(AtomicBool::new(false));
+    let graceful_stop = Arc::new(AtomicBool::new(false));
+    let mutation_gate = MutationGate::new();
+    let shutdown_result = Arc::new((
+        Mutex::new(ShutdownState {
+            result: None,
+            acknowledged: false,
+        }),
+        Condvar::new(),
+    ));
     let observer = spawn_observer(config.clone(), Arc::clone(&shared), Arc::clone(&stop));
     emit_shared_event(
         &shared,
@@ -408,8 +624,19 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
                 let shared = Arc::clone(&shared);
                 let config = config.clone();
                 let stop = Arc::clone(&stop);
+                let graceful_stop = Arc::clone(&graceful_stop);
+                let shutdown_result = Arc::clone(&shutdown_result);
+                let mutation_gate = mutation_gate.clone();
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, shared, config, Arc::clone(&stop)) {
+                    if let Err(error) = handle_client(
+                        stream,
+                        shared,
+                        config,
+                        Arc::clone(&stop),
+                        graceful_stop,
+                        shutdown_result,
+                        mutation_gate,
+                    ) {
                         eprintln!("warning: runtime client failed: {error}");
                     }
                 });
@@ -419,18 +646,49 @@ pub fn run_runtime_server(config: RuntimeServerConfig) -> AppResult<String> {
             }
             Err(error) => {
                 stop.store(true, Ordering::SeqCst);
+                mutation_gate.begin_stop();
                 let _ = observer.join();
+                mutation_gate.wait_for_drain();
+                let message = format!("runtime socket accept failed: {error}");
+                if graceful_stop.load(Ordering::SeqCst) {
+                    let (shutdown, ready) = &*shutdown_result;
+                    let mut shutdown = shutdown.lock().unwrap();
+                    shutdown.result = Some(Err(message.clone()));
+                    ready.notify_all();
+                    while !shutdown.acknowledged {
+                        shutdown = ready.wait(shutdown).unwrap();
+                    }
+                }
                 let _ = fs::remove_file(&socket_path);
-                return Err(AppError::new(format!(
-                    "runtime socket accept failed: {error}"
-                )));
+                return Err(AppError::new(message));
             }
         }
     }
 
-    let _ = observer.join();
+    let observer_result = observer
+        .join()
+        .map_err(|_| AppError::new("runtime observer thread panicked"));
+    mutation_gate.wait_for_drain();
+    let finalization = if graceful_stop.load(Ordering::SeqCst) {
+        observer_result.and_then(|_| finish_runtime_run_clean(&config.state_dir, &run_id))
+    } else {
+        observer_result
+    };
+    if graceful_stop.load(Ordering::SeqCst) {
+        let mapped = match &finalization {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        let (shutdown, ready) = &*shutdown_result;
+        let mut shutdown = shutdown.lock().unwrap();
+        shutdown.result = Some(mapped);
+        ready.notify_all();
+        while !shutdown.acknowledged {
+            shutdown = ready.wait(shutdown).unwrap();
+        }
+    }
     let _ = fs::remove_file(&socket_path);
-    Ok(String::new())
+    finalization.map(|_| String::new())
 }
 
 #[derive(Debug)]
@@ -442,10 +700,12 @@ struct RuntimeShared {
     panes: BTreeMap<String, TrackedPane>,
     subscribers: Vec<mpsc::SyncSender<RuntimeEvent>>,
     in_flight_actions: HashSet<String>,
+    in_flight_recoveries: HashSet<String>,
+    run_id: String,
 }
 
 impl RuntimeShared {
-    fn new(socket_path: &Path) -> Self {
+    fn new(socket_path: &Path, run_id: String) -> Self {
         Self {
             socket_path: socket_path.display().to_string(),
             boot_time_unix_ms: now_unix_ms(),
@@ -454,11 +714,15 @@ impl RuntimeShared {
             panes: BTreeMap::new(),
             subscribers: Vec::new(),
             in_flight_actions: HashSet::new(),
+            in_flight_recoveries: HashSet::new(),
+            run_id,
         }
     }
 
     fn status(&self) -> RuntimeStatus {
         RuntimeStatus {
+            protocol_version: RUNTIME_PROTOCOL_VERSION,
+            schema_version: RUNTIME_SCHEMA_VERSION,
             socket_path: self.socket_path.clone(),
             boot_time_unix_ms: self.boot_time_unix_ms,
             revision: self.next_revision,
@@ -745,6 +1009,9 @@ fn handle_client(
     shared: Arc<Mutex<RuntimeShared>>,
     config: RuntimeServerConfig,
     stop: Arc<AtomicBool>,
+    graceful_stop: Arc<AtomicBool>,
+    shutdown_result: Arc<(Mutex<ShutdownState>, Condvar)>,
+    mutation_gate: MutationGate,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
     let request = read_request(&mut reader)?;
@@ -785,6 +1052,7 @@ fn handle_client(
             all,
             enabled,
         } => {
+            let _mutation = mutation_gate.acquire()?;
             let updated =
                 handle_set_yolo(&config.state_dir, &shared, pane_id, workspace, all, enabled)?;
             write_message(&mut stream, &RuntimeResponse::YoloUpdated { updated })
@@ -794,6 +1062,7 @@ fn handle_client(
             session_name,
             action,
         } => {
+            let _mutation = mutation_gate.acquire()?;
             let result =
                 handle_run_action(&config, &shared, &pane_id, session_name.as_deref(), &action)?;
             write_message(&mut stream, &RuntimeResponse::Action { result })
@@ -805,6 +1074,7 @@ fn handle_client(
             prompt_text,
             submit_delay_ms,
         } => {
+            let _mutation = mutation_gate.acquire()?;
             let result = handle_submit_prompt(
                 &config,
                 &shared,
@@ -816,9 +1086,70 @@ fn handle_client(
             )?;
             write_message(&mut stream, &RuntimeResponse::Action { result })
         }
+        RuntimeRequest::ListRecoveries => {
+            match recovery_offers(&config.state_dir, &runtime_tmux_client()) {
+                Ok(recoveries) => {
+                    write_message(&mut stream, &RuntimeResponse::Recoveries { recoveries })
+                }
+                Err(error) => write_runtime_error(&mut stream, &error),
+            }
+        }
+        RuntimeRequest::StageRecovery { recovery_id } => {
+            let _mutation = match mutation_gate.acquire() {
+                Ok(permit) => permit,
+                Err(error) => return write_runtime_error(&mut stream, &error),
+            };
+            match handle_stage_recovery(&config, &shared, &recovery_id) {
+                Ok(recovery) => {
+                    write_message(&mut stream, &RuntimeResponse::RecoveryStaged { recovery })
+                }
+                Err(error) => write_runtime_error(&mut stream, &error),
+            }
+        }
+        RuntimeRequest::DismissRecovery { recovery_id } => {
+            let _mutation = match mutation_gate.acquire() {
+                Ok(permit) => permit,
+                Err(error) => return write_runtime_error(&mut stream, &error),
+            };
+            let result = RecoveryGuard::acquire(&shared, &recovery_id)
+                .and_then(|_guard| dismiss_recovery(&config.state_dir, &recovery_id));
+            match result {
+                Ok(_) => write_message(
+                    &mut stream,
+                    &RuntimeResponse::RecoveryDismissed { recovery_id },
+                ),
+                Err(error) => write_runtime_error(&mut stream, &error),
+            }
+        }
         RuntimeRequest::Stop => {
+            if !mutation_gate.begin_stop() || graceful_stop.swap(true, Ordering::SeqCst) {
+                return write_message(
+                    &mut stream,
+                    &RuntimeResponse::Error {
+                        message: "runtime stop is already in progress".to_string(),
+                        exit_code: 409,
+                    },
+                );
+            }
             stop.store(true, Ordering::SeqCst);
-            write_message(&mut stream, &RuntimeResponse::Ok)
+            let (shutdown, ready) = &*shutdown_result;
+            let mut shutdown = shutdown.lock().unwrap();
+            while shutdown.result.is_none() {
+                shutdown = ready.wait(shutdown).unwrap();
+            }
+            let result = shutdown.result.take().unwrap_or(Ok(()));
+            shutdown.acknowledged = true;
+            ready.notify_all();
+            match result {
+                Ok(()) => write_message(&mut stream, &RuntimeResponse::Ok),
+                Err(message) => write_message(
+                    &mut stream,
+                    &RuntimeResponse::Error {
+                        message,
+                        exit_code: 1,
+                    },
+                ),
+            }
         }
         RuntimeRequest::Subscribe => handle_subscribe(stream, &shared),
     }
@@ -1615,18 +1946,312 @@ fn mark_stream_activity(tracked: &mut TrackedPane) {
     tracked.last_stream_activity = Some(now);
 }
 
+fn recovery_offers(state_dir: &Path, client: &TmuxClient) -> AppResult<Vec<RuntimeRecoveryOffer>> {
+    let inventory = client.inventory()?;
+    recovery_offers_for_inventory(state_dir, &inventory)
+}
+
+fn recovery_offers_for_inventory(
+    state_dir: &Path,
+    inventory: &TmuxInventory,
+) -> AppResult<Vec<RuntimeRecoveryOffer>> {
+    let mut recoveries = list_nonterminal_recoveries(state_dir)?;
+    let mut stale_targets = BTreeSet::new();
+    for recovery in &mut recoveries {
+        let Some(target) = recovery.target.as_mut() else {
+            continue;
+        };
+        if let Some(current) = verified_persisted_target(inventory, target) {
+            target.pane = current.clone();
+        } else {
+            stale_targets.insert(recovery.id.clone());
+            recovery.target = None;
+        }
+    }
+    let mut matched = match_recoveries(&recoveries, inventory);
+    Ok(recoveries
+        .iter()
+        .filter_map(|record| {
+            matched.remove(&record.id).map(|mut result| {
+                if stale_targets.contains(&record.id) {
+                    result.target = None;
+                    result.disabled_reason = Some(
+                        "persisted recovery target is not verified in the current stable tmux inventory; navigation is disabled"
+                            .to_string(),
+                    );
+                }
+                offer_from_record(record, result)
+            })
+        })
+        .collect())
+}
+
+fn verified_persisted_target<'a>(
+    inventory: &'a TmuxInventory,
+    target: &RecoveryTarget,
+) -> Option<&'a TmuxPane> {
+    if target.server != inventory.server {
+        return None;
+    }
+    inventory.panes.iter().find(|pane| {
+        pane.pane_id == target.pane.pane_id
+            && pane.session_id == target.pane.session_id
+            && pane.window_id == target.pane.window_id
+            && pane.session_name == target.pane.session_name
+            && pane.window_index == target.pane.window_index
+            && pane.window_name == target.pane.window_name
+            && pane.pane_index == target.pane.pane_index
+            && pane.current_path == target.pane.current_path
+    })
+}
+
+fn handle_stage_recovery(
+    config: &RuntimeServerConfig,
+    shared: &Arc<Mutex<RuntimeShared>>,
+    recovery_id: &str,
+) -> AppResult<RuntimeRecoveryOffer> {
+    let _recovery_guard = RecoveryGuard::acquire(shared, recovery_id)?;
+    let client = runtime_tmux_client();
+    let run_id = shared.lock().unwrap().run_id.clone();
+    let store = SqliteRecoveryStageStore {
+        state_dir: &config.state_dir,
+    };
+    let hooks = RuntimeRecoveryStageHooks { shared };
+    let staged = stage_recovery_with(&client, &store, &hooks, &run_id, recovery_id)?;
+    Ok(offer_from_record(
+        &staged,
+        crate::recovery::RecoveryMatch {
+            state: RecoveryMatchState::NotStageable,
+            target: staged.target.clone(),
+            disabled_reason: Some("command was staged without Enter".to_string()),
+        },
+    ))
+}
+
+trait RecoveryStageTransport {
+    fn inventory(&self) -> AppResult<TmuxInventory>;
+    fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()>;
+}
+
+impl RecoveryStageTransport for TmuxClient {
+    fn inventory(&self) -> AppResult<TmuxInventory> {
+        TmuxClient::inventory(self)
+    }
+
+    fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()> {
+        TmuxClient::paste_text(self, pane_id, text)
+    }
+}
+
+trait RecoveryStageStore {
+    fn list(&self) -> AppResult<Vec<crate::recovery::RecoveryRecord>>;
+    fn claim(
+        &self,
+        recovery_id: &str,
+        run_id: &str,
+        token: &str,
+        target: &RecoveryTarget,
+        command: &str,
+    ) -> AppResult<()>;
+    fn release(&self, recovery_id: &str, token: &str) -> AppResult<bool>;
+    fn mark_staged(&self, recovery_id: &str, token: &str) -> AppResult<bool>;
+    fn mark_uncertain(&self, recovery_id: &str, token: &str) -> AppResult<bool>;
+    fn load(&self, recovery_id: &str) -> AppResult<Option<crate::recovery::RecoveryRecord>>;
+}
+
+struct SqliteRecoveryStageStore<'a> {
+    state_dir: &'a Path,
+}
+
+impl RecoveryStageStore for SqliteRecoveryStageStore<'_> {
+    fn list(&self) -> AppResult<Vec<crate::recovery::RecoveryRecord>> {
+        list_nonterminal_recoveries(self.state_dir)
+    }
+
+    fn claim(
+        &self,
+        recovery_id: &str,
+        run_id: &str,
+        token: &str,
+        target: &RecoveryTarget,
+        command: &str,
+    ) -> AppResult<()> {
+        claim_recovery_for_staging(self.state_dir, recovery_id, run_id, token, target, command)
+    }
+
+    fn release(&self, recovery_id: &str, token: &str) -> AppResult<bool> {
+        release_known_failed_staging_claim(self.state_dir, recovery_id, token)
+    }
+
+    fn mark_staged(&self, recovery_id: &str, token: &str) -> AppResult<bool> {
+        mark_recovery_staged(self.state_dir, recovery_id, token)
+    }
+
+    fn mark_uncertain(&self, recovery_id: &str, token: &str) -> AppResult<bool> {
+        mark_recovery_uncertain(self.state_dir, recovery_id, token)
+    }
+
+    fn load(&self, recovery_id: &str) -> AppResult<Option<crate::recovery::RecoveryRecord>> {
+        load_recovery(self.state_dir, recovery_id)
+    }
+}
+
+trait RecoveryStageHooks {
+    type TargetGuard;
+
+    fn target_selected(&self, target: &RecoveryTarget) -> AppResult<Self::TargetGuard>;
+    fn before_claim(&self) {}
+    fn before_paste(&self) {}
+}
+
+struct RuntimeRecoveryStageHooks<'a> {
+    shared: &'a Arc<Mutex<RuntimeShared>>,
+}
+
+impl RecoveryStageHooks for RuntimeRecoveryStageHooks<'_> {
+    type TargetGuard = ActionGuard;
+
+    fn target_selected(&self, target: &RecoveryTarget) -> AppResult<Self::TargetGuard> {
+        ActionGuard::acquire(self.shared, &target.pane.pane_id)
+    }
+}
+
+fn stage_recovery_with<T, S, H>(
+    transport: &T,
+    store: &S,
+    hooks: &H,
+    run_id: &str,
+    recovery_id: &str,
+) -> AppResult<crate::recovery::RecoveryRecord>
+where
+    T: RecoveryStageTransport,
+    S: RecoveryStageStore,
+    H: RecoveryStageHooks,
+{
+    let first_inventory = transport.inventory()?;
+    let first_records = store.list()?;
+    let first_matches = match_recoveries(&first_records, &first_inventory);
+    let record = first_records
+        .iter()
+        .find(|record| record.id == recovery_id)
+        .ok_or_else(|| {
+            AppError::with_exit_code(format!("recovery not found: {recovery_id}"), 404)
+        })?;
+    if record.lifecycle != RecoveryLifecycle::Crashed {
+        return Err(AppError::with_exit_code(
+            "recovery is not available for staging",
+            409,
+        ));
+    }
+    let first_match = first_matches
+        .get(recovery_id)
+        .ok_or_else(|| AppError::with_exit_code("recovery has no current matching result", 409))?;
+    if first_match.state != RecoveryMatchState::Ready {
+        return Err(AppError::with_exit_code(
+            first_match
+                .disabled_reason
+                .clone()
+                .unwrap_or_else(|| "recovery target is not ready".to_string()),
+            409,
+        ));
+    }
+    let target = first_match
+        .target
+        .clone()
+        .ok_or_else(|| AppError::with_exit_code("recovery has no unique target", 409))?;
+    let _target_guard = hooks.target_selected(&target)?;
+
+    let second_inventory = transport.inventory()?;
+    let second_records = store.list()?;
+    let second_matches = match_recoveries(&second_records, &second_inventory);
+    let second_target = second_matches
+        .get(recovery_id)
+        .filter(|matched| matched.state == RecoveryMatchState::Ready)
+        .and_then(|matched| matched.target.as_ref())
+        .ok_or_else(|| AppError::with_exit_code("recovery target changed before claim", 409))?;
+    if second_target != &target {
+        return Err(AppError::with_exit_code(
+            "recovery target identity changed before claim",
+            409,
+        ));
+    }
+
+    let command = build_recovery_command(
+        &record.provider,
+        &record.original.cwd,
+        &record.provider_session_id,
+    )?;
+    let token = Uuid::now_v7().to_string();
+    hooks.before_claim();
+    store.claim(recovery_id, run_id, &token, &target, &command)?;
+
+    let current_inventory = match transport.inventory() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            let _ = store.release(recovery_id, &token);
+            return Err(error);
+        }
+    };
+    if !inventory_contains_exact_target(&current_inventory, &target) {
+        let _ = store.release(recovery_id, &token);
+        return Err(AppError::with_exit_code(
+            "recovery target changed immediately before paste",
+            409,
+        ));
+    }
+    hooks.before_paste();
+    if let Err(error) = transport.paste_text(&target.pane.pane_id, &command) {
+        let _ = store.release(recovery_id, &token);
+        return Err(error);
+    }
+    match store.mark_staged(recovery_id, &token) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = store.mark_uncertain(recovery_id, &token);
+            return Err(AppError::new(
+                "command was pasted but recovery staging could not be confirmed",
+            ));
+        }
+        Err(error) => {
+            let _ = store.mark_uncertain(recovery_id, &token);
+            return Err(AppError::new(format!(
+                "command was pasted but recovery staging could not be confirmed: {error}"
+            )));
+        }
+    }
+    store
+        .load(recovery_id)?
+        .ok_or_else(|| AppError::new("staged recovery disappeared"))
+}
+
+fn inventory_contains_exact_target(inventory: &TmuxInventory, target: &RecoveryTarget) -> bool {
+    inventory.server == target.server && inventory.panes.iter().any(|pane| pane == &target.pane)
+}
+
+
 fn topology_scan(
     client: &TmuxClient,
     config: &RuntimeServerConfig,
     shared: &Arc<Mutex<RuntimeShared>>,
     known_candidates: &mut BTreeMap<String, TmuxPane>,
 ) -> AppResult<Vec<String>> {
-    let current = client
-        .list_panes_strict()?
-        .into_iter()
-        .filter(is_runtime_discovery_candidate)
-        .map(|pane| (pane.pane_id.clone(), pane))
-        .collect::<BTreeMap<_, _>>();
+    // Prefer structured inventory for recovery evidence when available; fall
+    // back to strict listing for topology deltas if inventory fails.
+    let inventory = client.inventory().ok();
+    let current = if let Some(ref inv) = inventory {
+        inv.panes
+            .iter()
+            .filter(|pane| is_runtime_discovery_candidate(pane))
+            .map(|pane| (pane.pane_id.clone(), pane.clone()))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        client
+            .list_panes_strict()?
+            .into_iter()
+            .filter(is_runtime_discovery_candidate)
+            .map(|pane| (pane.pane_id.clone(), pane))
+            .collect::<BTreeMap<_, _>>()
+    };
     let tracked_ids = tracked_pane_ids(shared)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1635,6 +2260,41 @@ fn topology_scan(
     for pane_id in removed {
         remove_tracked_pane(config, shared, &pane_id, "missing-pane");
     }
+
+    if let Some(inventory) = inventory {
+        let run_id = shared.lock().unwrap().run_id.clone();
+        let mut verified = Vec::new();
+        let resolver = crate::proc_fd::LiveProc;
+        for pane in &inventory.panes {
+            let Some(provider) = crate::recovery::provider_for_pane_command(&pane.current_command)
+            else {
+                continue;
+            };
+            let session_id = match provider {
+                "claude" => resolve_live_claude_session_id(pane).ok().flatten(),
+                "grok" => crate::grok::resolve_live_grok_session_id(pane, &resolver)
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            let Some(session_id) = session_id.filter(|id| Uuid::parse_str(id).is_ok()) else {
+                continue;
+            };
+            if let Ok(workspace) =
+                resolve_workspace_for_path(&config.state_dir, Path::new(&pane.current_path))
+            {
+                verified.push(VerifiedProviderRecoveryEvidence {
+                    workspace_id: workspace.id.clone(),
+                    pane: pane.clone(),
+                    provider: provider.to_string(),
+                    provider_session_id: session_id,
+                });
+            }
+        }
+        // Best-effort: recovery evidence should not fail topology scans.
+        let _ = apply_recovery_inventory_evidence(&config.state_dir, &run_id, &inventory, &verified);
+    }
+
     *known_candidates = current;
     Ok(changed)
 }
@@ -2448,6 +3108,37 @@ fn validate_action_target(
     Ok(current)
 }
 
+struct RecoveryGuard {
+    shared: Arc<Mutex<RuntimeShared>>,
+    recovery_id: String,
+}
+
+impl RecoveryGuard {
+    fn acquire(shared: &Arc<Mutex<RuntimeShared>>, recovery_id: &str) -> AppResult<Self> {
+        let mut locked = shared.lock().unwrap();
+        if !locked.in_flight_recoveries.insert(recovery_id.to_string()) {
+            return Err(AppError::with_exit_code(
+                format!("recovery {recovery_id} already has an in-flight action"),
+                409,
+            ));
+        }
+        Ok(Self {
+            shared: Arc::clone(shared),
+            recovery_id: recovery_id.to_string(),
+        })
+    }
+}
+
+impl Drop for RecoveryGuard {
+    fn drop(&mut self) {
+        self.shared
+            .lock()
+            .unwrap()
+            .in_flight_recoveries
+            .remove(&self.recovery_id);
+    }
+}
+
 struct ActionGuard {
     shared: Arc<Mutex<RuntimeShared>>,
     pane_id: String,
@@ -2548,6 +3239,16 @@ fn read_response(reader: &mut BufReader<UnixStream>) -> AppResult<RuntimeRespons
         }
         response => Ok(response),
     }
+}
+
+fn write_runtime_error(stream: &mut UnixStream, error: &AppError) -> AppResult<()> {
+    write_message(
+        stream,
+        &RuntimeResponse::Error {
+            message: error.to_string(),
+            exit_code: error.exit_code(),
+        },
+    )
 }
 
 fn write_message<T: Serialize>(stream: &mut UnixStream, value: &T) -> AppResult<()> {
@@ -3013,9 +3714,7 @@ mod tests {
 
     #[test]
     fn full_state_safety_pass_only_queues_tracked_panes() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         shared
             .lock()
             .unwrap()
@@ -3149,9 +3848,7 @@ mod tests {
 
     #[test]
     fn stream_output_only_marks_dirty_and_never_publishes_stale_snapshot() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         let now = Instant::now();
         shared
             .lock()
@@ -3324,9 +4021,7 @@ mod tests {
 
     #[test]
     fn full_subscriber_is_dropped_without_blocking_runtime() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(&PathBuf::from(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         let (tx, _rx) = mpsc::sync_channel(1);
         tx.try_send(RuntimeEvent {
             revision: 1,
@@ -3346,9 +4041,7 @@ mod tests {
 
     #[test]
     fn subscription_bootstrap_ends_at_ok_boundary_with_complete_backlog() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         shared
             .lock()
             .unwrap()
@@ -3390,9 +4083,7 @@ mod tests {
 
     #[test]
     fn action_and_post_approve_guards_reject_duplicate_work() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         let first = ActionGuard::acquire(&shared, "%1").unwrap();
         assert!(ActionGuard::acquire(&shared, "%1").is_err());
         drop(first);
@@ -3419,9 +4110,7 @@ mod tests {
 
     #[test]
     fn yolo_policy_update_is_immediately_reflected_in_snapshot_signature() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         shared
             .lock()
             .unwrap()
@@ -3444,9 +4133,7 @@ mod tests {
 
     #[test]
     fn post_yolo_commit_atomically_updates_busy_and_ready_durations() {
-        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new(
-            "/tmp/runtime-test.sock",
-        ))));
+        let shared = Arc::new(Mutex::new(RuntimeShared::new(Path::new("/tmp/runtime-test.sock"), String::from("test-run"))));
         let mut tracked = tracked_pane(Instant::now());
         tracked.snapshot.classification = sample_classification(SessionState::PermissionDialog);
         tracked.signature = SnapshotSignature::from_snapshot(

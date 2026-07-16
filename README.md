@@ -33,7 +33,7 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 These are the commands that matter most in day-to-day use:
 
 - `runtime` to start or stop the single local coordinator that owns live observation and automation
-- `dashboard` to see Claude Code panes, runtime-discovered panes, and supported Codex/OpenCode/Pi/Grok/Antigravity visibility, grouped by workspace, with state, PID, CPU, memory, observed active cook time, and YOLO controls for Claude and Codex
+- `dashboard` to see Claude Code panes, runtime-discovered panes, supported Codex/OpenCode/Pi/Grok/Antigravity visibility, and conservative Claude/Grok recovery offers after an external tool recreates missing tmux shell panes
 - `prompt` to run a one-shot prompt through a new interactive Claude TUI window in tmux and print only the final assistant text to stdout
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to set central YOLO policy for one pane or a scoped set of panes
@@ -56,6 +56,7 @@ Everything else is mostly setup, diagnostics, recovery, or lower-level plumbing 
 - dump the latest persisted assistant message from Claude, Codex, OpenCode, Pi, Grok, or Antigravity to `MESSAGE_<conversation-id>.md` or a path passed with `--out`
 - run `serve` as a runtime-backed foreground facade for one tmux session
 - run `dashboard` as a runtime-backed popup-sized TUI grouped by workspace with per-pane YOLO controls for Claude and Codex
+- offer Claude and Grok recovery commands after an external tool recreates a missing tmux shell pane and exact matching identifies one unambiguous target; botctl stages the command but never presses Enter
 - record and replay fixture cases for classifier regression tests
 - prepare prompts and hand them off through an external-editor workflow
 - run one-shot TUI-backed prompts with `prompt`, including file/stdin input and large-prompt temp instruction files
@@ -269,7 +270,13 @@ The same command using tmux pane syntax:
 cargo run -- status --pane 0:2.3
 ```
 
-The dashboard groups runtime-observed panes plus supported Codex/OpenCode/Pi/Grok/Antigravity visibility by workspace, shows the shared runtime state plus current pane PID, process-tree average CPU, memory, and observed active `Cook` time, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. `Cook` counts only observed busy agent work, pauses on idle and permission waits, resets when the agent session changes, and may be off by roughly one dashboard poll around state transitions. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+The dashboard groups runtime-observed panes plus supported Codex/OpenCode/Pi/Grok/Antigravity visibility by workspace, shows the shared runtime state plus current pane PID, process-tree average CPU, memory, and observed active `Cook` time, lets you jump directly to a pane with `Enter`, and can toggle YOLO for Claude Code and Codex panes per pane, per workspace, or globally while it is open. It also shows Claude and Grok recovery rows separately from live classifier panes. `Cook` counts only observed busy agent work, pauses on idle and permission waits, resets when the agent session changes, and may be off by roughly one dashboard poll around state transitions. While it runs, it also prefixes tmux window names with per-pane status emojis in pane-index order.
+
+Session recovery starts outside botctl: another tool must recreate the tmux server, sessions, windows, and shell panes. If botctl had checkpointed a verified Claude or Grok pane with a valid provider session UUID, a later successful stable all-pane inventory can mark it `Crashed` when the original pane object is absent. `Crashed` is evidence of absence, not a claim that the pane closed accidentally or intentionally. Failed, malformed, or unstable inventories create no recovery evidence.
+
+After external recreation, botctl requires either the exact original pane object on the same server or one exact logical match on socket path, session name, window index/name, pane index, and cwd. Cwd alone and fuzzy matches are never enough; zero, ambiguous, incompatible-shell, and globally conflicting matches remain disabled. This intentionally conservative matching can refuse recovery after panes are renamed or reordered.
+
+Select a recovery to preview its exact resume command (`cd '<cwd>' && claude --resume '<uuid>'` or `cd '<cwd>' && grok --resume '<uuid>'`) and target. Lowercase `r` refreshes. Uppercase `R` stages one ready `Crashed` recovery into the matched shell pane. Botctl pastes only the displayed command: it does not clear existing input, append a newline, press Enter, launch the provider, or restore tmux layout. Press `Enter` in the dashboard only to navigate to a uniquely matched target. Inspect the pane and staged command, then press Enter yourself. Uppercase `D` dismisses a selected `Crashed`, `Staged`, or `Uncertain` recovery; current staging cannot be dismissed. `Staged` and `Uncertain` recoveries are never pasted again automatically.
 
 The dashboard also passively includes OpenCode panes when they can be resolved without using an OpenCode API server. A pane is included only when its tmux command is `opencode`, its pane title is `OC | <session title>`, and exactly one row in OpenCode's SQLite database matches both the pane cwd and stripped title. If OpenCode truncates the pane title with `...`, botctl accepts that title as a prefix only when it is still unique within the same cwd. Missing, ambiguous, duplicate, or unreadable matches are ignored. For resolved panes, the details panel shows a bounded excerpt from recent OpenCode `message`/`part` rows. OpenCode, Pi, and Grok support is dashboard/window-title visibility only; YOLO, prompt submission, and guarded keypress workflows remain Claude-only (with narrow Codex/Agy YOLO exceptions).
 

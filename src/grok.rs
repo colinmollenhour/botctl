@@ -73,6 +73,20 @@ pub fn is_grok_pane(pane: &TmuxPane) -> bool {
     pane.current_command.eq_ignore_ascii_case("grok")
 }
 
+/// Resolve the live Grok session UUID for a pane without loading message context.
+/// Returns `None` when the pane is not `grok` or no identity can be established.
+pub fn resolve_live_grok_session_id(
+    pane: &TmuxPane,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<String>> {
+    if !is_grok_pane(pane) {
+        return Ok(None);
+    }
+    Ok(resolve_grok_session_identity(pane, resolver)?
+        .map(|resolved| resolved.id)
+        .filter(|id| !id.is_empty()))
+}
+
 pub fn resolve_grok_session_for_pane(
     pane: &TmuxPane,
     frame: &str,

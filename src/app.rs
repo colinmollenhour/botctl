@@ -45,7 +45,7 @@ use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
 };
-use crate::runtime::{RuntimeClient, RuntimeServerConfig, run_runtime_server};
+use crate::runtime::{RuntimeClient, RuntimeProbe, RuntimeServerConfig, run_runtime_server};
 use crate::serve::ServeRequest;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, capture_artifact_path, export_artifact_path,
@@ -267,7 +267,7 @@ fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
     if args.persistent && std::env::var_os(DASHBOARD_PERSISTENT_CHILD_ENV).is_none() {
         return run_persistent_dashboard(args);
     }
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let (_runtime_client, _runtime_guard) = ensure_runtime_client(
         &state_dir,
         if args.unmanaged {
@@ -284,12 +284,16 @@ fn run_dashboard(args: DashboardArgs) -> AppResult<String> {
 }
 
 fn run_runtime(args: RuntimeArgs) -> AppResult<String> {
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     if args.stop {
         stop_runtime_process(&state_dir)?;
         return Ok(String::from("stopped runtime"));
     }
     if !args.foreground {
+        if let Some(client) = prepare_runtime_state(&state_dir, RuntimeManagementMode::Managed)? {
+            let status = client.get_status()?;
+            return Ok(format!("runtime listening on {}", status.socket_path));
+        }
         let client = start_background_runtime(
             &state_dir,
             RuntimeBootstrapConfig {
@@ -301,6 +305,16 @@ fn run_runtime(args: RuntimeArgs) -> AppResult<String> {
         let status = client.get_status()?;
         return Ok(format!("runtime listening on {}", status.socket_path));
     }
+
+    match RuntimeClient::connect(&state_dir)?.probe()? {
+        RuntimeProbe::Unavailable => bootstrap_state_db(&state_dir)?,
+        RuntimeProbe::Compatible(_) | RuntimeProbe::Incompatible(_) => {
+            return Err(AppError::with_exit_code(
+                "a runtime is already serving this state directory; stop it before starting a foreground runtime",
+                409,
+            ));
+        }
+    };
 
     let metadata = load_runtime_manager_metadata(&state_dir)?;
     if metadata.is_none() {
@@ -555,8 +569,22 @@ fn wait_for_runtime(state_dir: &Path) -> AppResult<RuntimeClient> {
     let client = RuntimeClient::connect(state_dir)?;
     let deadline = std::time::Instant::now() + Duration::from_millis(RUNTIME_AUTOSTART_TIMEOUT_MS);
     loop {
-        match client.get_status() {
-            Ok(_) => return Ok(client),
+        match client.probe() {
+            Ok(RuntimeProbe::Compatible(_)) => return Ok(client),
+            Ok(RuntimeProbe::Incompatible(reason)) => {
+                return Err(AppError::with_exit_code(
+                    format!("started runtime is incompatible: {reason}"),
+                    426,
+                ));
+            }
+            Ok(RuntimeProbe::Unavailable) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(RUNTIME_AUTOSTART_POLL_MS));
+            }
+            Ok(RuntimeProbe::Unavailable) => {
+                return Err(AppError::new(
+                    "runtime did not become available before timeout",
+                ));
+            }
             Err(error) if std::time::Instant::now() < deadline => {
                 if !matches!(error.exit_code(), 1) {
                     return Err(error);
@@ -609,16 +637,17 @@ fn ensure_runtime_client(
     management: RuntimeManagementMode,
     config: RuntimeBootstrapConfig,
 ) -> AppResult<(RuntimeClient, ManagedRuntimeGuard)> {
+    let existing = prepare_runtime_state(state_dir, management)?;
     if management == RuntimeManagementMode::Unmanaged {
-        let client = RuntimeClient::connect(state_dir)?;
-        client.get_status()?;
+        let client = existing.ok_or_else(|| {
+            AppError::new("unmanaged mode requires a compatible running botctl runtime")
+        })?;
         return Ok((client, ManagedRuntimeGuard::noop(state_dir.to_path_buf())));
     }
 
-    let client = RuntimeClient::connect(state_dir)?;
-    let client = match client.get_status() {
-        Ok(_) => client,
-        Err(_) => start_background_runtime(state_dir, config, RuntimeLaunchMode::AutoManaged)?,
+    let client = match existing {
+        Some(client) => client,
+        None => start_background_runtime(state_dir, config, RuntimeLaunchMode::AutoManaged)?,
     };
     let lease_path = create_runtime_lease(state_dir)?;
     let should_consider_stop = matches!(
@@ -633,6 +662,36 @@ fn ensure_runtime_client(
             should_consider_stop,
         },
     ))
+}
+
+fn prepare_runtime_state(
+    state_dir: &Path,
+    management: RuntimeManagementMode,
+) -> AppResult<Option<RuntimeClient>> {
+    let client = RuntimeClient::connect(state_dir)?;
+    match client.probe()? {
+        RuntimeProbe::Compatible(_) => {
+            bootstrap_state_db(state_dir)?;
+            Ok(Some(client))
+        }
+        RuntimeProbe::Incompatible(reason) if management == RuntimeManagementMode::Unmanaged => {
+            Err(AppError::with_exit_code(
+                format!(
+                    "incompatible unmanaged runtime: {reason}; stop it and restart with this botctl version before retrying"
+                ),
+                426,
+            ))
+        }
+        RuntimeProbe::Incompatible(_) => {
+            stop_runtime_process(state_dir)?;
+            bootstrap_state_db(state_dir)?;
+            Ok(None)
+        }
+        RuntimeProbe::Unavailable => {
+            bootstrap_state_db(state_dir)?;
+            Ok(None)
+        }
+    }
 }
 
 fn runtime_has_active_yolo(state_dir: &Path) -> AppResult<bool> {
@@ -666,7 +725,7 @@ fn stop_runtime_process(state_dir: &Path) -> AppResult<()> {
         let deadline =
             std::time::Instant::now() + Duration::from_millis(RUNTIME_AUTOSTART_TIMEOUT_MS);
         while std::time::Instant::now() < deadline {
-            if client.get_status().is_err() {
+            if matches!(client.probe(), Ok(RuntimeProbe::Unavailable)) {
                 let _ = remove_runtime_manager_metadata(state_dir);
                 return Ok(());
             }
@@ -1021,7 +1080,7 @@ struct ObserveArtifactPaths {
 }
 
 fn run_serve(args: ServeArgs) -> AppResult<String> {
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let (runtime, _runtime_guard) = ensure_runtime_client(
         &state_dir,
         if args.unmanaged {
@@ -2595,7 +2654,7 @@ pub(crate) fn submit_prompt_for_pane(
 }
 
 fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let (runtime, _runtime_guard) = ensure_runtime_client(
         &state_dir,
         if args.unmanaged {
@@ -2667,7 +2726,7 @@ fn run_yolo_start(args: YoloStartArgs) -> AppResult<String> {
 }
 
 fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let (runtime, _runtime_guard) = ensure_runtime_client(
         &state_dir,
         if args.unmanaged {
@@ -2699,7 +2758,9 @@ fn run_yolo_stop(args: YoloStopArgs) -> AppResult<String> {
 
 pub(crate) fn resolve_bootstrapped_state_dir(path: Option<&Path>) -> AppResult<PathBuf> {
     let state_dir = resolve_state_dir(path)?;
-    bootstrap_state_db(&state_dir)?;
+    // This common helper must not migrate state underneath an older runtime.
+    // Managed preparation stops an incompatible runtime but never starts one.
+    let _ = prepare_runtime_state(&state_dir, RuntimeManagementMode::Managed)?;
     Ok(state_dir)
 }
 
@@ -6909,5 +6970,122 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
                 "agy doctor output must not suggest install-bindings; got {report}",
             );
         }
+    }
+
+    #[test]
+    fn unmanaged_old_protocol_is_rejected_before_v4_database_migration() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "botctl-old-runtime-probe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        let database =
+            rusqlite::Connection::open(crate::storage::state_db_path(&state_dir)).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+                 INSERT INTO schema_version (id, version) VALUES (1, 4);",
+            )
+            .unwrap();
+        drop(database);
+        let socket_path = crate::runtime::runtime_socket_path(&state_dir);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("get_status"));
+            stream
+                .write_all(
+                    b"{\"kind\":\"status\",\"status\":{\"socket_path\":\"old.sock\",\"boot_time_unix_ms\":1,\"revision\":0,\"pane_count\":0,\"tmux_socket_path\":null}}\n",
+                )
+                .unwrap();
+        });
+        let error =
+            super::prepare_runtime_state(&state_dir, super::RuntimeManagementMode::Unmanaged)
+                .unwrap_err();
+        assert_eq!(error.exit_code(), 426);
+        assert!(error.to_string().contains("restart"));
+        server.join().unwrap();
+        let database =
+            rusqlite::Connection::open(crate::storage::state_db_path(&state_dir)).unwrap();
+        let version: i64 = database
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 4);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn direct_bootstrap_helper_stops_old_protocol_before_database_migration() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "botctl-managed-old-runtime-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::storage::bootstrap_state_db(&state_dir).unwrap();
+        let database =
+            rusqlite::Connection::open(crate::storage::state_db_path(&state_dir)).unwrap();
+        database
+            .execute("UPDATE schema_version SET version = 4 WHERE id = 1", [])
+            .unwrap();
+        drop(database);
+        let socket_path = crate::runtime::runtime_socket_path(&state_dir);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut status_stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(status_stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("get_status"));
+            status_stream
+                .write_all(
+                    b"{\"kind\":\"status\",\"status\":{\"socket_path\":\"old.sock\",\"boot_time_unix_ms\":1,\"revision\":0,\"pane_count\":0,\"tmux_socket_path\":null}}\n",
+                )
+                .unwrap();
+            drop(status_stream);
+
+            let (mut stop_stream, _) = listener.accept().unwrap();
+            request.clear();
+            std::io::BufReader::new(stop_stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("stop"));
+            stop_stream.write_all(b"{\"kind\":\"ok\"}\n").unwrap();
+        });
+        let resolved = super::resolve_bootstrapped_state_dir(Some(&state_dir)).unwrap();
+        assert_eq!(resolved, state_dir);
+        server.join().unwrap();
+        let database =
+            rusqlite::Connection::open(crate::storage::state_db_path(&state_dir)).unwrap();
+        let version: i64 = database
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, crate::storage::CURRENT_SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(state_dir);
     }
 }

@@ -205,6 +205,14 @@ Notes:
 - consumes authoritative cook/wait duration bases from the runtime for runtime-backed panes and advances them locally while the runtime classification remains cooking/waiting; only fallback panes synchronize duration state from the dashboard
 - when launched from tmux, defaults the selected row to the invoking pane when that pane is visible in the dashboard
 - subscribes to the central runtime for shared pane state and yolo policy; reconnect bootstrap replaces the complete runtime-pane cache while transient disconnects retain the last good view
+- fetches recovery offers independently from live classifier panes and leaves their PID, CPU, memory, cook, wait, YOLO, and classifier columns blank
+- recovery requires an external tool to recreate the tmux server, sessions, windows, and shell panes first; botctl does not restore tmux objects or layouts
+- matches only the exact original object on the same server or one exact logical pane by socket path, session name, window index/name, pane index, and cwd; cwd-only, fuzzy, ambiguous, incompatible-shell, and globally conflicting matches remain disabled
+- recovery rows are Claude and Grok only and preview the exact `cd <cwd> && claude --resume <uuid>` or `cd <cwd> && grok --resume <uuid>` command, original identity, lifecycle, target, or precise disabled reason
+- lowercase `r` refreshes; uppercase `R` stages one selected ready `Crashed` recovery; uppercase `D` dismisses a selected `Crashed`, `Staged`, or `Uncertain` recovery; a current `Staging` recovery cannot be dismissed
+- `Enter` only navigates to a live pane or uniquely matched recovery target; it never stages or submits a command
+- staging pastes the exact preview without a newline or Enter; botctl does not clear shell input, and the operator must inspect the pane and press Enter manually
+- `Staged` and `Uncertain` records are not pasted again automatically
 - `--persistent` keeps the dashboard alive in its own tmux session and popup-friendly attach flow
 - auto-starts a managed runtime unless `--unmanaged` is set
 
