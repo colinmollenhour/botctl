@@ -1806,11 +1806,14 @@ impl DashboardApp {
         self.cpu_samples.clear();
     }
 
-    fn finish_reattach_attempt(&mut self, succeeded: bool) -> bool {
-        if !succeeded {
+    /// Refresh, downgrading any error to the message bar. A refresh failure
+    /// must never stop the event loop from reading keys: quitting has to work
+    /// even when a data source is unhealthy.
+    fn refresh_non_fatal(&mut self) {
+        if let Err(error) = self.refresh() {
             self.clear_detached_resource_state();
+            self.message = format!("refresh failed: {error}");
         }
-        succeeded
     }
 
     fn selected_pane(&self) -> Option<&PaneEntry> {
@@ -2270,11 +2273,12 @@ fn run_dashboard_loop(
                     draw_needed = false;
                 }
                 (DashboardVisibility::Detached, DashboardVisibility::Visible) => {
-                    let refreshed = app.refresh().is_ok();
-                    if app.finish_reattach_attempt(refreshed) {
-                        visibility = DashboardVisibility::Visible;
-                        draw_needed = true;
-                    }
+                    // Reattach unconditionally: a failing refresh once wedged
+                    // the persistent child in Detached, where no key (not
+                    // even q) is ever read.
+                    app.refresh_non_fatal();
+                    visibility = DashboardVisibility::Visible;
+                    draw_needed = true;
                 }
                 (_, next) => visibility = next,
             }
@@ -2356,7 +2360,7 @@ fn run_dashboard_loop(
                                 }
                             }
                         }
-                        KeyCode::Char('r') => app.refresh()?,
+                        KeyCode::Char('r') => app.refresh_non_fatal(),
                         KeyCode::Char('R') => app.stage_selected_recovery()?,
                         KeyCode::Char('D') => app.dismiss_selected_recovery()?,
                         KeyCode::Char('u') => app.unstick_selected_pane()?,
@@ -2386,7 +2390,7 @@ fn run_dashboard_loop(
         }
 
         if effects.full_refresh {
-            app.refresh()?;
+            app.refresh_non_fatal();
             draw_needed = true;
         }
         let clock_second = unix_time_ms() / 1000;
@@ -2432,7 +2436,7 @@ fn handle_mouse_event(
             {
                 app.select_row(index)?;
                 app.toggle_yolo_for_pane(&pane)?;
-                app.refresh()?;
+                app.refresh_non_fatal();
                 return Ok(None);
             }
             let was_selected = app.selection == index;
@@ -5352,7 +5356,9 @@ mod tests {
 
         app.resource_usage_for_pane(&tree, "%1", Some(10), std::time::Instant::now());
         assert!(!app.cpu_samples.is_empty());
-        assert!(!app.finish_reattach_attempt(false));
+        // A failed refresh (as during reattach) clears partially repopulated
+        // baselines via clear_detached_resource_state.
+        app.clear_detached_resource_state();
         assert!(app.cpu_samples.is_empty());
 
         let usage = app.resource_usage_for_pane(
