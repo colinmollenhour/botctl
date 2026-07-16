@@ -969,29 +969,21 @@ fn parse_length_prefixed_fields(
                 "malformed length prefix in tmux structured output",
             ));
         }
-        // tmux `#{n:field}` is a Unicode scalar (character) count, not a byte
-        // count — multi-byte UTF-8 (emoji, accents) must advance by chars.
-        let char_len = std::str::from_utf8(&bytes[length_start..*offset])
+        // tmux `#{n:field}` is a strlen() byte count, so multi-byte UTF-8
+        // (emoji, accents) must advance by bytes, then validate UTF-8.
+        let length = std::str::from_utf8(&bytes[length_start..*offset])
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .ok_or_else(|| AppError::new("invalid field length in tmux structured output"))?;
         *offset += 1;
-        let rest = std::str::from_utf8(&bytes[*offset..])
+        let end = (*offset)
+            .checked_add(length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| AppError::new("truncated field in tmux structured output"))?;
+        let value = std::str::from_utf8(&bytes[*offset..end])
             .map_err(|_| AppError::new("tmux structured output field was not valid UTF-8"))?;
-        let mut chars = rest.char_indices();
-        let mut end_in_rest = 0;
-        for _ in 0..char_len {
-            let Some((idx, ch)) = chars.next() else {
-                return Err(AppError::new("truncated field in tmux structured output"));
-            };
-            end_in_rest = idx + ch.len_utf8();
-        }
-        if char_len == 0 {
-            end_in_rest = 0;
-        }
-        let value = &rest[..end_in_rest];
         fields.push(value.to_string());
-        *offset += end_in_rest;
+        *offset = end;
     }
     Ok(fields)
 }
@@ -1000,8 +992,8 @@ fn parse_length_prefixed_fields(
 fn encode_pane_record_for_test(fields: &[&str]) -> String {
     let mut output = fields
         .iter()
-        // Match tmux `#{n:...}` character counts, not UTF-8 byte lengths.
-        .map(|field| format!("{}:{field}", field.chars().count()))
+        // Match tmux `#{n:...}` strlen() byte counts.
+        .map(|field| format!("{}:{field}", field.len()))
         .collect::<String>();
     output.push('\n');
     output
@@ -1386,8 +1378,9 @@ mod tests {
     }
 
     #[test]
-    fn pane_inventory_advances_by_unicode_characters_not_bytes() {
-        // "⚙" is one Unicode scalar (3 UTF-8 bytes); tmux prefixes use char count.
+    fn pane_inventory_advances_by_utf8_bytes_not_characters() {
+        // "⚙" is 3 UTF-8 bytes but one scalar; tmux `#{n:...}` is strlen(),
+        // so prefixes count bytes ("⚙ bloodraven" encodes as 14, not 12).
         let encoded = encode_pane_record_for_test(&[
             "%1",
             "/dev/pts/1",
@@ -1405,11 +1398,33 @@ mod tests {
             "12",
             "4",
         ]);
+        assert!(encoded.contains("14:⚙ bloodraven"));
+        assert!(encoded.contains("10:title 🚀"));
         let panes = parse_inventory_panes(&encoded).unwrap();
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].window_name, "⚙ bloodraven");
         assert_eq!(panes[0].pane_title, "title 🚀");
         assert_eq!(panes[0].pane_id, "%1");
+    }
+
+    #[test]
+    fn pane_inventory_rejects_length_prefix_splitting_a_utf8_scalar() {
+        // A prefix that ends mid-scalar (2 of ⚙'s 3 bytes) must fail cleanly
+        // rather than emit garbage fields.
+        let mut encoded = String::from("2:%1");
+        for field in [
+            "/dev/pts/1",
+            "123",
+            "$1",
+            "demo",
+            "@2",
+            "3",
+        ] {
+            encoded.push_str(&format!("{}:{field}", field.len()));
+        }
+        encoded.push_str("2:⚙ bloodraven");
+        encoded.push('\n');
+        assert!(parse_inventory_panes(&encoded).is_err());
     }
 
     #[test]
