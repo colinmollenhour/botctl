@@ -258,7 +258,8 @@ pub struct InstallBindingsArgs {
 pub struct InstallSkillArgs {
     /// Optional skill name (default: botctl-prompt).
     pub name: Option<String>,
-    /// Skills root directory (default: ~/.claude/skills).
+    /// Single skills root override. When omitted, installs to both
+    /// `~/.claude/skills` and `~/.agents/skills`.
     pub path: Option<PathBuf>,
 }
 

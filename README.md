@@ -33,11 +33,15 @@ See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `cl
 botctl ships a bundled Agent Skill that teaches coding agents how to run advanced
 Claude invocations through `botctl prompt` (observable tmux TUI, YOLO-safe
 blockers, multi-file packets, isolated `--session-id`s). After installing the
-binary, install the skill into Claude Code:
+binary, install the skill for Claude Code and other agents:
 
 ```bash
 botctl install-skill
 ```
+
+This writes `SKILL.md` to both `~/.claude/skills/botctl-prompt/` and
+`~/.agents/skills/botctl-prompt/`. Pass `--path DIR` to install into a single
+custom skills root instead.
 
 Inspect the skill without installing:
 

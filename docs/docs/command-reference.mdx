@@ -384,7 +384,7 @@ botctl view-skill
 botctl view-skill botctl-prompt
 ```
 
-Default install root is `~/.claude/skills/<name>/SKILL.md`. `view-skill` prints the embedded Markdown to stdout without writing files. The same skill is also available via `npx skills add colinmollenhour/botctl --skill botctl-prompt`.
+Default install roots are `~/.claude/skills/<name>/SKILL.md` and `~/.agents/skills/<name>/SKILL.md`. Pass `--path DIR` to write only `<DIR>/<name>/SKILL.md`. `view-skill` prints the embedded Markdown to stdout without writing files. The same skill is also available via `npx skills add colinmollenhour/botctl --skill botctl-prompt`.
 
 ### `last-message`
 

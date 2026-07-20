@@ -52,16 +52,26 @@ pub fn view_skill(name: Option<&str>) -> AppResult<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallSkillReport {
-    pub skill_name: String,
+pub struct SkillInstallTargetReport {
     pub path: PathBuf,
     pub wrote_file: bool,
     pub unchanged: bool,
 }
 
-/// Install a bundled skill under `<skills-root>/<name>/SKILL.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSkillReport {
+    pub skill_name: String,
+    pub targets: Vec<SkillInstallTargetReport>,
+}
+
+/// Install a bundled skill under one or more skills roots.
 ///
-/// When `skills_root` is `None`, installs to `~/.claude/skills`.
+/// When `skills_root` is `Some`, installs only to
+/// `<skills_root>/<name>/SKILL.md` (used by `--path` and tests).
+///
+/// When `skills_root` is `None`, installs to both default roots:
+/// - `~/.claude/skills/<name>/SKILL.md`
+/// - `~/.agents/skills/<name>/SKILL.md`
 pub fn install_skill(
     name: Option<&str>,
     skills_root: Option<&Path>,
@@ -77,11 +87,27 @@ pub fn install_skill(
         )
     })?;
 
-    let root = match skills_root {
-        Some(path) => path.to_path_buf(),
-        None => default_claude_skills_root()?,
+    let roots = match skills_root {
+        Some(path) => vec![path.to_path_buf()],
+        None => default_skill_roots()?,
     };
-    let skill_dir = root.join(skill.name);
+
+    let mut targets = Vec::with_capacity(roots.len());
+    for root in roots {
+        targets.push(install_skill_to_root(skill, &root)?);
+    }
+
+    Ok(InstallSkillReport {
+        skill_name: skill.name.to_string(),
+        targets,
+    })
+}
+
+fn install_skill_to_root(
+    skill: &BundledSkill,
+    skills_root: &Path,
+) -> AppResult<SkillInstallTargetReport> {
+    let skill_dir = skills_root.join(skill.name);
     let target = skill_dir.join("SKILL.md");
 
     fs::create_dir_all(&skill_dir).map_err(|error| {
@@ -93,8 +119,7 @@ pub fn install_skill(
 
     let existing = fs::read_to_string(&target).ok();
     if existing.as_deref() == Some(skill.markdown) {
-        return Ok(InstallSkillReport {
-            skill_name: skill.name.to_string(),
+        return Ok(SkillInstallTargetReport {
             path: target,
             wrote_file: false,
             unchanged: true,
@@ -108,41 +133,54 @@ pub fn install_skill(
         ))
     })?;
 
-    Ok(InstallSkillReport {
-        skill_name: skill.name.to_string(),
+    Ok(SkillInstallTargetReport {
         path: target,
         wrote_file: true,
         unchanged: false,
     })
 }
 
-fn default_claude_skills_root() -> AppResult<PathBuf> {
+fn default_skill_roots() -> AppResult<Vec<PathBuf>> {
     let home = std::env::var_os("HOME").ok_or_else(|| {
         AppError::new("HOME is not set; pass --path to locate the skills directory")
     })?;
-    Ok(PathBuf::from(home).join(".claude").join("skills"))
+    let home = PathBuf::from(home);
+    Ok(vec![
+        home.join(".claude").join("skills"),
+        home.join(".agents").join("skills"),
+    ])
 }
 
 pub fn render_install_skill_report(report: &InstallSkillReport) -> String {
-    let status = if report.unchanged {
-        "unchanged"
-    } else if report.wrote_file {
-        "installed"
-    } else {
-        "skipped"
-    };
-    format!(
-        "skill={}\nstatus={}\npath={}",
-        report.skill_name,
-        status,
-        report.path.display()
-    )
+    let mut out = format!("skill={}\n", report.skill_name);
+    for target in &report.targets {
+        let status = if target.unchanged {
+            "unchanged"
+        } else if target.wrote_file {
+            "installed"
+        } else {
+            "skipped"
+        };
+        out.push_str(&format!("status={status}\npath={}\n", target.path.display()));
+    }
+    // Trim trailing newline for a single-target report so the old three-line
+    // shape stays stable for scripts; multi-target reports end with a newline.
+    if report.targets.len() == 1 {
+        out.pop();
+    }
+    out
 }
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn home_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn bundles_botctl_prompt_skill_with_valid_frontmatter() {
@@ -169,17 +207,81 @@ mod tests {
     fn install_skill_writes_and_is_idempotent() {
         let root = unique_temp_dir("botctl-install-skill");
         let first = install_skill(Some("botctl-prompt"), Some(&root)).expect("install");
-        assert!(first.wrote_file);
-        assert!(!first.unchanged);
-        assert_eq!(first.path, root.join("botctl-prompt/SKILL.md"));
-        let content = fs::read_to_string(&first.path).expect("read installed skill");
+        assert_eq!(first.targets.len(), 1);
+        let target = &first.targets[0];
+        assert!(target.wrote_file);
+        assert!(!target.unchanged);
+        assert_eq!(target.path, root.join("botctl-prompt/SKILL.md"));
+        let content = fs::read_to_string(&target.path).expect("read installed skill");
         assert_eq!(content, BOTCTL_PROMPT_SKILL_MD);
 
         let second = install_skill(Some("botctl-prompt"), Some(&root)).expect("reinstall");
-        assert!(!second.wrote_file);
-        assert!(second.unchanged);
+        assert_eq!(second.targets.len(), 1);
+        assert!(!second.targets[0].wrote_file);
+        assert!(second.targets[0].unchanged);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skill_default_roots_write_claude_and_agents() {
+        let _guard = home_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = unique_temp_dir("botctl-install-skill-home");
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: HOME is restored before the mutex guard drops.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let report = install_skill(Some("botctl-prompt"), None).expect("default install");
+        assert_eq!(report.targets.len(), 2);
+
+        let claude_path = home.join(".claude/skills/botctl-prompt/SKILL.md");
+        let agents_path = home.join(".agents/skills/botctl-prompt/SKILL.md");
+        assert_eq!(report.targets[0].path, claude_path);
+        assert_eq!(report.targets[1].path, agents_path);
+        assert!(report.targets.iter().all(|t| t.wrote_file));
+        assert_eq!(
+            fs::read_to_string(&claude_path).expect("claude skill"),
+            BOTCTL_PROMPT_SKILL_MD
+        );
+        assert_eq!(
+            fs::read_to_string(&agents_path).expect("agents skill"),
+            BOTCTL_PROMPT_SKILL_MD
+        );
+
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn render_install_skill_report_lists_each_target() {
+        let report = InstallSkillReport {
+            skill_name: "botctl-prompt".to_string(),
+            targets: vec![
+                SkillInstallTargetReport {
+                    path: PathBuf::from("/tmp/a/botctl-prompt/SKILL.md"),
+                    wrote_file: true,
+                    unchanged: false,
+                },
+                SkillInstallTargetReport {
+                    path: PathBuf::from("/tmp/b/botctl-prompt/SKILL.md"),
+                    wrote_file: false,
+                    unchanged: true,
+                },
+            ],
+        };
+        let rendered = render_install_skill_report(&report);
+        assert!(rendered.contains("skill=botctl-prompt"));
+        assert!(rendered.contains("status=installed"));
+        assert!(rendered.contains("path=/tmp/a/botctl-prompt/SKILL.md"));
+        assert!(rendered.contains("status=unchanged"));
+        assert!(rendered.contains("path=/tmp/b/botctl-prompt/SKILL.md"));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
