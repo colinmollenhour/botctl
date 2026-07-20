@@ -30,14 +30,6 @@ command -v botctl && command -v tmux && command -v claude
 botctl --version
 ```
 
-If this skill file is not already loaded by the host agent, **do not install
-it**. Read the embedded copy on demand and follow it:
-
-```bash
-botctl view-skill
-# or: botctl view-skill botctl-prompt
-```
-
 ## Core pattern
 
 ```bash
@@ -232,15 +224,6 @@ inspect the surviving window.
   `botctl keep-going` against that pane.
 - Non-Claude providers (use provider-native CLIs or botctl MCP/`last-message`
   for visibility only).
-
-## If this skill is not installed
-
-Assume the user does **not** want it installed. Do not run any install
-command. Print and follow the copy bundled in the botctl binary:
-
-```bash
-botctl view-skill botctl-prompt
-```
 
 ## Verified examples (Sonnet)
 
