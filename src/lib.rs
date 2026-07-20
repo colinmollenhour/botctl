@@ -23,6 +23,7 @@ pub mod recovery;
 pub mod runtime;
 pub mod screen_model;
 pub mod serve;
+pub mod skill;
 pub mod storage;
 pub mod tmux;
 pub mod workspace;

@@ -46,7 +46,7 @@ Responsible for deciding what action is allowed in the current state. Example po
 
 ### Claude Code
 
-Full guarded automation path: pane launch, classification, prompt submission, YOLO permission approval, and `last-message` from `~/.claude/projects` transcripts. Crash recovery journals verified live Claude session UUIDs and can stage `cd <cwd> && claude --resume <uuid>` after external tmux recreation (paste only; never Enter).
+Full guarded automation path: pane launch, classification, prompt submission, YOLO permission approval, and `last-message` from `~/.claude/projects` transcripts. Conversation identity is resolved in order by: open project transcript FDs in the pane process tree, Claude's live `~/.claude/sessions/<pid>.json` registry (process tree), `--session-id` on the Claude command line, then a project-dir transcript only when it is unique for the pane cwd. When multiple transcripts share a cwd and no unique binding exists, resolution fails closed rather than returning the newest unrelated session. Crash recovery journals verified live Claude session UUIDs and can stage `cd <cwd> && claude --resume <uuid>` after external tmux recreation (paste only; never Enter).
 
 ### Codex CLI
 

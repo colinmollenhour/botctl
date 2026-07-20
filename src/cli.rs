@@ -21,6 +21,8 @@ pub enum Command {
     Replay(ReplayArgs),
     Bindings,
     InstallBindings(InstallBindingsArgs),
+    InstallSkill(InstallSkillArgs),
+    ViewSkill(ViewSkillArgs),
     SendAction(SendActionArgs),
     ApprovePermission(PaneCommandArgs),
     RejectPermission(PaneCommandArgs),
@@ -252,6 +254,20 @@ pub struct InstallBindingsArgs {
     pub path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSkillArgs {
+    /// Optional skill name (default: botctl-prompt).
+    pub name: Option<String>,
+    /// Skills root directory (default: ~/.claude/skills).
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSkillArgs {
+    /// Optional skill name (default: botctl-prompt).
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparePromptArgs {
     pub session_name: String,
@@ -370,6 +386,8 @@ where
         "install-bindings" => {
             with_command_context(parse_install_bindings(rest), "install-bindings")
         }
+        "install-skill" => with_command_context(parse_install_skill(rest), "install-skill"),
+        "view-skill" => with_command_context(parse_view_skill(rest), "view-skill"),
         "send-action" => with_command_context(parse_send_action(rest), "send-action"),
         "approve" | "approve-permission" => with_command_context(
             parse_approve_reject(rest, Command::ApprovePermission),
@@ -570,6 +588,8 @@ fn usage_with_color(color: bool) -> String {
         "replay --path PATH  [advanced]",
         "bindings",
         "install-bindings [--path PATH]",
+        "install-skill [--name NAME] [--path DIR]",
+        "view-skill [NAME]",
         "send-action --pane %ID|session:window.pane --action NAME  [advanced]",
     ] {
         out.push_str(&command(line));
@@ -632,6 +652,8 @@ fn closest_command(command: &str) -> Option<&'static str> {
         "replay",
         "bindings",
         "install-bindings",
+        "install-skill",
+        "view-skill",
         "send-action",
         "approve",
         "reject",
@@ -688,6 +710,8 @@ fn command_from_error(message: &str) -> Option<&'static str> {
         "classify",
         "replay",
         "install-bindings",
+        "install-skill",
+        "view-skill",
         "send-action",
         "dismiss-survey",
         "continue-session",
@@ -1060,6 +1084,8 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
         "replay" => "botctl replay --path PATH",
         "bindings" => "botctl bindings",
         "install-bindings" => "botctl install-bindings [--path PATH]",
+        "install-skill" => "botctl install-skill [--name NAME] [--path DIR]",
+        "view-skill" => "botctl view-skill [NAME]",
         "send-action" => "botctl send-action --pane TARGET --action NAME",
         "dismiss-survey" => "botctl dismiss-survey --pane TARGET",
         "continue-session" => {
@@ -1758,6 +1784,52 @@ fn parse_install_bindings(args: Vec<String>) -> AppResult<Command> {
     }
 
     Ok(Command::InstallBindings(InstallBindingsArgs { path }))
+}
+
+fn parse_install_skill(args: Vec<String>) -> AppResult<Command> {
+    let mut name = None;
+    let mut path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                name = Some(read_value(&args, &mut i, "--name")?);
+            }
+            "--path" => {
+                path = Some(PathBuf::from(read_value(&args, &mut i, "--path")?));
+            }
+            flag if !flag.starts_with('-') && name.is_none() => {
+                name = Some(flag.to_string());
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown install-skill flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::InstallSkill(InstallSkillArgs { name, path }))
+}
+
+fn parse_view_skill(args: Vec<String>) -> AppResult<Command> {
+    let mut name = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                name = Some(read_value(&args, &mut i, "--name")?);
+            }
+            flag if !flag.starts_with('-') && name.is_none() => {
+                name = Some(flag.to_string());
+            }
+            flag => {
+                return Err(AppError::new(format!("unknown view-skill flag: {flag}")));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::ViewSkill(ViewSkillArgs { name }))
 }
 
 fn parse_pane_command(
@@ -3288,6 +3360,42 @@ mod tests {
         match command {
             Command::InstallBindings(args) => {
                 assert!(args.path.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_install_skill_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("install-skill"),
+            String::from("--name"),
+            String::from("botctl-prompt"),
+            String::from("--path"),
+            String::from("/tmp/skills"),
+        ])
+        .expect("install-skill should parse");
+        match command {
+            Command::InstallSkill(args) => {
+                assert_eq!(args.name.as_deref(), Some("botctl-prompt"));
+                assert_eq!(args.path.as_deref(), Some(std::path::Path::new("/tmp/skills")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_view_skill_command() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("view-skill"),
+            String::from("botctl-prompt"),
+        ])
+        .expect("view-skill should parse");
+        match command {
+            Command::ViewSkill(args) => {
+                assert_eq!(args.name.as_deref(), Some("botctl-prompt"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

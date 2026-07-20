@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,10 +10,13 @@ use crate::app::{AppError, AppResult};
 use crate::grok;
 use crate::opencode;
 use crate::pi;
-use crate::proc_fd::transcript_from_process_fds;
+use crate::proc_fd::{
+    ChildResolver, LiveProc, transcript_from_process_fds, transcript_from_process_tree_fds,
+};
 use crate::tmux::{TmuxClient, TmuxPane};
 
 const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
+const CLAUDE_SESSIONS_DIR: &str = ".claude/sessions";
 const CODEX_SESSIONS_DIR: &str = ".codex/sessions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +79,28 @@ pub fn line_count(text: &str) -> usize {
 }
 
 fn load_claude_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
-    let (session_id, transcript_path) = resolve_claude_transcript_for_pane(pane)?
-        .ok_or_else(|| AppError::new("no Claude transcript found for pane"))?;
+    let (session_id, transcript_path) = match resolve_claude_transcript_for_pane(pane)? {
+        ClaudeTranscriptResolve::Found { session_id, path } => (session_id, path),
+        ClaudeTranscriptResolve::None => {
+            return Err(AppError::new(format!(
+                "no Claude transcript found for pane {} (cwd {}); expected an open project \
+                 transcript FD, ~/.claude/sessions/<pid>.json for the pane process tree, \
+                 --session-id on the Claude command line, or a single project transcript",
+                pane.pane_id, pane.current_path
+            )));
+        }
+        ClaudeTranscriptResolve::Ambiguous { candidates } => {
+            return Err(AppError::new(format!(
+                "ambiguous Claude transcript for pane {} cwd {}: {} candidate sessions and no \
+                 unique binding via ~/.claude/sessions/<pid>.json, open transcript FD, or \
+                 --session-id; candidates: {}",
+                pane.pane_id,
+                pane.current_path,
+                candidates.len(),
+                format_candidate_preview(&candidates, 10)
+            )));
+        }
+    };
     let text = latest_claude_assistant_text(&transcript_path)?.ok_or_else(|| {
         AppError::new(format!(
             "no assistant text message found in Claude transcript {}",
@@ -210,31 +234,261 @@ pub fn resolve_codex_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<St
     Ok(resolve_codex_transcript_for_pane(pane)?.map(|(session_id, _)| session_id))
 }
 
-fn resolve_claude_transcript_for_pane(pane: &TmuxPane) -> AppResult<Option<(String, PathBuf)>> {
-    let Some(projects_root) = home_dir().map(|home| home.join(CLAUDE_PROJECTS_DIR)) else {
-        return Ok(None);
-    };
+/// Resolve the live Claude session id for a pane without loading message text.
+///
+/// Prefers process-tree transcript FDs, then Claude's `~/.claude/sessions/<pid>.json`
+/// registry, then `--session-id` on the process command line. Falls back to a
+/// project-dir transcript only when it is unique for the pane cwd. Returns
+/// `None` when no binding can be made safely (including multi-session ambiguity).
+pub fn resolve_claude_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<String>> {
+    match resolve_claude_transcript_for_pane(pane)? {
+        ClaudeTranscriptResolve::Found { session_id, .. } => Ok(Some(session_id)),
+        ClaudeTranscriptResolve::None | ClaudeTranscriptResolve::Ambiguous { .. } => Ok(None),
+    }
+}
 
-    resolve_claude_transcript_in_projects_root(pane, &projects_root)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeTranscriptResolve {
+    Found {
+        session_id: String,
+        path: PathBuf,
+    },
+    None,
+    Ambiguous {
+        candidates: Vec<String>,
+    },
+}
+
+fn resolve_claude_transcript_for_pane(pane: &TmuxPane) -> AppResult<ClaudeTranscriptResolve> {
+    let Some(home) = home_dir() else {
+        return Ok(ClaudeTranscriptResolve::None);
+    };
+    let projects_root = home.join(CLAUDE_PROJECTS_DIR);
+    let sessions_root = home.join(CLAUDE_SESSIONS_DIR);
+    resolve_claude_transcript_with_roots(pane, &projects_root, &sessions_root, &LiveProc)
 }
 
 fn resolve_claude_transcript_in_projects_root(
     pane: &TmuxPane,
     projects_root: &Path,
-) -> AppResult<Option<(String, PathBuf)>> {
-    for project_dir in candidate_claude_project_dirs(projects_root, &pane.current_path) {
-        if let Some(pid) = pane.pane_pid
-            && let Some(transcript) = transcript_from_process_fds(pid, &project_dir, "jsonl")?
-            && let Some(session_id) = claude_session_id_from_transcript(&transcript, &project_dir)
-        {
-            return Ok(Some((session_id, transcript)));
-        }
-        if let Some((session_id, transcript)) = latest_claude_transcript(&project_dir)? {
-            return Ok(Some((session_id, transcript)));
+) -> AppResult<ClaudeTranscriptResolve> {
+    // Tests that only inject a projects root still get unique-transcript fallback;
+    // production also supplies ~/.claude/sessions via resolve_claude_transcript_for_pane.
+    let sessions_root = home_dir()
+        .map(|home| home.join(CLAUDE_SESSIONS_DIR))
+        .unwrap_or_else(|| PathBuf::from("/dev/null/botctl-no-sessions"));
+    resolve_claude_transcript_with_roots(pane, projects_root, &sessions_root, &LiveProc)
+}
+
+fn resolve_claude_transcript_with_roots(
+    pane: &TmuxPane,
+    projects_root: &Path,
+    sessions_root: &Path,
+    resolver: &dyn ChildResolver,
+) -> AppResult<ClaudeTranscriptResolve> {
+    let project_dirs = candidate_claude_project_dirs(projects_root, &pane.current_path);
+
+    // 1) Prefer an open transcript FD anywhere in the pane process tree.
+    if let Some(pid) = pane.pane_pid {
+        for project_dir in &project_dirs {
+            if let Some(transcript) =
+                transcript_from_process_tree_fds(pid, project_dir, "jsonl")?
+                && let Some(session_id) =
+                    claude_session_id_from_transcript(&transcript, project_dir)
+            {
+                return Ok(ClaudeTranscriptResolve::Found {
+                    session_id,
+                    path: transcript,
+                });
+            }
         }
     }
 
+    // 2) Claude 2.x writes ~/.claude/sessions/<pid>.json with the live sessionId.
+    // Once bound, never fall through to another transcript for the same cwd —
+    // the file may not exist yet during session startup (prompt wait loops).
+    if let Some(session_id) =
+        claude_session_id_from_sessions_registry(pane.pane_pid, sessions_root, resolver)?
+    {
+        return Ok(
+            match transcript_path_for_session_id(
+                &project_dirs,
+                projects_root,
+                &pane.current_path,
+                &session_id,
+            ) {
+                Some(path) => ClaudeTranscriptResolve::Found { session_id, path },
+                None => ClaudeTranscriptResolve::None,
+            },
+        );
+    }
+
+    // 3) Explicit --session-id on the Claude command line (or a descendant).
+    if let Some(session_id) = claude_session_id_from_process_tree_cmdline(pane.pane_pid, resolver) {
+        return Ok(
+            match transcript_path_for_session_id(
+                &project_dirs,
+                projects_root,
+                &pane.current_path,
+                &session_id,
+            ) {
+                Some(path) => ClaudeTranscriptResolve::Found { session_id, path },
+                None => ClaudeTranscriptResolve::None,
+            },
+        );
+    }
+
+    // 4) Safe cwd fallback: only when exactly one top-level project transcript exists.
+    let mut unique: Option<(String, PathBuf)> = None;
+    let mut ambiguous_ids = Vec::new();
+    for project_dir in &project_dirs {
+        for (session_id, path) in list_claude_transcripts(project_dir)? {
+            if ambiguous_ids.iter().any(|id| id == &session_id) {
+                continue;
+            }
+            ambiguous_ids.push(session_id.clone());
+            match &unique {
+                None => unique = Some((session_id, path)),
+                Some((existing_id, _)) if existing_id == &session_id => {}
+                Some(_) => {
+                    ambiguous_ids.sort();
+                    ambiguous_ids.dedup();
+                    return Ok(ClaudeTranscriptResolve::Ambiguous {
+                        candidates: ambiguous_ids,
+                    });
+                }
+            }
+        }
+        // Prefer the most specific (first) project dir that has transcripts.
+        if unique.is_some() {
+            break;
+        }
+    }
+
+    Ok(match unique {
+        Some((session_id, path)) if ambiguous_ids.len() <= 1 => {
+            ClaudeTranscriptResolve::Found { session_id, path }
+        }
+        Some(_) => {
+            ambiguous_ids.sort();
+            ambiguous_ids.dedup();
+            ClaudeTranscriptResolve::Ambiguous {
+                candidates: ambiguous_ids,
+            }
+        }
+        None => ClaudeTranscriptResolve::None,
+    })
+}
+
+fn claude_session_id_from_sessions_registry(
+    pane_pid: Option<u32>,
+    sessions_root: &Path,
+    resolver: &dyn ChildResolver,
+) -> AppResult<Option<String>> {
+    let Some(root_pid) = pane_pid else {
+        return Ok(None);
+    };
+    for pid in collect_process_tree_pids(root_pid, resolver) {
+        if let Some(session_id) = read_claude_sessions_file(&sessions_root.join(format!("{pid}.json")))?
+        {
+            return Ok(Some(session_id));
+        }
+    }
     Ok(None)
+}
+
+fn read_claude_sessions_file(path: &Path) -> AppResult<Option<String>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value: Value = match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string))
+}
+
+fn claude_session_id_from_process_tree_cmdline(
+    pane_pid: Option<u32>,
+    resolver: &dyn ChildResolver,
+) -> Option<String> {
+    let root_pid = pane_pid?;
+    for pid in collect_process_tree_pids(root_pid, resolver) {
+        if let Some(session_id) = session_id_from_process_cmdline(pid) {
+            return Some(session_id);
+        }
+    }
+    None
+}
+
+fn session_id_from_process_cmdline(pid: u32) -> Option<String> {
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<&str> = cmdline
+        .split(|&byte| byte == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index];
+        if let Some(value) = arg.strip_prefix("--session-id=") {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        } else if (arg == "--session-id" || arg == "-s")
+            && let Some(value) = args.get(index + 1)
+            && !value.is_empty()
+            && !value.starts_with('-')
+        {
+            return Some((*value).to_string());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn collect_process_tree_pids(root: u32, resolver: &dyn ChildResolver) -> Vec<u32> {
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        ordered.push(pid);
+        stack.extend(resolver.children_of(pid));
+    }
+    ordered
+}
+
+fn transcript_path_for_session_id(
+    project_dirs: &[PathBuf],
+    projects_root: &Path,
+    current_path: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    for project_dir in project_dirs {
+        let path = project_dir.join(&file_name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // Session registry may point at a cwd whose project dir was not yet scanned
+    // (e.g. path normalization). Try encoding the pane cwd directly.
+    let direct = projects_root
+        .join(encode_claude_project_path(Path::new(current_path)))
+        .join(&file_name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    None
 }
 
 fn candidate_claude_project_dirs(projects_root: &Path, current_path: &str) -> Vec<PathBuf> {
@@ -255,27 +509,22 @@ fn encode_claude_project_path(path: &Path) -> String {
     path.display().to_string().replace('/', "-")
 }
 
-fn latest_claude_transcript(project_dir: &Path) -> AppResult<Option<(String, PathBuf)>> {
-    let mut latest = None::<(SystemTime, String, PathBuf)>;
-    for entry in fs::read_dir(project_dir)? {
+fn list_claude_transcripts(project_dir: &Path) -> AppResult<Vec<(String, PathBuf)>> {
+    let mut transcripts = Vec::new();
+    let entries = match fs::read_dir(project_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(transcripts),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let Some(session_id) = claude_session_id_from_transcript(&path, project_dir) else {
             continue;
         };
-        let modified = entry
-            .metadata()?
-            .modified()
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if latest
-            .as_ref()
-            .map(|(latest_modified, _, _)| modified > *latest_modified)
-            .unwrap_or(true)
-        {
-            latest = Some((modified, session_id, path));
-        }
+        transcripts.push((session_id, path));
     }
-    Ok(latest.map(|(_, session_id, path)| (session_id, path)))
+    Ok(transcripts)
 }
 
 fn claude_session_id_from_transcript(path: &Path, project_dir: &Path) -> Option<String> {
@@ -496,6 +745,21 @@ fn read_jsonl_session_id(path: &Path, key: &str) -> AppResult<Option<String>> {
     Ok(None)
 }
 
+/// Format an ambiguity candidate list for errors without dumping hundreds of ids.
+fn format_candidate_preview(candidates: &[String], limit: usize) -> String {
+    if candidates.is_empty() {
+        return String::from("(none)");
+    }
+    if candidates.len() <= limit {
+        return candidates.join(", ");
+    }
+    let preview = candidates[..limit].join(", ");
+    format!(
+        "{preview}, … (+{} more)",
+        candidates.len().saturating_sub(limit)
+    )
+}
+
 fn sanitize_filename_part(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -525,9 +789,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        default_output_path, encode_claude_project_path, latest_claude_assistant_text,
-        latest_codex_assistant_text, line_count, resolve_claude_transcript_in_projects_root,
+        ClaudeTranscriptResolve, default_output_path, encode_claude_project_path,
+        format_candidate_preview, latest_claude_assistant_text, latest_codex_assistant_text,
+        line_count, resolve_claude_transcript_in_projects_root,
+        resolve_claude_transcript_with_roots,
     };
+    use crate::proc_fd::ChildResolver;
     use crate::tmux::TmuxPane;
 
     /// A pid guaranteed not to exist on any current Linux system. `/proc/4294967295/fd`
@@ -541,6 +808,16 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn format_candidate_preview_limits_long_lists() {
+        let many: Vec<String> = (0..15).map(|i| format!("id-{i}")).collect();
+        let preview = format_candidate_preview(&many, 10);
+        assert!(preview.starts_with("id-0, id-1"));
+        assert!(preview.contains("(+5 more)"));
+        assert!(!preview.contains("id-14"));
+        assert_eq!(format_candidate_preview(&many[..3], 10), "id-0, id-1, id-2");
     }
 
     #[test]
@@ -580,13 +857,133 @@ mod tests {
         )
         .expect("transcript should write");
 
-        let (session_id, path) =
+        let resolved =
             resolve_claude_transcript_in_projects_root(&sample_pane("/tmp/project/subdir"), &root)
-                .expect("resolver should succeed")
-                .expect("transcript should resolve");
+                .expect("resolver should succeed");
 
-        assert_eq!(session_id, "session-live");
-        assert_eq!(path, transcript);
+        match resolved {
+            ClaudeTranscriptResolve::Found { session_id, path } => {
+                assert_eq!(session_id, "session-live");
+                assert_eq!(path, transcript);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_resolver_binds_same_cwd_sessions_via_pid_registry() {
+        let root = unique_temp_dir("claude-last-message-multi");
+        let projects_root = root.join("projects");
+        let sessions_root = root.join("sessions");
+        fs::create_dir_all(&sessions_root).expect("sessions root should create");
+        let cwd = "/tmp/shared-project";
+        let project_dir = projects_root.join(encode_claude_project_path(std::path::Path::new(cwd)));
+        fs::create_dir_all(&project_dir).expect("project dir should create");
+
+        const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        for (session_id, text) in [(A, "sentinel-a"), (B, "sentinel-b")] {
+            fs::write(
+                project_dir.join(format!("{session_id}.jsonl")),
+                format!(
+                    "{{\"type\":\"permission-mode\",\"sessionId\":\"{session_id}\"}}\n\
+                     {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+                ),
+            )
+            .expect("transcript should write");
+        }
+
+        // No pane pid / sessions file: multi-session cwd must be ambiguous, not newest-wins.
+        let ambiguous =
+            resolve_claude_transcript_with_roots(&sample_pane(cwd), &projects_root, &sessions_root, &EmptyResolver)
+                .expect("resolver should succeed");
+        match ambiguous {
+            ClaudeTranscriptResolve::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates.iter().any(|id| id == A));
+                assert!(candidates.iter().any(|id| id == B));
+            }
+            other => panic!("expected Ambiguous without pid binding, got {other:?}"),
+        }
+
+        // Sessions registry pins pane pid 101 -> A and 102 -> B.
+        fs::write(
+            sessions_root.join("101.json"),
+            format!(r#"{{"pid":101,"sessionId":"{A}","cwd":"{cwd}"}}"#),
+        )
+        .expect("session A registry should write");
+        fs::write(
+            sessions_root.join("102.json"),
+            format!(r#"{{"pid":102,"sessionId":"{B}","cwd":"{cwd}"}}"#),
+        )
+        .expect("session B registry should write");
+
+        let mut pane_a = sample_pane(cwd);
+        pane_a.pane_pid = Some(101);
+        let mut pane_b = sample_pane(cwd);
+        pane_b.pane_id = String::from("%2");
+        pane_b.pane_pid = Some(102);
+
+        let resolved_a =
+            resolve_claude_transcript_with_roots(&pane_a, &projects_root, &sessions_root, &EmptyResolver)
+                .expect("pane A should resolve");
+        let resolved_b =
+            resolve_claude_transcript_with_roots(&pane_b, &projects_root, &sessions_root, &EmptyResolver)
+                .expect("pane B should resolve");
+
+        match resolved_a {
+            ClaudeTranscriptResolve::Found { session_id, path } => {
+                assert_eq!(session_id, A);
+                assert_eq!(path, project_dir.join(format!("{A}.jsonl")));
+                let text = latest_claude_assistant_text(&path)
+                    .expect("read A")
+                    .expect("text A");
+                assert_eq!(text, "sentinel-a");
+            }
+            other => panic!("expected Found for pane A, got {other:?}"),
+        }
+        match resolved_b {
+            ClaudeTranscriptResolve::Found { session_id, path } => {
+                assert_eq!(session_id, B);
+                assert_eq!(path, project_dir.join(format!("{B}.jsonl")));
+                let text = latest_claude_assistant_text(&path)
+                    .expect("read B")
+                    .expect("text B");
+                assert_eq!(text, "sentinel-b");
+            }
+            other => panic!("expected Found for pane B, got {other:?}"),
+        }
+
+        // Registry binding is exclusive: a known session id with no transcript yet
+        // must not fall through to another same-cwd session's file.
+        const C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        fs::write(
+            sessions_root.join("103.json"),
+            format!(r#"{{"pid":103,"sessionId":"{C}","cwd":"{cwd}"}}"#),
+        )
+        .expect("session C registry should write");
+        let mut pane_c = sample_pane(cwd);
+        pane_c.pane_id = String::from("%3");
+        pane_c.pane_pid = Some(103);
+        let resolved_c =
+            resolve_claude_transcript_with_roots(&pane_c, &projects_root, &sessions_root, &EmptyResolver)
+                .expect("pane C should resolve");
+        assert!(
+            matches!(resolved_c, ClaudeTranscriptResolve::None),
+            "expected None for bound-but-missing transcript, got {resolved_c:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Resolver with no children — unit tests supply sessions files for the
+    /// pane pid itself and must not consult live /proc.
+    struct EmptyResolver;
+
+    impl ChildResolver for EmptyResolver {
+        fn children_of(&self, _pid: u32) -> Vec<u32> {
+            Vec::new()
+        }
     }
 
     #[test]
