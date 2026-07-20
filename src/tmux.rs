@@ -507,15 +507,30 @@ impl TmuxClient {
     pub fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()> {
         let plan = self.plan_paste_text(pane_id, text);
         let byte_count = text.len();
-        self.run_command_plan_status(&plan.set_buffer)
-            .map_err(|_| {
+        // Run set-buffer without routing through run_command_plan_status: that
+        // helper joins full argv into the error and would leak the prompt body.
+        // Preserve spawn failures and the exit status only, then add size guidance.
+        let set_status = std::process::Command::new(&plan.set_buffer.program)
+            .args(&plan.set_buffer.args)
+            .status()
+            .map_err(|error| {
                 AppError::new(format!(
-                    "tmux set-buffer failed while staging prompt text ({byte_count} bytes); \
-                     tmux buffer size limits may apply — lower --large-prompt-threshold so \
-                     botctl stages a short instruction file instead of pasting the full body, \
-                     or paste via the large-prompt/editor path"
+                    "failed to spawn tmux set-buffer while staging prompt text \
+                     ({byte_count} bytes): {error}"
                 ))
             })?;
+        if !set_status.success() {
+            let exit = set_status
+                .code()
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| String::from("terminated by signal"));
+            return Err(AppError::new(format!(
+                "tmux set-buffer failed while staging prompt text ({byte_count} bytes, {exit}); \
+                 tmux buffer size limits may apply — lower --large-prompt-threshold so \
+                 botctl stages a short instruction file instead of pasting the full body, \
+                 or paste via the large-prompt/editor path"
+            )));
+        }
         self.run_command_plan_status(&plan.paste_buffer)
     }
 

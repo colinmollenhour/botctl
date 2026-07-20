@@ -97,7 +97,7 @@ fn load_claude_last_message(pane: &TmuxPane) -> AppResult<LastAgentMessage> {
                 pane.pane_id,
                 pane.current_path,
                 candidates.len(),
-                candidates.join(", ")
+                format_candidate_preview(&candidates, 10)
             )));
         }
     };
@@ -745,6 +745,21 @@ fn read_jsonl_session_id(path: &Path, key: &str) -> AppResult<Option<String>> {
     Ok(None)
 }
 
+/// Format an ambiguity candidate list for errors without dumping hundreds of ids.
+fn format_candidate_preview(candidates: &[String], limit: usize) -> String {
+    if candidates.is_empty() {
+        return String::from("(none)");
+    }
+    if candidates.len() <= limit {
+        return candidates.join(", ");
+    }
+    let preview = candidates[..limit].join(", ");
+    format!(
+        "{preview}, … (+{} more)",
+        candidates.len().saturating_sub(limit)
+    )
+}
+
 fn sanitize_filename_part(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -775,8 +790,9 @@ mod tests {
 
     use super::{
         ClaudeTranscriptResolve, default_output_path, encode_claude_project_path,
-        latest_claude_assistant_text, latest_codex_assistant_text, line_count,
-        resolve_claude_transcript_in_projects_root, resolve_claude_transcript_with_roots,
+        format_candidate_preview, latest_claude_assistant_text, latest_codex_assistant_text,
+        line_count, resolve_claude_transcript_in_projects_root,
+        resolve_claude_transcript_with_roots,
     };
     use crate::proc_fd::ChildResolver;
     use crate::tmux::TmuxPane;
@@ -792,6 +808,16 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn format_candidate_preview_limits_long_lists() {
+        let many: Vec<String> = (0..15).map(|i| format!("id-{i}")).collect();
+        let preview = format_candidate_preview(&many, 10);
+        assert!(preview.starts_with("id-0, id-1"));
+        assert!(preview.contains("(+5 more)"));
+        assert!(!preview.contains("id-14"));
+        assert_eq!(format_candidate_preview(&many[..3], 10), "id-0, id-1, id-2");
     }
 
     #[test]
