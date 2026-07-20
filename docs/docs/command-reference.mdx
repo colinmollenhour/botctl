@@ -377,6 +377,19 @@ botctl capture --pane 0:2.3 --history-lines 80
 
 Purpose: dump the latest assistant message for one Claude Code, Codex CLI, OpenCode, Pi, Grok, or Antigravity pane as raw Markdown. Claude/Codex/OpenCode/Pi/Grok read persisted provider transcripts (Grok from `~/.grok/sessions/.../updates.jsonl`); Antigravity scrapes the pane's tmux scrollback.
 
+### `install-skill` / `view-skill`
+
+Purpose: install or print the Agent Skill bundled inside the botctl binary (`botctl-prompt` by default). The skill teaches agents how to run advanced `botctl prompt` invocations.
+
+```bash
+botctl install-skill
+botctl install-skill --name botctl-prompt --path ~/.claude/skills
+botctl view-skill
+botctl view-skill botctl-prompt
+```
+
+Default install root is `~/.claude/skills/<name>/SKILL.md`. `view-skill` prints the embedded Markdown to stdout without writing files. The same skill is also available via `npx skills add colinmollenhour/botctl --skill botctl-prompt`.
+
 Syntax:
 ```bash
 botctl last-message --pane %ID|session:window.pane [--out PATH] [--history-lines N]

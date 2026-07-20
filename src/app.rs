@@ -29,10 +29,10 @@ use crate::classifier::{
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
     ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
-    KeepGoingArgs, LastMessageArgs, ListPanesArgs, McpArgs, McpTransportArgs, ObserveArgs,
-    PaneCommandArgs, PaneTargetArgs, PreparePromptArgs, PromptRunArgs, RecordFixtureArgs,
-    ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs, SubmitPromptArgs,
-    YoloStartArgs, YoloStopArgs,
+    InstallSkillArgs, KeepGoingArgs, LastMessageArgs, ListPanesArgs, McpArgs, McpTransportArgs,
+    ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs, PromptRunArgs,
+    RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
+    SubmitPromptArgs, ViewSkillArgs, YoloStartArgs, YoloStopArgs,
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
@@ -227,6 +227,8 @@ pub fn run(command: Command) -> AppResult<String> {
         Command::Replay(args) => run_replay(args),
         Command::Bindings => Ok(render_keybindings_json()),
         Command::InstallBindings(args) => run_install_bindings(args),
+        Command::InstallSkill(args) => run_install_skill(args),
+        Command::ViewSkill(args) => run_view_skill(args),
         Command::SendAction(args) => run_send_action(args),
         Command::ApprovePermission(args) => {
             run_guarded_pane_workflow(args, GuardedWorkflow::ApprovePermission)
@@ -1036,6 +1038,15 @@ fn run_install_bindings(args: InstallBindingsArgs) -> AppResult<String> {
     )
     .trim_end()
     .to_string())
+}
+
+fn run_install_skill(args: InstallSkillArgs) -> AppResult<String> {
+    let report = crate::skill::install_skill(args.name.as_deref(), args.path.as_deref())?;
+    Ok(crate::skill::render_install_skill_report(&report))
+}
+
+fn run_view_skill(args: ViewSkillArgs) -> AppResult<String> {
+    crate::skill::view_skill(args.name.as_deref())
 }
 
 fn run_observe(args: ObserveArgs) -> AppResult<String> {

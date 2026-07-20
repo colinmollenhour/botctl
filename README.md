@@ -28,6 +28,39 @@ cargo install --path .
 
 See [Requirements](#requirements) for the runtime dependencies (`tmux`, plus `claude` for Claude automation, `codex` for Codex CLI visibility and permission approval, `opencode` for OpenCode dashboard visibility, `grok` for Grok dashboard visibility, and `agy` for Antigravity dashboard visibility).
 
+### Agent skill (`botctl-prompt`)
+
+botctl ships a bundled Agent Skill that teaches coding agents how to run advanced
+Claude invocations through `botctl prompt` (observable tmux TUI, YOLO-safe
+blockers, multi-file packets, isolated `--session-id`s). After installing the
+binary, install the skill into Claude Code:
+
+```bash
+botctl install-skill
+```
+
+Inspect the skill without installing:
+
+```bash
+botctl view-skill
+```
+
+Or install from this repository with the skills CLI (`npx skills`):
+
+```bash
+# project-level (current repo)
+npx skills add colinmollenhour/botctl --skill botctl-prompt
+
+# global (user-level)
+npx skills add colinmollenhour/botctl --skill botctl-prompt -g
+
+# list skills in the package without installing
+npx skills add colinmollenhour/botctl -l
+```
+
+See `npx skills --help` for agent targeting (`--agent`), non-interactive
+install (`-y`), and update/remove commands.
+
 ## Main Commands
 
 These are the commands that matter most in day-to-day use:
@@ -35,6 +68,7 @@ These are the commands that matter most in day-to-day use:
 - `runtime` to start or stop the single local coordinator that owns live observation and automation
 - `dashboard` to see Claude Code panes, runtime-discovered panes, supported Codex/OpenCode/Pi/Grok/Antigravity visibility, and conservative Claude/Grok recovery offers after an external tool recreates missing tmux shell panes
 - `prompt` to run a one-shot prompt through a new interactive Claude TUI window in tmux and print only the final assistant text to stdout
+- `install-skill` / `view-skill` to install or print the bundled `botctl-prompt` Agent Skill
 - `last-message` to export the full latest assistant text from a pane transcript to Markdown
 - `yolo` to set central YOLO policy for one pane or a scoped set of panes
 - `serve` to expose HTTP and event output as a facade over runtime state
