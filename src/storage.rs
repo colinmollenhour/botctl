@@ -25,7 +25,6 @@ const STATE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
 const PLACEHOLDER_INSTANCE_KIND: &str = "prompt-placeholder";
 const TMUX_INSTANCE_KIND: &str = "tmux-pane";
 const LEGACY_WORKSPACE_ROOT: &str = "/__botctl_legacy_global_workspace__";
-const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
 const CLAUDE_SESSION_REVALIDATE_MS: i64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2694,34 +2693,44 @@ fn load_instance_runtime_state_with_connection(
 }
 
 /// Resolve the live Claude identity without consulting or updating SQLite.
+///
+/// Delegates to the same pane→session binding used by `last-message` so the
+/// dashboard, recovery, and export paths never pick a different transcript.
 pub fn resolve_live_claude_session_id(pane: &TmuxPane) -> AppResult<Option<String>> {
-    let Some(projects_root) = claude_projects_root() else {
-        return Ok(None);
-    };
-
-    resolve_live_claude_session_id_in(&projects_root, pane)
+    crate::last_message::resolve_claude_session_id_for_pane(pane)
 }
 
 fn resolve_live_claude_session_id_in(
     projects_root: &Path,
     pane: &TmuxPane,
 ) -> AppResult<Option<String>> {
-    for project_dir in candidate_claude_project_dirs(&projects_root, &pane.current_path) {
+    // Test/helper path: bind by open FD when possible, otherwise accept a
+    // project-dir transcript only when it is unique for the pane cwd.
+    // Production callers use `resolve_live_claude_session_id`, which also
+    // consults ~/.claude/sessions/<pid>.json.
+    for project_dir in candidate_claude_project_dirs(projects_root, &pane.current_path) {
         if let Some(pid) = pane.pane_pid
             && let Some(session_id) = claude_session_id_from_pid(pid, &project_dir)?
         {
             return Ok(Some(session_id));
         }
-        if let Some(session_id) = latest_claude_session_id(&project_dir)? {
-            return Ok(Some(session_id));
-        }
     }
 
-    Ok(None)
-}
-
-fn claude_projects_root() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(CLAUDE_PROJECTS_DIR))
+    let mut unique: Option<String> = None;
+    for project_dir in candidate_claude_project_dirs(projects_root, &pane.current_path) {
+        let mut ids = list_claude_session_ids(&project_dir)?;
+        ids.sort();
+        ids.dedup();
+        match ids.as_slice() {
+            [] => continue,
+            [only] => {
+                unique = Some(only.clone());
+                break;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(unique)
 }
 
 fn candidate_claude_project_dirs(projects_root: &Path, current_path: &str) -> Vec<PathBuf> {
@@ -2764,6 +2773,23 @@ fn claude_session_id_from_fd_dir(fd_dir: &Path, project_dir: &Path) -> AppResult
         }
     }
     Ok(None)
+}
+
+fn list_claude_session_ids(project_dir: &Path) -> AppResult<Vec<String>> {
+    let mut ids = Vec::new();
+    let entries = match fs::read_dir(project_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(session_id) = claude_session_id_from_transcript_path(&path, project_dir) {
+            ids.push(session_id);
+        }
+    }
+    Ok(ids)
 }
 
 fn latest_claude_session_id(project_dir: &Path) -> AppResult<Option<String>> {
@@ -2906,6 +2932,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rusqlite::params;
@@ -2924,6 +2951,38 @@ mod tests {
     };
     use crate::recovery::{RecoveryRecord, RecoveryTarget};
     use crate::tmux::{TmuxPane, TmuxServerIdentity};
+
+    /// Serialize tests that mutate process-global `HOME` so they do not race
+    /// with parallel Claude resolution paths that also read `$HOME`.
+    fn home_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct HomeEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn install(home: &std::path::Path) -> Self {
+            let prior = std::env::var_os("HOME");
+            // SAFETY: callers hold `home_env_lock` for the guard lifetime.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same lock as install.
+            match self.prior.take() {
+                Some(home) => unsafe { std::env::set_var("HOME", home) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
 
     #[test]
     fn state_db_path_uses_state_root_filename() {
@@ -3417,15 +3476,11 @@ mod tests {
         .expect("cook sync should start");
 
         let before_claude = cook_fields(&state_dir);
-        let previous_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", &home_dir);
-        }
-        sync_tmux_claude_session_id(&state_dir, &workspace.id, &pane)
-            .expect("claude sync should succeed");
-        match previous_home {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
+        {
+            let _lock = home_env_lock().lock().expect("home env lock");
+            let _home = HomeEnvGuard::install(&home_dir);
+            sync_tmux_claude_session_id(&state_dir, &workspace.id, &pane)
+                .expect("claude sync should succeed");
         }
         assert_eq!(cook_fields(&state_dir), before_claude);
 
@@ -4718,16 +4773,12 @@ mod tests {
         pane.current_path = workspace_root.display().to_string();
         pane.pane_pid = None;
 
-        let previous_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", &home_dir);
-        }
-        let resolved = sync_tmux_claude_session_id(&state_dir, &workspace.id, &pane)
-            .expect("claude session should sync");
-        match previous_home {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        let resolved = {
+            let _lock = home_env_lock().lock().expect("home env lock");
+            let _home = HomeEnvGuard::install(&home_dir);
+            sync_tmux_claude_session_id(&state_dir, &workspace.id, &pane)
+                .expect("claude session should sync")
+        };
 
         assert_eq!(resolved, Some(String::from("session-live")));
 

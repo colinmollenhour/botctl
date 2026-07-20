@@ -506,8 +506,16 @@ impl TmuxClient {
 
     pub fn paste_text(&self, pane_id: &str, text: &str) -> AppResult<()> {
         let plan = self.plan_paste_text(pane_id, text);
+        let byte_count = text.len();
         self.run_command_plan_status(&plan.set_buffer)
-            .map_err(|_| AppError::new("tmux set-buffer failed while staging prompt text"))?;
+            .map_err(|_| {
+                AppError::new(format!(
+                    "tmux set-buffer failed while staging prompt text ({byte_count} bytes); \
+                     tmux buffer size limits may apply — lower --large-prompt-threshold so \
+                     botctl stages a short instruction file instead of pasting the full body, \
+                     or paste via the large-prompt/editor path"
+                ))
+            })?;
         self.run_command_plan_status(&plan.paste_buffer)
     }
 

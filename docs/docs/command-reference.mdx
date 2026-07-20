@@ -404,7 +404,7 @@ botctl last-message --pane %19 --out - | pbcopy
 ```
 
 Provider notes:
-- Claude reads the pane's Claude transcript under `~/.claude/projects`, preferring the transcript opened by the pane process and falling back to the newest transcript for the pane cwd.
+- Claude binds the pane to a transcript under `~/.claude/projects` using, in order: an open project transcript FD in the pane process tree, Claude's live `~/.claude/sessions/<pid>.json` registry, `--session-id` on the Claude command line, then a project-dir transcript only when it is unique for the pane cwd. Multiple same-cwd sessions without a unique binding fail closed instead of returning the newest unrelated transcript.
 - Pi reads JSONL sessions under `~/.pi/agent/sessions` (or `PI_CODING_AGENT_SESSION_DIR`), preferring a transcript opened by the pane process tree and falling back to the newest session for the pane cwd.
 - Codex reads `~/.codex/sessions`, preferring an open transcript file descriptor and falling back to the newest session whose `session_meta.cwd` matches the pane cwd.
 - OpenCode resolves the pane by `OC | <session title>` plus cwd, then reads the latest assistant `text` parts from OpenCode's SQLite `message`/`part` rows.

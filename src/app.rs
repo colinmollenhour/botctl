@@ -2252,19 +2252,27 @@ fn resolve_prompt_run_input(
 fn compose_prompt_run_content(args: &PromptRunArgs) -> AppResult<String> {
     let mut sections = Vec::new();
     for path in &args.append_system_prompts {
+        let content = fs::read_to_string(path).map_err(|error| {
+            AppError::new(format!(
+                "failed to read --append-system-prompt {}: {error}",
+                path.display()
+            ))
+        })?;
         sections.push(format!(
-            "--- system prompt: {} ---\n{}",
-            path.display(),
-            fs::read_to_string(path)?
+            "--- system prompt: {} ---\n{content}",
+            path.display()
         ));
     }
 
     let mut user_parts = Vec::new();
     for path in &args.sources {
-        user_parts.push((
-            format!("source: {}", path.display()),
-            fs::read_to_string(path)?,
-        ));
+        let content = fs::read_to_string(path).map_err(|error| {
+            AppError::new(format!(
+                "failed to read --source {}: {error}",
+                path.display()
+            ))
+        })?;
+        user_parts.push((format!("source: {}", path.display()), content));
     }
     if let Some(text) = &args.text {
         user_parts.push((String::from("text"), text.clone()));
