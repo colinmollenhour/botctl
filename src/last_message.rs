@@ -268,6 +268,7 @@ fn resolve_claude_transcript_for_pane(pane: &TmuxPane) -> AppResult<ClaudeTransc
     resolve_claude_transcript_with_roots(pane, &projects_root, &sessions_root, &LiveProc)
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn resolve_claude_transcript_in_projects_root(
     pane: &TmuxPane,
     projects_root: &Path,

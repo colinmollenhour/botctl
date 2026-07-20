@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(any(test, rust_analyzer))]
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -2700,6 +2701,9 @@ pub fn resolve_live_claude_session_id(pane: &TmuxPane) -> AppResult<Option<Strin
     crate::last_message::resolve_claude_session_id_for_pane(pane)
 }
 
+// Test-only Claude session helpers. Production resolution lives in
+// `last_message` and is exposed via `resolve_live_claude_session_id`.
+#[cfg(any(test, rust_analyzer))]
 fn resolve_live_claude_session_id_in(
     projects_root: &Path,
     pane: &TmuxPane,
@@ -2733,6 +2737,7 @@ fn resolve_live_claude_session_id_in(
     Ok(unique)
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn candidate_claude_project_dirs(projects_root: &Path, current_path: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     for ancestor in Path::new(current_path).ancestors() {
@@ -2747,14 +2752,17 @@ fn candidate_claude_project_dirs(projects_root: &Path, current_path: &str) -> Ve
     candidates
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn encode_claude_project_path(path: &Path) -> String {
     path.display().to_string().replace('/', "-")
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn claude_session_id_from_pid(pid: u32, project_dir: &Path) -> AppResult<Option<String>> {
     claude_session_id_from_fd_dir(&PathBuf::from(format!("/proc/{pid}/fd")), project_dir)
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn claude_session_id_from_fd_dir(fd_dir: &Path, project_dir: &Path) -> AppResult<Option<String>> {
     let entries = match fs::read_dir(fd_dir) {
         Ok(entries) => entries,
@@ -2775,6 +2783,7 @@ fn claude_session_id_from_fd_dir(fd_dir: &Path, project_dir: &Path) -> AppResult
     Ok(None)
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn list_claude_session_ids(project_dir: &Path) -> AppResult<Vec<String>> {
     let mut ids = Vec::new();
     let entries = match fs::read_dir(project_dir) {
@@ -2792,6 +2801,7 @@ fn list_claude_session_ids(project_dir: &Path) -> AppResult<Vec<String>> {
     Ok(ids)
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn latest_claude_session_id(project_dir: &Path) -> AppResult<Option<String>> {
     let mut latest = None::<(SystemTime, String)>;
     for entry in fs::read_dir(project_dir)? {
@@ -2815,6 +2825,7 @@ fn latest_claude_session_id(project_dir: &Path) -> AppResult<Option<String>> {
     Ok(latest.map(|(_, session_id)| session_id))
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn claude_session_id_from_transcript_path(path: &Path, project_dir: &Path) -> Option<String> {
     if path.parent()? != project_dir {
         return None;
@@ -2825,6 +2836,7 @@ fn claude_session_id_from_transcript_path(path: &Path, project_dir: &Path) -> Op
     read_session_id_from_transcript(path).ok().flatten()
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn read_session_id_from_transcript(path: &Path) -> AppResult<Option<String>> {
     let content = fs::read_to_string(path)?;
     for line in content.lines().take(8) {
