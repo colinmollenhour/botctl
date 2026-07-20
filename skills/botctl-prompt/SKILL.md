@@ -30,25 +30,12 @@ command -v botctl && command -v tmux && command -v claude
 botctl --version
 ```
 
-Optional: install this skill into Claude Code (or other agents) from the
-embedded copy shipped in the binary:
-
-```bash
-botctl install-skill
-```
-
-Inspect the embedded skill without installing:
+If this skill file is not already loaded by the host agent, **do not install
+it**. Read the embedded copy on demand and follow it:
 
 ```bash
 botctl view-skill
 # or: botctl view-skill botctl-prompt
-```
-
-Install from GitHub with the skills CLI (project or global):
-
-```bash
-npx skills add colinmollenhour/botctl --skill botctl-prompt
-npx skills add colinmollenhour/botctl --skill botctl-prompt -g
 ```
 
 ## Core pattern
@@ -246,22 +233,14 @@ inspect the surviving window.
 - Non-Claude providers (use provider-native CLIs or botctl MCP/`last-message`
   for visibility only).
 
-## Skill discovery helpers
+## If this skill is not installed
+
+Assume the user does **not** want it installed. Do not run any install
+command. Print and follow the copy bundled in the botctl binary:
 
 ```bash
-# Print the skill shipped inside this botctl binary
-botctl view-skill
-
-# Install/update ~/.claude/skills/botctl-prompt/SKILL.md from the binary
-botctl install-skill
-
-# Optional install roots
-botctl install-skill --path ~/.claude/skills
-botctl install-skill --path ~/.agents/skills
+botctl view-skill botctl-prompt
 ```
-
-If the skill is not installed in the current agent, run `botctl view-skill` and
-follow those instructions instead of guessing flags.
 
 ## Verified examples (Sonnet)
 
