@@ -64,6 +64,11 @@ const KEEP_GOING_CUSTOM_PROMPT_ANCHOR: &str = "[[BOTCTL_KEEP_GOING_END_PROMPT]]"
 const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to cancel";
 const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
 const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
+// A large bracketed paste can take seconds to land in the Claude TUI on a busy
+// host, so wait for the composer to actually show the staged text before
+// pressing Enter; an Enter that arrives mid-paste is swallowed.
+const PROMPT_PASTE_VISIBLE_TIMEOUT_MS: u64 = 15_000;
+const PROMPT_SUBMIT_ATTEMPTS: usize = 3;
 const DASHBOARD_PERSISTENT_SOCKET: &str = "botctl-dashboard";
 const DASHBOARD_PERSISTENT_SESSION: &str = "botctl-dashboard";
 const DASHBOARD_PERSISTENT_WINDOW: &str = "dashboard";
@@ -2134,14 +2139,119 @@ fn submit_prompt_text_direct(
     submit_delay_ms: u64,
 ) -> AppResult<()> {
     client.paste_text(&pane.pane_id, prompt_text)?;
+    let paste_visible = wait_for_pasted_prompt_visible(client, &pane.pane_id)?;
     thread::sleep(Duration::from_millis(submit_delay_ms));
-    send_actions(
-        client,
-        &pane.pane_id,
-        &[AutomationAction::Submit],
-        bindings,
-        submit_delay_ms,
-    )
+
+    for attempt in 1..=PROMPT_SUBMIT_ATTEMPTS {
+        send_actions(
+            client,
+            &pane.pane_id,
+            &[AutomationAction::Submit],
+            bindings,
+            submit_delay_ms,
+        )?;
+        match watch_prompt_submission(client, &pane.pane_id, paste_visible)? {
+            SubmissionWatch::Started => return Ok(()),
+            SubmissionWatch::StillEditing => {
+                if attempt < PROMPT_SUBMIT_ATTEMPTS {
+                    prompt_warning(format_args!(
+                        "pane {} still had unsubmitted input after Enter; retrying submit ({}/{})",
+                        pane.pane_id,
+                        attempt + 1,
+                        PROMPT_SUBMIT_ATTEMPTS
+                    ));
+                }
+            }
+        }
+    }
+
+    Err(AppError::with_exit_code(
+        format!(
+            "prompt staged {} bytes into pane {} but it never left PromptEditing after {} submit attempts; the prompt is still unsubmitted in that pane",
+            prompt_text.len(),
+            pane.pane_id,
+            PROMPT_SUBMIT_ATTEMPTS
+        ),
+        2,
+    ))
+}
+
+/// Whether an Enter keypress actually moved the pane out of prompt composition.
+enum SubmissionWatch {
+    Started,
+    /// The staged prompt is still sitting in the composer: Enter was swallowed.
+    StillEditing,
+}
+
+/// Wait for a pasted prompt to appear in the composer so Enter is not sent
+/// while the TUI is still ingesting the bracketed paste; an Enter that lands
+/// mid-paste is swallowed. A paste never self-submits, so timing out here is
+/// non-fatal: report that the paste was never seen and let the submit retries
+/// (with stricter verification) deal with it.
+fn wait_for_pasted_prompt_visible(client: &TmuxClient, pane_id: &str) -> AppResult<bool> {
+    let attempts = std::cmp::max(
+        1,
+        PROMPT_PASTE_VISIBLE_TIMEOUT_MS / PROMPT_SUBMISSION_POLL_MS,
+    );
+    for _ in 0..attempts {
+        let frame = client.capture_pane(pane_id, KEEP_GOING_HISTORY_LINES)?;
+        let classification = Classifier.classify(pane_id, &focused_frame_source(&frame));
+        if classification.state == SessionState::PromptEditing {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
+    }
+    prompt_warning(format_args!(
+        "pasted prompt never became visible in pane {pane_id} composer; submitting anyway"
+    ));
+    Ok(false)
+}
+
+/// Watch a pane after Enter to decide whether the staged prompt was submitted.
+///
+/// When the paste was confirmed visible, leaving `PromptEditing` is proof of
+/// submission: the composer only clears when the prompt is sent. When it was
+/// never seen, fall back to requiring an affirmative post-submit state so a
+/// still-pending paste plus a ticking status line cannot read as success.
+fn watch_prompt_submission(
+    client: &TmuxClient,
+    pane_id: &str,
+    paste_visible: bool,
+) -> AppResult<SubmissionWatch> {
+    let attempts = std::cmp::max(1, PROMPT_SUBMISSION_TIMEOUT_MS / PROMPT_SUBMISSION_POLL_MS);
+    for _ in 0..attempts {
+        thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
+        let frame = client.capture_pane(pane_id, KEEP_GOING_HISTORY_LINES)?;
+        let classification = Classifier.classify(pane_id, &focused_frame_source(&frame));
+        if submission_left_composer(classification.state, paste_visible) {
+            return Ok(SubmissionWatch::Started);
+        }
+    }
+
+    Ok(SubmissionWatch::StillEditing)
+}
+
+fn submission_left_composer(state: SessionState, paste_visible: bool) -> bool {
+    match state {
+        SessionState::PromptEditing
+        | SessionState::ExternalEditorActive
+        | SessionState::Unknown
+        | SessionState::AgyCommandPermissionPrompt
+        | SessionState::AgyFolderTrustPrompt
+        | SessionState::AgySettingsPersistPrompt => false,
+        // Only reachable once the composer cleared, which requires the staged
+        // prompt to have been sent -- but that inference is sound only when the
+        // composer was observed holding the paste in the first place.
+        SessionState::ChatReady => paste_visible,
+        SessionState::BusyResponding
+        | SessionState::UserQuestionPrompt
+        | SessionState::PermissionDialog
+        | SessionState::PlanApprovalPrompt
+        | SessionState::FolderTrustPrompt
+        | SessionState::StartupChoicePrompt
+        | SessionState::SurveyPrompt
+        | SessionState::DiffDialog => true,
+    }
 }
 
 fn cleanup_prompt_temp(resolved_input: &ResolvedPromptRunInput, keep_temp: bool) {
@@ -4581,8 +4691,9 @@ mod tests {
         render_next_safe_action, render_observe_command_output, render_screen_excerpt,
         render_status_json, render_status_report, resolve_keep_going_prompt,
         resolve_prompt_run_input, run_prepare_prompt, shell_escape,
-        strip_dashboard_window_prefixes, submit_prompt_preflight_workflow,
-        tmux_socket_path_from_value, write_prompt_instruction_temp_file, yolo_action_for_state,
+        strip_dashboard_window_prefixes, submission_left_composer,
+        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
+        write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
@@ -5554,6 +5665,48 @@ mod tests {
             &ready,
             Some(KEEP_GOING_PROMPT_ANCHOR),
         ));
+    }
+
+    #[test]
+    fn staged_prompt_still_in_composer_is_never_submitted() {
+        for paste_visible in [true, false] {
+            assert!(!submission_left_composer(
+                SessionState::PromptEditing,
+                paste_visible
+            ));
+            assert!(!submission_left_composer(
+                SessionState::ExternalEditorActive,
+                paste_visible
+            ));
+            assert!(!submission_left_composer(
+                SessionState::Unknown,
+                paste_visible
+            ));
+        }
+    }
+
+    #[test]
+    fn chat_ready_counts_as_submitted_only_after_the_paste_was_seen() {
+        assert!(submission_left_composer(SessionState::ChatReady, true));
+        assert!(!submission_left_composer(SessionState::ChatReady, false));
+    }
+
+    #[test]
+    fn post_submit_states_count_as_submitted_regardless_of_paste_visibility() {
+        for paste_visible in [true, false] {
+            assert!(submission_left_composer(
+                SessionState::BusyResponding,
+                paste_visible
+            ));
+            assert!(submission_left_composer(
+                SessionState::PermissionDialog,
+                paste_visible
+            ));
+            assert!(submission_left_composer(
+                SessionState::UserQuestionPrompt,
+                paste_visible
+            ));
+        }
     }
 
     #[test]

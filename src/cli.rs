@@ -998,7 +998,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "-- CLAUDE_ARG ... (passed to the interactive Claude command)",
                 "--no-color",
             ][..],
-            "Launches Claude in a new detached tmux window in the owning session, creating that session first when needed, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. The default owning session is botctl; --session overrides it. On success, botctl loads a fresh assistant message before killing only the captured prompt window. Failed prompt windows are left alive for inspection. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
+            "Launches Claude in a new detached tmux window in the owning session, creating that session first when needed, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. The default owning session is botctl; --session overrides it. Submission is verified: botctl waits for the paste to appear in the composer, then confirms the pane actually left prompt composition, retrying Enter before failing rather than reporting a submit that never happened. On success, botctl loads a fresh assistant message before killing only the captured prompt window. Failed prompt windows are left alive for inspection. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
         ),
         "mcp" => (
             "mcp",
@@ -1803,9 +1803,7 @@ fn parse_install_skill(args: Vec<String>) -> AppResult<Command> {
                 name = Some(flag.to_string());
             }
             flag => {
-                return Err(AppError::new(format!(
-                    "unknown install-skill flag: {flag}"
-                )));
+                return Err(AppError::new(format!("unknown install-skill flag: {flag}")));
             }
         }
         i += 1;
@@ -3380,7 +3378,10 @@ mod tests {
         match command {
             Command::InstallSkill(args) => {
                 assert_eq!(args.name.as_deref(), Some("botctl-prompt"));
-                assert_eq!(args.path.as_deref(), Some(std::path::Path::new("/tmp/skills")));
+                assert_eq!(
+                    args.path.as_deref(),
+                    Some(std::path::Path::new("/tmp/skills"))
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
