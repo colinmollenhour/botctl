@@ -35,6 +35,66 @@ pub struct WorkspaceRecord {
     pub repo_key: Option<String>,
 }
 
+/// Whether a stored `instances` row still describes the pane it names.
+///
+/// tmux pane ids (`%N`) are only unique within one tmux server lifetime; the
+/// counter restarts with the server, so a long-lived state DB accumulates rows
+/// whose `pane_id` tmux later hands to an unrelated pane. Because `pane_id` is
+/// `UNIQUE` and the writer updates-in-place on conflict, a recycled id makes a
+/// new pane inherit the dead instance's row id — and with it that instance's
+/// `instance_runtime_state` (including the cached `claude_session_id`),
+/// `babysit_registrations`, and `pending_prompts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceBinding {
+    /// The row still describes the live pane; keep it.
+    Live,
+    /// tmux has no pane with this `pane_id` any more.
+    PaneGone,
+    /// A pane with this `pane_id` exists, but it is a different pane process:
+    /// tmux recycled the id. Liveness alone misses this case.
+    PaneRecycled,
+}
+
+impl InstanceBinding {
+    pub fn should_prune(self) -> bool {
+        !matches!(self, InstanceBinding::Live)
+    }
+}
+
+/// Decide whether a stored row still binds to the pane it claims.
+///
+/// `live` is the pane tmux currently reports for `stored.pane_id`, or `None`
+/// when tmux reports no such pane.
+///
+/// Identity is discriminated on `pane_pid` alone, deliberately. A pane's pid is
+/// fixed for its lifetime and is not realistically reused inside one tmux server
+/// lifetime, whereas every other stored field mutates legitimately under a live
+/// pane: `session_name`/`window_name` change on rename, `session_id`/`window_id`
+/// change on `break-pane`/`join-pane`, and `current_command`/`current_path`
+/// change whenever the pane runs something new. Treating those as identity would
+/// prune healthy rows.
+pub fn classify_instance_binding(
+    stored: &InstanceRecord,
+    live: Option<&TmuxPane>,
+) -> InstanceBinding {
+    let Some(pane_id) = stored.pane_id.as_deref() else {
+        // Placeholder rows are keyed by (workspace, session, kind) and never
+        // name a pane, so no pane can invalidate them.
+        return InstanceBinding::Live;
+    };
+    let Some(live) = live.filter(|pane| pane.pane_id == pane_id) else {
+        return InstanceBinding::PaneGone;
+    };
+    match (stored.pane_pid, live.pane_pid) {
+        (Some(stored_pid), Some(live_pid)) if stored_pid != live_pid => {
+            InstanceBinding::PaneRecycled
+        }
+        // A row with no recorded pid predates pid tracking and cannot be proven
+        // stale; keep it rather than prune a possibly-healthy binding.
+        _ => InstanceBinding::Live,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceRecord {
     pub id: String,
@@ -108,6 +168,8 @@ pub struct RecoveryInventoryUpdate {
     pub retired: usize,
     pub checkpointed: usize,
     pub resolved: usize,
+    /// Rows dropped from `instances` because their pane was gone or recycled.
+    pub pruned_instances: usize,
 }
 
 pub fn state_db_path(state_dir: &Path) -> PathBuf {
@@ -1536,6 +1598,7 @@ pub fn reconcile_abandoned_observations(
             )?;
         }
     }
+    prune_stale_instances_with_connection(&tx, inventory)?;
     tx.commit()?;
     Ok(crashed)
 }
@@ -1673,6 +1736,7 @@ pub fn apply_recovery_inventory_evidence(
             &evidence.provider_session_id,
         )?;
     }
+    let pruned_instances = prune_stale_instances_with_connection(&tx, inventory)?;
     tx.commit()?;
     Ok(RecoveryInventoryUpdate {
         abandoned_crashed,
@@ -1680,6 +1744,7 @@ pub fn apply_recovery_inventory_evidence(
         retired,
         checkpointed: verified.len(),
         resolved,
+        pruned_instances,
     })
 }
 
@@ -2585,7 +2650,11 @@ fn find_or_create_tmux_instance_with_connection(
     workspace_id: &str,
     pane: &TmuxPane,
 ) -> AppResult<InstanceRecord> {
-    if let Some(existing) = load_instance_by_pane_id(connection, &pane.pane_id)? {
+    // Reuse the existing row only when it still binds to *this* pane. If tmux
+    // recycled the id, the stale row is dropped here so the new pane gets a
+    // fresh instance id instead of inheriting the dead instance's runtime
+    // state, babysit registration, and pending prompt.
+    if let Some(existing) = load_live_instance_by_pane_id(connection, &pane.pane_id, Some(pane))? {
         connection.execute(
             "UPDATE instances SET \
                 workspace_id = ?2, session_name = ?3, pane_tty = ?4, pane_pid = ?5, session_id = ?6, \
@@ -2649,6 +2718,77 @@ fn load_instance_by_pane_id(
             row_to_instance,
         )
         .optional()?)
+}
+
+/// Load the row bound to `pane_id`, but only if it still describes `live`.
+///
+/// A stale binding is pruned on the spot and reported as absent, so a read-time
+/// lookup can never hand back an instance identity that belongs to a pane tmux
+/// has since reissued.
+fn load_live_instance_by_pane_id(
+    connection: &Connection,
+    pane_id: &str,
+    live: Option<&TmuxPane>,
+) -> AppResult<Option<InstanceRecord>> {
+    let Some(stored) = load_instance_by_pane_id(connection, pane_id)? else {
+        return Ok(None);
+    };
+    if classify_instance_binding(&stored, live).should_prune() {
+        delete_instance_with_connection(connection, &stored.id)?;
+        return Ok(None);
+    }
+    Ok(Some(stored))
+}
+
+/// Delete an instance row. `pending_prompts`, `babysit_registrations`, and
+/// `instance_runtime_state` cascade with it; observations live on `runtime_runs`
+/// and are deliberately untouched so crash recovery keeps its evidence.
+fn delete_instance_with_connection(connection: &Connection, instance_id: &str) -> AppResult<()> {
+    connection.execute("DELETE FROM instances WHERE id = ?1", params![instance_id])?;
+    Ok(())
+}
+
+/// Drop every pane-bound row whose pane is gone or has been recycled.
+///
+/// Returns the number of rows removed. `inventory` must be a complete
+/// server-wide pane listing (`TmuxClient::inventory`); a filtered listing would
+/// prune live panes that simply were not enumerated.
+fn prune_stale_instances_with_connection(
+    connection: &Connection,
+    inventory: &TmuxInventory,
+) -> AppResult<usize> {
+    let stored = {
+        let mut statement = connection.prepare(
+            "SELECT id, workspace_id, session_name, pane_id, pane_tty, pane_pid, session_id, \
+                window_id, window_name, current_command, current_path, kind, active \
+             FROM instances WHERE pane_id IS NOT NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map([], row_to_instance)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut pruned = 0;
+    for instance in stored {
+        let live = instance
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| inventory.panes.iter().find(|pane| pane.pane_id == pane_id));
+        if classify_instance_binding(&instance, live).should_prune() {
+            delete_instance_with_connection(connection, &instance.id)?;
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+/// Sweep stale pane bindings out of `instances`. See
+/// [`prune_stale_instances_with_connection`] for the inventory requirement.
+pub fn prune_stale_instances(state_dir: &Path, inventory: &TmuxInventory) -> AppResult<usize> {
+    let mut connection = open_bootstrapped_state_db(state_dir)?;
+    let tx = connection.transaction()?;
+    let pruned = prune_stale_instances_with_connection(&tx, inventory)?;
+    tx.commit()?;
+    Ok(pruned)
 }
 
 fn load_instance_by_id(
@@ -2950,7 +3090,8 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        CURRENT_SCHEMA_VERSION, LEGACY_WORKSPACE_ROOT, SCHEMA_VERSION_ROW_ID, bootstrap_state_db,
+        CURRENT_SCHEMA_VERSION, InstanceBinding, InstanceRecord, LEGACY_WORKSPACE_ROOT,
+        PLACEHOLDER_INSTANCE_KIND, SCHEMA_VERSION_ROW_ID, TMUX_INSTANCE_KIND, bootstrap_state_db,
         capture_artifact_path, claude_session_id_from_fd_dir, current_unix_ms,
         disable_babysit_registration_by_pane_id, encode_claude_project_path,
         ensure_schema_version_table, export_artifact_path, latest_claude_session_id,
@@ -4973,6 +5114,287 @@ mod tests {
             },
             recoveries,
         }
+    }
+
+    fn stored_instance(pane_id: Option<&str>, pane_pid: Option<u32>) -> InstanceRecord {
+        InstanceRecord {
+            id: String::from("instance-1"),
+            workspace_id: String::from("workspace-1"),
+            session_name: String::from("demo"),
+            pane_id: pane_id.map(String::from),
+            pane_tty: Some(String::from("/dev/pts/1")),
+            pane_pid,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_name: Some(String::from("claude")),
+            current_command: Some(String::from("claude")),
+            current_path: Some(String::from("/tmp/demo")),
+            kind: String::from(TMUX_INSTANCE_KIND),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn binding_is_live_when_the_pane_still_has_the_stored_pid() {
+        let stored = stored_instance(Some("%1"), Some(123));
+        let pane = sample_pane();
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, Some(&pane)),
+            InstanceBinding::Live
+        );
+        assert!(!InstanceBinding::Live.should_prune());
+    }
+
+    #[test]
+    fn binding_survives_renames_and_moves_that_keep_the_same_pane() {
+        // session/window/command all mutate legitimately under a live pane, so
+        // none of them may be treated as identity.
+        let stored = stored_instance(Some("%1"), Some(123));
+        let mut pane = sample_pane();
+        pane.session_id = String::from("$9");
+        pane.session_name = String::from("renamed");
+        pane.window_id = String::from("@9");
+        pane.window_name = String::from("renamed-window");
+        pane.current_command = String::from("bash");
+        pane.current_path = String::from("/tmp/elsewhere");
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, Some(&pane)),
+            InstanceBinding::Live
+        );
+    }
+
+    #[test]
+    fn binding_is_pane_gone_when_tmux_no_longer_reports_the_pane() {
+        let stored = stored_instance(Some("%1"), Some(123));
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, None),
+            InstanceBinding::PaneGone
+        );
+        assert!(InstanceBinding::PaneGone.should_prune());
+    }
+
+    #[test]
+    fn binding_is_pane_gone_when_the_live_pane_has_a_different_id() {
+        let stored = stored_instance(Some("%1"), Some(123));
+        let mut pane = sample_pane();
+        pane.pane_id = String::from("%2");
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, Some(&pane)),
+            InstanceBinding::PaneGone
+        );
+    }
+
+    #[test]
+    fn binding_is_recycled_when_the_pane_exists_but_the_pid_changed() {
+        // The case a liveness-only check misses: tmux reissued %1 after a server
+        // restart, so the pane exists but is an unrelated process.
+        let stored = stored_instance(Some("%1"), Some(26507));
+        let mut pane = sample_pane();
+        pane.pane_pid = Some(804025);
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, Some(&pane)),
+            InstanceBinding::PaneRecycled
+        );
+        assert!(InstanceBinding::PaneRecycled.should_prune());
+    }
+
+    #[test]
+    fn placeholder_rows_are_never_pruned_by_pane_liveness() {
+        let mut stored = stored_instance(None, None);
+        stored.kind = String::from(PLACEHOLDER_INSTANCE_KIND);
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, None),
+            InstanceBinding::Live
+        );
+    }
+
+    #[test]
+    fn rows_without_a_recorded_pid_are_kept_while_the_pane_exists() {
+        // Predates pid tracking: staleness cannot be proven, so keep the row
+        // rather than prune a possibly-healthy binding.
+        let stored = stored_instance(Some("%1"), None);
+        let pane = sample_pane();
+
+        assert_eq!(
+            super::classify_instance_binding(&stored, Some(&pane)),
+            InstanceBinding::Live
+        );
+        assert_eq!(
+            super::classify_instance_binding(&stored, None),
+            InstanceBinding::PaneGone
+        );
+    }
+
+    fn instance_row_count(state_dir: &std::path::Path) -> i64 {
+        open_state_db(state_dir)
+            .expect("db should reopen")
+            .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+            .expect("instances should count")
+    }
+
+    fn table_row_count(state_dir: &std::path::Path, table: &str) -> i64 {
+        open_state_db(state_dir)
+            .expect("db should reopen")
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("table should count")
+    }
+
+    #[test]
+    fn recycled_pane_id_does_not_inherit_the_dead_instances_session() {
+        let state_dir = unique_temp_dir("storage-pane-recycle");
+        let workspace_root = unique_temp_dir("workspace-pane-recycle");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace =
+            resolve_workspace_for_path(&state_dir, &workspace_root).expect("workspace resolves");
+
+        // A real instance on %1, with all three child rows populated.
+        let pane = sample_pane();
+        let original = store_babysit_registration(&state_dir, &workspace.id, &pane, true)
+            .expect("babysit registration should store");
+        store_pending_prompt_for_tmux_instance(
+            &state_dir,
+            &workspace.id,
+            "demo",
+            &pane,
+            "prompt for the original pane",
+        )
+        .expect("pending prompt should store");
+        let planted = super::sync_tmux_claude_session_id_with(
+            &state_dir,
+            &workspace.id,
+            &pane,
+            false,
+            |_| Ok(Some(String::from("original-session"))),
+        )
+        .expect("session id should sync");
+        assert_eq!(planted.as_deref(), Some("original-session"));
+
+        // tmux restarts and hands %1 to a brand-new, unrelated pane.
+        let recycled = TmuxPane {
+            pane_pid: Some(804025),
+            session_name: String::from("other-session"),
+            current_path: String::from("/tmp/unrelated"),
+            ..pane.clone()
+        };
+
+        // Cached read: without pruning this returns the dead instance's session.
+        let leaked =
+            super::sync_tmux_claude_session_id_with(&state_dir, &workspace.id, &recycled, true, {
+                |_| Ok(None)
+            })
+            .expect("session id should sync for the recycled pane");
+        assert_eq!(
+            leaked, None,
+            "recycled pane must not inherit the dead instance's claude session"
+        );
+
+        // The row was replaced, not reused, and the UNIQUE(pane_id) insert held.
+        let rebound = load_babysit_registration_by_pane_id(&state_dir, "%1")
+            .expect("babysit lookup should succeed");
+        assert!(
+            rebound.is_none(),
+            "the dead instance's babysit registration must not follow the pane id"
+        );
+        assert_eq!(
+            table_row_count(&state_dir, "pending_prompts"),
+            0,
+            "the dead instance's pending prompt must be dropped"
+        );
+        assert_eq!(
+            instance_row_count(&state_dir),
+            1,
+            "the recycled pane should own exactly one row"
+        );
+
+        let current = super::open_bootstrapped_state_db(&state_dir)
+            .and_then(|connection| super::load_instance_by_pane_id(&connection, "%1"))
+            .expect("current instance should load")
+            .expect("recycled pane should have an instance");
+        assert_ne!(
+            current.id, original.id,
+            "the recycled pane must get a fresh instance id"
+        );
+        assert_eq!(current.pane_pid, Some(804025));
+        assert_eq!(current.session_name, "other-session");
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn reconcile_prunes_dead_and_recycled_panes_but_keeps_live_ones() {
+        let state_dir = unique_temp_dir("storage-prune-sweep");
+        let workspace_root = unique_temp_dir("workspace-prune-sweep");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let workspace =
+            resolve_workspace_for_path(&state_dir, &workspace_root).expect("workspace resolves");
+
+        let live = sample_pane();
+        let mut recycled = sample_pane();
+        recycled.pane_id = String::from("%41");
+        recycled.pane_pid = Some(26507);
+        let mut gone = sample_pane();
+        gone.pane_id = String::from("%42");
+        gone.pane_pid = Some(804025);
+
+        for pane in [&live, &recycled, &gone] {
+            store_babysit_registration(&state_dir, &workspace.id, pane, true)
+                .expect("registration should store");
+        }
+        assert_eq!(instance_row_count(&state_dir), 3);
+
+        // tmux now reports %1 unchanged, %41 as a different process, no %42.
+        let inventory = crate::tmux::TmuxInventory {
+            server: crate::tmux::TmuxServerIdentity {
+                socket_path: String::from("/tmp/tmux-1000/default"),
+                pid: 4242,
+                start_time: 99,
+            },
+            panes: vec![
+                live.clone(),
+                TmuxPane {
+                    pane_pid: Some(999_999),
+                    ..recycled.clone()
+                },
+            ],
+        };
+
+        let pruned =
+            super::prune_stale_instances(&state_dir, &inventory).expect("sweep should run");
+
+        assert_eq!(
+            pruned, 2,
+            "the recycled and the gone pane should both prune"
+        );
+        assert_eq!(instance_row_count(&state_dir), 1);
+        assert_eq!(
+            table_row_count(&state_dir, "babysit_registrations"),
+            1,
+            "child rows should cascade with their instance"
+        );
+        assert!(
+            load_babysit_registration_by_pane_id(&state_dir, "%1")
+                .expect("lookup should succeed")
+                .is_some(),
+            "the live pane must survive the sweep"
+        );
+
+        // Sweeping again is a no-op.
+        assert_eq!(
+            super::prune_stale_instances(&state_dir, &inventory).expect("second sweep should run"),
+            0
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
