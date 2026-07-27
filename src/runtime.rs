@@ -3455,7 +3455,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::BufReader;
     use std::os::unix::net::UnixStream;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},

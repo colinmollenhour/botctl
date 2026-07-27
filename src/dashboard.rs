@@ -2352,12 +2352,11 @@ fn run_dashboard_loop(
                         KeyCode::Down | KeyCode::Char('j') => app.select_next()?,
                         KeyCode::Up | KeyCode::Char('k') => app.select_previous()?,
                         KeyCode::Enter => {
-                            if let Some(pane) = app.selected_navigation_pane()? {
-                                if let Some(pane) =
+                            if let Some(pane) = app.selected_navigation_pane()?
+                                && let Some(pane) =
                                     open_dashboard_pane(app, pane, exit_on_navigate, persistent)?
-                                {
-                                    return Ok(Some(pane));
-                                }
+                            {
+                                return Ok(Some(pane));
                             }
                         }
                         KeyCode::Char('r') => app.refresh_non_fatal(),
