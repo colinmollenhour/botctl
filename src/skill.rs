@@ -161,7 +161,10 @@ pub fn render_install_skill_report(report: &InstallSkillReport) -> String {
         } else {
             "skipped"
         };
-        out.push_str(&format!("status={status}\npath={}\n", target.path.display()));
+        out.push_str(&format!(
+            "status={status}\npath={}\n",
+            target.path.display()
+        ));
     }
     // Trim trailing newline for a single-target report so the old three-line
     // shape stays stable for scripts; multi-target reports end with a newline.

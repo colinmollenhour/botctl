@@ -249,14 +249,9 @@ pub fn resolve_claude_session_id_for_pane(pane: &TmuxPane) -> AppResult<Option<S
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClaudeTranscriptResolve {
-    Found {
-        session_id: String,
-        path: PathBuf,
-    },
+    Found { session_id: String, path: PathBuf },
     None,
-    Ambiguous {
-        candidates: Vec<String>,
-    },
+    Ambiguous { candidates: Vec<String> },
 }
 
 fn resolve_claude_transcript_for_pane(pane: &TmuxPane) -> AppResult<ClaudeTranscriptResolve> {
@@ -292,8 +287,7 @@ fn resolve_claude_transcript_with_roots(
     // 1) Prefer an open transcript FD anywhere in the pane process tree.
     if let Some(pid) = pane.pane_pid {
         for project_dir in &project_dirs {
-            if let Some(transcript) =
-                transcript_from_process_tree_fds(pid, project_dir, "jsonl")?
+            if let Some(transcript) = transcript_from_process_tree_fds(pid, project_dir, "jsonl")?
                 && let Some(session_id) =
                     claude_session_id_from_transcript(&transcript, project_dir)
             {
@@ -390,7 +384,8 @@ fn claude_session_id_from_sessions_registry(
         return Ok(None);
     };
     for pid in collect_process_tree_pids(root_pid, resolver) {
-        if let Some(session_id) = read_claude_sessions_file(&sessions_root.join(format!("{pid}.json")))?
+        if let Some(session_id) =
+            read_claude_sessions_file(&sessions_root.join(format!("{pid}.json")))?
         {
             return Ok(Some(session_id));
         }
@@ -895,9 +890,13 @@ mod tests {
         }
 
         // No pane pid / sessions file: multi-session cwd must be ambiguous, not newest-wins.
-        let ambiguous =
-            resolve_claude_transcript_with_roots(&sample_pane(cwd), &projects_root, &sessions_root, &EmptyResolver)
-                .expect("resolver should succeed");
+        let ambiguous = resolve_claude_transcript_with_roots(
+            &sample_pane(cwd),
+            &projects_root,
+            &sessions_root,
+            &EmptyResolver,
+        )
+        .expect("resolver should succeed");
         match ambiguous {
             ClaudeTranscriptResolve::Ambiguous { candidates } => {
                 assert_eq!(candidates.len(), 2);
@@ -925,12 +924,20 @@ mod tests {
         pane_b.pane_id = String::from("%2");
         pane_b.pane_pid = Some(102);
 
-        let resolved_a =
-            resolve_claude_transcript_with_roots(&pane_a, &projects_root, &sessions_root, &EmptyResolver)
-                .expect("pane A should resolve");
-        let resolved_b =
-            resolve_claude_transcript_with_roots(&pane_b, &projects_root, &sessions_root, &EmptyResolver)
-                .expect("pane B should resolve");
+        let resolved_a = resolve_claude_transcript_with_roots(
+            &pane_a,
+            &projects_root,
+            &sessions_root,
+            &EmptyResolver,
+        )
+        .expect("pane A should resolve");
+        let resolved_b = resolve_claude_transcript_with_roots(
+            &pane_b,
+            &projects_root,
+            &sessions_root,
+            &EmptyResolver,
+        )
+        .expect("pane B should resolve");
 
         match resolved_a {
             ClaudeTranscriptResolve::Found { session_id, path } => {
@@ -966,9 +973,13 @@ mod tests {
         let mut pane_c = sample_pane(cwd);
         pane_c.pane_id = String::from("%3");
         pane_c.pane_pid = Some(103);
-        let resolved_c =
-            resolve_claude_transcript_with_roots(&pane_c, &projects_root, &sessions_root, &EmptyResolver)
-                .expect("pane C should resolve");
+        let resolved_c = resolve_claude_transcript_with_roots(
+            &pane_c,
+            &projects_root,
+            &sessions_root,
+            &EmptyResolver,
+        )
+        .expect("pane C should resolve");
         assert!(
             matches!(resolved_c, ClaudeTranscriptResolve::None),
             "expected None for bound-but-missing transcript, got {resolved_c:?}"
