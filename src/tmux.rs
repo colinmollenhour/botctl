@@ -642,7 +642,10 @@ impl TmuxClient {
         pane: &TmuxPane,
     ) -> AppResult<bool> {
         let Some(args) = guarded_kill_window_args(target_window, server, pane) else {
-            return Ok(false);
+            return Err(AppError::new(format!(
+                "cannot build an atomic kill guard for window {target_window}: pane {} identity is unavailable or contains characters unsafe for a tmux format predicate",
+                pane.pane_id
+            )));
         };
         let output = self.run_output(args)?;
         match output.trim() {
@@ -1625,6 +1628,16 @@ mod tests {
         assert!(
             guarded_kill_window_args("@4; kill-server", &server, &pane).is_none(),
             "tmux command separators must fail closed"
+        );
+        let mut unavailable_pane = pane.clone();
+        unavailable_pane.pane_pid = None;
+        let error = TmuxClient::with_socket_path("/tmp/tmux/default")
+            .kill_window_if_pane_matches("@4", &server, &unavailable_pane)
+            .expect_err("unavailable identity must not be reported as a completed guard refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot build an atomic kill guard")
         );
     }
 

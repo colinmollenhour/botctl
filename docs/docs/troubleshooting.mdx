@@ -135,6 +135,9 @@ Symptoms:
 - `outcome=ready-timeout` reports a last state or occupied composer.
 - Submission reports `guard-refused`, `composer-changed`,
   `staging-unverified`, or `input-dead`.
+- Submission reports `target-changed`, `precondition-changed`, or
+  `state-changed` when the pane identity, guard, or classified state moves
+  before botctl can verify the action.
 
 Cause:
 

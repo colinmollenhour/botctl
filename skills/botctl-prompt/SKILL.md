@@ -228,6 +228,9 @@ footer or stable composer text, botctl still prints the answer, warns, and
 retains the window. Occupied-composer warnings include the pane-specific
 `botctl submit-composer --pane %ID` and
 `botctl clear-composer --pane %ID` commands.
+`clear-composer` is destructive and discards text botctl could not prove it
+owns. Inspect the pane with `botctl capture --pane %ID` and get explicit
+operator confirmation before running it; never run it unattended.
 
 Failed and retained runs leave the tmux window up:
 

@@ -876,7 +876,10 @@ Flags:
 
 Targeting: accepts either one explicit pane or a fully qualified session/window target.
 
-Safety: refuses ambiguous targets and `--max-steps 0`; it may stop early if a permission dialog would require more than one approval.
+Safety: refuses ambiguous targets, `--max-steps 0`, and every occupied composer;
+it names explicit recovery commands instead of submitting or destroying existing
+text. It may stop early if a permission dialog would require more than one
+approval.
 
 Example:
 ```bash

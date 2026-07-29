@@ -1496,20 +1496,6 @@ fn occupied_composer_recommendation(snapshot: &ComposerActionSnapshot) -> Option
     if snapshot.composer.disposition != ComposerDisposition::Occupied {
         return None;
     }
-    let actionable = snapshot.state() == SessionState::PromptEditing
-        || (snapshot.state() == SessionState::BusyResponding
-            && snapshot.activity.shells_running > 0
-            && !snapshot.activity.has_non_shell_busy_evidence()
-            && snapshot.process.ghost_shell == GhostShellEvidence::Confirmed);
-    if actionable {
-        return Some(AppError::with_exit_code(
-            format!(
-                "auto-unstick sends no key for occupied composer text in pane {}; recover with botctl submit-composer --pane {}; destructive alternative: botctl clear-composer --pane {}",
-                snapshot.identity.pane_id, snapshot.identity.pane_id, snapshot.identity.pane_id,
-            ),
-            2,
-        ));
-    }
     if snapshot.state() == SessionState::BusyResponding
         && snapshot.activity.shells_running > 0
         && !snapshot.activity.has_non_shell_busy_evidence()
@@ -1523,7 +1509,13 @@ fn occupied_composer_recommendation(snapshot: &ComposerActionSnapshot) -> Option
             2,
         ));
     }
-    None
+    Some(AppError::with_exit_code(
+        format!(
+            "auto-unstick sends no key for occupied composer text in pane {}; recover with botctl submit-composer --pane {}; destructive alternative: botctl clear-composer --pane {}",
+            snapshot.identity.pane_id, snapshot.identity.pane_id, snapshot.identity.pane_id,
+        ),
+        2,
+    ))
 }
 
 fn run_auto_unstick(args: AutoUnstickArgs) -> AppResult<String> {
@@ -2597,9 +2589,8 @@ fn composer_attempt_decision(
         ComposerDisposition::Occupied if before.fingerprint.has_same_text(&after.fingerprint) => {
             ComposerAttemptDecision::UnsafeState
         }
-        ComposerDisposition::Occupied | ComposerDisposition::Unavailable => {
-            ComposerAttemptDecision::Changed
-        }
+        ComposerDisposition::Occupied => ComposerAttemptDecision::Changed,
+        ComposerDisposition::Unavailable => ComposerAttemptDecision::Unchanged,
     }
 }
 
@@ -3520,7 +3511,7 @@ fn wait_for_submit_prompt_ready_with(
                     last.identity.pane_id,
                     last.state().as_str(),
                     last.composer.disposition.as_str(),
-                    timeout.as_millis(),
+                    current.saturating_duration_since(started).as_millis(),
                 ),
                 2,
             ));
@@ -5754,6 +5745,19 @@ mod tests {
             ),
             ComposerAttemptDecision::Unchanged
         );
+
+        let mut unavailable = before.clone();
+        unavailable.composer.disposition = ComposerDisposition::Unavailable;
+        unavailable.composer.normalized_region = None;
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Submit,
+                ComposerAuthorization::Normal,
+                &before,
+                &unavailable,
+            ),
+            ComposerAttemptDecision::Unchanged
+        );
         assert_eq!(PROMPT_SUBMIT_ATTEMPTS, 3);
 
         let consumed = composer_snapshot(
@@ -5979,6 +5983,17 @@ mod tests {
                 .to_string()
                 .contains("botctl clear-composer --pane %1")
         );
+
+        for state in [SessionState::PermissionDialog, SessionState::SurveyPrompt] {
+            let snapshot = composer_snapshot(
+                state,
+                Some("operator text"),
+                ScreenActivityEvidence::default(),
+                GhostShellEvidence::NotDetected,
+            );
+            occupied_composer_recommendation(&snapshot)
+                .expect("every occupied composer must stop auto-unstick");
+        }
     }
 
     #[test]
@@ -6090,6 +6105,7 @@ mod tests {
         assert_eq!(captures.get(), 1);
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("outcome=ready-timeout"));
+        assert!(error.to_string().contains("elapsed_ms=101"));
     }
 
     #[test]
