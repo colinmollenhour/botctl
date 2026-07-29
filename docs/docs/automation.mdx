@@ -34,7 +34,9 @@ Before any guarded workflow runs, `botctl` checks that the pane is owned by Clau
 
 Guarded workflows validate state before acting:
 
-- `submit-prompt` requires `ChatReady`
+- `submit-prompt` supplies new text and requires `ChatReady` with an empty composer
+- `submit-composer` submits existing text and requires an occupied composer in `PromptEditing`, or a freshly confirmed ghost-shell condition
+- `clear-composer` destructively clears existing text under the same guard
 - `approve` accepts `PermissionDialog` and `FolderTrustPrompt`; `approve-permission` is a compatibility alias
 - `reject` requires `PermissionDialog`; `reject-permission` is a compatibility alias
 - `dismiss-survey` requires `SurveyPrompt`
@@ -55,9 +57,9 @@ Refusal states are part of the safety model:
 
 | State | Safe automated action | Notes |
 | --- | --- | --- |
-| `ChatReady` | `submit-prompt`; `keep-going` loop submission | Prompt submission verifies that the pane transitions after the submit sequence. |
-| `PromptEditing` | none | Submit or clear the unsubmitted prompt manually. `submit-prompt` refuses this state because it could replace typed input. |
-| `BusyResponding` | wait | `continue-session` can report the pane as already usable. |
+| `ChatReady` | `submit-prompt`; `keep-going` loop submission | New prompt submission verifies bot ownership of the staged text and an affirmative transition. |
+| `PromptEditing` | `submit-composer`; destructive `clear-composer` | Both require occupied text, revalidate the exact composer, and have no force mode. |
+| `BusyResponding` | wait; composer recovery only for a freshly confirmed ghost shell | Composer recovery also requires occupied text, visible shell activity, no other busy evidence, and a process probe that confirms no tool child. |
 | `PermissionDialog` | `approve`, `reject`, YOLO | Approval is allowed only when the prompt is classified as a permission dialog and policy allows the action. |
 | `FolderTrustPrompt` | `approve`; `auto-unstick`; `keep-going` with YOLO enabled | Uses raw `Enter` because Claude's folder trust prompt confirms the selected default directly. |
 | `SurveyPrompt` | `dismiss-survey`, YOLO, `auto-unstick`, `keep-going` with YOLO enabled | Uses raw `0`. |
@@ -76,6 +78,14 @@ Refusal states are part of the safety model:
 - classification is `Unknown`
 - the workflow does not match the current state
 - required Claude keybindings are missing or invalid
+- the composer text, cursor, state, activity, target identity, or process evidence changes during a composer action
+- a required process probe is unavailable
+
+Composer actions can retry a swallowed key only while every guard remains
+identical. `input-dead` and `composer-changed` refusals use exit code `2` and
+retain unproven or foreign text. `auto-unstick` does not choose whether existing
+composer text should be submitted or destroyed; it names the explicit recovery
+commands and refuses.
 
 That refusal is deliberate: it is safer to stop than to guess.
 

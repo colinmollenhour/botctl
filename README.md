@@ -241,7 +241,7 @@ printf 'Summarize this input' | cargo run -- prompt --stdin
 cargo run -- prompt --text "Say hi" -- --model sonnet --name "Just testing"
 ```
 
-`prompt` does not use `claude -p` or `--prompt`; it creates a new window in the owning tmux session, creates that session first when needed, waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, waits for a fresh final assistant message, kills only that captured prompt window on success, and prints assistant text only on stdout. The owning session defaults to `botctl`; pass `--session NAME` to override it. When `prompt` creates the owning session, it disables tmux `status` only for that session. Failed prompt windows stay alive for inspection. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
+`prompt` does not use `claude -p` or `--prompt`; it creates a new window in the owning tmux session, creates that session first when needed, waits for `ChatReady`, pastes the prompt through tmux into the interactive TUI, waits for a fresh final assistant message, and prints assistant text only on stdout. Normal `ChatReady` plus an empty composer kills the captured prompt window only when its captured pane is still the sole exact pane there; otherwise botctl warns and retains it. A confirmed stale shell-running footer or stable residual composer text returns the answer with a warning and retains the window. The owning session defaults to `botctl`; pass `--session NAME` to override it. When `prompt` creates the owning session, it disables tmux `status` only for that session. Failed prompt windows stay alive for inspection. Pass `--verbose` to send launch/wait progress to stderr. Arguments after `--` are passed through to the interactive Claude command.
 
 Run the observer and a localhost HTTP API for a web UI:
 
@@ -361,6 +361,47 @@ Prepare and submit a prompt:
 cargo run -- prepare-prompt --session demo --text "Summarize the current repo"
 cargo run -- submit-prompt --session demo --pane %19 --text "Summarize the current repo"
 ```
+
+For a multi-hour Megamind run, give tmux and Claude unique identities and use
+an eight-hour response deadline:
+
+```bash
+TASK_FILE=/ABSOLUTE/PATH/TO/TASK.md
+WORKTREE=/ABSOLUTE/PATH/TO/WORKTREE
+RUN_ID="megamind-$(date +%s)-$$"
+CLAUDE_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+botctl prompt \
+  --source "$TASK_FILE" \
+  --cwd "$WORKTREE" \
+  --session "botctl-${RUN_ID}" \
+  --window "claude-${RUN_ID}" \
+  --idle-timeout-ms 28800000 \
+  --keep-temp \
+  --verbose \
+  -- \
+  --agent megamind \
+  --session-id "$CLAUDE_SESSION_ID" \
+  --name "megamind: ${RUN_ID}"
+```
+
+`--idle-timeout-ms` is a fixed response deadline that starts after verified
+submission; it does not reset as the response progresses. The default remains
+`600000` (10 minutes), and `--agent megamind` warns when the configured value
+is below one hour. `--keep-temp` preserves generated large-prompt instructions,
+and `--verbose` prints their path and wait progress to stderr.
+
+Safe YOLO handling is on by default for `prompt`; use `--no-yolo` to disable it.
+For the standalone command, the canonical boolean syntax is
+`botctl yolo start --pane %19 --follow`. Omit `--follow` when you do not want to
+tail events; the flag accepts no value.
+
+Use `submit-prompt` to supply **new** text to an existing pane. If the pane
+already contains text, run `botctl submit-composer --pane %19` to submit that
+exact composer, or use the destructive
+`botctl clear-composer --pane %19` after inspecting it. See the
+[command reference](docs/docs/command-reference.mdx#submit-composer) for the
+guarded postconditions and recovery outcomes.
 
 Scope prompt prep or babysit work to one workspace:
 

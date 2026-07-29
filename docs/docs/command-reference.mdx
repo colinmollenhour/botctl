@@ -81,6 +81,27 @@ botctl prompt --text "Fix the failing tests" --no-yolo
 botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
+Eight-hour Megamind example:
+```bash
+TASK_FILE=/ABSOLUTE/PATH/TO/TASK.md
+WORKTREE=/ABSOLUTE/PATH/TO/WORKTREE
+RUN_ID="megamind-$(date +%s)-$$"
+CLAUDE_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+botctl prompt \
+  --source "$TASK_FILE" \
+  --cwd "$WORKTREE" \
+  --session "botctl-${RUN_ID}" \
+  --window "claude-${RUN_ID}" \
+  --idle-timeout-ms 28800000 \
+  --keep-temp \
+  --verbose \
+  -- \
+  --agent megamind \
+  --session-id "$CLAUDE_SESSION_ID" \
+  --name "megamind: ${RUN_ID}"
+```
+
 Flags and defaults:
 
 - `--session NAME` defaults to the shared `botctl` tmux session, which is created automatically when needed.
@@ -92,21 +113,26 @@ Flags and defaults:
 - `--stdin` reads stdin explicitly; when no input flags are present, piped stdin is read implicitly.
 - `--append-system-prompt PATH` is repeatable and is prepended as labeled text because the TUI accepts one chat prompt.
 - `--poll-ms` default `1000`; `--submit-delay-ms` default `250`.
-- `--ready-timeout-ms` default `30000`; `--idle-timeout-ms` default `600000`.
+- `--ready-timeout-ms` default `30000`; it bounds the initial wait for `ChatReady`.
+- `--idle-timeout-ms` default `600000`; despite the flag name, it is a fixed response deadline that starts after verified prompt submission and does not reset on progress.
+- `--agent megamind` with an idle timeout below `3600000` prints a warning to stderr but does not change the configured timeout. Use `28800000` for an eight-hour run.
 - `--large-prompt-threshold` default `8192` bytes; larger prompts are written under the state dir and a short file-pointer prompt is submitted.
 - `--keep-temp` preserves that large-prompt instruction file and prints its path to stderr.
 - `--no-yolo` refuses permission, folder-trust, and survey blockers instead of using the safe recovery paths.
-- `--verbose` prints launch/wait/temp-file progress to stderr.
+- `--verbose` prints launch, wait, and temp-file progress to stderr.
+- Safe YOLO handling is enabled by default. The separate `yolo` command accepts bare `--follow`; omit it to avoid tailing events. The flag accepts no value.
 - `-- CLAUDE_ARG ...` passes additional arguments to the interactive Claude command. Prompt/headless mode (`-p`/`--prompt`) is still refused.
 
 Output and safety:
 
-- stdout contains only the latest assistant message text on success.
-- with `--verbose`, progress, temp paths, and wait status go to stderr; cleanup warnings always go to stderr.
-- successful runs load a fresh assistant message first, then kill only the captured prompt window.
+- stdout contains only the fresh final assistant message text on success.
+- with `--verbose`, progress, temp paths, and wait status go to stderr; cleanup and residual-composer warnings always go to stderr.
+- after a fresh terminal assistant record, a stable empty composer completes normally; botctl kills the captured prompt window only when its captured pane remains the sole exact pane, otherwise it warns and retains the window.
+- after a fresh terminal assistant record, two stable observations of an empty composer plus `ghost_shell=confirmed` and no other busy evidence also complete successfully; botctl warns about the stale footer and retains the window.
+- after a fresh terminal assistant record, stable occupied composer text also completes successfully: botctl prints the final assistant text, warns with `botctl submit-composer --pane %ID` and `botctl clear-composer --pane %ID`, and retains the window.
 - failed prompt windows are left alive for inspection.
 - when `prompt` creates the owning tmux session, it disables tmux `status` only for that session; existing user-provided sessions are not changed.
-- submission waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, waits for final `ChatReady`, and refuses to print stale transcript output.
+- submission waits for `ChatReady`, proves the pasted text is bot-owned, verifies that Claude consumed it, and refuses stale transcript output.
 - exit code `2` is used for usage errors and guarded refusals such as empty input, TTY stdin without data, unsafe blockers, unknown state, or a non-Claude launched pane.
 
 ### `mcp`
@@ -266,9 +292,9 @@ Notes:
 
 | State | Use | Refuses or requires review |
 | --- | --- | --- |
-| `ChatReady` | `submit-prompt`; `keep-going` loop submission | direct approval/rejection commands |
-| `PromptEditing` | manual submit or clear | `submit-prompt`, because it could replace unsubmitted input |
-| `BusyResponding` | wait; observe with `serve` | prompt submission and approval commands |
+| `ChatReady` | `submit-prompt`; `keep-going` loop submission | composer recovery commands require existing text instead |
+| `PromptEditing` | `submit-composer` for existing text; `clear-composer` to destructively discard it | `submit-prompt`, because it supplies new text |
+| `BusyResponding` | wait; observe with `serve`; composer recovery only with occupied text and freshly `confirmed` ghost-shell evidence | composer mutation when a tool child exists, the probe is unavailable, or other busy evidence is visible |
 | `PermissionDialog` | `approve`, `reject`, YOLO, `continue-session`, `auto-unstick` | unsafe permission prompts that policy cannot approve |
 | `FolderTrustPrompt` | `approve`, `continue-session`, `auto-unstick` | `reject`; raw `Enter` is used for approval |
 | `SurveyPrompt` | `dismiss-survey`, YOLO, `continue-session`, `auto-unstick` | `approve` and `reject` |
@@ -447,6 +473,22 @@ botctl status --pane 0:2.3
 botctl status --pane 0:2.3 --json
 botctl status --pane 0:2.3 --plain
 ```
+
+`status` and `doctor` expose the same composer and process evidence in
+line-oriented and JSON output:
+
+| Field | Values and meaning |
+| --- | --- |
+| `composer` | `empty`, `occupied`, or `unavailable`, derived from the visible Claude composer. |
+| `ui_shells_running` | Visible shell count reported by Claude's UI: `none` or a positive count in line-oriented output, and a non-negative integer in JSON. This is screen evidence, not a process-tree result. |
+| `tool_child_probe` | `present`, `confirmed-absent`, or `unavailable`, derived from the pane process tree. |
+| `ghost_shell` | `confirmed` only when the UI reports a running shell and the probe confirms no tool child; `unknown` when that UI evidence exists but the probe is unavailable; `not-detected` otherwise. |
+| `tool_child_probe_reason` | Machine-readable unavailability reason; `none` in line-oriented output or `null` in JSON when the probe is available. |
+| `tool_child_probe_recommendation` | Probe retry action when unavailable; `none` in line-oriented output or `null` in JSON when the probe is available. |
+
+These fields are evidence, not an automatic recovery request. Inspect the
+composer before choosing `submit-composer` or the destructive
+`clear-composer`; an unavailable probe never authorizes composer mutation.
 
 ### `doctor`
 
@@ -943,13 +985,99 @@ Example:
 botctl editor-helper --session demo /tmp/botctl-prompt.txt
 ```
 
-### `submit-prompt`
+### `submit-composer`
 
-Purpose: resolve prompt text from `--text` or `--source`, stage it in the state database, and submit it into a pane.
+Purpose: submit the exact text already visible in a Claude composer through a
+guarded, verified action.
 
 Syntax:
 ```bash
-botctl submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]
+botctl submit-composer --pane %ID|session:window.pane [--submit-delay-ms N]
+```
+
+Flags:
+- `--pane %ID|session:window.pane` (required)
+- `--submit-delay-ms N` (default: `250`, must be at least `1`)
+
+Required state: an occupied composer in `PromptEditing`, or an occupied composer
+in `BusyResponding` when the UI reports at least one running shell, no other
+busy UI evidence is present, and a fresh process probe confirms that no tool
+child exists (`ghost_shell=confirmed`).
+
+Verified postcondition: success is reported as `outcome=submitted` only after
+the original composer text is consumed and the pane reaches a state that
+affirmatively proves submission was accepted. Botctl reloads the live submit
+binding before each attempt. It makes at most three attempts, waits up to five
+seconds after each attempt for the postcondition, and revalidates the exact
+target, composer text, state, activity, and process evidence before retrying.
+There is no `--force`.
+
+Example:
+```bash
+botctl submit-composer --pane %19
+```
+
+### `clear-composer`
+
+Purpose: destructively discard the exact text already visible in a Claude
+composer through a guarded, verified action.
+
+Syntax:
+```bash
+botctl clear-composer --pane %ID|session:window.pane [--submit-delay-ms N]
+```
+
+Flags:
+- `--pane %ID|session:window.pane` (required)
+- `--submit-delay-ms N` (default: `250`, must be at least `1`)
+
+Required state: the same occupied-composer guard as `submit-composer`.
+
+Verified postcondition: success is reported as `outcome=cleared` only after the
+composer is empty and the pane is `ChatReady`; a still-`BusyResponding` pane is
+accepted only for the same freshly confirmed ghost-shell condition. Botctl
+reloads the live clear-input binding before each of at most three attempts and
+waits up to five seconds after each attempt, revalidating all guards before a
+retry. There is no `--force`.
+
+Example:
+```bash
+botctl clear-composer --pane %19
+```
+
+This command is destructive. Capture or inspect the existing text before
+running it.
+
+Common exit-2 outcomes for both composer commands:
+
+| Outcome | Meaning |
+| --- | --- |
+| `guard-refused` | The composer is empty or unavailable, the state is not authorized, a live tool child makes mutation unsafe, or the required process probe is unavailable. No key is sent. |
+| `target-changed` | The exact pane identity changed or disappeared. |
+| `precondition-changed` | The state, cursor, activity, authorization, or equivalent pre-key guard changed. |
+| `composer-changed` | Text changed, was merged, became partial, or could be foreign. Botctl retains it and never clears it. |
+| `state-changed` | The composer changed state without an affirmative submit/clear postcondition. |
+| `input-dead` | All three attempts left the exact composer unchanged. The residual text is retained. |
+
+An `input-dead` refusal prints the exact alternative recovery command for the
+resolved pane: failed `submit-composer` names
+`botctl clear-composer --pane %ID`; failed `clear-composer` names
+`botctl submit-composer --pane %ID`. For any changed-state or changed-composer
+outcome, inspect with `botctl status --pane %ID` and choose a recovery again;
+do not replay a stale command.
+
+### `submit-prompt`
+
+Purpose: resolve **new** prompt text from `--text` or `--source` and submit it
+to an existing Claude pane with one ownership-safe staging transaction. It
+does not submit or replace text that is already in the composer.
+
+Syntax:
+```bash
+botctl submit-prompt --session NAME --pane %ID|session:window.pane \
+  [--state-dir PATH] [--workspace PATH|UUID] \
+  [--source PATH | --text TEXT] \
+  [--when-ready [--ready-timeout-ms N]] [--submit-delay-ms N]
 ```
 
 Flags:
@@ -958,15 +1086,38 @@ Flags:
 - `--state-dir PATH` (optional; overrides the default state root)
 - `--workspace PATH|UUID` (optional; must match the target pane workspace when provided)
 - `--source PATH` or `--text TEXT` (exactly one required)
+- `--when-ready` (optional; synchronously and passively wait for readiness)
+- `--ready-timeout-ms N` (default: `30000`, must be at least `1`, and requires `--when-ready`)
 - `--submit-delay-ms N` (default: `250`, must be at least `1`)
 
-Targeting: session plus explicit pane; workspace defaults from the pane path.
+Targeting and readiness:
 
-Safety: refuses if both prompt inputs are provided, if neither is provided, or if `--submit-delay-ms 0` is used.
+- without `--when-ready`, botctl checks readiness immediately
+- with `--when-ready`, botctl polls only the initially resolved exact pane until
+  two stable checks show `ChatReady` with an empty composer
+- the wait sends no key, pastes no text, and writes no pending-prompt record
+- timeout exits `2` with `outcome=ready-timeout`, the last state, composer
+  disposition, and elapsed timeout; the pane and pending store are unchanged
+- target identity changes exit `2` with `outcome=target-changed`
 
-Example:
+After readiness, botctl verifies the live submit binding, pastes the new text,
+waits up to 15 seconds for a complete matching composer, and then uses the same
+verified submit action. Success is reported only after the composer is consumed
+and the pane reaches an affirmative accepted state.
+
+If the composer remains non-matching through the 15-second staging deadline,
+botctl exits `2` with `outcome=composer-changed` and retains the text. If no
+occupied composer can be proven, it exits `2` with
+`outcome=staging-unverified`. If submission remains `input-dead`, the staged
+text is retained so botctl cannot erase whitespace or text that another actor
+may have changed. Guard, precondition, target, and state-change refusals also
+exit `2`. There is no `--force`.
+
+Examples:
 ```bash
 botctl submit-prompt --session demo --pane 0:2.3 --text "Continue"
+botctl submit-prompt --session demo --pane %19 --source task.md \
+  --when-ready --ready-timeout-ms 30000
 ```
 
 ## Yolo

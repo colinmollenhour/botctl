@@ -29,6 +29,8 @@ pub enum Command {
     DismissSurvey(PaneCommandArgs),
     ContinueSession(ContinueSessionArgs),
     AutoUnstick(AutoUnstickArgs),
+    SubmitComposer(ComposerActionArgs),
+    ClearComposer(ComposerActionArgs),
     KeepGoing(KeepGoingArgs),
     Prompt(PromptRunArgs),
     Mcp(McpArgs),
@@ -84,6 +86,12 @@ pub struct ContinueSessionArgs {
 pub struct AutoUnstickArgs {
     pub target: PaneTargetArgs,
     pub max_steps: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerActionArgs {
+    pub pane_id: String,
+    pub submit_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +305,8 @@ pub struct SubmitPromptArgs {
     pub source: Option<PathBuf>,
     pub text: Option<String>,
     pub submit_delay_ms: u64,
+    pub when_ready: bool,
+    pub ready_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +416,14 @@ where
             with_command_context(parse_continue_session(rest), "continue-session")
         }
         "auto-unstick" => with_command_context(parse_auto_unstick(rest), "auto-unstick"),
+        "submit-composer" => with_command_context(
+            parse_composer_action(rest, "submit-composer", Command::SubmitComposer),
+            "submit-composer",
+        ),
+        "clear-composer" => with_command_context(
+            parse_composer_action(rest, "clear-composer", Command::ClearComposer),
+            "clear-composer",
+        ),
         "keep-going" => with_command_context(parse_keep_going(rest), "keep-going"),
         "prompt" => with_command_context(parse_prompt_run(rest), "prompt"),
         "mcp" => with_command_context(parse_mcp(rest), "mcp"),
@@ -534,6 +552,8 @@ fn usage_with_color(color: bool) -> String {
         "continue-session (--pane %ID|session:window.pane | --session NAME --window NAME)",
         "auto-unstick (--pane %ID|session:window.pane | --session NAME --window NAME) [--max-steps N]",
         "keep-going (--pane %ID|session:window.pane | --session NAME --window NAME) [--poll-ms N] [--submit-delay-ms N] [--state-dir PATH] [--source PATH | --text TEXT] [--no-yolo]",
+        "submit-composer --pane %ID|session:window.pane [--submit-delay-ms N]",
+        "clear-composer --pane %ID|session:window.pane [--submit-delay-ms N]",
         "approve --pane %ID|session:window.pane [--format human|jsonl]  (alias: approve-permission)",
         "reject --pane %ID|session:window.pane [--format human|jsonl]  (alias: reject-permission)",
         "dismiss-survey --pane %ID|session:window.pane",
@@ -563,7 +583,7 @@ fn usage_with_color(color: bool) -> String {
         "prompt [--text TEXT] [--source PATH ...] [--stdin] [--append-system-prompt PATH ...] [--cwd PATH] [--no-yolo] [--verbose] [-- CLAUDE_ARG ...]",
         "prepare-prompt --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT]",
         "editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET  [advanced]",
-        "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]",
+        "submit-prompt --session NAME --pane %ID|session:window.pane [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--when-ready [--ready-timeout-ms N]] [--submit-delay-ms N]",
     ] {
         out.push_str(&command(line));
         out.push('\n');
@@ -661,6 +681,8 @@ fn closest_command(command: &str) -> Option<&'static str> {
         "dismiss-survey",
         "continue-session",
         "auto-unstick",
+        "submit-composer",
+        "clear-composer",
         "keep-going",
         "prompt",
         "prepare-prompt",
@@ -717,6 +739,8 @@ fn command_from_error(message: &str) -> Option<&'static str> {
         "dismiss-survey",
         "continue-session",
         "auto-unstick",
+        "submit-composer",
+        "clear-composer",
         "keep-going",
         "prompt",
         "prepare-prompt",
@@ -943,6 +967,30 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             "Sends keys only from PermissionDialog.",
         ),
+        "submit-composer" => (
+            "submit-composer",
+            "Submit existing Claude composer text through a guarded, verified action.",
+            "botctl submit-composer --pane TARGET [--submit-delay-ms N]",
+            &["botctl submit-composer --pane %19"][..],
+            &[
+                "--pane TARGET",
+                "--submit-delay-ms N (default: 250)",
+                "--no-color",
+            ][..],
+            "Requires occupied input in PromptEditing or a freshly confirmed ghost-shell condition. Returns outcome=submitted only after the exact composer is consumed. There is no --force.",
+        ),
+        "clear-composer" => (
+            "clear-composer",
+            "Clear existing Claude composer text through a guarded, verified action.",
+            "botctl clear-composer --pane TARGET [--submit-delay-ms N]",
+            &["botctl clear-composer --pane %19"][..],
+            &[
+                "--pane TARGET",
+                "--submit-delay-ms N (default: 250)",
+                "--no-color",
+            ][..],
+            "Destructive: requires occupied input in PromptEditing or a freshly confirmed ghost-shell condition. Returns outcome=cleared only after the composer is empty. There is no --force.",
+        ),
         "keep-going" => (
             "keep-going",
             "Audit current task progress and submit follow-up work when Claude is ready.",
@@ -965,6 +1013,28 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
             ][..],
             "Targets must be explicit. Default mode may use yolo state while waiting; --no-yolo refuses blockers instead of auto-recovering. Prompt input must use either --source or --text, not both.",
         ),
+        "submit-prompt" => (
+            "submit-prompt",
+            "Submit one resolved prompt to an existing Claude pane, immediately or after a bounded passive readiness wait.",
+            "botctl submit-prompt --session NAME --pane TARGET (--source PATH | --text TEXT) [--when-ready [--ready-timeout-ms N]] [--submit-delay-ms N] [--state-dir PATH] [--workspace PATH|UUID]",
+            &[
+                "botctl submit-prompt --session demo --pane %19 --text \"Continue\"",
+                "botctl submit-prompt --session demo --pane %19 --source task.md --when-ready --ready-timeout-ms 30000",
+            ][..],
+            &[
+                "--session NAME",
+                "--pane TARGET",
+                "--source PATH",
+                "--text TEXT",
+                "--when-ready",
+                "--ready-timeout-ms N (default: 30000; requires --when-ready)",
+                "--submit-delay-ms N (default: 250)",
+                "--state-dir PATH",
+                "--workspace PATH|UUID",
+                "--no-color",
+            ][..],
+            "Without --when-ready, readiness is checked immediately. With it, botctl polls only the resolved exact pane and performs no pane or pending-store write before ChatReady with an empty composer. Timeout exits 2 with outcome=ready-timeout. Submission delegates exactly once to ownership-safe verified staging.",
+        ),
         "prompt" => (
             "prompt",
             "Run a one-shot prompt through an observable Claude TUI in tmux.",
@@ -975,6 +1045,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "cat prompt.md | botctl prompt --stdin --cwd /path/to/project",
                 "botctl prompt --source big-plan.md --large-prompt-threshold 10 --keep-temp",
                 "botctl prompt --text hi -- --model sonnet --name \"Just testing\"",
+                "botctl prompt --source task.md --idle-timeout-ms 28800000 --verbose -- --agent megamind --session-id UUID",
             ][..],
             &[
                 "--session NAME (default: botctl)",
@@ -988,7 +1059,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "--poll-ms N (default: 1000)",
                 "--submit-delay-ms N (default: 250)",
                 "--ready-timeout-ms N (default: 30000)",
-                "--idle-timeout-ms N (default: 600000)",
+                "--idle-timeout-ms N (default: 600000; fixed response deadline; use 28800000 for an eight-hour autonomous run)",
                 "--state-dir PATH",
                 "--workspace PATH|UUID",
                 "--large-prompt-threshold BYTES (default: 8192)",
@@ -998,7 +1069,7 @@ fn command_usage(topic: &str, color: bool) -> Option<String> {
                 "-- CLAUDE_ARG ... (passed to the interactive Claude command)",
                 "--no-color",
             ][..],
-            "Launches Claude in a new detached tmux window in the owning session, creating that session first when needed, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. The default owning session is botctl; --session overrides it. Submission is verified: botctl waits for the paste to appear in the composer, then confirms the pane actually left prompt composition, retrying Enter before failing rather than reporting a submit that never happened. On success, botctl loads a fresh assistant message before killing only the captured prompt window. Failed prompt windows are left alive for inspection. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
+            "Launches Claude in a new detached tmux window in the owning session, creating that session first when needed, pastes the resolved prompt into the interactive TUI through tmux, and prints only the latest assistant text to stdout. The default owning session is botctl; --session overrides it. Submission is verified: botctl waits for the paste to appear in the composer, then confirms the pane actually left prompt composition, retrying Enter before failing rather than reporting a submit that never happened. On success, botctl requires a fresh terminal assistant record. Normal ChatReady plus an empty composer removes the captured prompt window only when the captured pane remains its sole exact pane; otherwise botctl warns and retains it. A confirmed stale shell-running footer or stable residual composer text prints the final answer with a warning and retains the window. Failed prompt windows are left alive for inspection. The idle timeout is a fixed response deadline; --agent megamind below one hour emits a warning. Use --verbose for launch/wait progress on stderr. Arguments after -- are passed to Claude, except prompt/headless mode is refused. Safe blockers may be handled unless --no-yolo is set.",
         ),
         "mcp" => (
             "mcp",
@@ -1111,7 +1182,7 @@ fn generic_command_usage(topic: &str, color: bool) -> Option<String> {
             "botctl editor-helper --session NAME [--state-dir PATH] [--workspace PATH|UUID] [--source PATH] [--keep-pending] TARGET"
         }
         "submit-prompt" => {
-            "botctl submit-prompt --session NAME --pane TARGET [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--submit-delay-ms N]"
+            "botctl submit-prompt --session NAME --pane TARGET [--state-dir PATH] [--workspace PATH|UUID] [--source PATH | --text TEXT] [--when-ready [--ready-timeout-ms N]] [--submit-delay-ms N]"
         }
         _ => return None,
     };
@@ -1892,6 +1963,41 @@ fn parse_auto_unstick(args: Vec<String>) -> AppResult<Command> {
     Ok(Command::AutoUnstick(AutoUnstickArgs { target, max_steps }))
 }
 
+fn parse_composer_action(
+    args: Vec<String>,
+    command_name: &str,
+    command: fn(ComposerActionArgs) -> Command,
+) -> AppResult<Command> {
+    let mut pane_id = None;
+    let mut submit_delay_ms = 250u64;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" => pane_id = Some(read_value(&args, &mut i, "--pane")?),
+            "--submit-delay-ms" => {
+                submit_delay_ms = parse_u64_flag(&args, &mut i, "--submit-delay-ms")?;
+            }
+            flag => {
+                return Err(AppError::new(format!(
+                    "unknown {command_name} flag: {flag}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    let pane_id = pane_id.ok_or_else(|| AppError::new("missing required flag: --pane"))?;
+    if submit_delay_ms == 0 {
+        return Err(AppError::new(format!(
+            "{command_name} requires --submit-delay-ms to be at least 1"
+        )));
+    }
+    Ok(command(ComposerActionArgs {
+        pane_id,
+        submit_delay_ms,
+    }))
+}
+
 fn parse_keep_going(args: Vec<String>) -> AppResult<Command> {
     let mut no_yolo = false;
     let mut poll_ms = 1000u64;
@@ -2087,7 +2193,7 @@ fn reject_prompt_mode_claude_command(command: &str, claude_args: &[String]) -> A
     Ok(())
 }
 
-fn shell_like_command_tokens(command: &str) -> AppResult<Vec<String>> {
+pub(crate) fn shell_like_command_tokens(command: &str) -> AppResult<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut chars = command.chars().peekable();
@@ -2372,6 +2478,9 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
     let mut source = None;
     let mut text = None;
     let mut submit_delay_ms = 250u64;
+    let mut when_ready = false;
+    let mut ready_timeout_ms = 30_000u64;
+    let mut ready_timeout_explicit = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -2395,10 +2504,12 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
                 text = Some(read_value(&args, &mut i, "--text")?);
             }
             "--submit-delay-ms" => {
-                let raw = read_value(&args, &mut i, "--submit-delay-ms")?;
-                submit_delay_ms = raw.parse::<u64>().map_err(|_| {
-                    AppError::new(format!("invalid value for --submit-delay-ms: {raw}"))
-                })?;
+                submit_delay_ms = parse_u64_flag(&args, &mut i, "--submit-delay-ms")?;
+            }
+            "--when-ready" => when_ready = true,
+            "--ready-timeout-ms" => {
+                ready_timeout_ms = parse_u64_flag(&args, &mut i, "--ready-timeout-ms")?;
+                ready_timeout_explicit = true;
             }
             flag => {
                 return Err(AppError::new(format!("unknown submit-prompt flag: {flag}")));
@@ -2416,6 +2527,16 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
             "submit-prompt requires --submit-delay-ms to be at least 1",
         ));
     }
+    if ready_timeout_explicit && !when_ready {
+        return Err(AppError::new(
+            "submit-prompt --ready-timeout-ms requires --when-ready",
+        ));
+    }
+    if ready_timeout_ms == 0 {
+        return Err(AppError::new(
+            "submit-prompt requires --ready-timeout-ms to be at least 1",
+        ));
+    }
 
     Ok(Command::SubmitPrompt(SubmitPromptArgs {
         session_name,
@@ -2425,6 +2546,8 @@ fn parse_submit_prompt(args: Vec<String>) -> AppResult<Command> {
         source,
         text,
         submit_delay_ms,
+        when_ready,
+        ready_timeout_ms,
     }))
 }
 
@@ -3994,6 +4117,121 @@ mod tests {
                 .to_string()
                 .contains("submit-prompt requires --submit-delay-ms to be at least 1")
         );
+    }
+
+    #[test]
+    fn parses_guarded_composer_commands_without_force() {
+        let submit = parse_args(vec![
+            String::from("botctl"),
+            String::from("submit-composer"),
+            String::from("--pane"),
+            String::from("0:2.3"),
+            String::from("--submit-delay-ms"),
+            String::from("17"),
+        ])
+        .expect("submit-composer should parse");
+        match submit {
+            Command::SubmitComposer(args) => {
+                assert_eq!(args.pane_id, "0:2.3");
+                assert_eq!(args.submit_delay_ms, 17);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let clear = parse_args(vec![
+            String::from("botctl"),
+            String::from("clear-composer"),
+            String::from("--pane"),
+            String::from("%7"),
+        ])
+        .expect("clear-composer should parse");
+        match clear {
+            Command::ClearComposer(args) => {
+                assert_eq!(args.pane_id, "%7");
+                assert_eq!(args.submit_delay_ms, 250);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("submit-composer"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--force"),
+        ])
+        .expect_err("composer commands must not accept --force");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown submit-composer flag: --force")
+        );
+    }
+
+    #[test]
+    fn parses_submit_prompt_when_ready_and_enforces_timeout_dependency() {
+        let command = parse_args(vec![
+            String::from("botctl"),
+            String::from("submit-prompt"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--text"),
+            String::from("hello"),
+            String::from("--when-ready"),
+        ])
+        .expect("submit-prompt --when-ready should parse");
+        match command {
+            Command::SubmitPrompt(args) => {
+                assert!(args.when_ready);
+                assert_eq!(args.ready_timeout_ms, 30_000);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let error = parse_args(vec![
+            String::from("botctl"),
+            String::from("submit-prompt"),
+            String::from("--session"),
+            String::from("demo"),
+            String::from("--pane"),
+            String::from("%7"),
+            String::from("--text"),
+            String::from("hello"),
+            String::from("--ready-timeout-ms"),
+            String::from("9"),
+        ])
+        .expect_err("ready timeout without --when-ready should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("--ready-timeout-ms requires --when-ready")
+        );
+    }
+
+    #[test]
+    fn composer_and_when_ready_help_describe_verified_refusals() {
+        let submit = super::usage_for(&super::HelpArgs {
+            topic: Some(String::from("submit-composer")),
+            color: false,
+        });
+        assert!(submit.contains("outcome=submitted"));
+        assert!(submit.contains("There is no --force"));
+
+        let clear = super::usage_for(&super::HelpArgs {
+            topic: Some(String::from("clear-composer")),
+            color: false,
+        });
+        assert!(clear.contains("outcome=cleared"));
+        assert!(clear.contains("Destructive"));
+
+        let prepared = super::usage_for(&super::HelpArgs {
+            topic: Some(String::from("submit-prompt")),
+            color: false,
+        });
+        assert!(prepared.contains("--when-ready"));
+        assert!(prepared.contains("--ready-timeout-ms"));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +127,85 @@ const PERMISSION_CONFIRM_KEYWORDS: &[&str] = &["yes", "no", "enter", "escape", "
 const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to cancel";
 const CODEX_PERMISSION_OPTION_YES: &str = "yes, proceed";
 const CODEX_PERMISSION_OPTION_NO: &str = "no, and tell codex what to do differently";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComposerDisposition {
+    Empty,
+    Occupied,
+    Unavailable,
+}
+
+impl ComposerDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Occupied => "occupied",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenActivityEvidence {
+    pub shells_running: u32,
+    pub monitor_running: bool,
+    pub background_agent_running: bool,
+    pub active_agent_roster: bool,
+    pub spinner_running: bool,
+    pub other_busy: bool,
+}
+
+impl ScreenActivityEvidence {
+    pub fn is_busy(self) -> bool {
+        self.shells_running > 0
+            || self.monitor_running
+            || self.background_agent_running
+            || self.active_agent_roster
+            || self.spinner_running
+            || self.other_busy
+    }
+
+    pub fn shells_running_label(self) -> String {
+        if self.shells_running == 0 {
+            String::from("none")
+        } else {
+            self.shells_running.to_string()
+        }
+    }
+
+    pub fn has_non_shell_busy_evidence(self) -> bool {
+        self.monitor_running
+            || self.background_agent_running
+            || self.active_agent_roster
+            || self.spinner_running
+            || self.other_busy
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ComposerScreenEvidence {
+    pub(crate) disposition: ComposerDisposition,
+    pub(crate) normalized_region: Option<String>,
+}
+impl fmt::Debug for ComposerScreenEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComposerScreenEvidence")
+            .field("disposition", &self.disposition)
+            .field(
+                "normalized_region",
+                &self.normalized_region.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl ComposerScreenEvidence {
+    pub(crate) fn matches_text(&self, text: &str) -> bool {
+        self.normalized_region.as_deref() == Some(normalized_composer_text(text).as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Classification {
@@ -277,10 +358,12 @@ impl Classifier {
                 "waiting",
             ],
         );
-        let has_busy_status_banner = has_live_busy_status(&lines);
-        let has_live_busy = has_busy_status_banner
-            || (has_busy_interrupt_hint && has_busy_keywords)
-            || has_claude_streaming_output;
+        let mut screen_activity = inspect_screen_activity_lines(&lines);
+        screen_activity.other_busy |= (has_busy_interrupt_hint && has_busy_keywords)
+            || has_claude_streaming_output
+            || has_codex_busy_statusline;
+        let has_busy_status_banner = screen_activity.is_busy();
+        let has_live_busy = has_busy_status_banner;
 
         // Provider-owned fingerprint checks run BEFORE the rest of the chain.
         // Once a frame fingerprints as agy or Grok, that provider owns the
@@ -485,6 +568,142 @@ pub(crate) fn prepare_frame_for_classification(frame_text: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     crate::agy::strip_ansi(&without_dim_suggestions).into_owned()
+}
+pub(crate) fn inspect_composer(frame_text: &str) -> ComposerScreenEvidence {
+    let prepared;
+    let frame_text = if frame_text.contains('\x1b') {
+        prepared = prepare_frame_for_classification(frame_text);
+        prepared.as_str()
+    } else {
+        frame_text
+    };
+    let lines = frame_text.lines().collect::<Vec<_>>();
+    let Some(input_idx) = lines.iter().rposition(|line| {
+        let trimmed = line.trim();
+        is_plain_chat_input_line(trimmed)
+            || is_codex_plain_chat_input_line(trimmed)
+            || is_prompt_editing_line(trimmed)
+            || is_claude_suggested_prompt_line(trimmed)
+    }) else {
+        return ComposerScreenEvidence {
+            disposition: ComposerDisposition::Unavailable,
+            normalized_region: None,
+        };
+    };
+
+    let input_line = lines[input_idx].trim();
+    let live = if input_line.starts_with('❯') {
+        claude_prompt_editing_tail_is_live(&lines[input_idx + 1..])
+    } else {
+        lines[input_idx + 1..]
+            .iter()
+            .copied()
+            .filter(|line| !line.trim().is_empty())
+            .all(is_prompt_editing_tail_chrome)
+    };
+    if !live {
+        return ComposerScreenEvidence {
+            disposition: ComposerDisposition::Unavailable,
+            normalized_region: None,
+        };
+    }
+
+    if is_plain_chat_input_line(input_line)
+        || is_codex_plain_chat_input_line(input_line)
+        || is_claude_suggested_prompt_line(input_line)
+    {
+        return ComposerScreenEvidence {
+            disposition: ComposerDisposition::Empty,
+            normalized_region: None,
+        };
+    }
+
+    let region = lines[input_idx..]
+        .iter()
+        .take_while(|line| !is_composer_region_boundary(line))
+        .enumerate()
+        .map(|(offset, line)| {
+            let line = line.trim();
+            if offset == 0 {
+                line.strip_prefix('❯')
+                    .or_else(|| line.strip_prefix('›'))
+                    .unwrap_or(line)
+                    .trim()
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized_region = normalized_composer_text(&region);
+    ComposerScreenEvidence {
+        disposition: if normalized_region.is_empty() {
+            ComposerDisposition::Unavailable
+        } else {
+            ComposerDisposition::Occupied
+        },
+        normalized_region: (!normalized_region.is_empty()).then_some(normalized_region),
+    }
+}
+
+pub(crate) fn normalized_composer_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn inspect_screen_activity(frame_text: &str) -> ScreenActivityEvidence {
+    let prepared;
+    let frame_text = if frame_text.contains('\x1b') {
+        prepared = prepare_frame_for_classification(frame_text);
+        prepared.as_str()
+    } else {
+        frame_text
+    };
+    let lines = frame_text.lines().map(str::trim).collect::<Vec<_>>();
+    let normalized = normalize(frame_text);
+    let mut evidence = inspect_screen_activity_lines(&lines);
+    let has_interrupt_hint = contains_any(
+        &normalized,
+        &[
+            "press esc to interrupt",
+            "esc to interrupt",
+            "ctrl+c to interrupt",
+        ],
+    );
+    let has_busy_words = contains_any(
+        &normalized,
+        &[
+            "thinking",
+            "running",
+            "background task",
+            "still thinking",
+            "working",
+            "waiting",
+        ],
+    );
+    let has_plain_chat_input = lines.iter().copied().any(is_plain_chat_input_line)
+        || lines.iter().copied().any(is_codex_plain_chat_input_line);
+    let has_streaming_output = lines.iter().copied().any(is_claude_footer_line)
+        && !has_plain_chat_input
+        && has_assistant_output_after_latest_input(&lines);
+    evidence.other_busy |= (has_interrupt_hint && has_busy_words)
+        || has_streaming_output
+        || lines.iter().copied().any(is_codex_busy_statusline_line);
+    evidence
+}
+
+fn is_composer_region_boundary(line: &&str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && (is_horizontal_rule(trimmed)
+            || is_prompt_editing_tail_chrome(trimmed)
+            || is_claude_footer_line(trimmed))
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    line.chars().count() >= 3
+        && line
+            .chars()
+            .all(|ch| matches!(ch, '─' | '━' | '═' | '╌' | '╍' | '┄' | '┅'))
 }
 
 fn collapse_claude_dim_suggested_prompt_line(line: &str) -> String {
@@ -1225,19 +1444,60 @@ fn is_busy_status_line(line: &str) -> bool {
             && stripped.contains(" background agent")
             && stripped.ends_with(" to finish"))
         || is_active_claude_agent_row(trimmed)
-        || lower.contains(" monitor still running")
-        || lower.contains(" monitors still running")
+        || live_footer_count(trimmed, "monitor", "monitors").is_some()
+        || live_footer_count(trimmed, "shell", "shells").is_some()
+}
+
+fn inspect_screen_activity_lines(lines: &[&str]) -> ScreenActivityEvidence {
+    let mut evidence = ScreenActivityEvidence::default();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !is_busy_status_line(trimmed) || busy_status_is_superseded(trimmed, &lines[idx + 1..]) {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let stripped = lower.trim_start_matches(|ch: char| !ch.is_ascii_alphanumeric());
+        evidence.shells_running = evidence
+            .shells_running
+            .max(live_footer_count(trimmed, "shell", "shells").unwrap_or(0));
+        evidence.monitor_running |= live_footer_count(trimmed, "monitor", "monitors").is_some();
+        evidence.background_agent_running |= stripped.starts_with("waiting for ")
+            && stripped.contains(" background agent")
+            && stripped.ends_with(" to finish");
+        evidence.active_agent_roster |= is_active_claude_agent_row(trimmed);
+        evidence.spinner_running |=
+            is_claude_spinner_status_line(trimmed, &trimmed.to_ascii_lowercase());
+        evidence.other_busy |= stripped.starts_with("waiting for task")
+            || lower.contains("waiting for task (esc to give additional instructions)");
+    }
+    evidence
+}
+
+fn live_footer_count(line: &str, singular: &str, plural: &str) -> Option<u32> {
+    let trimmed = line.trim();
+    if !trimmed
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '·' | '✻' | '✽' | '✶' | '✳' | '✢'))
+    {
+        return None;
+    }
+    trimmed.split('·').map(str::trim).find_map(|segment| {
+        let mut words = segment.split_whitespace();
+        let count = words.next()?.parse::<u32>().ok()?;
+        let role = words.next()?;
+        (count > 0
+            && (role == singular || role == plural)
+            && words.next() == Some("still")
+            && words.next() == Some("running")
+            && words.next().is_none())
+        .then_some(count)
+    })
 }
 
 fn is_active_claude_agent_row(trimmed: &str) -> bool {
     let row = trimmed.strip_prefix("❯ ").unwrap_or(trimmed);
     row.starts_with("◯ ") && row.contains(" · ↓ ") && row.contains(" tokens")
-}
-
-fn has_live_busy_status(lines: &[&str]) -> bool {
-    lines.iter().enumerate().any(|(idx, line)| {
-        is_busy_status_line(line) && !busy_status_is_superseded(line, &lines[idx + 1..])
-    })
 }
 
 fn busy_status_is_superseded(busy_line: &str, later_lines: &[&str]) -> bool {
@@ -1631,10 +1891,11 @@ fn starts_with_numbered_option(line: &str) -> bool {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use super::{
-        Classifier, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS, SIGNAL_CHAT_QUESTIONS,
-        SIGNAL_CODEX_KEYWORDS, SIGNAL_DIFF_KEYWORDS, SIGNAL_PERMISSION_KEYWORDS,
-        SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH,
-        SIGNAL_STARTUP_CHOICE_KEYWORDS, SIGNAL_SURVEY_KEYWORDS, SessionState,
+        Classifier, ComposerDisposition, SIGNAL_BUSY_KEYWORDS, SIGNAL_CHAT_KEYWORDS,
+        SIGNAL_CHAT_QUESTIONS, SIGNAL_CODEX_KEYWORDS, SIGNAL_DIFF_KEYWORDS,
+        SIGNAL_PERMISSION_KEYWORDS, SIGNAL_PLAN_APPROVAL_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
+        SIGNAL_SENSITIVE_CLAUDE_PATH, SIGNAL_STARTUP_CHOICE_KEYWORDS, SIGNAL_SURVEY_KEYWORDS,
+        SessionState, inspect_composer, inspect_screen_activity,
     };
 
     #[test]
@@ -2601,5 +2862,72 @@ mod tests {
 
         assert_eq!(result.state, SessionState::UserQuestionPrompt);
         assert!(result.has_questions);
+    }
+    #[test]
+    fn shell_footer_and_occupied_composer_are_orthogonal_busy_evidence() {
+        let frame = "● Earlier response\n✻ Worked for 3m 4s · 1 shell still running\n────────────────\n❯ open an issue for the setup enable-before-write window\n────────────────\n~/Projects/botctl";
+        let result = Classifier.classify("test", frame);
+        let composer = inspect_composer(frame);
+        let activity = inspect_screen_activity(frame);
+
+        assert_eq!(result.state, SessionState::BusyResponding);
+        assert_eq!(composer.disposition, ComposerDisposition::Occupied);
+        assert_eq!(activity.shells_running, 1);
+        assert!(!activity.has_non_shell_busy_evidence());
+    }
+
+    #[test]
+    fn busy_footer_outside_recent_tail_still_blocks_readiness() {
+        let frame = format!(
+            "✻ Worked for 3m 4s · 1 shell still running\n{}\n────────────────\n❯\n────────────────\n~/Projects/botctl",
+            "\n".repeat(20)
+        );
+
+        assert_eq!(
+            Classifier.classify("test", &frame).state,
+            SessionState::BusyResponding
+        );
+        assert_eq!(inspect_screen_activity(&frame).shells_running, 1);
+    }
+
+    #[test]
+    fn parses_singular_and_plural_live_shell_footer_counts() {
+        for (status, expected) in [
+            ("✻ Worked for 2m · 1 shell still running", 1),
+            ("✽ Brewed for 2m · 3 shells still running", 3),
+        ] {
+            let evidence = inspect_screen_activity(status);
+            assert_eq!(evidence.shells_running, expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn prose_and_completed_shell_mentions_do_not_claim_live_shells() {
+        for frame in [
+            "● The shell still running text is quoted in this answer.\n✻ Worked for 2m\n❯",
+            "● All 2 shells still running earlier have completed.\n✻ Worked for 2m\n❯",
+            "1 shell still running\n❯",
+        ] {
+            assert_eq!(inspect_screen_activity(frame).shells_running, 0, "{frame}");
+        }
+    }
+
+    #[test]
+    fn stale_superseded_shell_footer_does_not_claim_live_shells() {
+        let frame = "✻ Worked for 2m · 1 shell still running\n● Shell completed\n✻ Worked for 3m\n※ recap: all work complete\n❯";
+        let result = Classifier.classify("test", frame);
+
+        assert_eq!(result.state, SessionState::ChatReady);
+        assert_eq!(inspect_screen_activity(frame).shells_running, 0);
+    }
+
+    #[test]
+    fn composer_evidence_normalizes_wrapped_text_without_exposing_it_in_disposition() {
+        let frame = "✻ Worked for 2m\n────────────────\n❯ preserve this exact\n  composer payload\n────────────────\n~/Projects/botctl";
+        let composer = inspect_composer(frame);
+
+        assert_eq!(composer.disposition.as_str(), "occupied");
+        assert!(composer.matches_text("preserve this exact composer payload"));
+        assert!(!composer.matches_text("different payload"));
     }
 }

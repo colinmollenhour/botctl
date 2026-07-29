@@ -132,12 +132,16 @@ Fix:
 
 Symptoms:
 
-- Submission reports that no prompt-submission transition was observed.
-- The pane is not `ChatReady`.
+- `outcome=ready-timeout` reports a last state or occupied composer.
+- Submission reports `guard-refused`, `composer-changed`,
+  `staging-unverified`, or `input-dead`.
 
 Cause:
 
-`submit-prompt` only submits from `ChatReady`, except for supported preflight recovery such as survey dismissal. It verifies that the pane transitions after submission.
+`submit-prompt` supplies new text. It requires `ChatReady` with an empty
+composer and verifies both bot ownership of the staged bytes and an affirmative
+submission transition. `--when-ready` waits passively; it does not clear or
+submit existing text.
 
 Fix:
 
@@ -148,10 +152,32 @@ botctl status --pane %19
 
 Then:
 
-- If the state is `ChatReady`, retry `submit-prompt`.
-- If the state is `SurveyPrompt`, run `dismiss-survey` or retry `submit-prompt` and let preflight handle it.
-- If the state is `ExternalEditorActive`, finish the editor handoff manually or with `editor-helper`.
-- If the state is `DiffDialog`, review the diff manually.
+- If the composer is empty and the pane is still working, retry with a bounded wait:
+
+  ```bash
+  botctl submit-prompt --session demo --pane %19 --source task.md \
+    --when-ready --ready-timeout-ms 30000
+  ```
+
+- If the composer contains the text you want to send, submit that existing text:
+
+  ```bash
+  botctl submit-composer --pane %19
+  ```
+
+- If the composer contains text you intend to discard, capture or inspect it,
+  then use the destructive command:
+
+  ```bash
+  botctl clear-composer --pane %19
+  ```
+
+- If the result is `composer-changed`, do not retry a stale command. Inspect
+  again; botctl deliberately retained text it could not prove was its own.
+- If the state is `SurveyPrompt`, run `dismiss-survey` or let immediate
+  `submit-prompt` preflight handle it.
+- If the state is `ExternalEditorActive` or `DiffDialog`, complete the manual
+  workflow first.
 
 ## `prompt` fails or prints no answer
 
@@ -184,6 +210,69 @@ botctl doctor --pane %19
 - Run `botctl status --pane <session:window.pane>` to inspect the classified state.
 - Review unsafe blockers manually; `--no-yolo` makes supported blockers fail instead of auto-recovering.
 - If stale/no transcript output persists, attach to the tmux session and verify Claude wrote a response in the same workspace.
+
+## `prompt` warns about residual composer text
+
+Symptoms:
+
+- `prompt` exits successfully and prints the final assistant text.
+- stderr says `completed with residual composer text`, names the retained
+  window and pane, and prints two recovery commands.
+
+Cause:
+
+A fresh final assistant record arrived, but the same occupied composer was
+still visible on two observations. Botctl treats the response as complete but
+does not destroy or submit that text and does not remove the window.
+
+Fix:
+
+Inspect the named pane, then run exactly one command from the warning:
+
+```bash
+botctl submit-composer --pane %19
+botctl clear-composer --pane %19
+```
+
+The second command is destructive. There is no force option.
+
+## Claude reports a shell that the process tree does not confirm
+
+Symptoms:
+
+- `status` or `doctor` shows `ui_shells_running` with a number.
+- `tool_child_probe` is `confirmed-absent` or `unavailable`.
+- `ghost_shell` is `confirmed` or `unknown`.
+- `prompt` may exit successfully with a warning that it retained a stale shell-running footer window.
+
+Cause:
+
+`ui_shells_running` is visible UI evidence. `tool_child_probe` is independent
+process-tree evidence. `ghost_shell=confirmed` means the UI reports a shell but
+the process probe freshly confirmed no tool child.
+
+After a fresh terminal response, `prompt` can also complete when two stable
+observations show an empty composer, a confirmed ghost shell, and no other busy
+evidence. It prints the response, warns, and retains the window instead of
+waiting for the full response deadline.
+
+`ghost_shell=unknown` means the process probe was unavailable; read
+`tool_child_probe_reason` and `tool_child_probe_recommendation`.
+
+Fix:
+
+```bash
+botctl status --pane %19 --plain
+botctl doctor --pane %19 --plain
+```
+
+Retry the probe recommendation when it is present. Botctl has no automatic
+ghost-shell repair. An unavailable probe does not authorize any composer
+mutation. If `ghost_shell=confirmed`, the composer is occupied, and no other
+busy evidence is present, inspect the text and explicitly choose
+`submit-composer` or destructive `clear-composer`.
+If the composer is empty, no recovery key is needed; inspect the retained pane
+and stop it manually when it is no longer useful.
 
 ## YOLO already active
 

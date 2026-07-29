@@ -147,6 +147,8 @@ Use the direct pane-targeted actions only when the classified state matches the 
 | `FolderTrustPrompt` | `approve` | Sends raw `Enter`, not the user's `confirm-yes` binding. |
 | `AgyCommandPermissionPrompt` | `yolo start --pane <agy-pane>` | Opt-in YOLO sends raw `Enter` only when the cursor is on the captured `> 1. Yes` default and `current_command == "agy"`. Folder-trust and settings-persist agy shapes are not auto-approved. |
 | `SurveyPrompt` | `dismiss-survey` | Sends raw `0`. |
+| `PromptEditing` with occupied composer text | `submit-composer` or destructive `clear-composer` | Operates on existing text only; both commands verify the result and have no force mode. |
+| `BusyResponding` with occupied composer text and `ghost_shell=confirmed` | `submit-composer` or destructive `clear-composer` | Requires a fresh process probe, visible shell activity, and no other busy evidence. An unavailable probe refuses. |
 | `ChatReady` or `BusyResponding` after a pause | `continue-session` | Refuses unsupported states. |
 | Repeated safe blockers | `auto-unstick` | Bounded recovery loop; stops rather than guessing. |
 | `PlanApprovalPrompt`, `DiffDialog`, `ExternalEditorActive`, `UserQuestionPrompt`, or `Unknown` | manual review | No safe automatic recovery is defined. |
@@ -161,6 +163,8 @@ botctl reject --pane %19
 botctl dismiss-survey --pane %19
 botctl continue-session --pane %19
 botctl auto-unstick --pane %19
+botctl submit-composer --pane %19
+botctl clear-composer --pane %19
 ```
 
 Notes:
@@ -172,14 +176,18 @@ Notes:
 
 ## Prompt flow overview
 
-There are four prompt paths today:
+There are five prompt paths:
 
 1. **TUI-backed one-shot execution** — use `prompt` to launch Claude, submit the prompt, wait for the answer, and print assistant text to stdout.
-2. **One-shot submission to an existing pane** — pass `--text` or `--source` directly to `submit-prompt`.
-3. **Manual staging** — use `prepare-prompt`, then `editor-helper` when Claude requests an external editor target.
-4. **Loop submission** — use `keep-going` when you want `botctl` to keep asking Claude to audit the current task until Claude reports a terminal token.
+2. **New-text submission to an existing pane** — pass `--text` or `--source` to `submit-prompt`; add `--when-ready` for a bounded passive wait.
+3. **Existing-composer recovery** — use `submit-composer` to submit text already present, or destructive `clear-composer` to discard it.
+4. **Manual staging** — use `prepare-prompt`, then `editor-helper` when Claude requests an external editor target.
+5. **Loop submission** — use `keep-going` when you want `botctl` to keep asking Claude to audit the current task until Claude reports a terminal token.
 
-Manual staging now keeps the session's pending prompt in `<state-root>/state.db` under a workspace-scoped placeholder instance rather than a separate prompt file.
+Manual editor handoff keeps the session's pending prompt in
+`<state-root>/state.db`. `submit-prompt` and `keep-going` instead use one
+in-memory, ownership-checked staging transaction and do not write a pending
+record.
 
 ## TUI-backed one-shot prompt
 
@@ -192,13 +200,62 @@ printf 'Say exactly hello' | botctl prompt --stdin --cwd /path/to/project
 botctl prompt --text hi -- --model sonnet --name "Just testing"
 ```
 
-`prompt` launches a new detached tmux window in the owning session, creates that session automatically when needed, waits for `ChatReady`, pastes the resolved prompt into the interactive TUI through tmux, handles only the same safe survey/folder-trust/permission blockers as YOLO unless `--no-yolo` is set, waits for a fresh final assistant reply, and prints only assistant text to stdout. The owning session defaults to the shared `botctl` session; pass `--session NAME` to override it. Successful runs kill only the captured prompt window after loading the fresh assistant message. Failed prompt windows stay alive for inspection. Pass `--verbose` for launch/wait progress on stderr. Arguments after `--` pass through to Claude. Use `submit-prompt` instead when you already have an existing pane you want to target.
+For a multi-hour Megamind run:
 
-Existing-pane one-shot example:
+```bash
+TASK_FILE=/ABSOLUTE/PATH/TO/TASK.md
+WORKTREE=/ABSOLUTE/PATH/TO/WORKTREE
+RUN_ID="megamind-$(date +%s)-$$"
+CLAUDE_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+botctl prompt \
+  --source "$TASK_FILE" \
+  --cwd "$WORKTREE" \
+  --session "botctl-${RUN_ID}" \
+  --window "claude-${RUN_ID}" \
+  --idle-timeout-ms 28800000 \
+  --keep-temp \
+  --verbose \
+  -- \
+  --agent megamind \
+  --session-id "$CLAUDE_SESSION_ID" \
+  --name "megamind: ${RUN_ID}"
+```
+
+The idle timeout is a fixed response deadline after verified submission; the
+default is `600000`, and Megamind values below one hour warn without changing
+the timeout. Safe YOLO handling is on by default. For standalone YOLO, use
+`botctl yolo start --pane %19 --follow`; `--follow` is a bare flag, and omitting
+it means do not tail events.
+
+`prompt` launches a new detached tmux window in the owning session, creates that
+session automatically when needed, waits for `ChatReady`, proves ownership of
+the pasted prompt, handles only supported safe blockers unless `--no-yolo` is
+set, and waits for a fresh final assistant record. Normal `ChatReady` plus an
+empty composer prints the answer and removes the captured prompt window only
+when its captured pane remains the sole exact pane; otherwise botctl warns and
+retains it. A confirmed stale shell-running footer plus a stable empty composer
+prints the answer, warns, and retains the window. Stable residual composer text also
+prints the answer, warns with exact `submit-composer` and `clear-composer`
+commands, and retains the window. Failed prompt windows remain for inspection.
+
+Existing-pane new-text examples:
 
 ```bash
 botctl submit-prompt --session demo --pane %19 --text "Summarize the current repo"
+botctl submit-prompt --session demo --pane %19 --source task.md \
+  --when-ready --ready-timeout-ms 30000
 ```
+
+Existing-composer recovery:
+
+```bash
+botctl submit-composer --pane %19
+botctl clear-composer --pane %19
+```
+
+Inspect first: `clear-composer` is destructive. Neither composer command has a
+force mode.
 
 Manual staging example:
 
