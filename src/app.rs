@@ -18,29 +18,32 @@ use time::macros::format_description;
 use crate::automation::{
     AutomationAction, GuardedWorkflow, KeybindingsInspection, KeybindingsStatus,
     ResolvedKeybindings, inspect_keybindings, install_recommended_keybindings,
-    load_resolved_keybindings, prompt_submission_sequence, render_keybindings_json,
-    validate_workflow_state,
+    load_resolved_keybindings, render_keybindings_json, validate_workflow_state,
 };
 use crate::classifier::{
-    Classification, Classifier, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
-    SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState, has_startup_choice_prompt_text,
+    Classification, Classifier, ComposerDisposition, ComposerScreenEvidence, SIGNAL_CODEX_KEYWORDS,
+    SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, ScreenActivityEvidence,
+    SessionState, has_startup_choice_prompt_text, inspect_composer, inspect_screen_activity,
     prepare_frame_for_classification,
 };
 use crate::cli::{
     AttachArgs, AutoUnstickArgs, BabysitFormat, CaptureArgs, ClassifyArgs, Command,
-    ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs, InstallBindingsArgs,
-    InstallSkillArgs, KeepGoingArgs, LastMessageArgs, ListPanesArgs, McpArgs, McpTransportArgs,
-    ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs, PromptRunArgs,
-    RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs, StartArgs, StatusArgs,
-    SubmitPromptArgs, ViewSkillArgs, YoloStartArgs, YoloStopArgs,
+    ComposerActionArgs, ContinueSessionArgs, DashboardArgs, DoctorArgs, EditorHelperArgs,
+    InstallBindingsArgs, InstallSkillArgs, KeepGoingArgs, LastMessageArgs, ListPanesArgs, McpArgs,
+    McpTransportArgs, ObserveArgs, PaneCommandArgs, PaneTargetArgs, PreparePromptArgs,
+    PromptRunArgs, RecordFixtureArgs, ReplayArgs, RuntimeArgs, SendActionArgs, ServeArgs,
+    StartArgs, StatusArgs, SubmitPromptArgs, ViewSkillArgs, YoloStartArgs, YoloStopArgs,
+    shell_like_command_tokens,
 };
 use crate::dashboard;
 use crate::fixtures::{FixtureCase, FixtureRecordInput, record_case};
 use crate::http_api::spawn_http_server;
 use crate::last_message::{
-    default_output_path, line_count, load_last_agent_message, output_path_is_stdout,
+    ClaudeTranscriptCursor, capture_claude_transcript_cursor, default_output_path, line_count,
+    load_last_agent_message, output_path_is_stdout, read_fresh_claude_terminal_record,
 };
 use crate::observe::{CollectedObservation, ObserveRequest, collect_observation};
+use crate::proc_fd::{ToolChildProbe, probe_claude_tool_children};
 use crate::prompt::{
     PromptSource, prepare_prompt, resolve_prompt_text, resolve_state_dir, write_editor_target,
     write_editor_target_from_pending,
@@ -49,10 +52,12 @@ use crate::runtime::{RuntimeClient, RuntimeProbe, RuntimeServerConfig, run_runti
 use crate::serve::ServeRequest;
 use crate::storage::{
     WorkspaceRecord, bootstrap_state_db, capture_artifact_path, export_artifact_path,
-    resolve_workspace, resolve_workspace_for_path, state_db_path,
-    store_pending_prompt_for_tmux_instance, tape_artifact_path,
+    resolve_workspace, resolve_workspace_for_path, state_db_path, tape_artifact_path,
 };
-use crate::tmux::{StartSessionRequest, StartWindowRequest, StartedWindow, TmuxClient, TmuxPane};
+use crate::tmux::{
+    StartSessionRequest, StartWindowRequest, StartedWindow, TmuxClient, TmuxInventory, TmuxPane,
+    TmuxServerIdentity,
+};
 #[cfg(test)]
 use crate::yolo::{YoloRecord, disable_yolo_record};
 
@@ -64,6 +69,7 @@ const KEEP_GOING_CUSTOM_PROMPT_ANCHOR: &str = "[[BOTCTL_KEEP_GOING_END_PROMPT]]"
 const CODEX_PERMISSION_CONFIRM_FOOTER: &str = "press enter to confirm or esc to cancel";
 const PROMPT_SUBMISSION_POLL_MS: u64 = 100;
 const PROMPT_SUBMISSION_TIMEOUT_MS: u64 = 5000;
+const MIN_AUTONOMOUS_IDLE_TIMEOUT_MS: u64 = 3_600_000;
 // A large bracketed paste can take seconds to land in the Claude TUI on a busy
 // host, so wait for the composer to actually show the staged text before
 // pressing Enter; an Enter that arrives mid-paste is swallowed.
@@ -246,6 +252,8 @@ pub fn run(command: Command) -> AppResult<String> {
         }
         Command::ContinueSession(args) => run_continue_session(args),
         Command::AutoUnstick(args) => run_auto_unstick(args),
+        Command::SubmitComposer(args) => run_submit_composer(args),
+        Command::ClearComposer(args) => run_clear_composer(args),
         Command::KeepGoing(args) => run_keep_going(args),
         Command::Prompt(args) => run_prompt(args),
         Command::Mcp(args) => run_mcp(args),
@@ -998,8 +1006,11 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
     if args.json {
         render_status_json(&pane, &classification, &bindings, &frame, automation_ready)
     } else {
+        let composer = inspect_composer(&focused);
+        let activity = inspect_screen_activity(&focused);
+        let process_evidence = inspect_process_evidence(&pane, activity);
         Ok(format!(
-            "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\nprovider={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
+            "automation_ready={}\npane={}\nsession={}\nwindow={}\nactive={}\nprovider={}\ncommand={}\ncommand_matches_claude={}\ncwd={}\ncursor={}\nstate={}\ncomposer={}\nui_shells_running={}\ntool_child_probe={}\nghost_shell={}\ntool_child_probe_reason={}\ntool_child_probe_recommendation={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}{}",
             automation_ready,
             pane.pane_id,
             pane.session_name,
@@ -1011,16 +1022,27 @@ fn run_doctor(args: DoctorArgs) -> AppResult<String> {
             pane.current_path,
             render_cursor(&pane),
             classification.state.as_str(),
+            composer.disposition.as_str(),
+            activity.shells_running_label(),
+            process_evidence.tool_child_probe.as_str(),
+            process_evidence.ghost_shell.as_str(),
+            render_probe_unavailable_reason(process_evidence.tool_child_probe),
+            render_probe_recommendation(process_evidence.tool_child_probe),
             classification.has_questions,
             classification.recap_present,
             classification.recap_excerpt.as_deref().unwrap_or("none"),
             render_signals(&classification),
-            render_screen_excerpt(&frame),
+            render_status_screen_excerpt(&frame, composer.disposition),
             render_next_safe_action(&classification, &pane, &bindings),
             bindings.path.display(),
             bindings.status.as_str(),
             render_missing_bindings(&bindings),
-            render_doctor_recommendations(&classification, &pane, &bindings)
+            render_doctor_recommendations_with_process(
+                &classification,
+                &pane,
+                &bindings,
+                process_evidence,
+            )
         ))
     }
 }
@@ -1435,13 +1457,78 @@ fn run_continue_session(args: ContinueSessionArgs) -> AppResult<String> {
     ))
 }
 
+fn run_submit_composer(args: ComposerActionArgs) -> AppResult<String> {
+    run_explicit_composer_action(args, ComposerMutation::Submit, "submit-composer")
+}
+
+fn run_clear_composer(args: ComposerActionArgs) -> AppResult<String> {
+    run_explicit_composer_action(args, ComposerMutation::Clear, "clear-composer")
+}
+
+fn run_explicit_composer_action(
+    args: ComposerActionArgs,
+    mutation: ComposerMutation,
+    action: &str,
+) -> AppResult<String> {
+    let client = TmuxClient::default();
+    let pane = client
+        .pane_by_target(&args.pane_id)?
+        .ok_or_else(|| AppError::with_exit_code(format!("no pane found: {}", args.pane_id), 2))?;
+    let initial = capture_composer_action_snapshot(&client, &pane.pane_id)?;
+    if !same_action_pane(&pane, &initial.pane) {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=target-changed action={} pane={} before=unknown after={} composer={} attempts=0 residual=retained",
+                action,
+                pane.pane_id,
+                initial.state().as_str(),
+                initial.composer.disposition.as_str(),
+            ),
+            2,
+        ));
+    }
+    let outcome =
+        execute_verified_composer_action(&client, initial, mutation, action, args.submit_delay_ms)?;
+    Ok(outcome.render(action, mutation))
+}
+
+fn occupied_composer_recommendation(snapshot: &ComposerActionSnapshot) -> Option<AppError> {
+    if snapshot.composer.disposition != ComposerDisposition::Occupied {
+        return None;
+    }
+    if snapshot.state() == SessionState::BusyResponding
+        && snapshot.activity.shells_running > 0
+        && !snapshot.activity.has_non_shell_busy_evidence()
+        && snapshot.process.ghost_shell == GhostShellEvidence::Unknown
+    {
+        return Some(AppError::with_exit_code(
+            format!(
+                "auto-unstick sends no key for occupied composer text in pane {}; ghost shell status cannot be established because the process probe is unavailable",
+                snapshot.identity.pane_id,
+            ),
+            2,
+        ));
+    }
+    Some(AppError::with_exit_code(
+        format!(
+            "auto-unstick sends no key for occupied composer text in pane {}; recover with botctl submit-composer --pane {}; destructive alternative: botctl clear-composer --pane {}",
+            snapshot.identity.pane_id, snapshot.identity.pane_id, snapshot.identity.pane_id,
+        ),
+        2,
+    ))
+}
+
 fn run_auto_unstick(args: AutoUnstickArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_target_pane(&client, &args.target)?;
     ensure_pane_owned_by_claude(&pane)?;
+    let initial = capture_composer_action_snapshot(&client, &pane.pane_id)?;
+    if let Some(refusal) = occupied_composer_recommendation(&initial) {
+        return Err(refusal);
+    }
     let mut actions = Vec::new();
     let mut approved_permission = false;
-    let mut current = classify_pane(&client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let mut current = initial.inspected.classification;
 
     for _ in 0..args.max_steps {
         if is_usable_state(current.state) {
@@ -1501,10 +1588,8 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
     let client = TmuxClient::default();
     let pane = resolve_target_pane(&client, &args.target)?;
     ensure_pane_owned_by_claude(&pane)?;
-    let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let prompt =
         resolve_keep_going_prompt(args.prompt_source.as_deref(), args.prompt_text.as_deref())?;
-    let bindings = load_automation_keybindings(None)?;
     let mut awaiting_reply = false;
     let mut last_state: Option<SessionState> = None;
 
@@ -1619,33 +1704,11 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
                 }
             }
         } else if classification.state == SessionState::ChatReady {
-            let before_submit = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-            submit_keep_going_prompt(
-                &client,
-                &current_pane,
-                &state_dir,
-                &prompt.text,
-                &bindings,
-                args.submit_delay_ms,
-            )?;
+            submit_keep_going_prompt(&client, &current_pane, &prompt.text, args.submit_delay_ms)?;
             emit_babysit_output(format!(
-                "keep-going pane={} action=submit-prompt",
+                "keep-going pane={} action=submit-prompt outcome=verified-consumed",
                 pane.pane_id
             ))?;
-            wait_for_prompt_submission_start(
-                &client,
-                &pane.pane_id,
-                &before_submit,
-                prompt.anchor.as_deref(),
-            )
-            .map_err(
-                |_| {
-                    AppError::new(format!(
-                        "keep-going submitted the loop prompt but pane {} did not show a prompt-submission transition",
-                        pane.pane_id
-                    ))
-                },
-            )?;
             awaiting_reply = true;
         }
 
@@ -1656,26 +1719,10 @@ fn run_keep_going(args: KeepGoingArgs) -> AppResult<String> {
 fn submit_keep_going_prompt(
     client: &TmuxClient,
     pane: &TmuxPane,
-    state_dir: &Path,
     prompt_text: &str,
-    bindings: &ResolvedKeybindings,
     submit_delay_ms: u64,
 ) -> AppResult<()> {
-    let workspace = resolve_workspace_for_path(state_dir, Path::new(&pane.current_path))?;
-    store_pending_prompt_for_tmux_instance(
-        state_dir,
-        &workspace.id,
-        &pane.session_name,
-        pane,
-        prompt_text,
-    )?;
-    send_actions(
-        client,
-        &pane.pane_id,
-        &prompt_submission_sequence(),
-        bindings,
-        submit_delay_ms,
-    )
+    submit_prompt_text_direct(client, pane, prompt_text, submit_delay_ms).map(|_| ())
 }
 
 fn execute_keep_going_yolo_action(
@@ -1716,6 +1763,7 @@ fn keep_going_no_yolo_blocker(classification: &Classification, pane_id: &str) ->
     ))
 }
 
+#[cfg(any(test, rust_analyzer))]
 fn prompt_submission_started(
     before_frame: &str,
     after_frame: &str,
@@ -1746,57 +1794,15 @@ fn prompt_submission_started(
 
     match prompt_anchor {
         Some(anchor) => {
-            if count_prompt_anchors(after_frame, anchor)
-                > count_prompt_anchors(before_frame, anchor)
-            {
-                return true;
-            }
-
-            last_prompt_anchor_idx(after_frame, anchor)
-                != last_prompt_anchor_idx(before_frame, anchor)
-                || before_frame != after_frame
+            count_prompt_anchors(after_frame, anchor) > count_prompt_anchors(before_frame, anchor)
         }
-        None => before_frame != after_frame,
+        None => false,
     }
 }
 
-fn wait_for_prompt_submission_start(
-    client: &TmuxClient,
-    pane_id: &str,
-    before_frame: &str,
-    prompt_anchor: Option<&str>,
-) -> AppResult<()> {
-    let attempts = std::cmp::max(1, PROMPT_SUBMISSION_TIMEOUT_MS / PROMPT_SUBMISSION_POLL_MS);
-    for _ in 0..attempts {
-        thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
-        let after_frame = client.capture_pane(pane_id, KEEP_GOING_HISTORY_LINES)?;
-        let after_classification =
-            Classifier.classify(pane_id, &focused_frame_source(&after_frame));
-        if prompt_submission_started(
-            before_frame,
-            &after_frame,
-            &after_classification,
-            prompt_anchor,
-        ) {
-            return Ok(());
-        }
-    }
-
-    Err(AppError::new(format!(
-        "pane {pane_id} did not show a prompt-submission transition"
-    )))
-}
-
+#[cfg(any(test, rust_analyzer))]
 fn count_prompt_anchors(frame: &str, anchor: &str) -> usize {
     frame.lines().filter(|line| line.contains(anchor)).count()
-}
-
-fn last_prompt_anchor_idx(frame: &str, anchor: &str) -> Option<usize> {
-    frame
-        .lines()
-        .collect::<Vec<_>>()
-        .iter()
-        .rposition(|line| line.contains(anchor))
 }
 
 fn render_keep_going_wait_message(
@@ -1990,9 +1996,35 @@ fn run_prompt(args: PromptRunArgs) -> AppResult<String> {
         .unwrap_or_else(|| String::from(DEFAULT_PROMPT_SESSION));
     let prompt_run_id = default_prompt_run_id();
     let resolved_input = resolve_prompt_run_input(&args, &state_dir, &prompt_run_id)?;
+    if needs_long_running_idle_warning(&args) {
+        prompt_warning(format_args!(
+            "--agent megamind uses --idle-timeout-ms {} (less than one hour); this is the fixed response deadline and may stop a multi-hour run. Use --idle-timeout-ms 28800000 for an eight-hour run",
+            args.idle_timeout_ms
+        ));
+    }
     let result = run_prompt_with_resolved_input(&args, &state_dir, &session_name, &resolved_input);
     cleanup_prompt_temp(&resolved_input, args.keep_temp || result.is_err());
     result
+}
+
+fn needs_long_running_idle_warning(args: &PromptRunArgs) -> bool {
+    if args.idle_timeout_ms >= MIN_AUTONOMOUS_IDLE_TIMEOUT_MS {
+        return false;
+    }
+    prompt_tokens_request_megamind(&args.claude_args)
+        || shell_like_command_tokens(&args.command)
+            .is_ok_and(|tokens| prompt_tokens_request_megamind(&tokens))
+}
+
+fn prompt_tokens_request_megamind(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, arg)| {
+        arg.strip_prefix("--agent=")
+            .is_some_and(|agent| agent.eq_ignore_ascii_case("megamind"))
+            || (arg == "--agent"
+                && tokens
+                    .get(index + 1)
+                    .is_some_and(|agent| agent.eq_ignore_ascii_case("megamind")))
+    })
 }
 
 fn run_prompt_with_resolved_input(
@@ -2038,39 +2070,47 @@ fn run_prompt_with_resolved_input(
         args,
         Duration::from_millis(args.ready_timeout_ms),
     )?;
-    pane = resolve_pane_by_id(&client, &pane.pane_id)?;
+    let prompt_inventory = client.inventory()?;
+    let captured_server = prompt_inventory.server.clone();
+    pane = inventory_pane(&prompt_inventory, &pane.pane_id)?;
     ensure_pane_owned_by_claude(&pane)
         .map_err(|error| AppError::with_exit_code(error.to_string(), 2))?;
-    // `history_lines = 2000` matches the dashboard polling default and is only
-    // used by the agy pane-scrape branch; other providers ignore it.
-    let pre_submit_message = load_last_agent_message(&pane, &client, 2000).ok();
+    let mut transcript_cursor = capture_claude_transcript_cursor(&pane)?;
     submit_prompt_text_direct(
         &client,
         &pane,
         &resolved_input.submitted_text,
-        &load_automation_keybindings(None)?,
         args.submit_delay_ms,
     )?;
+    let response_deadline = Instant::now()
+        .checked_add(Duration::from_millis(args.idle_timeout_ms))
+        .ok_or_else(|| AppError::new("prompt response deadline is outside the clock range"))?;
     prompt_verbose(
         args,
         format_args!("submitted prompt to pane {}", pane.pane_id),
     );
     prompt_verbose(args, format_args!("waiting for assistant response"));
-    wait_for_prompt_completion(
+    match wait_for_prompt_completion(
         &client,
         &pane,
+        &captured_server,
         args,
-        Duration::from_millis(args.idle_timeout_ms),
-    )?;
-    let message = wait_for_fresh_last_message(
-        &pane,
-        &client,
-        pre_submit_message.as_ref(),
-        Duration::from_millis(args.idle_timeout_ms),
-    )?;
-    cleanup_prompt_window(&client, &started);
-
-    Ok(message.text)
+        &mut transcript_cursor,
+        response_deadline,
+    )? {
+        PromptCompletionOutcome::Clean { text } => {
+            cleanup_prompt_window(&client, &started, &captured_server, &pane);
+            Ok(text)
+        }
+        PromptCompletionOutcome::Residual { text } => {
+            prompt_warning(format_args!("{}", prompt_residual_warning(&started)));
+            Ok(text)
+        }
+        PromptCompletionOutcome::GhostShell { text } => {
+            prompt_warning(format_args!("{}", prompt_ghost_shell_warning(&started)));
+            Ok(text)
+        }
+    }
 }
 
 fn start_prompt_window(
@@ -2088,29 +2128,45 @@ fn start_prompt_window(
     })
 }
 
-fn cleanup_prompt_window(client: &TmuxClient, started: &StartedWindow) {
-    match client.pane_by_id(&started.pane_id) {
+fn cleanup_prompt_window(
+    client: &TmuxClient,
+    started: &StartedWindow,
+    captured_server: &TmuxServerIdentity,
+    captured_pane: &TmuxPane,
+) {
+    match resolve_captured_prompt_pane(client, captured_server, captured_pane) {
         Ok(Some(pane)) if pane.window_id == started.window_id => {
-            if let Err(error) = client.kill_window(&started.window_id) {
-                prompt_warning(format_args!(
-                    "failed to kill prompt window {}: {}",
+            match client.kill_window_if_pane_matches(
+                &started.window_id,
+                captured_server,
+                captured_pane,
+            ) {
+                Ok(true) => {}
+                Ok(false) => prompt_warning(format_args!(
+                    "refused to kill prompt window {}; captured pane {} is no longer the sole exact pane in the captured tmux server",
+                    started.window_id, started.pane_id
+                )),
+                Err(error) => prompt_warning(format_args!(
+                    "failed to atomically verify and kill prompt window {}: {}",
                     started.window_id, error
-                ));
+                )),
             }
         }
         Ok(Some(pane)) => {
             prompt_warning(format_args!(
-                "refused to kill prompt window {}; pane {} now belongs to window {}",
-                started.window_id, started.pane_id, pane.window_id
+                "refused to kill prompt window {}; captured pane {} identity changed to session {} window {} provider {}",
+                started.window_id,
+                started.pane_id,
+                pane.session_id,
+                pane.window_id,
+                pane.current_command
             ));
         }
         Ok(None) => {
-            if let Err(error) = client.kill_window(&started.window_id) {
-                prompt_warning(format_args!(
-                    "prompt pane {} disappeared and killing window {} failed: {}",
-                    started.pane_id, started.window_id, error
-                ));
-            }
+            prompt_warning(format_args!(
+                "refused to kill prompt window {}; captured pane {} or tmux server identity changed before cleanup",
+                started.window_id, started.pane_id
+            ));
         }
         Err(error) => {
             prompt_warning(format_args!(
@@ -2119,6 +2175,44 @@ fn cleanup_prompt_window(client: &TmuxClient, started: &StartedWindow) {
             ));
         }
     }
+}
+
+fn resolve_captured_prompt_pane(
+    client: &TmuxClient,
+    captured_server: &TmuxServerIdentity,
+    captured_pane: &TmuxPane,
+) -> AppResult<Option<TmuxPane>> {
+    let inventory = client.inventory()?;
+    if &inventory.server != captured_server {
+        return Ok(None);
+    }
+    Ok(inventory
+        .panes
+        .into_iter()
+        .find(|pane| prompt_pane_identity_matches(captured_pane, pane)))
+}
+
+fn prompt_pane_identity_matches(captured: &TmuxPane, current: &TmuxPane) -> bool {
+    captured.pane_id == current.pane_id
+        && captured.session_id == current.session_id
+        && captured.window_id == current.window_id
+        && captured.pane_pid == current.pane_pid
+        && captured.pane_tty == current.pane_tty
+        && is_pane_command_claude(current)
+}
+
+fn prompt_residual_warning(started: &StartedWindow) -> String {
+    format!(
+        "completed with residual composer text; retained window {} pane={}; recover with botctl submit-composer --pane {} or botctl clear-composer --pane {}",
+        started.window_id, started.pane_id, started.pane_id, started.pane_id
+    )
+}
+
+fn prompt_ghost_shell_warning(started: &StartedWindow) -> String {
+    format!(
+        "completed with a fresh terminal response while the UI retained a stale shell-running footer; retained window {} pane={}; inspect with botctl status --pane {}",
+        started.window_id, started.pane_id, started.pane_id
+    )
 }
 
 fn prompt_verbose(args: &PromptRunArgs, message: std::fmt::Arguments<'_>) {
@@ -2131,127 +2225,661 @@ fn prompt_warning(message: std::fmt::Arguments<'_>) {
     eprintln!("prompt: warning: {message}");
 }
 
-fn submit_prompt_text_direct(
-    client: &TmuxClient,
-    pane: &TmuxPane,
-    prompt_text: &str,
-    bindings: &ResolvedKeybindings,
-    submit_delay_ms: u64,
-) -> AppResult<()> {
-    client.paste_text(&pane.pane_id, prompt_text)?;
-    let paste_visible = wait_for_pasted_prompt_visible(client, &pane.pane_id)?;
-    thread::sleep(Duration::from_millis(submit_delay_ms));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerMutation {
+    Submit,
+    Clear,
+}
 
-    for attempt in 1..=PROMPT_SUBMIT_ATTEMPTS {
-        send_actions(
-            client,
-            &pane.pane_id,
-            &[AutomationAction::Submit],
-            bindings,
-            submit_delay_ms,
-        )?;
-        match watch_prompt_submission(client, &pane.pane_id, paste_visible)? {
-            SubmissionWatch::Started => return Ok(()),
-            SubmissionWatch::StillEditing => {
-                if attempt < PROMPT_SUBMIT_ATTEMPTS {
-                    prompt_warning(format_args!(
-                        "pane {} still had unsubmitted input after Enter; retrying submit ({}/{})",
-                        pane.pane_id,
-                        attempt + 1,
-                        PROMPT_SUBMIT_ATTEMPTS
-                    ));
-                }
-            }
+impl ComposerMutation {
+    fn workflow(self) -> GuardedWorkflow {
+        match self {
+            Self::Submit => GuardedWorkflow::SubmitComposer,
+            Self::Clear => GuardedWorkflow::ClearComposer,
         }
     }
 
+    fn action(self) -> AutomationAction {
+        match self {
+            Self::Submit => AutomationAction::Submit,
+            Self::Clear => AutomationAction::ClearInput,
+        }
+    }
+
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::Submit => "submitted",
+            Self::Clear => "cleared",
+        }
+    }
+
+    fn successful_composer(self) -> &'static str {
+        match self {
+            Self::Submit => "consumed",
+            Self::Clear => "empty",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerAuthorization {
+    Normal,
+    ConfirmedGhost,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ComposerFingerprint {
+    pane_id: String,
+    cursor_x: Option<u16>,
+    cursor_y: Option<u16>,
+    disposition: ComposerDisposition,
+    normalized_region: Option<String>,
+}
+
+impl ComposerFingerprint {
+    fn from_evidence(pane: &TmuxPane, composer: &ComposerScreenEvidence) -> Self {
+        Self {
+            pane_id: pane.pane_id.clone(),
+            cursor_x: pane.cursor_x,
+            cursor_y: pane.cursor_y,
+            disposition: composer.disposition,
+            normalized_region: composer.normalized_region.clone(),
+        }
+    }
+
+    fn has_same_text(&self, other: &Self) -> bool {
+        self.disposition == other.disposition && self.normalized_region == other.normalized_region
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposerTargetIdentity {
+    server: TmuxServerIdentity,
+    pane_id: String,
+    session_id: String,
+    window_id: String,
+    pane_pid: Option<u32>,
+    pane_tty: String,
+    provider: String,
+}
+
+impl ComposerTargetIdentity {
+    fn capture(
+        server: TmuxServerIdentity,
+        pane: &TmuxPane,
+        classification: &Classification,
+    ) -> Self {
+        Self {
+            server,
+            pane_id: pane.pane_id.clone(),
+            session_id: pane.session_id.clone(),
+            window_id: pane.window_id.clone(),
+            pane_pid: pane.pane_pid,
+            pane_tty: pane.pane_tty.clone(),
+            provider: classification_provider_label(classification, pane).to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ComposerActionSnapshot {
+    identity: ComposerTargetIdentity,
+    pane: TmuxPane,
+    inspected: InspectedPane,
+    composer: ComposerScreenEvidence,
+    activity: ScreenActivityEvidence,
+    process: PaneProcessEvidence,
+    fingerprint: ComposerFingerprint,
+}
+
+impl ComposerActionSnapshot {
+    fn state(&self) -> SessionState {
+        self.inspected.classification.state
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedComposerOutcome {
+    pub(crate) pane_id: String,
+    pub(crate) before: SessionState,
+    pub(crate) after: SessionState,
+    pub(crate) attempts: usize,
+    pub(crate) residual: &'static str,
+}
+
+impl VerifiedComposerOutcome {
+    fn render(&self, action: &str, mutation: ComposerMutation) -> String {
+        format!(
+            "outcome={} action={} pane={} before={} after={} composer={} attempts={} residual={}",
+            mutation.outcome(),
+            action,
+            self.pane_id,
+            self.before.as_str(),
+            self.after.as_str(),
+            mutation.successful_composer(),
+            self.attempts,
+            self.residual,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerAttemptDecision {
+    Success,
+    Unchanged,
+    Changed,
+    UnsafeState,
+}
+
+fn capture_composer_action_snapshot(
+    client: &TmuxClient,
+    pane_id: &str,
+) -> AppResult<ComposerActionSnapshot> {
+    let before = client.inventory()?;
+    let before_pane = inventory_pane(&before, pane_id)?;
+    let inspected = inspect_pane(client, pane_id, ACTION_GUARD_HISTORY_LINES)?;
+    let after = client.inventory()?;
+    let pane = inventory_pane(&after, pane_id)?;
+    if before.server != after.server || !same_action_pane(&before_pane, &pane) {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=target-changed pane={} target identity changed while collecting final action evidence",
+                pane_id
+            ),
+            2,
+        ));
+    }
+    ensure_pane_owned_by_claude(&pane)
+        .map_err(|error| AppError::with_exit_code(error.to_string(), 2))?;
+    let composer = inspected.composer_evidence();
+    let activity = inspected.screen_activity();
+    let process = inspect_process_evidence(&pane, activity);
+    let identity = ComposerTargetIdentity::capture(after.server, &pane, &inspected.classification);
+    let fingerprint = ComposerFingerprint::from_evidence(&pane, &composer);
+    Ok(ComposerActionSnapshot {
+        identity,
+        pane,
+        inspected,
+        composer,
+        activity,
+        process,
+        fingerprint,
+    })
+}
+
+fn inventory_pane(inventory: &TmuxInventory, pane_id: &str) -> AppResult<TmuxPane> {
+    inventory
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::with_exit_code(
+                format!("outcome=target-changed pane={pane_id} target pane disappeared"),
+                2,
+            )
+        })
+}
+
+fn same_action_pane(left: &TmuxPane, right: &TmuxPane) -> bool {
+    left.pane_id == right.pane_id
+        && left.session_id == right.session_id
+        && left.window_id == right.window_id
+        && left.pane_pid == right.pane_pid
+        && left.pane_tty == right.pane_tty
+        && left
+            .current_command
+            .eq_ignore_ascii_case(&right.current_command)
+}
+
+fn ensure_same_composer_target(
+    expected: &ComposerTargetIdentity,
+    actual: &ComposerActionSnapshot,
+    action: &str,
+) -> AppResult<()> {
+    if expected == &actual.identity {
+        return Ok(());
+    }
     Err(AppError::with_exit_code(
         format!(
-            "prompt staged {} bytes into pane {} but it never left PromptEditing after {} submit attempts; the prompt is still unsubmitted in that pane",
-            prompt_text.len(),
-            pane.pane_id,
-            PROMPT_SUBMIT_ATTEMPTS
+            "outcome=target-changed action={} pane={} before=unknown after={} composer={} attempts=0 residual=retained",
+            action,
+            expected.pane_id,
+            actual.state().as_str(),
+            actual.composer.disposition.as_str(),
         ),
         2,
     ))
 }
 
-/// Whether an Enter keypress actually moved the pane out of prompt composition.
-enum SubmissionWatch {
-    Started,
-    /// The staged prompt is still sitting in the composer: Enter was swallowed.
-    StillEditing,
-}
-
-/// Wait for a pasted prompt to appear in the composer so Enter is not sent
-/// while the TUI is still ingesting the bracketed paste; an Enter that lands
-/// mid-paste is swallowed. A paste never self-submits, so timing out here is
-/// non-fatal: report that the paste was never seen and let the submit retries
-/// (with stricter verification) deal with it.
-fn wait_for_pasted_prompt_visible(client: &TmuxClient, pane_id: &str) -> AppResult<bool> {
-    let attempts = std::cmp::max(
-        1,
-        PROMPT_PASTE_VISIBLE_TIMEOUT_MS / PROMPT_SUBMISSION_POLL_MS,
-    );
-    for _ in 0..attempts {
-        let frame = client.capture_pane(pane_id, KEEP_GOING_HISTORY_LINES)?;
-        let classification = Classifier.classify(pane_id, &focused_frame_source(&frame));
-        if classification.state == SessionState::PromptEditing {
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
+fn authorize_existing_composer(
+    snapshot: &ComposerActionSnapshot,
+    mutation: ComposerMutation,
+    action: &str,
+) -> AppResult<ComposerAuthorization> {
+    if snapshot.composer.disposition != ComposerDisposition::Occupied {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=guard-refused action={} pane={} before={} after={} composer={} attempts=0 residual={}; existing non-empty composer text is required",
+                action,
+                snapshot.identity.pane_id,
+                snapshot.state().as_str(),
+                snapshot.state().as_str(),
+                snapshot.composer.disposition.as_str(),
+                if snapshot.composer.disposition == ComposerDisposition::Empty {
+                    "none"
+                } else {
+                    "retained"
+                },
+            ),
+            2,
+        ));
     }
-    prompt_warning(format_args!(
-        "pasted prompt never became visible in pane {pane_id} composer; submitting anyway"
-    ));
-    Ok(false)
-}
-
-/// Watch a pane after Enter to decide whether the staged prompt was submitted.
-///
-/// When the paste was confirmed visible, leaving `PromptEditing` is proof of
-/// submission: the composer only clears when the prompt is sent. When it was
-/// never seen, fall back to requiring an affirmative post-submit state so a
-/// still-pending paste plus a ticking status line cannot read as success.
-fn watch_prompt_submission(
-    client: &TmuxClient,
-    pane_id: &str,
-    paste_visible: bool,
-) -> AppResult<SubmissionWatch> {
-    let attempts = std::cmp::max(1, PROMPT_SUBMISSION_TIMEOUT_MS / PROMPT_SUBMISSION_POLL_MS);
-    for _ in 0..attempts {
-        thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
-        let frame = client.capture_pane(pane_id, KEEP_GOING_HISTORY_LINES)?;
-        let classification = Classifier.classify(pane_id, &focused_frame_source(&frame));
-        if submission_left_composer(classification.state, paste_visible) {
-            return Ok(SubmissionWatch::Started);
-        }
+    if snapshot.state() == SessionState::PromptEditing {
+        ensure_workflow_state(mutation.workflow(), &snapshot.inspected.classification)?;
+        return Ok(ComposerAuthorization::Normal);
     }
-
-    Ok(SubmissionWatch::StillEditing)
+    if snapshot.state() == SessionState::BusyResponding
+        && snapshot.activity.shells_running > 0
+        && !snapshot.activity.has_non_shell_busy_evidence()
+    {
+        return match snapshot.process.ghost_shell {
+            GhostShellEvidence::Confirmed => Ok(ComposerAuthorization::ConfirmedGhost),
+            GhostShellEvidence::Unknown => Err(AppError::with_exit_code(
+                format!(
+                    "outcome=guard-refused action={} pane={} before=BusyResponding after=BusyResponding composer=occupied attempts=0 residual=retained; ghost shell status cannot be established because the required process probe is unavailable",
+                    action, snapshot.identity.pane_id,
+                ),
+                2,
+            )),
+            GhostShellEvidence::NotDetected => Err(AppError::with_exit_code(
+                format!(
+                    "outcome=guard-refused action={} pane={} before=BusyResponding after=BusyResponding composer=occupied attempts=0 residual=retained; live tool-child evidence makes composer mutation unsafe",
+                    action, snapshot.identity.pane_id,
+                ),
+                2,
+            )),
+        };
+    }
+    Err(AppError::with_exit_code(
+        format!(
+            "outcome=guard-refused action={} pane={} before={} after={} composer=occupied attempts=0 residual=retained; composer mutation requires PromptEditing or a freshly confirmed ghost shell with no other busy evidence",
+            action,
+            snapshot.identity.pane_id,
+            snapshot.state().as_str(),
+            snapshot.state().as_str(),
+        ),
+        2,
+    ))
 }
 
-fn submission_left_composer(state: SessionState, paste_visible: bool) -> bool {
-    match state {
-        SessionState::PromptEditing
-        | SessionState::ExternalEditorActive
-        | SessionState::Unknown
-        | SessionState::AgyCommandPermissionPrompt
-        | SessionState::AgyFolderTrustPrompt
-        | SessionState::AgySettingsPersistPrompt => false,
-        // Only reachable once the composer cleared, which requires the staged
-        // prompt to have been sent -- but that inference is sound only when the
-        // composer was observed holding the paste in the first place.
-        SessionState::ChatReady => paste_visible,
+fn equivalent_final_composer_guard(
+    initial: &ComposerActionSnapshot,
+    final_snapshot: &ComposerActionSnapshot,
+    authorization: ComposerAuthorization,
+    mutation: ComposerMutation,
+    action: &str,
+) -> AppResult<()> {
+    ensure_same_composer_target(&initial.identity, final_snapshot, action)?;
+    if !initial
+        .fingerprint
+        .has_same_text(&final_snapshot.fingerprint)
+    {
+        return Err(composer_changed_error(action, initial, final_snapshot, 0));
+    }
+    if initial.fingerprint.cursor_x != final_snapshot.fingerprint.cursor_x
+        || initial.fingerprint.cursor_y != final_snapshot.fingerprint.cursor_y
+        || initial.activity != final_snapshot.activity
+        || initial.state() != final_snapshot.state()
+    {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=precondition-changed action={} pane={} before={} after={} composer=unchanged attempts=0 residual=retained",
+                action,
+                initial.identity.pane_id,
+                initial.state().as_str(),
+                final_snapshot.state().as_str(),
+            ),
+            2,
+        ));
+    }
+    let final_authorization = authorize_existing_composer(final_snapshot, mutation, action)?;
+    if final_authorization != authorization {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=precondition-changed action={} pane={} before={} after={} composer=unchanged attempts=0 residual=retained",
+                action,
+                initial.identity.pane_id,
+                initial.state().as_str(),
+                final_snapshot.state().as_str(),
+            ),
+            2,
+        ));
+    }
+    Ok(())
+}
+
+fn composer_attempt_decision(
+    mutation: ComposerMutation,
+    authorization: ComposerAuthorization,
+    before: &ComposerActionSnapshot,
+    after: &ComposerActionSnapshot,
+) -> ComposerAttemptDecision {
+    match after.composer.disposition {
+        ComposerDisposition::Empty => match mutation {
+            ComposerMutation::Submit if is_affirmative_submit_state(after.state()) => {
+                ComposerAttemptDecision::Success
+            }
+            ComposerMutation::Clear
+                if after.state() == SessionState::ChatReady
+                    || (authorization == ComposerAuthorization::ConfirmedGhost
+                        && after.state() == SessionState::BusyResponding) =>
+            {
+                ComposerAttemptDecision::Success
+            }
+            _ => ComposerAttemptDecision::UnsafeState,
+        },
+        ComposerDisposition::Occupied
+            if before.fingerprint == after.fingerprint
+                && before.state() == after.state()
+                && before.activity == after.activity =>
+        {
+            ComposerAttemptDecision::Unchanged
+        }
+        ComposerDisposition::Occupied if before.fingerprint.has_same_text(&after.fingerprint) => {
+            ComposerAttemptDecision::UnsafeState
+        }
+        ComposerDisposition::Occupied => ComposerAttemptDecision::Changed,
+        ComposerDisposition::Unavailable => ComposerAttemptDecision::Unchanged,
+    }
+}
+
+fn is_affirmative_submit_state(state: SessionState) -> bool {
+    matches!(
+        state,
         SessionState::BusyResponding
-        | SessionState::UserQuestionPrompt
-        | SessionState::PermissionDialog
-        | SessionState::PlanApprovalPrompt
-        | SessionState::FolderTrustPrompt
-        | SessionState::StartupChoicePrompt
-        | SessionState::SurveyPrompt
-        | SessionState::DiffDialog => true,
+            | SessionState::UserQuestionPrompt
+            | SessionState::PermissionDialog
+            | SessionState::PlanApprovalPrompt
+            | SessionState::FolderTrustPrompt
+            | SessionState::StartupChoicePrompt
+            | SessionState::SurveyPrompt
+            | SessionState::DiffDialog
+    )
+}
+
+#[cfg(any(test, rust_analyzer))]
+fn submission_left_composer(state: SessionState, _paste_visible: bool) -> bool {
+    is_affirmative_submit_state(state)
+}
+
+fn composer_changed_error(
+    action: &str,
+    before: &ComposerActionSnapshot,
+    after: &ComposerActionSnapshot,
+    attempts: usize,
+) -> AppError {
+    AppError::with_exit_code(
+        format!(
+            "outcome=composer-changed action={} pane={} before={} after={} composer=changed attempts={} residual=retained; changed, partial, merged, or foreign composer text was not cleared",
+            action,
+            before.identity.pane_id,
+            before.state().as_str(),
+            after.state().as_str(),
+            attempts,
+        ),
+        2,
+    )
+}
+
+fn input_dead_error(
+    action: &str,
+    mutation: ComposerMutation,
+    initial: &ComposerActionSnapshot,
+    last: &ComposerActionSnapshot,
+) -> AppError {
+    let alternative = match mutation {
+        ComposerMutation::Submit => {
+            format!("botctl clear-composer --pane {}", initial.identity.pane_id)
+        }
+        ComposerMutation::Clear => {
+            format!("botctl submit-composer --pane {}", initial.identity.pane_id)
+        }
+    };
+    AppError::with_exit_code(
+        format!(
+            "outcome=input-dead action={} pane={} before={} after={} composer=unchanged attempts={} residual=retained; recover with {}",
+            action,
+            initial.identity.pane_id,
+            initial.state().as_str(),
+            last.state().as_str(),
+            PROMPT_SUBMIT_ATTEMPTS,
+            alternative,
+        ),
+        2,
+    )
+}
+
+fn execute_verified_composer_action(
+    client: &TmuxClient,
+    initial: ComposerActionSnapshot,
+    mutation: ComposerMutation,
+    action: &str,
+    submit_delay_ms: u64,
+) -> AppResult<VerifiedComposerOutcome> {
+    let authorization = authorize_existing_composer(&initial, mutation, action)?;
+    let mut last = None;
+
+    for attempt in 1..=PROMPT_SUBMIT_ATTEMPTS {
+        // Resolve the user's keymap before the per-attempt authorization
+        // snapshot so no filesystem work separates the final guard from send.
+        let bindings = load_automation_keybindings(None)?;
+        let keys = keys_for_action(&bindings, mutation.action())?;
+        let before_attempt = capture_composer_action_snapshot(client, &initial.identity.pane_id)?;
+        equivalent_final_composer_guard(
+            &initial,
+            &before_attempt,
+            authorization,
+            mutation,
+            action,
+        )?;
+        client.send_keys(&initial.identity.pane_id, keys)?;
+        thread::sleep(Duration::from_millis(submit_delay_ms));
+        let deadline = Instant::now() + Duration::from_millis(PROMPT_SUBMISSION_TIMEOUT_MS);
+        loop {
+            let after = capture_composer_action_snapshot(client, &initial.identity.pane_id)?;
+            ensure_same_composer_target(&initial.identity, &after, action)?;
+            match composer_attempt_decision(mutation, authorization, &initial, &after) {
+                ComposerAttemptDecision::Success => {
+                    return Ok(VerifiedComposerOutcome {
+                        pane_id: initial.identity.pane_id.clone(),
+                        before: initial.state(),
+                        after: after.state(),
+                        attempts: attempt,
+                        residual: "none",
+                    });
+                }
+                ComposerAttemptDecision::Changed => {
+                    return Err(composer_changed_error(action, &initial, &after, attempt));
+                }
+                ComposerAttemptDecision::UnsafeState => {
+                    return Err(AppError::with_exit_code(
+                        format!(
+                            "outcome=state-changed action={} pane={} before={} after={} composer={} attempts={} residual={}; composer changed state without affirmative action acceptance",
+                            action,
+                            initial.identity.pane_id,
+                            initial.state().as_str(),
+                            after.state().as_str(),
+                            after.composer.disposition.as_str(),
+                            attempt,
+                            if after.composer.disposition == ComposerDisposition::Empty {
+                                "none"
+                            } else {
+                                "retained"
+                            },
+                        ),
+                        2,
+                    ));
+                }
+                ComposerAttemptDecision::Unchanged => last = Some(after),
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS));
+        }
     }
+
+    Err(input_dead_error(
+        action,
+        mutation,
+        &initial,
+        last.as_ref().unwrap_or(&initial),
+    ))
+}
+
+fn wait_for_owned_staging(
+    client: &TmuxClient,
+    identity: &ComposerTargetIdentity,
+    prompt_text: &str,
+) -> AppResult<ComposerActionSnapshot> {
+    wait_for_owned_staging_with(
+        identity,
+        prompt_text,
+        Duration::from_millis(PROMPT_PASTE_VISIBLE_TIMEOUT_MS),
+        Instant::now,
+        thread::sleep,
+        || capture_composer_action_snapshot(client, &identity.pane_id),
+    )
+}
+
+fn wait_for_owned_staging_with(
+    identity: &ComposerTargetIdentity,
+    prompt_text: &str,
+    timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut capture: impl FnMut() -> AppResult<ComposerActionSnapshot>,
+) -> AppResult<ComposerActionSnapshot> {
+    let deadline = now().checked_add(timeout).ok_or_else(|| {
+        AppError::with_exit_code(
+            "submit-prompt staging timeout is outside the clock range",
+            2,
+        )
+    })?;
+    loop {
+        let snapshot = capture()?;
+        ensure_same_composer_target(identity, &snapshot, "submit-prompt")?;
+        let captured_at = now();
+        let matches_prompt = snapshot.composer.matches_text(prompt_text);
+        if matches_prompt && captured_at < deadline {
+            return Ok(snapshot);
+        }
+        if captured_at >= deadline {
+            if snapshot.composer.disposition == ComposerDisposition::Occupied && !matches_prompt {
+                return Err(AppError::with_exit_code(
+                    format!(
+                        "outcome=composer-changed action=submit-prompt pane={} before=ChatReady after={} composer=changed attempts=0 residual=retained; pasted text remained non-matching through the staging deadline and was not cleared",
+                        identity.pane_id,
+                        snapshot.state().as_str(),
+                    ),
+                    2,
+                ));
+            }
+            return Err(AppError::with_exit_code(
+                format!(
+                    "outcome=staging-unverified action=submit-prompt pane={} before=ChatReady after={} composer={} attempts=0 residual=retained; pasted prompt could not be proven bot-owned",
+                    identity.pane_id,
+                    snapshot.state().as_str(),
+                    snapshot.composer.disposition.as_str(),
+                ),
+                2,
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(captured_at);
+        sleep(remaining.min(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS)));
+    }
+}
+
+pub(crate) fn submit_prompt_text_direct(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    prompt_text: &str,
+    submit_delay_ms: u64,
+) -> AppResult<VerifiedComposerOutcome> {
+    let initial = capture_composer_action_snapshot(client, &pane.pane_id)?;
+    if !same_action_pane(pane, &initial.pane) {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=target-changed action=submit-prompt pane={} before=unknown after={} composer={} attempts=0 residual={}",
+                pane.pane_id,
+                initial.state().as_str(),
+                initial.composer.disposition.as_str(),
+                if initial.composer.disposition == ComposerDisposition::Empty {
+                    "none"
+                } else {
+                    "retained"
+                },
+            ),
+            2,
+        ));
+    }
+    if initial.state() != SessionState::ChatReady
+        || initial.composer.disposition != ComposerDisposition::Empty
+    {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=guard-refused action=submit-prompt pane={} before={} after={} composer={} attempts=0 residual={}; staging requires ChatReady with an empty composer",
+                initial.identity.pane_id,
+                initial.state().as_str(),
+                initial.state().as_str(),
+                initial.composer.disposition.as_str(),
+                if initial.composer.disposition == ComposerDisposition::Empty {
+                    "none"
+                } else {
+                    "retained"
+                },
+            ),
+            2,
+        ));
+    }
+
+    let final_snapshot = capture_composer_action_snapshot(client, &pane.pane_id)?;
+    ensure_same_composer_target(&initial.identity, &final_snapshot, "submit-prompt")?;
+    if final_snapshot.state() != SessionState::ChatReady
+        || final_snapshot.composer.disposition != ComposerDisposition::Empty
+    {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=precondition-changed action=submit-prompt pane={} before=ChatReady after={} composer={} attempts=0 residual={}",
+                initial.identity.pane_id,
+                final_snapshot.state().as_str(),
+                final_snapshot.composer.disposition.as_str(),
+                if final_snapshot.composer.disposition == ComposerDisposition::Empty {
+                    "none"
+                } else {
+                    "retained"
+                },
+            ),
+            2,
+        ));
+    }
+
+    // Reject invalid or missing live bindings before the paste mutates the
+    // pane. The action engine reloads again after staging so a remap made in
+    // the meantime is still honored at the first key attempt.
+    let pre_stage_bindings = load_automation_keybindings(None)?;
+    let _ = keys_for_action(&pre_stage_bindings, AutomationAction::Submit)?;
+
+    client.paste_text(&initial.identity.pane_id, prompt_text)?;
+    let staged = wait_for_owned_staging(client, &initial.identity, prompt_text)?;
+    execute_verified_composer_action(
+        client,
+        staged,
+        ComposerMutation::Submit,
+        "submit-prompt",
+        submit_delay_ms,
+    )
 }
 
 fn cleanup_prompt_temp(resolved_input: &ResolvedPromptRunInput, keep_temp: bool) {
@@ -2525,49 +3153,170 @@ fn wait_for_prompt_pane_ready(
     }
 }
 
-fn wait_for_prompt_completion(
-    client: &TmuxClient,
-    pane: &TmuxPane,
-    args: &PromptRunArgs,
-    timeout: Duration,
-) -> AppResult<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-        if is_prompt_completion_state(inspected.classification.state) {
-            return Ok(());
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptCompletionOutcome {
+    Clean { text: String },
+    Residual { text: String },
+    GhostShell { text: String },
+}
+
+#[derive(Debug, Default)]
+struct PromptCompletionTracker {
+    terminal_text: Option<String>,
+    previous_occupied: Option<ComposerScreenEvidence>,
+    previous_empty_ghost: bool,
+}
+
+impl PromptCompletionTracker {
+    fn observe(
+        &mut self,
+        fresh_terminal_text: Option<String>,
+        state: SessionState,
+        composer: ComposerScreenEvidence,
+        ghost_shell: GhostShellEvidence,
+    ) -> Option<PromptCompletionOutcome> {
+        if let Some(text) = fresh_terminal_text {
+            self.terminal_text = Some(text);
+            self.previous_occupied = None;
+            self.previous_empty_ghost = false;
         }
-        if matches!(
-            inspected.classification.state,
-            SessionState::PromptEditing | SessionState::Unknown
-        ) {
-            if Instant::now() >= deadline {
-                return Err(AppError::new(format!(
-                    "timed out waiting for assistant response in pane {}; last state {}",
-                    pane.pane_id,
-                    inspected.classification.state.as_str()
-                )));
+        self.terminal_text.as_ref()?;
+
+        if state == SessionState::ChatReady && composer.disposition == ComposerDisposition::Empty {
+            return Some(PromptCompletionOutcome::Clean {
+                text: self.terminal_text.take().expect("terminal text is present"),
+            });
+        }
+
+        if state == SessionState::BusyResponding
+            && composer.disposition == ComposerDisposition::Empty
+            && ghost_shell == GhostShellEvidence::Confirmed
+        {
+            if self.previous_empty_ghost {
+                return Some(PromptCompletionOutcome::GhostShell {
+                    text: self.terminal_text.take().expect("terminal text is present"),
+                });
             }
-            thread::sleep(Duration::from_millis(args.poll_ms));
-            continue;
+            self.previous_empty_ghost = true;
+            self.previous_occupied = None;
+            return None;
         }
-        prompt_wait_step(client, pane, &inspected, args.no_yolo)?;
-        if Instant::now() >= deadline {
-            return Err(AppError::new(format!(
-                "timed out waiting for assistant response in pane {}; last state {}",
-                pane.pane_id,
-                inspected.classification.state.as_str()
-            )));
+        self.previous_empty_ghost = false;
+
+        if composer.disposition == ComposerDisposition::Occupied {
+            let stable = self.previous_occupied.as_ref() == Some(&composer);
+            self.previous_occupied = Some(composer);
+            if stable {
+                return Some(PromptCompletionOutcome::Residual {
+                    text: self.terminal_text.take().expect("terminal text is present"),
+                });
+            }
+        } else {
+            self.previous_occupied = None;
         }
-        thread::sleep(Duration::from_millis(args.poll_ms));
+        None
     }
 }
 
-fn is_prompt_completion_state(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::ChatReady | SessionState::UserQuestionPrompt
-    )
+fn wait_for_prompt_completion(
+    client: &TmuxClient,
+    pane: &TmuxPane,
+    captured_server: &TmuxServerIdentity,
+    args: &PromptRunArgs,
+    transcript_cursor: &mut ClaudeTranscriptCursor,
+    deadline: Instant,
+) -> AppResult<PromptCompletionOutcome> {
+    let mut tracker = PromptCompletionTracker::default();
+    let mut last_state = SessionState::Unknown;
+    let mut last_composer = ComposerDisposition::Unavailable;
+
+    loop {
+        if remaining_response_budget(deadline, Instant::now()).is_none() {
+            return Err(prompt_completion_timeout(pane, last_state, last_composer));
+        }
+
+        let inspected = inspect_pane(client, &pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
+        let Some(current_pane) = resolve_captured_prompt_pane(client, captured_server, pane)?
+        else {
+            return Err(AppError::new(format!(
+                "prompt pane {} or tmux server identity changed during completion observation; retained its captured window",
+                pane.pane_id
+            )));
+        };
+
+        let composer = inspected.composer_evidence();
+        let activity = inspected.screen_activity();
+        let process = inspect_process_evidence(&current_pane, activity);
+        let observed_ghost_shell = if !activity.has_non_shell_busy_evidence() {
+            process.ghost_shell
+        } else {
+            GhostShellEvidence::NotDetected
+        };
+        last_state = inspected.classification.state;
+        last_composer = composer.disposition;
+        let fresh_terminal = read_fresh_claude_terminal_record(&current_pane, transcript_cursor)?
+            .map(|record| record.text);
+        let transcript_at_boundary = transcript_cursor.at_complete_record_boundary();
+        let completion_composer = if transcript_at_boundary {
+            composer
+        } else {
+            ComposerScreenEvidence {
+                disposition: ComposerDisposition::Unavailable,
+                normalized_region: None,
+            }
+        };
+        let completion_ghost_shell = if transcript_at_boundary {
+            observed_ghost_shell
+        } else {
+            GhostShellEvidence::NotDetected
+        };
+        if remaining_response_budget(deadline, Instant::now()).is_none() {
+            return Err(prompt_completion_timeout(pane, last_state, last_composer));
+        }
+        if let Some(outcome) = tracker.observe(
+            fresh_terminal,
+            last_state,
+            completion_composer,
+            completion_ghost_shell,
+        ) {
+            return Ok(outcome);
+        }
+
+        if !matches!(
+            last_state,
+            SessionState::BusyResponding
+                | SessionState::PromptEditing
+                | SessionState::Unknown
+                | SessionState::ChatReady
+                | SessionState::UserQuestionPrompt
+        ) {
+            prompt_wait_step(client, &current_pane, &inspected, args.no_yolo)?;
+        }
+
+        let Some(remaining) = remaining_response_budget(deadline, Instant::now()) else {
+            return Err(prompt_completion_timeout(pane, last_state, last_composer));
+        };
+        thread::sleep(Duration::from_millis(args.poll_ms).min(remaining));
+    }
+}
+
+fn remaining_response_budget(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn prompt_completion_timeout(
+    pane: &TmuxPane,
+    state: SessionState,
+    composer: ComposerDisposition,
+) -> AppError {
+    AppError::new(format!(
+        "timed out waiting for a fresh terminal assistant record in pane {}; last state {} composer={}; refusing to print stale output and retaining the prompt window",
+        pane.pane_id,
+        state.as_str(),
+        composer.as_str()
+    ))
 }
 
 fn prompt_wait_step(
@@ -2617,42 +3366,6 @@ fn prompt_wait_step(
     }
 }
 
-fn wait_for_fresh_last_message(
-    pane: &TmuxPane,
-    tmux: &TmuxClient,
-    prior: Option<&crate::last_message::LastAgentMessage>,
-    timeout: Duration,
-) -> AppResult<crate::last_message::LastAgentMessage> {
-    let deadline = Instant::now() + timeout;
-    let mut last_error = None;
-    loop {
-        match load_last_agent_message(pane, tmux, 2000) {
-            Ok(message)
-                if prior
-                    .map(|old| old.session_id != message.session_id || old.text != message.text)
-                    .unwrap_or(true) =>
-            {
-                return Ok(message);
-            }
-            Ok(_) => {}
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        if Instant::now() >= deadline {
-            return Err(AppError::new(match last_error {
-                Some(error) if prior.is_none() => {
-                    format!(
-                        "Claude became ready but no assistant transcript message was found: {error}"
-                    )
-                }
-                _ => String::from(
-                    "Claude became ready but no new assistant transcript message was found; refusing to print stale output",
-                ),
-            }));
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-}
-
 fn run_prepare_prompt(args: PreparePromptArgs) -> AppResult<String> {
     let state_dir = resolve_bootstrapped_state_dir(args.state_dir.as_deref())?;
     let workspace = resolve_selected_workspace(&state_dir, args.workspace.as_deref())?;
@@ -2694,10 +3407,39 @@ fn run_editor_helper(args: EditorHelperArgs) -> AppResult<String> {
 }
 
 fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
-    let client = TmuxClient::default();
-    let pane = resolve_pane_by_id(&client, &args.pane_id)?;
-    ensure_pane_owned_by_claude(&pane)?;
+    // Input is resolved before the readiness budget starts. A source read may
+    // fail, but it never touches tmux or the pending-prompt store.
     let prompt_text = read_prompt_input(args.source.as_deref(), args.text.as_deref())?;
+    let client = TmuxClient::default();
+    let pane = client
+        .pane_by_target(&args.pane_id)?
+        .ok_or_else(|| AppError::with_exit_code(format!("no pane found: {}", args.pane_id), 2))?;
+    let initial = capture_composer_action_snapshot(&client, &pane.pane_id)?;
+    if !same_action_pane(&pane, &initial.pane) {
+        return Err(AppError::with_exit_code(
+            format!(
+                "outcome=target-changed action=submit-prompt pane={} before=unknown after={} composer={} attempts=0 residual={}",
+                pane.pane_id,
+                initial.state().as_str(),
+                initial.composer.disposition.as_str(),
+                if initial.composer.disposition == ComposerDisposition::Empty {
+                    "none"
+                } else {
+                    "retained"
+                },
+            ),
+            2,
+        ));
+    }
+    let pane = if args.when_ready {
+        wait_for_submit_prompt_ready(
+            &client,
+            initial,
+            Duration::from_millis(args.ready_timeout_ms),
+        )?
+    } else {
+        initial.pane
+    };
     let submitted = submit_prompt_for_pane(
         &client,
         &pane,
@@ -2719,6 +3461,69 @@ fn run_submit_prompt(args: SubmitPromptArgs) -> AppResult<String> {
     ))
 }
 
+fn submit_prompt_ready(snapshot: &ComposerActionSnapshot) -> bool {
+    snapshot.state() == SessionState::ChatReady
+        && snapshot.composer.disposition == ComposerDisposition::Empty
+}
+
+fn wait_for_submit_prompt_ready(
+    client: &TmuxClient,
+    initial: ComposerActionSnapshot,
+    timeout: Duration,
+) -> AppResult<TmuxPane> {
+    let pane_id = initial.identity.pane_id.clone();
+    wait_for_submit_prompt_ready_with(initial, timeout, Instant::now, thread::sleep, || {
+        capture_composer_action_snapshot(client, &pane_id)
+    })
+}
+
+fn wait_for_submit_prompt_ready_with(
+    initial: ComposerActionSnapshot,
+    timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut capture: impl FnMut() -> AppResult<ComposerActionSnapshot>,
+) -> AppResult<TmuxPane> {
+    let started = now();
+    let deadline = started.checked_add(timeout).ok_or_else(|| {
+        AppError::with_exit_code("submit-prompt ready timeout is outside the clock range", 2)
+    })?;
+    let identity = initial.identity.clone();
+    let mut last = initial;
+    loop {
+        ensure_same_composer_target(&identity, &last, "submit-prompt")?;
+        if submit_prompt_ready(&last) {
+            // Readiness is not authorization by itself. Re-read the exact
+            // target once more; only this final stable check may delegate.
+            let final_snapshot = capture()?;
+            ensure_same_composer_target(&identity, &final_snapshot, "submit-prompt")?;
+            let ready_before_deadline = submit_prompt_ready(&final_snapshot) && now() < deadline;
+            if ready_before_deadline {
+                return Ok(final_snapshot.pane);
+            }
+            last = final_snapshot;
+        }
+        let current = now();
+        if current >= deadline {
+            return Err(AppError::with_exit_code(
+                format!(
+                    "outcome=ready-timeout pane={} last_state={} composer={} elapsed_ms={}",
+                    last.identity.pane_id,
+                    last.state().as_str(),
+                    last.composer.disposition.as_str(),
+                    current.saturating_duration_since(started).as_millis(),
+                ),
+                2,
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(current);
+        sleep(remaining.min(Duration::from_millis(PROMPT_SUBMISSION_POLL_MS)));
+        let next = capture()?;
+        ensure_same_composer_target(&identity, &next, "submit-prompt")?;
+        last = next;
+    }
+}
+
 pub(crate) struct PromptSubmissionOutcome {
     pub(crate) pane_id: String,
     pub(crate) workspace_id: String,
@@ -2736,6 +3541,10 @@ pub(crate) fn submit_prompt_for_pane(
     prompt_text: &str,
     submit_delay_ms: u64,
 ) -> AppResult<PromptSubmissionOutcome> {
+    // Workspace/state lookup happens only after immediate readiness or the
+    // synchronous --when-ready waiter has completed. No pending record is
+    // written: staging is in-memory and ownership-checked in the shared
+    // direct submission transaction.
     let mut classification = classify_pane(client, &pane.pane_id, ACTION_GUARD_HISTORY_LINES)?;
     if let Some(workflow) = submit_prompt_preflight_workflow(&classification) {
         execute_classified_workflow(client, &pane.pane_id, workflow, &classification)?;
@@ -2748,35 +3557,13 @@ pub(crate) fn submit_prompt_for_pane(
 
     let state_dir = resolve_bootstrapped_state_dir(state_dir_override)?;
     let workspace = resolve_workspace_for_pane(&state_dir, pane, workspace_selector)?;
-    store_pending_prompt_for_tmux_instance(
-        &state_dir,
-        &workspace.id,
-        session_name,
-        pane,
-        prompt_text,
-    )?;
-
-    let bindings = load_automation_keybindings(None)?;
-    let before_submit = client.capture_pane(&pane.pane_id, KEEP_GOING_HISTORY_LINES)?;
-
-    send_actions(
-        client,
-        &pane.pane_id,
-        &prompt_submission_sequence(),
-        &bindings,
-        submit_delay_ms,
-    )?;
-    wait_for_prompt_submission_start(client, &pane.pane_id, &before_submit, None).map_err(|_| {
-        AppError::new(format!(
-            "submit-prompt sent the prepared prompt but pane {} did not show a prompt-submission transition",
-            pane.pane_id
-        ))
-    })?;
+    let submitted = submit_prompt_text_direct(client, pane, prompt_text, submit_delay_ms)?;
+    let _ = session_name;
 
     Ok(PromptSubmissionOutcome {
-        pane_id: pane.pane_id.clone(),
+        pane_id: submitted.pane_id,
         workspace_id: workspace.id,
-        state: classification.state.as_str().to_string(),
+        state: submitted.after.as_str().to_string(),
         state_db: state_db_path(&state_dir),
         delay_ms: submit_delay_ms,
     })
@@ -3171,6 +3958,60 @@ pub(crate) struct InspectedPane {
     pub(crate) classification: Classification,
     pub(crate) focused_source: String,
     pub(crate) raw_source: String,
+}
+impl InspectedPane {
+    pub(crate) fn composer_evidence(&self) -> ComposerScreenEvidence {
+        inspect_composer(&self.focused_source)
+    }
+
+    pub(crate) fn screen_activity(&self) -> ScreenActivityEvidence {
+        inspect_screen_activity(&self.focused_source)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GhostShellEvidence {
+    Confirmed,
+    NotDetected,
+    Unknown,
+}
+
+impl GhostShellEvidence {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::NotDetected => "not-detected",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneProcessEvidence {
+    pub(crate) tool_child_probe: ToolChildProbe,
+    pub(crate) ghost_shell: GhostShellEvidence,
+}
+
+pub(crate) fn inspect_process_evidence(
+    pane: &TmuxPane,
+    activity: ScreenActivityEvidence,
+) -> PaneProcessEvidence {
+    let tool_child_probe = probe_claude_tool_children(pane.pane_pid);
+    let ghost_shell = derive_ghost_shell(activity, tool_child_probe);
+    PaneProcessEvidence {
+        tool_child_probe,
+        ghost_shell,
+    }
+}
+fn derive_ghost_shell(
+    activity: ScreenActivityEvidence,
+    tool_child_probe: ToolChildProbe,
+) -> GhostShellEvidence {
+    match (activity.shells_running > 0, tool_child_probe) {
+        (true, ToolChildProbe::ConfirmedAbsent) => GhostShellEvidence::Confirmed,
+        (true, ToolChildProbe::Unavailable(_)) => GhostShellEvidence::Unknown,
+        _ => GhostShellEvidence::NotDetected,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3713,7 +4554,10 @@ fn render_babysit_action_event(
         Some(match workflow {
             GuardedWorkflow::ApprovePermission => "Permission prompt",
             GuardedWorkflow::DismissSurvey => "Survey prompt",
-            GuardedWorkflow::RejectPermission | GuardedWorkflow::SubmitPrompt => "Prompt",
+            GuardedWorkflow::RejectPermission
+            | GuardedWorkflow::SubmitPrompt
+            | GuardedWorkflow::SubmitComposer
+            | GuardedWorkflow::ClearComposer => "Prompt",
         })
     } else {
         None
@@ -3744,7 +4588,10 @@ fn render_babysit_action_event(
                     GuardedWorkflow::ApprovePermission => "Auto-approving",
                     GuardedWorkflow::DismissSurvey => "Auto-dismissing",
                     GuardedWorkflow::RejectPermission => "Auto-rejecting",
-                    GuardedWorkflow::SubmitPrompt => "Auto-submitting",
+                    GuardedWorkflow::SubmitPrompt | GuardedWorkflow::SubmitComposer => {
+                        "Auto-submitting"
+                    }
+                    GuardedWorkflow::ClearComposer => "Auto-clearing",
                 }
             ),
             "details": if format == BabysitFormat::Human { serde_json::json!(human_details) } else { json_details },
@@ -4198,8 +5045,12 @@ fn render_status_report(
     bindings: &KeybindingsInspection,
     frame: &str,
 ) -> String {
+    let focused = focused_frame_source(frame);
+    let composer = inspect_composer(&focused);
+    let activity = inspect_screen_activity(&focused);
+    let process_evidence = inspect_process_evidence(pane, activity);
     format!(
-        "pane={}\nsession={}\nwindow={}\nactive={}\nprovider={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
+        "pane={}\nsession={}\nwindow={}\nactive={}\nprovider={}\ncommand={}\ncwd={}\ncursor={}\nstate={}\ncomposer={}\nui_shells_running={}\ntool_child_probe={}\nghost_shell={}\ntool_child_probe_reason={}\ntool_child_probe_recommendation={}\nhas_questions={}\nrecap_present={}\nrecap_excerpt={}\nsignals={}\nscreen_excerpt={}\nnext_safe_action={}\nbindings_path={}\nbindings_status={}\nbindings_missing={}",
         pane.pane_id,
         pane.session_name,
         pane.window_name,
@@ -4209,11 +5060,17 @@ fn render_status_report(
         pane.current_path,
         render_cursor(pane),
         classification.state.as_str(),
+        composer.disposition.as_str(),
+        activity.shells_running_label(),
+        process_evidence.tool_child_probe.as_str(),
+        process_evidence.ghost_shell.as_str(),
+        render_probe_unavailable_reason(process_evidence.tool_child_probe),
+        render_probe_recommendation(process_evidence.tool_child_probe),
         classification.has_questions,
         classification.recap_present,
         classification.recap_excerpt.as_deref().unwrap_or("none"),
         render_signals(classification),
-        render_screen_excerpt(frame),
+        render_status_screen_excerpt(frame, composer.disposition),
         render_next_safe_action(classification, pane, bindings),
         bindings.path.display(),
         bindings.status.as_str(),
@@ -4228,6 +5085,22 @@ fn render_status_json(
     frame: &str,
     automation_ready: bool,
 ) -> AppResult<String> {
+    let focused = focused_frame_source(frame);
+    let composer = inspect_composer(&focused);
+    let activity = inspect_screen_activity(&focused);
+    let process_evidence = inspect_process_evidence(pane, activity);
+    let probe_reason = process_evidence
+        .tool_child_probe
+        .unavailable_reason()
+        .map_or(serde_json::Value::Null, |reason| {
+            serde_json::Value::String(reason.as_str().to_string())
+        });
+    let probe_recommendation = process_evidence
+        .tool_child_probe
+        .unavailable_reason()
+        .map_or(serde_json::Value::Null, |reason| {
+            serde_json::Value::String(reason.recommendation().to_string())
+        });
     let mut json = serde_json::json!({
         "pane_id": pane.pane_id,
         "session": pane.session_name,
@@ -4242,11 +5115,17 @@ fn render_status_json(
             "y": pane.cursor_y,
         },
         "state": classification.state.as_str(),
+        "composer": composer.disposition.as_str(),
+        "ui_shells_running": activity.shells_running,
+        "tool_child_probe": process_evidence.tool_child_probe.as_str(),
+        "ghost_shell": process_evidence.ghost_shell.as_str(),
+        "tool_child_probe_reason": probe_reason,
+        "tool_child_probe_recommendation": probe_recommendation,
         "has_questions": classification.has_questions,
         "recap_present": classification.recap_present,
         "recap_excerpt": classification.recap_excerpt.as_deref(),
         "signals": classification.signals.clone(),
-        "screen_excerpt": render_screen_excerpt(frame),
+        "screen_excerpt": render_status_screen_excerpt(frame, composer.disposition),
         "automation_ready": automation_ready,
         "next_safe_action": render_next_safe_action(classification, pane, bindings),
         "bindings": {
@@ -4267,6 +5146,34 @@ fn render_status_json(
     }
     serde_json::to_string_pretty(&json)
         .map_err(|error| AppError::new(format!("failed to encode status JSON: {error}")))
+}
+
+fn render_probe_unavailable_reason(probe: ToolChildProbe) -> &'static str {
+    probe
+        .unavailable_reason()
+        .map_or("none", |reason| reason.as_str())
+}
+
+fn render_probe_recommendation(probe: ToolChildProbe) -> &'static str {
+    probe
+        .unavailable_reason()
+        .map_or("none", |reason| reason.recommendation())
+}
+
+fn render_status_screen_excerpt(frame: &str, composer: ComposerDisposition) -> String {
+    let may_contain_composer_text = frame.lines().any(|line| {
+        let trimmed = line.trim();
+        ['❯', '›'].into_iter().any(|prefix| {
+            trimmed
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.trim().is_empty())
+        })
+    });
+    if composer == ComposerDisposition::Occupied || may_contain_composer_text {
+        String::from("[composer text redacted]")
+    } else {
+        render_screen_excerpt(frame)
+    }
 }
 
 pub(crate) fn render_screen_excerpt(frame: &str) -> String {
@@ -4371,7 +5278,8 @@ fn render_guarded_workflow_output(
             GuardedWorkflow::ApprovePermission => "Approval sent",
             GuardedWorkflow::RejectPermission => "Rejection sent",
             GuardedWorkflow::DismissSurvey => "Survey dismissed",
-            GuardedWorkflow::SubmitPrompt => "Prompt submitted",
+            GuardedWorkflow::SubmitPrompt | GuardedWorkflow::SubmitComposer => "Prompt submitted",
+            GuardedWorkflow::ClearComposer => "Composer cleared",
         },
         classification.state.as_str()
     );
@@ -4636,6 +5544,27 @@ fn render_doctor_recommendations(
         format!("\n{}", lines.join("\n"))
     }
 }
+fn render_doctor_recommendations_with_process(
+    classification: &Classification,
+    pane: &TmuxPane,
+    bindings: &KeybindingsInspection,
+    process_evidence: PaneProcessEvidence,
+) -> String {
+    let base = render_doctor_recommendations(classification, pane, bindings);
+    let Some(reason) = process_evidence.tool_child_probe.unavailable_reason() else {
+        return base;
+    };
+    let probe_line = format!(
+        "recommendation=tool child probe unavailable ({}); {}",
+        reason.as_str(),
+        reason.recommendation()
+    );
+    if base.trim() == "recommendation=none" {
+        format!("\n{probe_line}")
+    } else {
+        format!("{base}\n{probe_line}")
+    }
+}
 
 fn load_frame_text(path: &PathBuf) -> AppResult<String> {
     std::fs::read_to_string(path).map_err(AppError::from)
@@ -4667,43 +5596,55 @@ fn parse_expected_state_arg(
 
 #[cfg(any(test, rust_analyzer))]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        AppError, BabysitFormat, BabysitOutputFormat, DASHBOARD_PERSISTENT_CHILD_ENV,
-        DASHBOARD_TARGET_TMUX_SOCKET_ENV, DashboardArgs, InspectedPane,
-        KEEP_GOING_CUSTOM_PROMPT_ANCHOR, KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective,
-        ObserveArtifactPaths, RecoveryAction, YoloAction, agy_doctor_recommendation_line,
-        artifact_state_dir_result, classification_provider_label, cleanup_babysit_record,
-        compose_prompt_run_content, ensure_pane_owned_by_automatable_provider,
-        ensure_pane_owned_by_claude, ensure_pane_owned_by_yolo_provider, ensure_state_transition,
-        extract_keep_going_response, extract_permission_prompt_details, focused_frame_source,
-        is_agy_command_permission_safe_to_approve, is_prompt_completion_state,
-        is_startup_enter_prompt, is_usable_state, is_yolo_safe_to_approve,
-        keep_going_no_yolo_blocker, pane_provider_label, parse_env_value_from_environ_bytes,
+        AppError, BabysitFormat, BabysitOutputFormat, ComposerActionSnapshot,
+        ComposerAttemptDecision, ComposerAuthorization, ComposerFingerprint, ComposerMutation,
+        ComposerTargetIdentity, DASHBOARD_PERSISTENT_CHILD_ENV, DASHBOARD_TARGET_TMUX_SOCKET_ENV,
+        DashboardArgs, GhostShellEvidence, InspectedPane, KEEP_GOING_CUSTOM_PROMPT_ANCHOR,
+        KEEP_GOING_PROMPT_ANCHOR, KeepGoingDirective, MIN_AUTONOMOUS_IDLE_TIMEOUT_MS,
+        ObserveArtifactPaths, PROMPT_PASTE_VISIBLE_TIMEOUT_MS, PROMPT_SUBMIT_ATTEMPTS,
+        PaneProcessEvidence, PromptCompletionOutcome, PromptCompletionTracker, RecoveryAction,
+        VerifiedComposerOutcome, YoloAction, agy_doctor_recommendation_line,
+        artifact_state_dir_result, authorize_existing_composer, classification_provider_label,
+        cleanup_babysit_record, compose_prompt_run_content, composer_attempt_decision,
+        derive_ghost_shell, ensure_pane_owned_by_automatable_provider, ensure_pane_owned_by_claude,
+        ensure_pane_owned_by_yolo_provider, ensure_state_transition,
+        equivalent_final_composer_guard, extract_keep_going_response,
+        extract_permission_prompt_details, focused_frame_source, input_dead_error,
+        is_agy_command_permission_safe_to_approve, is_startup_enter_prompt, is_usable_state,
+        is_yolo_safe_to_approve, keep_going_no_yolo_blocker, needs_long_running_idle_warning,
+        occupied_composer_recommendation, pane_provider_label, parse_env_value_from_environ_bytes,
         permission_manual_review_reason, persistent_dashboard_child_command_with_target_socket,
-        prompt_launch_command, prompt_submission_started, raw_key_for_workflow,
-        recovery_action_for_state, render_babysit_action_event, render_babysit_output,
-        render_babysit_start_event, render_babysit_wait_event, render_doctor_recommendations,
-        render_guarded_workflow_output, render_keep_going_wait_message, render_list_panes,
-        render_next_safe_action, render_observe_command_output, render_screen_excerpt,
-        render_status_json, render_status_report, resolve_keep_going_prompt,
-        resolve_prompt_run_input, run_prepare_prompt, shell_escape,
-        strip_dashboard_window_prefixes, submission_left_composer,
-        submit_prompt_preflight_workflow, tmux_socket_path_from_value,
+        prompt_completion_timeout, prompt_ghost_shell_warning, prompt_launch_command,
+        prompt_pane_identity_matches, prompt_residual_warning, prompt_submission_started,
+        raw_key_for_workflow, recovery_action_for_state, remaining_response_budget,
+        render_babysit_action_event, render_babysit_output, render_babysit_start_event,
+        render_babysit_wait_event, render_doctor_recommendations,
+        render_doctor_recommendations_with_process, render_guarded_workflow_output,
+        render_keep_going_wait_message, render_list_panes, render_next_safe_action,
+        render_observe_command_output, render_screen_excerpt, render_status_json,
+        render_status_report, resolve_keep_going_prompt, resolve_prompt_run_input,
+        run_prepare_prompt, same_action_pane, shell_escape, strip_dashboard_window_prefixes,
+        submission_left_composer, submit_prompt_preflight_workflow, tmux_socket_path_from_value,
+        wait_for_owned_staging_with, wait_for_submit_prompt_ready_with,
         write_prompt_instruction_temp_file, yolo_action_for_state,
     };
     use crate::automation::{GuardedWorkflow, KeybindingsInspection, KeybindingsStatus};
     use crate::classifier::{
-        Classification, SIGNAL_CODEX_KEYWORDS, SIGNAL_SELF_SETTINGS_LANGUAGE,
-        SIGNAL_SENSITIVE_CLAUDE_PATH, SessionState,
+        Classification, ComposerDisposition, ComposerScreenEvidence, SIGNAL_CODEX_KEYWORDS,
+        SIGNAL_SELF_SETTINGS_LANGUAGE, SIGNAL_SENSITIVE_CLAUDE_PATH, ScreenActivityEvidence,
+        SessionState,
     };
     use crate::cli::{PreparePromptArgs, PromptRunArgs};
+    use crate::proc_fd::{ProbeUnavailableReason, ToolChildProbe};
     use crate::prompt::pending_prompt_text;
     use crate::storage::{CURRENT_SCHEMA_VERSION, resolve_workspace_for_path, state_db_path};
-    use crate::tmux::TmuxPane;
+    use crate::tmux::{StartedWindow, TmuxPane, TmuxServerIdentity};
     use crate::yolo::{YoloRecord, read_yolo_record, write_yolo_record};
 
     fn sample_pane(current_command: &str) -> TmuxPane {
@@ -4724,6 +5665,570 @@ mod tests {
             cursor_x: Some(0),
             cursor_y: Some(0),
         }
+    }
+
+    fn composer_snapshot(
+        state: SessionState,
+        text: Option<&str>,
+        activity: ScreenActivityEvidence,
+        ghost_shell: GhostShellEvidence,
+    ) -> ComposerActionSnapshot {
+        let pane = sample_pane("claude");
+        let composer = ComposerScreenEvidence {
+            disposition: if text.is_some() {
+                ComposerDisposition::Occupied
+            } else {
+                ComposerDisposition::Empty
+            },
+            normalized_region: text.map(str::to_string),
+        };
+        let classification = Classification {
+            source: String::from("pane"),
+            state,
+            has_questions: false,
+            recap_present: false,
+            recap_excerpt: None,
+            signals: Vec::new(),
+        };
+        let inspected = InspectedPane {
+            classification: classification.clone(),
+            focused_source: String::from("focused frame"),
+            raw_source: String::from("raw frame"),
+        };
+        let identity = ComposerTargetIdentity::capture(
+            TmuxServerIdentity {
+                socket_path: String::from("/tmp/tmux.sock"),
+                pid: 99,
+                start_time: 1234,
+            },
+            &pane,
+            &classification,
+        );
+        let process = PaneProcessEvidence {
+            tool_child_probe: match ghost_shell {
+                GhostShellEvidence::Confirmed => ToolChildProbe::ConfirmedAbsent,
+                GhostShellEvidence::Unknown => {
+                    ToolChildProbe::Unavailable(ProbeUnavailableReason::MissingRootPid)
+                }
+                GhostShellEvidence::NotDetected => ToolChildProbe::Present,
+            },
+            ghost_shell,
+        };
+        let fingerprint = ComposerFingerprint::from_evidence(&pane, &composer);
+        ComposerActionSnapshot {
+            identity,
+            pane,
+            inspected,
+            composer,
+            activity,
+            process,
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn composer_verification_ignores_timer_redraw_and_bounds_swallowed_keys() {
+        let before = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("owned composer"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let mut timer_redraw = before.clone();
+        timer_redraw.inspected.raw_source = String::from("timer changed from 1s to 2s");
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Submit,
+                ComposerAuthorization::Normal,
+                &before,
+                &timer_redraw,
+            ),
+            ComposerAttemptDecision::Unchanged
+        );
+
+        let mut unavailable = before.clone();
+        unavailable.composer.disposition = ComposerDisposition::Unavailable;
+        unavailable.composer.normalized_region = None;
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Submit,
+                ComposerAuthorization::Normal,
+                &before,
+                &unavailable,
+            ),
+            ComposerAttemptDecision::Unchanged
+        );
+        assert_eq!(PROMPT_SUBMIT_ATTEMPTS, 3);
+
+        let consumed = composer_snapshot(
+            SessionState::BusyResponding,
+            None,
+            ScreenActivityEvidence {
+                spinner_running: true,
+                ..ScreenActivityEvidence::default()
+            },
+            GhostShellEvidence::NotDetected,
+        );
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Submit,
+                ComposerAuthorization::Normal,
+                &before,
+                &consumed,
+            ),
+            ComposerAttemptDecision::Success
+        );
+    }
+
+    #[test]
+    fn changed_foreign_or_partial_composer_is_retained_and_never_owned_for_cleanup() {
+        let before = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("exact bot text"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let changed = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("exact bot text plus foreign"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Submit,
+                ComposerAuthorization::Normal,
+                &before,
+                &changed,
+            ),
+            ComposerAttemptDecision::Changed
+        );
+    }
+
+    #[test]
+    fn normal_and_fresh_confirmed_ghost_composer_guards_are_distinct() {
+        let normal = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("recover me"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        assert_eq!(
+            authorize_existing_composer(&normal, ComposerMutation::Submit, "submit-composer")
+                .expect("normal occupied composer should authorize"),
+            ComposerAuthorization::Normal
+        );
+
+        let ghost = composer_snapshot(
+            SessionState::BusyResponding,
+            Some("recover me"),
+            ScreenActivityEvidence {
+                shells_running: 1,
+                ..ScreenActivityEvidence::default()
+            },
+            GhostShellEvidence::Confirmed,
+        );
+        assert_eq!(
+            authorize_existing_composer(&ghost, ComposerMutation::Clear, "clear-composer")
+                .expect("confirmed ghost should authorize"),
+            ComposerAuthorization::ConfirmedGhost
+        );
+
+        let cleared_normal = composer_snapshot(
+            SessionState::ChatReady,
+            None,
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Clear,
+                ComposerAuthorization::Normal,
+                &normal,
+                &cleared_normal,
+            ),
+            ComposerAttemptDecision::Success
+        );
+        let cleared_ghost = composer_snapshot(
+            SessionState::BusyResponding,
+            None,
+            ghost.activity,
+            GhostShellEvidence::Confirmed,
+        );
+        assert_eq!(
+            composer_attempt_decision(
+                ComposerMutation::Clear,
+                ComposerAuthorization::ConfirmedGhost,
+                &ghost,
+                &cleared_ghost,
+            ),
+            ComposerAttemptDecision::Success
+        );
+
+        let unstable_probe = composer_snapshot(
+            SessionState::BusyResponding,
+            Some("recover me"),
+            ghost.activity,
+            GhostShellEvidence::Unknown,
+        );
+        let error = equivalent_final_composer_guard(
+            &ghost,
+            &unstable_probe,
+            ComposerAuthorization::ConfirmedGhost,
+            ComposerMutation::Clear,
+            "clear-composer",
+        )
+        .expect_err("fresh final probe instability must refuse before a key");
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .to_string()
+                .contains("ghost shell status cannot be established")
+        );
+
+        let live_child_appeared = composer_snapshot(
+            SessionState::BusyResponding,
+            Some("recover me"),
+            ghost.activity,
+            GhostShellEvidence::NotDetected,
+        );
+        let error = equivalent_final_composer_guard(
+            &ghost,
+            &live_child_appeared,
+            ComposerAuthorization::ConfirmedGhost,
+            ComposerMutation::Submit,
+            "submit-composer",
+        )
+        .expect_err("a fresh live tool child must refuse before a key");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("live tool-child evidence"));
+    }
+
+    #[test]
+    fn pane_identity_and_state_races_fail_closed() {
+        let before = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("recover me"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let mut replaced_pane = before.pane.clone();
+        replaced_pane.window_id = String::from("@foreign");
+        assert!(!same_action_pane(&before.pane, &replaced_pane));
+
+        let expected = before.identity.clone();
+        let mut server_changed = expected.clone();
+        server_changed.server.pid += 1;
+        let mut session_changed = expected.clone();
+        session_changed.session_id = String::from("$foreign");
+        let mut window_changed = expected.clone();
+        window_changed.window_id = String::from("@foreign");
+        let mut process_changed = expected.clone();
+        process_changed.pane_pid = Some(expected.pane_pid.unwrap_or_default() + 1);
+        let mut tty_changed = expected.clone();
+        tty_changed.pane_tty = String::from("/dev/pts/foreign");
+        let mut provider_changed = expected.clone();
+        provider_changed.provider = String::from("codex");
+        for changed in [
+            server_changed,
+            session_changed,
+            window_changed,
+            process_changed,
+            tty_changed,
+            provider_changed,
+        ] {
+            assert_ne!(expected, changed);
+        }
+
+        let raced = composer_snapshot(
+            SessionState::BusyResponding,
+            Some("recover me"),
+            ScreenActivityEvidence {
+                spinner_running: true,
+                ..ScreenActivityEvidence::default()
+            },
+            GhostShellEvidence::NotDetected,
+        );
+        let error = equivalent_final_composer_guard(
+            &before,
+            &raced,
+            ComposerAuthorization::Normal,
+            ComposerMutation::Submit,
+            "submit-composer",
+        )
+        .expect_err("state race must refuse");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("precondition-changed"));
+    }
+
+    #[test]
+    fn auto_unstick_only_recommends_exact_resolved_pane_commands_for_composer() {
+        let snapshot = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("operator text"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let refusal = occupied_composer_recommendation(&snapshot)
+            .expect("occupied composer should produce recommendation");
+        assert_eq!(refusal.exit_code(), 2);
+        assert!(refusal.to_string().contains("sends no key"));
+        assert!(
+            refusal
+                .to_string()
+                .contains("botctl submit-composer --pane %1")
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("botctl clear-composer --pane %1")
+        );
+
+        for state in [SessionState::PermissionDialog, SessionState::SurveyPrompt] {
+            let snapshot = composer_snapshot(
+                state,
+                Some("operator text"),
+                ScreenActivityEvidence::default(),
+                GhostShellEvidence::NotDetected,
+            );
+            occupied_composer_recommendation(&snapshot)
+                .expect("every occupied composer must stop auto-unstick");
+        }
+    }
+
+    #[test]
+    fn auto_unstick_probe_unavailable_explicitly_sends_no_key() {
+        let snapshot = composer_snapshot(
+            SessionState::BusyResponding,
+            Some("operator text"),
+            ScreenActivityEvidence {
+                shells_running: 1,
+                ..ScreenActivityEvidence::default()
+            },
+            GhostShellEvidence::Unknown,
+        );
+        let refusal = occupied_composer_recommendation(&snapshot)
+            .expect("unavailable ghost proof must stop auto-unstick");
+        assert_eq!(refusal.exit_code(), 2);
+        assert!(refusal.to_string().contains("sends no key"));
+        assert!(refusal.to_string().contains("process probe is unavailable"));
+    }
+
+    #[test]
+    fn passive_when_ready_waits_through_busy_and_requires_stable_readiness() {
+        let busy = composer_snapshot(
+            SessionState::BusyResponding,
+            None,
+            ScreenActivityEvidence {
+                spinner_running: true,
+                ..ScreenActivityEvidence::default()
+            },
+            GhostShellEvidence::NotDetected,
+        );
+        let occupied = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("foreign"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let ready = composer_snapshot(
+            SessionState::ChatReady,
+            None,
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let base = Instant::now();
+        let clock = Cell::new(base);
+        let captures = Cell::new(0usize);
+
+        let timeout_error = match wait_for_submit_prompt_ready_with(
+            busy.clone(),
+            Duration::from_millis(200),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || {
+                captures.set(captures.get() + 1);
+                Ok(occupied.clone())
+            },
+        ) {
+            Ok(_) => panic!("busy or occupied input must not delegate"),
+            Err(error) => error,
+        };
+        assert_eq!(captures.get(), 2);
+        assert_eq!(timeout_error.exit_code(), 2);
+        assert!(timeout_error.to_string().contains("outcome=ready-timeout"));
+
+        clock.set(base);
+        captures.set(0);
+        let stable_ready = ready.clone();
+        let pane = wait_for_submit_prompt_ready_with(
+            busy,
+            Duration::from_millis(300),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || {
+                captures.set(captures.get() + 1);
+                Ok(stable_ready.clone())
+            },
+        )
+        .expect("busy-to-ready requires a ready poll plus a final ready capture");
+        assert_eq!(captures.get(), 2);
+        assert_eq!(pane.pane_id, ready.pane.pane_id);
+    }
+
+    #[test]
+    fn passive_when_ready_rejects_final_ready_snapshot_after_deadline() {
+        let ready = composer_snapshot(
+            SessionState::ChatReady,
+            None,
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let final_ready = ready.clone();
+        let base = Instant::now();
+        let clock = Cell::new(base);
+        let captures = Cell::new(0usize);
+
+        let error = wait_for_submit_prompt_ready_with(
+            ready,
+            Duration::from_millis(100),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || {
+                captures.set(captures.get() + 1);
+                clock.set(base + Duration::from_millis(101));
+                Ok(final_ready.clone())
+            },
+        )
+        .expect_err("a final snapshot after the deadline must not delegate");
+
+        assert_eq!(captures.get(), 1);
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("outcome=ready-timeout"));
+        assert!(error.to_string().contains("elapsed_ms=101"));
+    }
+
+    #[test]
+    fn staging_waits_through_foreign_text_and_preserves_terminal_residue() {
+        assert_eq!(PROMPT_PASTE_VISIBLE_TIMEOUT_MS, 15_000);
+        let initial = composer_snapshot(
+            SessionState::ChatReady,
+            None,
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let identity = initial.identity.clone();
+        let foreign = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("partial or foreign"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let matching = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("expected prompt"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let base = Instant::now();
+        let clock = Cell::new(base);
+        let captures = Cell::new(0usize);
+
+        let staged = wait_for_owned_staging_with(
+            &identity,
+            "expected prompt",
+            Duration::from_millis(200),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || {
+                let index = captures.get();
+                captures.set(index + 1);
+                Ok(if index == 0 {
+                    foreign.clone()
+                } else {
+                    matching.clone()
+                })
+            },
+        )
+        .expect("a complete late match should be accepted");
+        assert_eq!(captures.get(), 2);
+        assert!(staged.composer.matches_text("expected prompt"));
+
+        clock.set(base);
+        captures.set(0);
+        let error = match wait_for_owned_staging_with(
+            &identity,
+            "expected prompt",
+            Duration::from_millis(100),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || {
+                captures.set(captures.get() + 1);
+                Ok(foreign.clone())
+            },
+        ) {
+            Ok(_) => panic!("non-matching occupied text must remain retained at the deadline"),
+            Err(error) => error,
+        };
+        assert_eq!(captures.get(), 2);
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("outcome=composer-changed"));
+        assert!(error.to_string().contains("residual=retained"));
+        assert!(error.to_string().contains("was not cleared"));
+
+        clock.set(base);
+        let error = match wait_for_owned_staging_with(
+            &identity,
+            "expected prompt",
+            Duration::from_millis(100),
+            || clock.get(),
+            |_| {},
+            || {
+                clock.set(base + Duration::from_millis(101));
+                Ok(matching.clone())
+            },
+        ) {
+            Ok(_) => panic!("a matching capture after the deadline must remain unsubmitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("outcome=staging-unverified"));
+        assert!(error.to_string().contains("residual=retained"));
+    }
+
+    #[test]
+    fn verified_composer_success_output_is_stable_and_parseable() {
+        let outcome = VerifiedComposerOutcome {
+            pane_id: String::from("%47"),
+            before: SessionState::PromptEditing,
+            after: SessionState::BusyResponding,
+            attempts: 1,
+            residual: "none",
+        };
+        assert_eq!(
+            outcome.render("submit-composer", ComposerMutation::Submit),
+            "outcome=submitted action=submit-composer pane=%47 before=PromptEditing after=BusyResponding composer=consumed attempts=1 residual=none"
+        );
+    }
+
+    #[test]
+    fn input_dead_error_has_stable_fields_and_exact_alternative_command() {
+        let unchanged = composer_snapshot(
+            SessionState::PromptEditing,
+            Some("still here"),
+            ScreenActivityEvidence::default(),
+            GhostShellEvidence::NotDetected,
+        );
+        let error = input_dead_error(
+            "submit-composer",
+            ComposerMutation::Submit,
+            &unchanged,
+            &unchanged,
+        );
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "outcome=input-dead action=submit-composer pane=%1 before=PromptEditing after=PromptEditing composer=unchanged attempts=3 residual=retained; recover with botctl clear-composer --pane %1"
+        );
     }
 
     #[test]
@@ -4765,6 +6270,32 @@ mod tests {
     }
 
     #[test]
+    fn short_megamind_prompt_timeout_requires_warning() {
+        let mut args = prompt_args_for_test();
+        args.claude_args = vec![String::from("--agent"), String::from("megamind")];
+        assert!(needs_long_running_idle_warning(&args));
+
+        args.claude_args = vec![String::from("--agent=MEGAMIND")];
+        assert!(needs_long_running_idle_warning(&args));
+
+        args.claude_args.clear();
+        args.command = String::from("claude --agent 'megamind'");
+        assert!(needs_long_running_idle_warning(&args));
+    }
+
+    #[test]
+    fn one_hour_or_non_megamind_prompt_does_not_warn() {
+        let mut args = prompt_args_for_test();
+        args.claude_args = vec![String::from("--agent"), String::from("megamind")];
+        args.idle_timeout_ms = MIN_AUTONOMOUS_IDLE_TIMEOUT_MS;
+        assert!(!needs_long_running_idle_warning(&args));
+
+        args.idle_timeout_ms = 600_000;
+        args.claude_args = vec![String::from("--agent"), String::from("task")];
+        assert!(!needs_long_running_idle_warning(&args));
+    }
+
+    #[test]
     fn prompt_run_combines_system_and_user_sources() {
         let root = unique_temp_dir("prompt-run-combine");
         fs::create_dir_all(&root).expect("temp dir should exist");
@@ -4801,11 +6332,240 @@ mod tests {
     }
 
     #[test]
-    fn prompt_completion_treats_assistant_question_as_final_response() {
-        assert!(is_prompt_completion_state(SessionState::ChatReady));
-        assert!(is_prompt_completion_state(SessionState::UserQuestionPrompt));
-        assert!(!is_prompt_completion_state(SessionState::PermissionDialog));
-        assert!(!is_prompt_completion_state(SessionState::BusyResponding));
+    fn prompt_completion_requires_terminal_evidence_and_clean_empty_composer() {
+        let empty = ComposerScreenEvidence {
+            disposition: ComposerDisposition::Empty,
+            normalized_region: None,
+        };
+        let mut tracker = PromptCompletionTracker::default();
+
+        assert!(
+            tracker
+                .observe(
+                    None,
+                    SessionState::ChatReady,
+                    empty.clone(),
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none(),
+            "screen readiness alone must not complete"
+        );
+        let unavailable = ComposerScreenEvidence {
+            disposition: ComposerDisposition::Unavailable,
+            normalized_region: None,
+        };
+        assert!(
+            tracker
+                .observe(
+                    Some(String::from("fresh response")),
+                    SessionState::ChatReady,
+                    unavailable,
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none(),
+            "unavailable composer evidence must fail closed"
+        );
+        assert_eq!(
+            tracker.observe(
+                None,
+                SessionState::ChatReady,
+                empty,
+                GhostShellEvidence::NotDetected,
+            ),
+            Some(PromptCompletionOutcome::Clean {
+                text: String::from("fresh response"),
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_completion_requires_two_consecutive_identical_residual_polls() {
+        let occupied = ComposerScreenEvidence {
+            disposition: ComposerDisposition::Occupied,
+            normalized_region: Some(String::from("retained input")),
+        };
+        let changed = ComposerScreenEvidence {
+            disposition: ComposerDisposition::Occupied,
+            normalized_region: Some(String::from("foreign input")),
+        };
+        let mut tracker = PromptCompletionTracker::default();
+
+        assert!(
+            tracker
+                .observe(
+                    Some(String::from("fresh response")),
+                    SessionState::PromptEditing,
+                    occupied.clone(),
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none()
+        );
+        assert!(
+            tracker
+                .observe(
+                    None,
+                    SessionState::PromptEditing,
+                    changed.clone(),
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none(),
+            "changed residual must reset stability"
+        );
+        assert!(
+            tracker
+                .observe(
+                    None,
+                    SessionState::BusyResponding,
+                    occupied.clone(),
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none(),
+            "returning to the first residual is a new first poll"
+        );
+        assert_eq!(
+            tracker.observe(
+                None,
+                SessionState::BusyResponding,
+                occupied,
+                GhostShellEvidence::NotDetected,
+            ),
+            Some(PromptCompletionOutcome::Residual {
+                text: String::from("fresh response"),
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_completion_uses_latest_terminal_text_and_completes_empty_ghost_shell() {
+        let empty = ComposerScreenEvidence {
+            disposition: ComposerDisposition::Empty,
+            normalized_region: None,
+        };
+        let mut tracker = PromptCompletionTracker::default();
+
+        assert!(
+            tracker
+                .observe(
+                    Some(String::from("intermediate status")),
+                    SessionState::BusyResponding,
+                    empty.clone(),
+                    GhostShellEvidence::Confirmed,
+                )
+                .is_none()
+        );
+        assert!(
+            tracker
+                .observe(
+                    Some(String::from("final delivery")),
+                    SessionState::BusyResponding,
+                    empty.clone(),
+                    GhostShellEvidence::Confirmed,
+                )
+                .is_none(),
+            "new terminal text resets stable completion evidence"
+        );
+        assert_eq!(
+            tracker.observe(
+                None,
+                SessionState::BusyResponding,
+                empty,
+                GhostShellEvidence::Confirmed,
+            ),
+            Some(PromptCompletionOutcome::GhostShell {
+                text: String::from("final delivery"),
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_completion_never_returns_residual_without_terminal_record() {
+        let occupied = ComposerScreenEvidence {
+            disposition: ComposerDisposition::Occupied,
+            normalized_region: Some(String::from("retained input")),
+        };
+        let mut tracker = PromptCompletionTracker::default();
+        assert!(
+            tracker
+                .observe(
+                    None,
+                    SessionState::PromptEditing,
+                    occupied.clone(),
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none()
+        );
+        assert!(
+            tracker
+                .observe(
+                    None,
+                    SessionState::PromptEditing,
+                    occupied,
+                    GhostShellEvidence::NotDetected,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prompt_response_budget_is_one_fixed_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        assert_eq!(
+            remaining_response_budget(deadline, start + Duration::from_secs(4)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(remaining_response_budget(deadline, deadline), None);
+        assert_eq!(prompt_args_for_test().idle_timeout_ms, 600_000);
+
+        let error = prompt_completion_timeout(
+            &sample_pane("claude"),
+            SessionState::PromptEditing,
+            ComposerDisposition::Occupied,
+        );
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("refusing to print stale output"));
+        assert!(error.to_string().contains("retaining the prompt window"));
+    }
+
+    #[test]
+    fn prompt_window_cleanup_identity_requires_captured_process_and_coordinates() {
+        let captured = sample_pane("claude");
+        assert!(prompt_pane_identity_matches(&captured, &captured));
+
+        let mut changed = captured.clone();
+        changed.window_id = String::from("@foreign");
+        assert!(!prompt_pane_identity_matches(&captured, &changed));
+        changed = captured.clone();
+        changed.session_id = String::from("$foreign");
+        assert!(!prompt_pane_identity_matches(&captured, &changed));
+        changed = captured.clone();
+        changed.pane_pid = Some(changed.pane_pid.unwrap_or_default() + 1);
+        assert!(!prompt_pane_identity_matches(&captured, &changed));
+        changed = captured.clone();
+        changed.pane_tty = String::from("/dev/pts/foreign");
+        assert!(!prompt_pane_identity_matches(&captured, &changed));
+        changed = captured.clone();
+        changed.current_command = String::from("bash");
+        assert!(!prompt_pane_identity_matches(&captured, &changed));
+    }
+
+    #[test]
+    fn prompt_residual_warning_is_stable_and_names_identity_safe_recovery() {
+        let started = StartedWindow {
+            session_name: String::from("botctl"),
+            window_name: String::from("prompt"),
+            cwd: PathBuf::from("/tmp/demo"),
+            pane_id: String::from("%47"),
+            window_id: String::from("@12"),
+        };
+        assert_eq!(
+            prompt_residual_warning(&started),
+            "completed with residual composer text; retained window @12 pane=%47; recover with botctl submit-composer --pane %47 or botctl clear-composer --pane %47"
+        );
+        assert_eq!(
+            prompt_ghost_shell_warning(&started),
+            "completed with a fresh terminal response while the UI retained a stale shell-running footer; retained window @12 pane=%47; inspect with botctl status --pane %47"
+        );
     }
 
     #[test]
@@ -5653,7 +7413,7 @@ mod tests {
             &ready,
             Some(KEEP_GOING_PROMPT_ANCHOR),
         ));
-        assert!(prompt_submission_started(
+        assert!(!prompt_submission_started(
             "old output",
             "different output",
             &ready,
@@ -5686,8 +7446,8 @@ mod tests {
     }
 
     #[test]
-    fn chat_ready_counts_as_submitted_only_after_the_paste_was_seen() {
-        assert!(submission_left_composer(SessionState::ChatReady, true));
+    fn chat_ready_without_fresh_matching_record_is_not_verified_submission() {
+        assert!(!submission_left_composer(SessionState::ChatReady, true));
         assert!(!submission_left_composer(SessionState::ChatReady, false));
     }
 
@@ -5710,7 +7470,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_submission_started_accepts_generic_frame_change_without_anchor() {
+    fn prompt_submission_started_rejects_generic_frame_change_without_anchor() {
         let ready = Classification {
             source: String::from("pane"),
             state: SessionState::ChatReady,
@@ -5720,7 +7480,7 @@ mod tests {
             signals: vec![String::from("chat-keywords")],
         };
 
-        assert!(prompt_submission_started("before", "after", &ready, None));
+        assert!(!prompt_submission_started("before", "after", &ready, None));
     }
 
     #[test]
@@ -6812,6 +8572,117 @@ Esc to cancel · Tab to amend · ctrl+e to explain"#,
             recap_excerpt: None,
             signals: vec![],
         }
+    }
+
+    #[test]
+    fn ghost_shell_is_derived_only_from_shell_claim_and_process_probe() {
+        let shell = ScreenActivityEvidence {
+            shells_running: 1,
+            ..ScreenActivityEvidence::default()
+        };
+        assert_eq!(
+            derive_ghost_shell(shell, ToolChildProbe::ConfirmedAbsent),
+            GhostShellEvidence::Confirmed
+        );
+        assert_eq!(
+            derive_ghost_shell(
+                shell,
+                ToolChildProbe::Unavailable(ProbeUnavailableReason::PermissionDenied),
+            ),
+            GhostShellEvidence::Unknown
+        );
+        assert_eq!(
+            derive_ghost_shell(shell, ToolChildProbe::Present),
+            GhostShellEvidence::NotDetected
+        );
+        assert_eq!(
+            derive_ghost_shell(
+                ScreenActivityEvidence::default(),
+                ToolChildProbe::ConfirmedAbsent,
+            ),
+            GhostShellEvidence::NotDetected
+        );
+    }
+
+    #[test]
+    fn human_status_exposes_evidence_without_composer_text() {
+        let mut pane = sample_pane("claude");
+        pane.pane_pid = None;
+        let classification = sample_classification(SessionState::BusyResponding);
+        let bindings = sample_bindings(KeybindingsStatus::Valid);
+        let secret = "do not print this occupied composer";
+        let frame = format!(
+            "✻ Worked for 3m · 1 shell still running\n────────────────\n❯ {secret}\n────────────────\n~/Projects/botctl"
+        );
+
+        let report = render_status_report(&pane, &classification, &bindings, &frame);
+
+        assert!(report.contains("composer=occupied"));
+        assert!(report.contains("ui_shells_running=1"));
+        assert!(report.contains("tool_child_probe=unavailable"));
+        assert!(report.contains("ghost_shell=unknown"));
+        assert!(report.contains("tool_child_probe_reason=missing-root-pid"));
+        assert!(!report.contains(secret));
+    }
+    #[test]
+    fn uncertain_composer_evidence_redacts_possible_text_fail_closed() {
+        let mut pane = sample_pane("claude");
+        pane.pane_pid = None;
+        let classification = sample_classification(SessionState::Unknown);
+        let bindings = sample_bindings(KeybindingsStatus::Valid);
+        let secret = "ambiguous composer text";
+        let frame = format!("❯ {secret}\n● later output makes the composer region uncertain");
+
+        let report = render_status_report(&pane, &classification, &bindings, &frame);
+
+        assert!(report.contains("composer=unavailable"));
+        assert!(report.contains("screen_excerpt=[composer text redacted]"));
+        assert!(!report.contains(secret));
+    }
+
+    #[test]
+    fn json_status_uses_typed_evidence_and_never_emits_composer_text() {
+        let mut pane = sample_pane("claude");
+        pane.pane_pid = None;
+        let classification = sample_classification(SessionState::BusyResponding);
+        let bindings = sample_bindings(KeybindingsStatus::Valid);
+        let secret = "private composer payload";
+        let frame = format!(
+            "✻ Worked for 3m · 2 shells still running\n────────────────\n❯ {secret}\n────────────────\n~/Projects/botctl"
+        );
+
+        let rendered = render_status_json(&pane, &classification, &bindings, &frame, false)
+            .expect("unavailable probes remain observational");
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered).expect("status JSON should parse");
+
+        assert_eq!(json["composer"], "occupied");
+        assert_eq!(json["ui_shells_running"], 2);
+        assert_eq!(json["tool_child_probe"], "unavailable");
+        assert_eq!(json["ghost_shell"], "unknown");
+        assert_eq!(json["tool_child_probe_reason"], "missing-root-pid");
+        assert!(json["tool_child_probe_recommendation"].is_string());
+        assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn doctor_recommends_retry_but_remains_renderable_when_probe_is_unavailable() {
+        let pane = sample_pane("claude");
+        let classification = sample_classification(SessionState::ChatReady);
+        let bindings = sample_bindings(KeybindingsStatus::Valid);
+        let process_evidence = PaneProcessEvidence {
+            tool_child_probe: ToolChildProbe::Unavailable(ProbeUnavailableReason::PermissionDenied),
+            ghost_shell: GhostShellEvidence::NotDetected,
+        };
+
+        let report = render_doctor_recommendations_with_process(
+            &classification,
+            &pane,
+            &bindings,
+            process_evidence,
+        );
+        assert!(report.contains("tool child probe unavailable (permission-denied)"));
+        assert!(report.contains("retry after confirming /proc access"));
     }
 
     #[test]

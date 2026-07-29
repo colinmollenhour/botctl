@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -17,6 +18,7 @@ use crate::tmux::{TmuxClient, TmuxPane};
 
 const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
 const CLAUDE_SESSIONS_DIR: &str = ".claude/sessions";
+const CLAUDE_CURSOR_WITNESS_BYTES: usize = 256;
 const CODEX_SESSIONS_DIR: &str = ".codex/sessions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,371 @@ pub struct LastAgentMessage {
     pub provider: &'static str,
     pub session_id: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeTranscriptRecordIdentity {
+    pub(crate) session_id: String,
+    pub(crate) transcript_path: PathBuf,
+    file_identity: ClaudeFileIdentity,
+    pub(crate) complete_record_end_offset: u64,
+    pub(crate) outer_uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeTerminalRecord {
+    pub(crate) identity: ClaudeTranscriptRecordIdentity,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeTranscriptCursor {
+    session_id: String,
+    transcript_path: PathBuf,
+    file_identity: ClaudeFileIdentity,
+    complete_record_end_offset: u64,
+    read_offset: u64,
+    read_witness_start: u64,
+    read_witness: Vec<u8>,
+    pending_start_offset: u64,
+    pending: Vec<u8>,
+    fresh_record_start_floor: u64,
+    seen_main_chain_uuids: HashSet<String>,
+}
+
+impl ClaudeTranscriptCursor {
+    pub(crate) fn at_complete_record_boundary(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+pub(crate) fn capture_claude_transcript_cursor(
+    pane: &TmuxPane,
+) -> AppResult<ClaudeTranscriptCursor> {
+    if !pane.current_command.eq_ignore_ascii_case("claude") {
+        return Err(AppError::new(format!(
+            "cannot bind Claude transcript cursor for pane {} running {}",
+            pane.pane_id, pane.current_command
+        )));
+    }
+    let (session_id, transcript_path) = resolved_claude_transcript_for_cursor(pane)?;
+    capture_claude_transcript_cursor_from_resolved(session_id, transcript_path)
+}
+
+pub(crate) fn read_fresh_claude_terminal_record(
+    pane: &TmuxPane,
+    cursor: &mut ClaudeTranscriptCursor,
+) -> AppResult<Option<ClaudeTerminalRecord>> {
+    if !pane.current_command.eq_ignore_ascii_case("claude") {
+        return Err(AppError::new(format!(
+            "Claude transcript cursor provider changed for pane {}: now running {}",
+            pane.pane_id, pane.current_command
+        )));
+    }
+    let (session_id, transcript_path) = resolved_claude_transcript_for_cursor(pane)?;
+    read_fresh_claude_terminal_record_from_resolved(&session_id, &transcript_path, cursor)
+}
+
+fn resolved_claude_transcript_for_cursor(pane: &TmuxPane) -> AppResult<(String, PathBuf)> {
+    match resolve_claude_transcript_for_pane(pane)? {
+        ClaudeTranscriptResolve::Found { session_id, path } => Ok((session_id, path)),
+        ClaudeTranscriptResolve::None => Err(AppError::new(format!(
+            "no main-chain Claude transcript can be bound to pane {} session {}",
+            pane.pane_id, pane.session_name
+        ))),
+        ClaudeTranscriptResolve::Ambiguous { candidates } => Err(AppError::new(format!(
+            "ambiguous Claude transcript continuity for pane {}: candidates {}",
+            pane.pane_id,
+            format_candidate_preview(&candidates, 10)
+        ))),
+    }
+}
+
+fn capture_claude_transcript_cursor_from_resolved(
+    session_id: String,
+    transcript_path: PathBuf,
+) -> AppResult<ClaudeTranscriptCursor> {
+    let transcript_path = fs::canonicalize(&transcript_path).map_err(|error| {
+        AppError::new(format!(
+            "failed to canonicalize Claude transcript {}: {error}",
+            transcript_path.display()
+        ))
+    })?;
+    let mut file = File::open(&transcript_path)?;
+    let metadata = file.metadata()?;
+    let file_identity = claude_file_identity(&metadata)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    let capture_offset = content.len() as u64;
+
+    let witness_start = content.len().saturating_sub(CLAUDE_CURSOR_WITNESS_BYTES);
+    let read_witness = content[witness_start..].to_vec();
+    let mut cursor = ClaudeTranscriptCursor {
+        session_id,
+        transcript_path,
+        file_identity,
+        complete_record_end_offset: 0,
+        read_offset: capture_offset,
+        read_witness_start: witness_start as u64,
+        read_witness,
+        pending_start_offset: 0,
+        pending: content,
+        fresh_record_start_floor: capture_offset,
+        seen_main_chain_uuids: HashSet::new(),
+    };
+    consume_complete_claude_records(&mut cursor, false)?;
+    Ok(cursor)
+}
+
+fn read_fresh_claude_terminal_record_from_resolved(
+    session_id: &str,
+    transcript_path: &Path,
+    cursor: &mut ClaudeTranscriptCursor,
+) -> AppResult<Option<ClaudeTerminalRecord>> {
+    let transcript_path = fs::canonicalize(transcript_path).map_err(|error| {
+        AppError::new(format!(
+            "failed to revalidate Claude transcript {}: {error}",
+            transcript_path.display()
+        ))
+    })?;
+    if session_id != cursor.session_id || transcript_path != cursor.transcript_path {
+        return Err(AppError::new(format!(
+            "Claude transcript continuity changed: bound session {} path {}, now session {} path {}",
+            cursor.session_id,
+            cursor.transcript_path.display(),
+            session_id,
+            transcript_path.display()
+        )));
+    }
+
+    let mut file = File::open(&transcript_path)?;
+    let metadata = file.metadata()?;
+    let file_identity = claude_file_identity(&metadata)?;
+    if file_identity != cursor.file_identity {
+        return Err(AppError::new(format!(
+            "Claude transcript {} was replaced while waiting for completion",
+            transcript_path.display()
+        )));
+    }
+    if metadata.len() < cursor.read_offset
+        || metadata.len() < cursor.complete_record_end_offset
+        || cursor.pending_start_offset > cursor.read_offset
+    {
+        return Err(AppError::new(format!(
+            "Claude transcript {} offset regressed while waiting for completion",
+            transcript_path.display()
+        )));
+    }
+
+    verify_claude_cursor_witness(&mut file, cursor)?;
+    file.seek(SeekFrom::Start(cursor.read_offset))?;
+    let appended_start = cursor.pending.len();
+    let bytes_read = file.read_to_end(&mut cursor.pending)?;
+    cursor.read_offset += bytes_read as u64;
+    cursor
+        .read_witness
+        .extend_from_slice(&cursor.pending[appended_start..]);
+    if cursor.read_witness.len() > CLAUDE_CURSOR_WITNESS_BYTES {
+        let excess = cursor.read_witness.len() - CLAUDE_CURSOR_WITNESS_BYTES;
+        cursor.read_witness.drain(..excess);
+    }
+    cursor.read_witness_start = cursor.read_offset - cursor.read_witness.len() as u64;
+    consume_complete_claude_records(cursor, true)
+}
+
+fn verify_claude_cursor_witness(file: &mut File, cursor: &ClaudeTranscriptCursor) -> AppResult<()> {
+    if cursor.read_witness.is_empty() {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(cursor.read_witness_start))?;
+    let mut observed = vec![0; cursor.read_witness.len()];
+    file.read_exact(&mut observed)?;
+    if observed != cursor.read_witness {
+        return Err(AppError::new(format!(
+            "Claude transcript {} content before offset {} changed while waiting for completion",
+            cursor.transcript_path.display(),
+            cursor.read_offset
+        )));
+    }
+    Ok(())
+}
+
+fn consume_complete_claude_records(
+    cursor: &mut ClaudeTranscriptCursor,
+    collect_terminal: bool,
+) -> AppResult<Option<ClaudeTerminalRecord>> {
+    let mut consumed = 0usize;
+    let mut terminal = None;
+
+    while let Some(relative_newline) = cursor.pending[consumed..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+    {
+        let end = consumed + relative_newline;
+        let record_end_offset = cursor.pending_start_offset + end as u64 + 1;
+        let record_start_offset = cursor.pending_start_offset + consumed as u64;
+        if cursor.pending[consumed..end]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+        {
+            let value = serde_json::from_slice::<Value>(&cursor.pending[consumed..end])
+                .map_err(|error| {
+                    AppError::new(format!(
+                        "malformed complete Claude transcript record ending at offset {record_end_offset}: {error}"
+                    ))
+                })?;
+            if let Some(candidate) =
+                inspect_claude_main_chain_record(cursor, value, record_end_offset)?
+                && collect_terminal
+                && record_start_offset >= cursor.fresh_record_start_floor
+            {
+                terminal = Some(candidate);
+            }
+        }
+        consumed = end + 1;
+        cursor.complete_record_end_offset = record_end_offset;
+    }
+
+    if consumed > 0 {
+        cursor.pending.drain(..consumed);
+        cursor.pending_start_offset += consumed as u64;
+    }
+    Ok(terminal)
+}
+
+fn inspect_claude_main_chain_record(
+    cursor: &mut ClaudeTranscriptCursor,
+    value: Value,
+    record_end_offset: u64,
+) -> AppResult<Option<ClaudeTerminalRecord>> {
+    let Some(record_type) = value.get("type").and_then(Value::as_str) else {
+        return Err(AppError::new(format!(
+            "Claude transcript record ending at offset {record_end_offset} has malformed type metadata"
+        )));
+    };
+    let has_chain_metadata = value.get("parentUuid").is_some()
+        || value.get("isSidechain").is_some()
+        || value.get("uuid").is_some();
+    if !has_chain_metadata && !matches!(record_type, "user" | "assistant") {
+        return Ok(None);
+    }
+
+    let record_session = required_nonempty_string(&value, "sessionId", record_end_offset)?;
+    if record_session != cursor.session_id {
+        return Err(AppError::new(format!(
+            "Claude transcript record ending at offset {record_end_offset} changed session from {} to {record_session}",
+            cursor.session_id
+        )));
+    }
+    let is_sidechain = value
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            AppError::new(format!(
+                "Claude transcript record ending at offset {record_end_offset} has malformed sidechain metadata"
+            ))
+        })?;
+    if is_sidechain {
+        return Ok(None);
+    }
+
+    let outer_uuid = required_nonempty_string(&value, "uuid", record_end_offset)?.to_string();
+    if cursor.seen_main_chain_uuids.contains(&outer_uuid) {
+        return Err(AppError::new(format!(
+            "Claude transcript record ending at offset {record_end_offset} repeats outer uuid {outer_uuid}"
+        )));
+    }
+    let parent_uuid = match value.get("parentUuid") {
+        Some(Value::Null) => None,
+        Some(Value::String(parent)) if !parent.is_empty() => Some(parent.as_str()),
+        _ => {
+            return Err(AppError::new(format!(
+                "Claude transcript record ending at offset {record_end_offset} has malformed parent continuity metadata"
+            )));
+        }
+    };
+    let parent_is_valid = match parent_uuid {
+        Some(parent) => cursor.seen_main_chain_uuids.contains(parent),
+        None => cursor.seen_main_chain_uuids.is_empty(),
+    };
+    if !parent_is_valid {
+        return Err(AppError::new(format!(
+            "Claude transcript main-chain continuity is ambiguous at offset {record_end_offset}"
+        )));
+    }
+    cursor.seen_main_chain_uuids.insert(outer_uuid.clone());
+
+    if record_type != "assistant" {
+        return Ok(None);
+    }
+    if value.pointer("/message/role").and_then(Value::as_str) != Some("assistant") {
+        return Err(AppError::new(format!(
+            "Claude assistant record ending at offset {record_end_offset} has malformed role metadata"
+        )));
+    }
+    if value
+        .pointer("/message/stop_reason")
+        .and_then(Value::as_str)
+        != Some("end_turn")
+    {
+        return Ok(None);
+    }
+    let Some(text) = text_from_claude_content(value.pointer("/message/content"))
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(ClaudeTerminalRecord {
+        identity: ClaudeTranscriptRecordIdentity {
+            session_id: cursor.session_id.clone(),
+            transcript_path: cursor.transcript_path.clone(),
+            file_identity: cursor.file_identity.clone(),
+            complete_record_end_offset: record_end_offset,
+            outer_uuid,
+        },
+        text,
+    }))
+}
+
+fn required_nonempty_string<'a>(
+    value: &'a Value,
+    field: &str,
+    record_end_offset: u64,
+) -> AppResult<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::new(format!(
+                "Claude transcript record ending at offset {record_end_offset} has malformed {field} metadata"
+            ))
+        })
+}
+
+#[cfg(unix)]
+fn claude_file_identity(metadata: &fs::Metadata) -> AppResult<ClaudeFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(ClaudeFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn claude_file_identity(_metadata: &fs::Metadata) -> AppResult<ClaudeFileIdentity> {
+    Err(AppError::new(
+        "durable Claude transcript file identity is unavailable on this platform",
+    ))
 }
 
 pub fn load_last_agent_message(
@@ -781,14 +1148,16 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(any(test, rust_analyzer))]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ClaudeTranscriptResolve, default_output_path, encode_claude_project_path,
-        format_candidate_preview, latest_claude_assistant_text, latest_codex_assistant_text,
-        line_count, resolve_claude_transcript_in_projects_root,
-        resolve_claude_transcript_with_roots,
+        ClaudeTranscriptResolve, capture_claude_transcript_cursor_from_resolved,
+        default_output_path, encode_claude_project_path, format_candidate_preview,
+        latest_claude_assistant_text, latest_codex_assistant_text, line_count,
+        read_fresh_claude_terminal_record_from_resolved,
+        resolve_claude_transcript_in_projects_root, resolve_claude_transcript_with_roots,
     };
     use crate::proc_fd::ChildResolver;
     use crate::tmux::TmuxPane;
@@ -837,6 +1206,655 @@ mod tests {
             .expect("message should exist");
 
         assert_eq!(text, "second\n\npart");
+    }
+
+    fn claude_conversation_record(
+        record_type: &str,
+        uuid: &str,
+        parent_uuid: Option<&str>,
+        message_id: &str,
+        stop_reason: Option<&str>,
+        text: &str,
+        is_sidechain: bool,
+    ) -> String {
+        serde_json::json!({
+            "type": record_type,
+            "uuid": uuid,
+            "parentUuid": parent_uuid,
+            "sessionId": "session-main",
+            "isSidechain": is_sidechain,
+            "message": {
+                "id": message_id,
+                "role": record_type,
+                "stop_reason": stop_reason,
+                "content": [{"type": "text", "text": text}],
+            },
+        })
+        .to_string()
+    }
+
+    fn append_jsonl(path: &std::path::Path, records: &[String]) {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("transcript should open for append");
+        for record in records {
+            writeln!(file, "{record}").expect("record should append");
+        }
+    }
+
+    fn cursor_fixture(name: &str) -> (std::path::PathBuf, super::ClaudeTranscriptCursor) {
+        let path = unique_temp_path(name);
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                claude_conversation_record(
+                    "assistant",
+                    "old-assistant",
+                    None,
+                    "repeated-message-id",
+                    Some("end_turn"),
+                    "same reply",
+                    false,
+                )
+            ),
+        )
+        .expect("initial transcript should write");
+        let cursor = capture_claude_transcript_cursor_from_resolved(
+            String::from("session-main"),
+            path.clone(),
+        )
+        .expect("cursor should bind");
+        (path, cursor)
+    }
+
+    #[test]
+    fn claude_cursor_uses_outer_uuid_and_offset_not_text_or_inner_message_id() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-fresh-identity");
+        append_jsonl(
+            &path,
+            &[
+                serde_json::json!({
+                    "type": "system",
+                    "subtype": "turn_duration",
+                    "uuid": "turn-duration",
+                    "parentUuid": "old-assistant",
+                    "sessionId": "session-main",
+                    "isSidechain": false,
+                })
+                .to_string(),
+                claude_conversation_record(
+                    "user",
+                    "new-user",
+                    Some("turn-duration"),
+                    "user-message",
+                    None,
+                    "prompt",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "new-assistant",
+                    Some("new-user"),
+                    "repeated-message-id",
+                    Some("end_turn"),
+                    "same reply",
+                    false,
+                ),
+            ],
+        );
+
+        let record =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("incremental read should succeed")
+                .expect("fresh terminal record should complete");
+
+        assert_eq!(record.text, "same reply");
+        assert_eq!(record.identity.outer_uuid, "new-assistant");
+        assert_eq!(record.identity.session_id, "session-main");
+        assert_eq!(
+            record.identity.transcript_path,
+            fs::canonicalize(&path).expect("path should canonicalize")
+        );
+        assert!(record.identity.complete_record_end_offset > 0);
+        assert!(
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("second poll should succeed")
+                .is_none(),
+            "an already-consumed durable record must not be returned twice"
+        );
+    }
+
+    #[test]
+    fn claude_cursor_binds_before_any_assistant_text_exists() {
+        let path = unique_temp_path("claude-cursor-no-prior-text");
+        fs::write(
+            &path,
+            "{\"type\":\"permission-mode\",\"sessionId\":\"session-main\"}\n",
+        )
+        .expect("metadata-only transcript should write");
+        let mut cursor = capture_claude_transcript_cursor_from_resolved(
+            String::from("session-main"),
+            path.clone(),
+        )
+        .expect("metadata-only cursor should bind");
+        append_jsonl(
+            &path,
+            &[
+                claude_conversation_record(
+                    "user",
+                    "first-user",
+                    None,
+                    "user-message",
+                    None,
+                    "first prompt",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "first-assistant",
+                    Some("first-user"),
+                    "assistant-message",
+                    Some("end_turn"),
+                    "first reply",
+                    false,
+                ),
+            ],
+        );
+
+        let record =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("first incremental response should parse")
+                .expect("first response should complete");
+        assert_eq!(record.text, "first reply");
+    }
+
+    #[test]
+    fn claude_cursor_waits_for_partial_trailing_record() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-partial");
+        append_jsonl(
+            &path,
+            &[claude_conversation_record(
+                "user",
+                "partial-user",
+                Some("old-assistant"),
+                "user-message",
+                None,
+                "prompt",
+                false,
+            )],
+        );
+        let terminal = claude_conversation_record(
+            "assistant",
+            "partial-assistant",
+            Some("partial-user"),
+            "assistant-message",
+            Some("end_turn"),
+            "complete later",
+            false,
+        );
+        let split = terminal.len() - 2;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("transcript should open")
+            .write_all(&terminal.as_bytes()[..split])
+            .expect("partial record should append");
+
+        assert!(
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("partial record should be nonterminal")
+                .is_none()
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("transcript should reopen");
+        file.write_all(&terminal.as_bytes()[split..])
+            .expect("record tail should append");
+        file.write_all(b"\n").expect("newline should append");
+        let record =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("completed record should parse")
+                .expect("completed end_turn should be terminal");
+        assert_eq!(record.text, "complete later");
+    }
+
+    #[test]
+    fn claude_cursor_excludes_record_that_started_before_capture() {
+        let path = unique_temp_path("claude-cursor-initial-partial");
+        let old_user = claude_conversation_record(
+            "user",
+            "old-user",
+            None,
+            "old-user-message",
+            None,
+            "old prompt",
+            false,
+        );
+        let stale_terminal = claude_conversation_record(
+            "assistant",
+            "old-assistant",
+            Some("old-user"),
+            "old-assistant-message",
+            Some("end_turn"),
+            "stale response",
+            false,
+        );
+        fs::write(&path, format!("{old_user}\n{stale_terminal}"))
+            .expect("initial partial transcript should write");
+        let mut cursor = capture_claude_transcript_cursor_from_resolved(
+            String::from("session-main"),
+            path.clone(),
+        )
+        .expect("cursor should bind");
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("transcript should reopen")
+            .write_all(b"\n")
+            .expect("record delimiter should append");
+        assert!(
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("pre-cursor partial record should parse")
+                .is_none(),
+            "a record that began before capture is not a fresh response"
+        );
+        assert!(cursor.at_complete_record_boundary());
+    }
+
+    #[test]
+    fn claude_cursor_requires_newline_after_valid_json_record() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-newline");
+        append_jsonl(
+            &path,
+            &[claude_conversation_record(
+                "user",
+                "newline-user",
+                Some("old-assistant"),
+                "user-message",
+                None,
+                "prompt",
+                false,
+            )],
+        );
+        let terminal = claude_conversation_record(
+            "assistant",
+            "newline-assistant",
+            Some("newline-user"),
+            "assistant-message",
+            Some("end_turn"),
+            "durable after newline",
+            false,
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("transcript should open")
+            .write_all(terminal.as_bytes())
+            .expect("valid unterminated record should append");
+
+        assert!(
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("unterminated JSON should remain pending")
+                .is_none()
+        );
+        assert!(!cursor.at_complete_record_boundary());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("transcript should reopen")
+            .write_all(b"\n")
+            .expect("record delimiter should append");
+        let record =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("delimited record should parse")
+                .expect("delimited end_turn should complete");
+        assert!(cursor.at_complete_record_boundary());
+        assert_eq!(record.text, "durable after newline");
+    }
+
+    #[test]
+    fn claude_cursor_returns_newest_terminal_record_in_append_batch() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-newest-terminal");
+        append_jsonl(
+            &path,
+            &[
+                claude_conversation_record(
+                    "user",
+                    "batch-user",
+                    Some("old-assistant"),
+                    "user-message",
+                    None,
+                    "prompt",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "batch-status",
+                    Some("batch-user"),
+                    "status-message",
+                    Some("end_turn"),
+                    "intermediate status",
+                    false,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "batch-followup",
+                    Some("batch-status"),
+                    "user-message-2",
+                    None,
+                    "continue",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "batch-final",
+                    Some("batch-followup"),
+                    "final-message",
+                    Some("end_turn"),
+                    "final delivery",
+                    false,
+                ),
+            ],
+        );
+
+        let record =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("append batch should parse")
+                .expect("latest terminal record should complete");
+        assert_eq!(record.identity.outer_uuid, "batch-final");
+        assert_eq!(record.text, "final delivery");
+    }
+
+    #[test]
+    fn claude_cursor_accepts_nonadjacent_branched_tool_result_ancestry() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-branched");
+        append_jsonl(
+            &path,
+            &[
+                claude_conversation_record(
+                    "user",
+                    "branch-user",
+                    Some("old-assistant"),
+                    "user-message",
+                    None,
+                    "prompt",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "tool-a1",
+                    Some("branch-user"),
+                    "tool-message-1",
+                    None,
+                    "",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "tool-a2",
+                    Some("tool-a1"),
+                    "tool-message-2",
+                    None,
+                    "",
+                    false,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "tool-r2",
+                    Some("tool-a2"),
+                    "result-message-2",
+                    None,
+                    "",
+                    false,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "tool-r1",
+                    Some("tool-a1"),
+                    "result-message-1",
+                    None,
+                    "",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "branch-final",
+                    Some("tool-r1"),
+                    "final-message",
+                    Some("end_turn"),
+                    "branched delivery",
+                    false,
+                ),
+            ],
+        );
+
+        let record =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("branched ancestry should parse")
+                .expect("final branched record should complete");
+        assert_eq!(record.text, "branched delivery");
+    }
+
+    #[test]
+    fn claude_cursor_rejects_nonterminal_empty_and_sidechain_records() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-nonterminal");
+        append_jsonl(
+            &path,
+            &[
+                claude_conversation_record(
+                    "assistant",
+                    "sidechain",
+                    Some("old-assistant"),
+                    "side-message",
+                    Some("end_turn"),
+                    "must not print",
+                    true,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "tool-user",
+                    Some("old-assistant"),
+                    "user-message",
+                    None,
+                    "prompt",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "tool-assistant",
+                    Some("tool-user"),
+                    "assistant-message",
+                    Some("tool_use"),
+                    "tool preamble",
+                    false,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "missing-stop-user",
+                    Some("tool-assistant"),
+                    "user-message",
+                    None,
+                    "tool result",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "missing-stop-assistant",
+                    Some("missing-stop-user"),
+                    "assistant-message",
+                    None,
+                    "not terminal",
+                    false,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "unknown-stop-user",
+                    Some("missing-stop-assistant"),
+                    "user-message",
+                    None,
+                    "continue",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "unknown-stop-assistant",
+                    Some("unknown-stop-user"),
+                    "assistant-message",
+                    Some("pause_turn"),
+                    "not terminal either",
+                    false,
+                ),
+                claude_conversation_record(
+                    "user",
+                    "empty-user",
+                    Some("unknown-stop-assistant"),
+                    "user-message",
+                    None,
+                    "continue",
+                    false,
+                ),
+                claude_conversation_record(
+                    "assistant",
+                    "empty-assistant",
+                    Some("empty-user"),
+                    "assistant-message",
+                    Some("end_turn"),
+                    "  ",
+                    false,
+                ),
+            ],
+        );
+
+        assert!(
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect("nonterminal records should parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_cursor_fails_closed_on_malformed_or_ambiguous_continuity() {
+        let (malformed_path, mut malformed_cursor) = cursor_fixture("claude-cursor-malformed");
+        append_jsonl(&malformed_path, &[String::from("{not-json}")]);
+        let malformed = read_fresh_claude_terminal_record_from_resolved(
+            "session-main",
+            &malformed_path,
+            &mut malformed_cursor,
+        )
+        .expect_err("terminated malformed JSON must fail closed");
+        assert!(malformed.to_string().contains("malformed complete"));
+
+        let (ambiguous_path, mut ambiguous_cursor) = cursor_fixture("claude-cursor-ambiguous");
+        append_jsonl(
+            &ambiguous_path,
+            &[claude_conversation_record(
+                "assistant",
+                "unlinked-assistant",
+                Some("foreign-parent"),
+                "assistant-message",
+                Some("end_turn"),
+                "must not print",
+                false,
+            )],
+        );
+        let ambiguous = read_fresh_claude_terminal_record_from_resolved(
+            "session-main",
+            &ambiguous_path,
+            &mut ambiguous_cursor,
+        )
+        .expect_err("unlinked main-chain record must fail closed");
+        assert!(ambiguous.to_string().contains("continuity is ambiguous"));
+    }
+
+    #[test]
+    fn claude_cursor_fails_closed_on_duplicate_uuid_session_switch_and_truncation() {
+        let (duplicate_path, mut duplicate_cursor) = cursor_fixture("claude-cursor-duplicate");
+        append_jsonl(
+            &duplicate_path,
+            &[claude_conversation_record(
+                "user",
+                "old-assistant",
+                Some("old-assistant"),
+                "user-message",
+                None,
+                "prompt",
+                false,
+            )],
+        );
+        let duplicate = read_fresh_claude_terminal_record_from_resolved(
+            "session-main",
+            &duplicate_path,
+            &mut duplicate_cursor,
+        )
+        .expect_err("duplicate outer uuid must fail closed");
+        assert!(duplicate.to_string().contains("repeats outer uuid"));
+
+        let (session_path, mut session_cursor) = cursor_fixture("claude-cursor-session");
+        let switched = read_fresh_claude_terminal_record_from_resolved(
+            "other-session",
+            &session_path,
+            &mut session_cursor,
+        )
+        .expect_err("session switch must fail closed");
+        assert!(switched.to_string().contains("continuity changed"));
+
+        let (truncated_path, mut truncated_cursor) = cursor_fixture("claude-cursor-truncated");
+        fs::write(&truncated_path, "").expect("same file should truncate");
+        let truncated = read_fresh_claude_terminal_record_from_resolved(
+            "session-main",
+            &truncated_path,
+            &mut truncated_cursor,
+        )
+        .expect_err("offset regression must fail closed");
+        assert!(truncated.to_string().contains("offset regressed"));
+
+        let (rewritten_path, mut rewritten_cursor) = cursor_fixture("claude-cursor-rewritten");
+        let original_len = fs::metadata(&rewritten_path)
+            .expect("transcript metadata should read")
+            .len() as usize;
+        fs::write(&rewritten_path, vec![b'x'; original_len])
+            .expect("same-length in-place rewrite should succeed");
+        let rewritten = read_fresh_claude_terminal_record_from_resolved(
+            "session-main",
+            &rewritten_path,
+            &mut rewritten_cursor,
+        )
+        .expect_err("same-length rewrite before the cursor must fail closed");
+        assert!(rewritten.to_string().contains("content before offset"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_cursor_fails_closed_when_transcript_file_is_replaced() {
+        let (path, mut cursor) = cursor_fixture("claude-cursor-replaced");
+        let old_path = path.with_extension("old");
+        fs::rename(&path, &old_path).expect("bound transcript should move");
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                claude_conversation_record(
+                    "assistant",
+                    "replacement",
+                    None,
+                    "message",
+                    Some("end_turn"),
+                    "replacement text",
+                    false,
+                )
+            ),
+        )
+        .expect("replacement transcript should write");
+
+        let replaced =
+            read_fresh_claude_terminal_record_from_resolved("session-main", &path, &mut cursor)
+                .expect_err("replacement identity must fail closed");
+        assert!(replaced.to_string().contains("was replaced"));
     }
 
     #[test]

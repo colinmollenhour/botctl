@@ -23,6 +23,8 @@ pub enum AutomationAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuardedWorkflow {
     SubmitPrompt,
+    SubmitComposer,
+    ClearComposer,
     ApprovePermission,
     RejectPermission,
     DismissSurvey,
@@ -67,6 +69,8 @@ const SUBMIT_PROMPT_ACTIONS: [AutomationAction; 3] = [
     AutomationAction::ExternalEditor,
     AutomationAction::Submit,
 ];
+const SUBMIT_COMPOSER_ACTIONS: [AutomationAction; 1] = [AutomationAction::Submit];
+const CLEAR_COMPOSER_ACTIONS: [AutomationAction; 1] = [AutomationAction::ClearInput];
 
 const APPROVE_PERMISSION_ACTIONS: [AutomationAction; 1] = [AutomationAction::ConfirmYes];
 const REJECT_PERMISSION_ACTIONS: [AutomationAction; 1] = [AutomationAction::ConfirmNo];
@@ -143,6 +147,8 @@ impl GuardedWorkflow {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SubmitPrompt => "submit-prompt",
+            Self::SubmitComposer => "submit-composer",
+            Self::ClearComposer => "clear-composer",
             Self::ApprovePermission => "approve",
             Self::RejectPermission => "reject",
             Self::DismissSurvey => "dismiss-survey",
@@ -152,6 +158,7 @@ impl GuardedWorkflow {
     pub fn required_state(self) -> SessionState {
         match self {
             Self::SubmitPrompt => SessionState::ChatReady,
+            Self::SubmitComposer | Self::ClearComposer => SessionState::PromptEditing,
             Self::ApprovePermission | Self::RejectPermission => SessionState::PermissionDialog,
             Self::DismissSurvey => SessionState::SurveyPrompt,
         }
@@ -183,6 +190,8 @@ impl GuardedWorkflow {
     pub fn actions(self) -> &'static [AutomationAction] {
         match self {
             Self::SubmitPrompt => &SUBMIT_PROMPT_ACTIONS,
+            Self::SubmitComposer => &SUBMIT_COMPOSER_ACTIONS,
+            Self::ClearComposer => &CLEAR_COMPOSER_ACTIONS,
             Self::ApprovePermission => &APPROVE_PERMISSION_ACTIONS,
             Self::RejectPermission => &REJECT_PERMISSION_ACTIONS,
             Self::DismissSurvey => &DISMISS_SURVEY_ACTIONS,
@@ -691,6 +700,14 @@ mod tests {
             GuardedWorkflow::ApprovePermission.actions(),
             &[AutomationAction::ConfirmYes]
         );
+        assert_eq!(
+            GuardedWorkflow::SubmitComposer.actions(),
+            &[AutomationAction::Submit]
+        );
+        assert_eq!(
+            GuardedWorkflow::ClearComposer.actions(),
+            &[AutomationAction::ClearInput]
+        );
         assert_eq!(GuardedWorkflow::DismissSurvey.actions(), &[]);
     }
 
@@ -709,6 +726,16 @@ mod tests {
             .expect_err("workflow should reject incompatible state");
         assert!(error.contains("requires state=ChatReady"));
         assert!(error.contains("pane is BusyResponding"));
+
+        for workflow in [
+            GuardedWorkflow::SubmitComposer,
+            GuardedWorkflow::ClearComposer,
+        ] {
+            let error = validate_workflow_state(workflow, &classification)
+                .expect_err("normal composer workflow must reject busy state");
+            assert!(error.contains("requires state=PromptEditing"));
+            assert!(error.contains("pane is BusyResponding"));
+        }
     }
 
     #[test]
@@ -804,8 +831,39 @@ mod tests {
             Some([String::from("C-x"), String::from("C-e")].as_slice())
         );
         assert_eq!(
+            bindings.keys_for(AutomationAction::Submit),
+            Some([String::from("Enter")].as_slice())
+        );
+        assert_ne!(
+            bindings.keys_for(AutomationAction::Submit),
+            Some([String::from("F8")].as_slice())
+        );
+        assert_eq!(
             bindings.keys_for(AutomationAction::ConfirmYes),
             Some([String::from("y")].as_slice())
+        );
+    }
+
+    #[test]
+    fn action_time_reload_observes_changed_submit_binding() {
+        let root = unique_temp_dir("bindings-live-reload");
+        fs::create_dir_all(&root).expect("temp dir should exist");
+        let path = root.join("keybindings.json");
+        fs::write(&path, USER_BINDINGS).expect("initial bindings should write");
+        let initial = load_resolved_keybindings(Some(&path)).expect("initial bindings should load");
+        assert_eq!(
+            initial.keys_for(AutomationAction::Submit),
+            Some([String::from("Enter")].as_slice())
+        );
+
+        let changed =
+            USER_BINDINGS.replace("\"enter\": \"chat:submit\"", "\"ctrl+j\": \"chat:submit\"");
+        fs::write(&path, changed).expect("changed bindings should write");
+        let reloaded =
+            load_resolved_keybindings(Some(&path)).expect("changed bindings should reload");
+        assert_eq!(
+            reloaded.keys_for(AutomationAction::Submit),
+            Some([String::from("C-j")].as_slice())
         );
     }
 

@@ -47,8 +47,8 @@ botctl prompt \
 | Piece | Behavior |
 | --- | --- |
 | stdout | Final assistant Markdown/text only (on success) |
-| stderr | Launch/wait progress when `--verbose` |
-| exit 0 | Fresh assistant message extracted for **this** pane/session |
+| stderr | Launch/wait progress when `--verbose`; warnings always |
+| exit 0 | Fresh assistant message extracted for **this** pane/session; stable residual composer text retains the window and prints recovery commands |
 | exit ≠ 0 | Failure; the prompt window is **left alive** for inspection |
 | after `--` | Extra Claude CLI args (`--model`, `--name`, `--session-id`, …) |
 | prompt mode | `claude -p` / `--prompt` is refused — botctl always uses the TUI |
@@ -165,6 +165,14 @@ botctl prompt --text "..." --cwd "$PWD" -- --model sonnet
 botctl prompt --text "..." --cwd "$PWD" --no-yolo -- --model sonnet
 ```
 
+For the separate long-running YOLO command, use the bare boolean flag:
+
+```bash
+botctl yolo start --pane '%19' --follow
+```
+
+Omit `--follow` when you do not want to tail events. The flag accepts no value.
+
 Sensitive paths (e.g. Claude settings) still require manual review.
 
 ## Timeouts and observability
@@ -172,15 +180,62 @@ Sensitive paths (e.g. Claude settings) still require manual review.
 | Flag | Default | Use |
 | --- | --- | --- |
 | `--ready-timeout-ms` | 30000 | Wait for ChatReady before submit |
-| `--idle-timeout-ms` | 600000 | Wait for response / fresh last-message |
+| `--idle-timeout-ms` | 600000 | Fixed response deadline after verified submission |
 | `--poll-ms` | 1000 | Classification poll interval |
 | `--submit-delay-ms` | 250 | Delay after paste before submit |
 | `--verbose` | off | Progress on stderr |
 
-Failed runs leave the tmux window up:
+The response deadline does not reset as Claude makes progress. When
+`--agent megamind` receives a value below `3600000` (one hour), botctl warns on
+stderr but keeps the configured value. The true default remains `600000` (10
+minutes).
+
+### Multi-hour Megamind run
+
+Replace the two absolute paths, then run:
 
 ```bash
-tmux list-windows -t botctl
+TASK_FILE=/ABSOLUTE/PATH/TO/TASK.md
+WORKTREE=/ABSOLUTE/PATH/TO/WORKTREE
+RUN_ID="megamind-$(date +%s)-$$"
+CLAUDE_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+botctl prompt \
+  --source "$TASK_FILE" \
+  --cwd "$WORKTREE" \
+  --session "botctl-${RUN_ID}" \
+  --window "claude-${RUN_ID}" \
+  --idle-timeout-ms 28800000 \
+  --keep-temp \
+  --verbose \
+  -- \
+  --agent megamind \
+  --session-id "$CLAUDE_SESSION_ID" \
+  --name "megamind: ${RUN_ID}"
+```
+
+This gives the tmux session, window, and Claude session unique identities. The
+eight-hour value is the fixed response deadline. `--keep-temp` retains any
+generated large-prompt instruction file, and `--verbose` prints the path and
+wait progress to stderr.
+
+On normal `ChatReady` plus an empty composer, stdout contains the final
+assistant text. Botctl removes the captured prompt window only when the
+captured pane is still its sole exact pane; otherwise it warns and retains the
+window. If a fresh
+final assistant record arrives with either a confirmed stale shell-running
+footer or stable composer text, botctl still prints the answer, warns, and
+retains the window. Occupied-composer warnings include the pane-specific
+`botctl submit-composer --pane %ID` and
+`botctl clear-composer --pane %ID` commands.
+`clear-composer` is destructive and discards text botctl could not prove it
+owns. Inspect the pane with `botctl capture --pane %ID` and get explicit
+operator confirmation before running it; never run it unattended.
+
+Failed and retained runs leave the tmux window up:
+
+```bash
+tmux list-windows -t "botctl-${RUN_ID}"
 botctl capture --pane '%N'
 botctl last-message --pane '%N'
 ```
@@ -220,8 +275,10 @@ inspect the surviving window.
 
 - Trivial one-liner completions where `claude --print` is enough and no tools
   are needed.
-- You already have a live managed pane and only need `botctl submit-prompt` /
-  `botctl keep-going` against that pane.
+- You already have a live managed pane and need to supply new text with
+  `botctl submit-prompt`, operate on existing composer text with
+  `botctl submit-composer` / `botctl clear-composer`, or run
+  `botctl keep-going`.
 - Non-Claude providers (use provider-native CLIs or botctl MCP/`last-message`
   for visibility only).
 

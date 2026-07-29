@@ -635,6 +635,28 @@ impl TmuxClient {
         ])
     }
 
+    pub fn kill_window_if_pane_matches(
+        &self,
+        target_window: &str,
+        server: &TmuxServerIdentity,
+        pane: &TmuxPane,
+    ) -> AppResult<bool> {
+        let Some(args) = guarded_kill_window_args(target_window, server, pane) else {
+            return Err(AppError::new(format!(
+                "cannot build an atomic kill guard for window {target_window}: pane {} identity is unavailable or contains characters unsafe for a tmux format predicate",
+                pane.pane_id
+            )));
+        };
+        let output = self.run_output(args)?;
+        match output.trim() {
+            "" => Ok(true),
+            GUARDED_KILL_REFUSAL_MARKER => Ok(false),
+            other => Err(AppError::new(format!(
+                "tmux guarded window cleanup returned unexpected output: {other:?}"
+            ))),
+        }
+    }
+
     pub fn attach_session(&self, target_session: &str) -> AppResult<()> {
         self.run_status(vec![
             String::from("attach-session"),
@@ -1038,6 +1060,67 @@ fn stable_inventory(
     })
 }
 
+const GUARDED_KILL_REFUSAL_MARKER: &str = "BOTCTL_GUARDED_KILL_REFUSED";
+
+fn is_exact_tmux_id(value: &str, prefix: char) -> bool {
+    value.strip_prefix(prefix).is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn is_safe_tmux_format_literal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.' | b'%' | b'@')
+        })
+}
+
+fn guarded_kill_window_args(
+    target_window: &str,
+    server: &TmuxServerIdentity,
+    pane: &TmuxPane,
+) -> Option<Vec<String>> {
+    let pane_pid = pane.pane_pid?;
+    let literals = [
+        target_window,
+        pane.window_id.as_str(),
+        pane.pane_id.as_str(),
+        pane.pane_tty.as_str(),
+        pane.current_command.as_str(),
+    ];
+    if target_window != pane.window_id
+        || !is_exact_tmux_id(target_window, '@')
+        || !is_exact_tmux_id(&pane.pane_id, '%')
+        || literals
+            .iter()
+            .any(|value| !is_safe_tmux_format_literal(value))
+    {
+        return None;
+    }
+    let clauses = [
+        format!("#{{==:#{{pid}},{}}}", server.pid),
+        format!("#{{==:#{{start_time}},{}}}", server.start_time),
+        format!("#{{==:#{{window_id}},{}}}", pane.window_id),
+        String::from("#{==:#{window_panes},1}"),
+        format!("#{{==:#{{pane_id}},{}}}", pane.pane_id),
+        format!("#{{==:#{{pane_pid}},{pane_pid}}}"),
+        format!("#{{==:#{{pane_tty}},{}}}", pane.pane_tty),
+        format!("#{{==:#{{pane_current_command}},{}}}", pane.current_command),
+    ];
+    let condition = clauses
+        .into_iter()
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))?;
+    Some(vec![
+        String::from("if-shell"),
+        String::from("-F"),
+        String::from("-t"),
+        target_window.to_string(),
+        condition,
+        format!("kill-window -t {target_window}"),
+        format!("display-message -p {GUARDED_KILL_REFUSAL_MARKER}"),
+    ])
+}
+
 fn list_panes_args(target: Option<&str>) -> Vec<String> {
     let mut args = vec![String::from("list-panes")];
     if let Some(target) = target {
@@ -1180,8 +1263,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        StartSessionRequest, StartWindowRequest, TmuxClient, TmuxCommandPlan,
-        encode_pane_record_for_test, list_panes_args, parse_created_pane_window,
+        GUARDED_KILL_REFUSAL_MARKER, StartSessionRequest, StartWindowRequest, TmuxClient,
+        TmuxCommandPlan, TmuxPane, TmuxServerIdentity, encode_pane_record_for_test,
+        guarded_kill_window_args, list_panes_args, parse_created_pane_window,
         parse_explicit_pane_target_line, parse_inventory_panes, parse_pane_line,
         parse_pane_listing_strict, parse_server_identity, parse_session_attached_count,
         parse_window_line, select_explicit_pane_target, session_attached_count_args,
@@ -1500,6 +1584,61 @@ mod tests {
         let mut after = before.clone();
         after.pid += 1;
         assert!(stable_inventory(before, Vec::new(), after).is_err());
+    }
+
+    #[test]
+    fn guarded_window_kill_is_atomic_and_requires_one_exact_pane() {
+        let pane = TmuxPane {
+            pane_id: String::from("%7"),
+            pane_tty: String::from("/dev/pts/9"),
+            pane_pid: Some(123),
+            session_id: String::from("$1"),
+            session_name: String::from("demo"),
+            window_id: String::from("@4"),
+            window_index: 2,
+            window_name: String::from("prompt"),
+            pane_index: 0,
+            current_command: String::from("claude"),
+            current_path: String::from("/tmp/demo"),
+            pane_title: String::new(),
+            pane_active: true,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+        };
+        let server = TmuxServerIdentity {
+            socket_path: String::from("/tmp/tmux.sock"),
+            pid: 99,
+            start_time: 456,
+        };
+        let args = guarded_kill_window_args("@4", &server, &pane)
+            .expect("safe identity should produce one conditional command");
+        assert_eq!(args[0..4], ["if-shell", "-F", "-t", "@4"]);
+        assert!(args[4].contains("#{==:#{pid},99}"));
+        assert!(args[4].contains("#{==:#{start_time},456}"));
+        assert!(args[4].contains("#{==:#{window_panes},1}"));
+        assert!(args[4].contains("#{==:#{pane_id},%7}"));
+        assert!(args[4].contains("#{==:#{pane_pid},123}"));
+        assert!(args[4].contains("#{==:#{pane_tty},/dev/pts/9}"));
+        assert!(
+            args[4].contains("#{==:#{pane_current_command},claude}"),
+            "provider command must be part of the atomic predicate"
+        );
+        assert_eq!(args[5], "kill-window -t @4");
+        assert!(args[6].contains(GUARDED_KILL_REFUSAL_MARKER));
+        assert!(
+            guarded_kill_window_args("@4; kill-server", &server, &pane).is_none(),
+            "tmux command separators must fail closed"
+        );
+        let mut unavailable_pane = pane.clone();
+        unavailable_pane.pane_pid = None;
+        let error = TmuxClient::with_socket_path("/tmp/tmux/default")
+            .kill_window_if_pane_matches("@4", &server, &unavailable_pane)
+            .expect_err("unavailable identity must not be reported as a completed guard refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot build an atomic kill guard")
+        );
     }
 
     #[test]
